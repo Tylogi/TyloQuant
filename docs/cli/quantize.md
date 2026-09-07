@@ -126,13 +126,23 @@ MFQ reads the layer count from recipe metadata. If it is missing, pass
 
 ## Sharding and restart controls
 
+HF and full-precision-MFQ quantization use the low-disk streaming writer by
+default. Each completed tensor blob is appended to an output-side private
+payload and deleted immediately, so peak workspace is approximately one model
+copy plus the tensor currently being encoded. Use `--staged-blobs` to select
+the older two-phase path that retains the complete blob set until final
+assembly.
+
 - `--split-max-size N[M|G]` limits tensor payload per output shard.
 - `--split-max-tensors N` limits the tensor count per shard.
-- `--resume` reuses validated HF or Important-Neuron temporary blobs.
+- `--staged-blobs` retains all HF/MFQ tensor blobs before final assembly.
+- `--resume` reuses validated HF or Important-Neuron temporary blobs; for
+  HF/MFQ inputs it implies `--staged-blobs`.
 - `--resume-completed N` reuses completed, validated GGUF tensor blobs.
 - `--dry-run` validates and plans without writing final output.
 - `--overwrite` replaces an existing output.
-- `--keep-temp` retains temporary blobs for diagnosis or restart.
+- `--keep-temp` retains temporary blobs for diagnosis or restart and likewise
+  implies `--staged-blobs` for HF/MFQ inputs.
 
 The shard limits are mutually exclusive. Python and native runtimes load
 numbered shards as one model family.

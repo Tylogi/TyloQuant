@@ -104,6 +104,14 @@ class QuantizePayload(_Payload):
     full_precision: bool = False
     text_only: bool = False
     exclude_mtp: bool = False
+    staged_blobs: bool = Field(
+        default=False,
+        title="Retain staged tensor blobs",
+        description=(
+            "Use the resumable two-phase HF/MFQ writer instead of the default "
+            "low-disk streaming writer."
+        ),
+    )
     resume: bool = False
     overwrite: bool = False
     split_max_size: str | None = Field(default=None, pattern=r"^[1-9][0-9]*[MmGg]$")
@@ -117,6 +125,8 @@ class QuantizePayload(_Payload):
             raise ValueError("full_precision cannot be combined with a quantization recipe")
         if self.full_precision and self.calibrate_imatrix:
             raise ValueError("full_precision cannot calibrate an imatrix")
+        if self.full_precision and self.staged_blobs:
+            raise ValueError("staged_blobs applies to quantized outputs, not full_precision")
         if self.calibrate_imatrix:
             if self.imatrix is not None:
                 raise ValueError("choose an existing imatrix or calibrate a new one, not both")
@@ -604,6 +614,7 @@ class ToolJobHandlers:
             (request.full_precision, "--full-precision"),
             (request.text_only, "--text-only"),
             (request.exclude_mtp, "--exclude-mtp"),
+            (request.staged_blobs, "--staged-blobs"),
             (request.resume, "--resume"),
             (request.overwrite, "--overwrite"),
         ):

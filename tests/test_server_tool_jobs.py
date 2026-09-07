@@ -93,6 +93,7 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
             """\
             #!/usr/bin/env python3
             import pathlib, sys
+            assert '--staged-blobs' in sys.argv
             output = pathlib.Path(sys.argv[5])
             output.write_bytes(b'MFQ1')
             print('100% done')
@@ -115,6 +116,7 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
         kinds = {item.kind: item for item in manager.kinds().data}
         assert kinds["model.quantize"].payload_schema["additionalProperties"] is False
         assert "input" in kinds["model.quantize"].payload_schema["properties"]
+        assert "staged_blobs" in kinds["model.quantize"].payload_schema["properties"]
         artifact = (await catalog.list()).data[0]
 
         checked = await manager.submit(
@@ -129,7 +131,11 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
         quantized = await manager.submit(
             CreateJobRequest(
                 kind="model.quantize",
-                payload={"input": "source", "output": "output/model.mfq"},
+                payload={
+                    "input": "source",
+                    "output": "output/model.mfq",
+                    "staged_blobs": True,
+                },
             )
         )
         result = await _wait(store, quantized.id)
@@ -138,6 +144,7 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
         lineage = store.list_artifact_lineage(artifact_uri="workspace://output/model.mfq")[0]
         assert lineage.producer_kind == "model.quantize"
         assert lineage.parameters["source_format"] == "auto"
+        assert lineage.parameters["staged_blobs"] is True
         assert lineage.source_uris == ["workspace://source"]
 
         rejected = await manager.submit(

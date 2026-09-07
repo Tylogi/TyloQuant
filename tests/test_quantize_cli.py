@@ -39,6 +39,7 @@ def test_quantize_routes_hf_common_options(tmp_path: Path, monkeypatch) -> None:
                 "5",
                 "--split-max-size",
                 "2G",
+                "--staged-blobs",
                 "--resume",
                 "--dry-run",
             ]
@@ -53,6 +54,7 @@ def test_quantize_routes_hf_common_options(tmp_path: Path, monkeypatch) -> None:
     assert args.calibration_scheme == str(tmp_path / "ew.json")
     assert args.bits == 5
     assert args.split_max_size == 2_000_000_000
+    assert args.staged_blobs is True
     assert args.resume_temp is True
     assert args.dry_run is True
 
@@ -78,6 +80,7 @@ def test_quantize_routes_metal_backend(tmp_path: Path, monkeypatch) -> None:
         == 0
     )
     assert captured[0].quant_backend == "metal"
+    assert captured[0].staged_blobs is False
 
 
 def test_quantize_routes_incremental_mtp_base(tmp_path: Path, monkeypatch) -> None:

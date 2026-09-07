@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -13,9 +14,11 @@ from mfq.formats.shards import (
     SPLIT_NO_KEY,
     SPLIT_RECORDS_COUNT_KEY,
     SPLIT_TENSORS_COUNT_KEY,
+    StreamingBlobShardWriter,
     format_shard_path,
     parse_shard_path,
     parse_size,
+    write_blob_record_shards,
 )
 from mfq.tools.split_mfq import split_mfq
 
@@ -35,6 +38,21 @@ def _source_model(path: Path) -> None:
             MODEL_CONFIG_ASSET: b'{"model_type":"fixture"}',
         },
     )
+
+
+@dataclass(frozen=True)
+class _BlobRecord:
+    name: str
+    dtype: str
+    nbytes: int
+    path: Path
+    offset: int = 0
+
+
+def _blob_record(root: Path, name: str, dtype: str, data: bytes) -> _BlobRecord:
+    path = root / f"{len(list(root.iterdir())):02d}.blob"
+    path.write_bytes(data)
+    return _BlobRecord(name, dtype, len(data), path)
 
 
 def test_shard_name_round_trip(tmp_path: Path) -> None:
@@ -128,3 +146,99 @@ def test_split_can_use_the_source_base_name_and_keeps_the_source(
         assert store.header.extra[SPLIT_NO_KEY] == 0
         assert store.header.extra[SPLIT_COUNT_KEY] == 1
         assert len(store) == 4
+
+
+@pytest.mark.parametrize("split_max_tensors", [0, 2])
+def test_streaming_blob_writer_matches_staged_bytes_and_consumes_inputs(
+    tmp_path: Path,
+    split_max_tensors: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(StreamingBlobShardWriter, "_COPY_CHUNK", 31)
+    header = FileHeader(
+        version=2,
+        model_arch="writer-equivalence",
+        extra={"model": "fixture", "nested": {"value": 7}},
+    )
+    tensor_data = (
+        ("weight.0", "F16", b"first-tensor"),
+        ("weight.1", "NINT4", bytes(range(37))),
+        ("weight.2", "F32", bytes(range(256)) * 4),
+    )
+    asset_data = b'{"model_type":"writer-equivalence"}'
+
+    staged_root = tmp_path / "staged-blobs"
+    staged_root.mkdir()
+    staged_records = [
+        _blob_record(staged_root, name, dtype, data)
+        for name, dtype, data in tensor_data
+    ]
+    staged_asset = _blob_record(
+        staged_root,
+        MODEL_CONFIG_ASSET,
+        "BLOB",
+        asset_data,
+    )
+    staged_paths = write_blob_record_shards(
+        tmp_path / "staged.mfq",
+        header,
+        [*staged_records, staged_asset],
+        split_max_tensors=split_max_tensors,
+    )
+
+    streaming_root = tmp_path / "streaming-blobs"
+    streaming_root.mkdir()
+    streaming_records = [
+        _blob_record(streaming_root, name, dtype, data)
+        for name, dtype, data in tensor_data
+    ]
+    streaming_asset = _blob_record(
+        streaming_root,
+        MODEL_CONFIG_ASSET,
+        "BLOB",
+        asset_data,
+    )
+    writer = StreamingBlobShardWriter(
+        tmp_path / "streaming.mfq",
+        split_max_tensors=split_max_tensors,
+    )
+    for record in streaming_records:
+        writer.append(record, consume=True)
+        assert not record.path.exists()
+    streaming_paths = writer.finalize(
+        header,
+        [streaming_asset],
+        consume_assets=True,
+    )
+
+    assert not streaming_asset.path.exists()
+    assert len(streaming_paths) == len(staged_paths)
+    assert [path.read_bytes() for path in streaming_paths] == [
+        path.read_bytes() for path in staged_paths
+    ]
+    with open_mmap(streaming_paths[-1]) as store:
+        expected_records = ["weight.0", "weight.1", "weight.2"]
+        if split_max_tensors:
+            expected_records.insert(0, MODEL_CONFIG_ASSET)
+        else:
+            expected_records.append(MODEL_CONFIG_ASSET)
+        assert list(store.records) == expected_records
+        assert store.read_blob(MODEL_CONFIG_ASSET) == asset_data
+
+
+def test_streaming_blob_writer_preserves_source_and_cleans_up_after_copy_failure(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "truncated.blob"
+    source.write_bytes(b"short")
+    record = _BlobRecord("weight", "F16", 10, source)
+    output = tmp_path / "failed.mfq"
+    writer = StreamingBlobShardWriter(output)
+
+    with pytest.raises(EOFError, match="truncated MFQ blob source"):
+        writer.append(record, consume=True)
+    writer.abort()
+
+    assert source.read_bytes() == b"short"
+    assert not output.exists()
+    assert not (tmp_path / ".failed.mfq.streaming").exists()

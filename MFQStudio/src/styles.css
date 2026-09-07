@@ -1456,6 +1456,8 @@ select:focus-visible, summary:focus-visible {
   --sidebar-surface: rgb(255 255 255 / 58%);
   --sidebar-hover: rgb(32 34 35 / 7%);
   --sidebar-line: rgb(32 34 35 / 10%);
+  --warning: #9e6900;
+  --warning-soft: rgb(158 105 0 / 11%);
   --success: #147a43;
   --success-soft: rgb(20 122 67 / 11%);
   --danger: #b5322d;
@@ -1496,6 +1498,8 @@ select:focus-visible, summary:focus-visible {
   --sidebar-surface: rgb(240 243 243 / 5%);
   --sidebar-hover: rgb(240 243 243 / 8%);
   --sidebar-line: rgb(240 243 243 / 10%);
+  --warning: #ffc747;
+  --warning-soft: rgb(255 199 71 / 12%);
   --success: #57d184;
   --success-soft: rgb(87 209 132 / 12%);
   --danger: #ff7169;
@@ -1535,6 +1539,8 @@ select:focus-visible, summary:focus-visible {
     --sidebar-surface: rgb(240 243 243 / 5%);
     --sidebar-hover: rgb(240 243 243 / 8%);
     --sidebar-line: rgb(240 243 243 / 10%);
+    --warning: #ffc747;
+    --warning-soft: rgb(255 199 71 / 12%);
     --success: #57d184;
     --success-soft: rgb(87 209 132 / 12%);
     --danger: #ff7169;
@@ -2333,6 +2339,26 @@ select:focus-visible, summary:focus-visible { outline-color: rgb(83 142 144 / 40
   margin: 0;
   padding: 20px;
 }
+.model-monogram {
+  display: grid;
+  width: 54px;
+  height: 54px;
+  place-items: center;
+  color: var(--ink-strong);
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+.model-monogram.loading { color: var(--warning); }
+.model-monogram.ready { color: var(--success); }
+.model-monogram.failed { color: var(--danger); }
+.runtime-status-pill.loading { color: var(--warning); background: var(--warning-soft); }
+.runtime-status-pill.loading i { background: var(--warning); }
+.runtime-status-pill.ready { color: var(--success); background: var(--success-soft); }
+.runtime-status-pill.ready i { background: var(--success); }
+.runtime-status-pill.failed { color: var(--danger); background: var(--danger-soft); }
+.runtime-status-pill.failed i { background: var(--danger); }
 .runtime-hero-copy { display: grid; gap: 5px; }
 .runtime-hero-copy > div { display: flex; min-width: 0; align-items: center; gap: 9px; }
 .runtime-hero-copy > p.runtime-endpoint {
@@ -2497,6 +2523,7 @@ select:focus-visible, summary:focus-visible { outline-color: rgb(83 142 144 / 40
   .logs-grid { grid-template-columns: 1fr; }
   .logs-grid > .runtime-log-panel { grid-column: 1; }
   .tm-panel.runtime-hero { grid-template-columns: 46px minmax(0, 1fr); }
+  .model-monogram { width: 46px; height: 46px; font-size: 24px; }
   .runtime-hero-actions { grid-column: 1 / -1; }
   .overview-footer-grid { grid-template-columns: 1fr; }
   .settings-page-grid { grid-template-columns: 1fr; }

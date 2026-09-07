@@ -258,6 +258,19 @@ def test_studio_exposes_omlx_style_runtime_lifecycle_controls():
     assert "--accent: #0a84ff" in STYLES
 
 
+def test_studio_runtime_monogram_tracks_the_real_model_lifecycle():
+    assert "function ModelMonogram" in APP
+    assert 'const runtimeModelName = runtime?.model || "Empty";' in APP
+    assert 'job.kind === "model.load"' in APP
+    assert 'instance.state === "loading"' in APP
+    assert 'instance.state === "failed"' in APP
+    assert '<ModelMonogram name={modelHero.name} state={modelHero.state} />' in APP
+    assert 'className={`runtime-status-pill ${modelHero.state}`}' in APP
+    assert ".model-monogram.loading { color: var(--warning); }" in STYLES
+    assert ".model-monogram.ready { color: var(--success); }" in STYLES
+    assert ".model-monogram.failed { color: var(--danger); }" in STYLES
+
+
 def test_studio_adapts_prefix_cache_panel_to_flash_next_hot_cache():
     assert 'prefix_cache_mode?: string;' in API
     assert 'prefix_cache_pending_bytes?: number;' in API

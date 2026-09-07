@@ -192,6 +192,7 @@ from mfq.formats.runtime_profile import (
 )
 from mfq.formats.shards import (
     SPLIT_KEYS,
+    StreamingBlobShardWriter,
     matching_shard_paths,
     parse_size,
     validate_split_limits,
@@ -4632,6 +4633,13 @@ def convert(args: argparse.Namespace) -> None:
     split_max_size = int(getattr(args, "split_max_size", 0))
     split_max_tensors = int(getattr(args, "split_max_tensors", 0))
     validate_split_limits(split_max_size, split_max_tensors)
+    resume_temp = bool(getattr(args, "resume_temp", False))
+    staged_blobs = bool(
+        getattr(args, "staged_blobs", False)
+        or resume_temp
+        or getattr(args, "keep_temp", False)
+    )
+    writer_mode = "staged_blobs" if staged_blobs else "streaming"
     if (output.exists() or matching_shard_paths(output)) and not args.overwrite:
         raise FileExistsError(f"output exists: {output}")
     if base_store is not None and output in {path.resolve() for path in base_store.paths}:
@@ -4820,6 +4828,10 @@ def convert(args: argparse.Namespace) -> None:
                 },
                 "source_full_precision_gb": round(total_src / 1e9, 3),
                 "estimated_mfq_gb": round((nint_est + dense_est) / 1e9, 3),
+                "estimated_writer_workspace_gb": round(
+                    (nint_est + dense_est) * (2 if staged_blobs else 1) / 1e9,
+                    3,
+                ),
                 "default_spec": {
                     "bits": spec.bits,
                     "groupsize": spec.groupsize,
@@ -4850,6 +4862,7 @@ def convert(args: argparse.Namespace) -> None:
                 "quant_backend": quant_backend,
                 "device": quant_device,
                 "row_chunk": row_chunk,
+                "writer_mode": writer_mode,
                 "text_only": args.text_only,
                 "dense_dtype": "MOSTLY_BF16" if mostly_bf16 else dense_dtype,
                 "mostly_bf16": mostly_bf16,
@@ -4941,7 +4954,6 @@ def convert(args: argparse.Namespace) -> None:
         if temp_dir_arg
         else output.parent / f".{output.name}.tmp_blobs"
     )
-    resume_temp = bool(getattr(args, "resume_temp", False))
     if tmp_root.exists() and not resume_temp:
         raise FileExistsError(f"temporary directory exists: {tmp_root}")
     tmp_root.mkdir(parents=True, exist_ok=resume_temp)
@@ -4950,8 +4962,16 @@ def convert(args: argparse.Namespace) -> None:
     gain_results: dict[str, dict[str, object]] = {}
     start_time = time.time()
     completed = False
+    stream_writer: StreamingBlobShardWriter | None = None
 
     try:
+        if not staged_blobs and base_store is None:
+            stream_writer = StreamingBlobShardWriter(
+                output,
+                split_max_size=split_max_size,
+                split_max_tensors=split_max_tensors,
+                overwrite=bool(args.overwrite),
+            )
         by_shard: dict[str, list[TensorPlan]] = {}
         for item in plan:
             by_shard.setdefault(item.shard, []).append(item)
@@ -5254,7 +5274,10 @@ def convert(args: argparse.Namespace) -> None:
                     raise RuntimeError(
                         f"blob size mismatch for {item.name}: {nbytes} != {expected_nbytes}"
                     )
-                records.append(BlobRecord(item.name, item.target_dtype, nbytes, blob_path))
+                record = BlobRecord(item.name, item.target_dtype, nbytes, blob_path)
+                records.append(record)
+                if stream_writer is not None:
+                    stream_writer.append(record, consume=True)
                 elapsed = time.time() - t0
                 print(
                     json.dumps(
@@ -5466,6 +5489,17 @@ def convert(args: argparse.Namespace) -> None:
                 and not base_legacy_names.get(record.name, record.name).startswith("predictor.")
             ]
             records = copied_tensors + generated_tensors + generated_assets
+            if not staged_blobs:
+                stream_writer = StreamingBlobShardWriter(
+                    output,
+                    split_max_size=split_max_size,
+                    split_max_tensors=split_max_tensors,
+                    overwrite=bool(args.overwrite),
+                )
+                for record in copied_tensors:
+                    stream_writer.append(record)
+                for record in generated_tensors:
+                    stream_writer.append(record, consume=True)
 
             inherited_counts = base_store.header.extra.get("target_counts", {})
             merged_counts = (
@@ -5607,14 +5641,23 @@ def convert(args: argparse.Namespace) -> None:
             num_tensors=len(records),
             extra=output_extra,
         )
-        outputs = write_blob_record_shards(
-            output,
-            header,
-            records,
-            split_max_size=split_max_size,
-            split_max_tensors=split_max_tensors,
-            overwrite=bool(args.overwrite),
-        )
+        if staged_blobs:
+            outputs = write_blob_record_shards(
+                output,
+                header,
+                records,
+                split_max_size=split_max_size,
+                split_max_tensors=split_max_tensors,
+                overwrite=bool(args.overwrite),
+            )
+        else:
+            if stream_writer is None:
+                raise RuntimeError("streaming MFQ writer was not initialized")
+            outputs = stream_writer.finalize(
+                header,
+                [record for record in records if is_asset_record(record.name)],
+                consume_assets=True,
+            )
         if len(outputs) > 1 and output.exists() and args.overwrite:
             output.unlink()
         completed = True
@@ -5627,13 +5670,18 @@ def convert(args: argparse.Namespace) -> None:
                     "shard_count": len(outputs),
                     "output_gb": round(sum(path.stat().st_size for path in outputs) / 1e9, 3),
                     "elapsed_sec": round(time.time() - start_time, 2),
+                    "writer_mode": writer_mode,
                 },
                 ensure_ascii=False,
             ),
             flush=True,
         )
     finally:
-        if not args.keep_temp and tmp_root.exists() and (completed or not resume_temp):
+        if stream_writer is not None and not completed:
+            stream_writer.abort()
+        if not getattr(args, "keep_temp", False) and tmp_root.exists() and (
+            completed or not resume_temp
+        ):
             shutil.rmtree(tmp_root)
         if mfq_checkpoint is not None:
             mfq_checkpoint.close()
@@ -5788,6 +5836,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
+    parser.add_argument(
+        "--staged-blobs",
+        action="store_true",
+        help=(
+            "use the legacy two-phase writer that retains every tensor blob "
+            "until final assembly; implied by --resume-temp and --keep-temp"
+        ),
+    )
     split = parser.add_mutually_exclusive_group()
     split.add_argument(
         "--split-max-size",
@@ -5810,7 +5866,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--temp-dir",
         default="",
-        help="exact temporary blob directory; defaults beside the output file",
+        help="intermediate tensor workspace; defaults beside the output file",
     )
     return parser
 

@@ -1176,6 +1176,74 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
         store.close()
 
 
+def test_hf_default_streaming_writer_matches_explicit_staged_blobs(tmp_path, capsys):
+    root = tmp_path / "hf-writer"
+    root.mkdir()
+    save_file(
+        {
+            "model.language_model.layers.0.mlp.down_proj.weight": torch.linspace(
+                -2.0,
+                2.0,
+                steps=4 * 24,
+                dtype=torch.float32,
+            )
+            .reshape(4, 24)
+            .to(torch.bfloat16),
+            "model.language_model.norm.weight": torch.arange(24, dtype=torch.float32),
+        },
+        root / "model.safetensors",
+    )
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}),
+        encoding="utf-8",
+    )
+
+    streaming_output = tmp_path / "streaming.mfq"
+    common = [
+        "--input",
+        str(root),
+        "--quant-backend",
+        "cpu",
+        "--device",
+        "cpu",
+        "--row-chunk",
+        "4",
+    ]
+    streaming_args = hf_to_mfq.build_parser().parse_args(
+        [*common, "--output", str(streaming_output)]
+    )
+    assert streaming_args.staged_blobs is False
+    convert(streaming_args)
+
+    staged_output = tmp_path / "staged.mfq"
+    staged_args = hf_to_mfq.build_parser().parse_args(
+        [*common, "--output", str(staged_output), "--staged-blobs"]
+    )
+    assert staged_args.staged_blobs is True
+    convert(staged_args)
+
+    assert streaming_output.read_bytes() == staged_output.read_bytes()
+    assert not (tmp_path / ".streaming.mfq.streaming").exists()
+    assert not (tmp_path / ".streaming.mfq.tmp_blobs").exists()
+    assert not (tmp_path / ".staged.mfq.tmp_blobs").exists()
+
+    completed_output = capsys.readouterr().out
+    assert '"writer_mode": "streaming"' in completed_output
+    assert '"writer_mode": "staged_blobs"' in completed_output
+    for option in ("--resume-temp", "--keep-temp"):
+        implied_args = hf_to_mfq.build_parser().parse_args(
+            [
+                *common,
+                "--output",
+                str(tmp_path / f"implied-{option[2:]}.mfq"),
+                "--dry-run",
+                option,
+            ]
+        )
+        convert(implied_args)
+        assert '"writer_mode": "staged_blobs"' in capsys.readouterr().out
+
+
 def test_hf_convert_writes_an_ordinary_vq_tensor_via_precision_override(
     tmp_path,
 ):

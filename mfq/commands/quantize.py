@@ -234,7 +234,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default=0,
         help="maximum tensor count per MFQ shard",
     )
-    output.add_argument("--temp-dir", default="", help="HF temporary blob directory")
+    output.add_argument("--temp-dir", default="", help="HF intermediate tensor workspace")
+    output.add_argument(
+        "--staged-blobs",
+        action="store_true",
+        help=(
+            "HF/MFQ: retain all tensor blobs until final assembly; "
+            "uses more disk but supports restart inspection"
+        ),
+    )
     output.add_argument(
         "--resume",
         action="store_true",
@@ -432,6 +440,7 @@ def _hf_arguments(
     _append_flag(argv, "--bf16", args.bf16)
     _append_flag(argv, "--q8-to-nint8-zero", args.q8_mode == "nint8-0")
     _append_vq_arguments(argv, args)
+    _append_flag(argv, "--staged-blobs", args.staged_blobs)
     _append_flag(argv, "--resume-temp", args.resume)
     _append_flag(argv, "--dry-run", args.dry_run)
     _append_flag(argv, "--overwrite", args.overwrite)
@@ -503,6 +512,12 @@ def _run_in(args: argparse.Namespace, baseline: Path, output: Path) -> None:
 
 
 def _validate(args: argparse.Namespace, source_format: str) -> None:
+    if args.staged_blobs and (
+        source_format == "gguf" or args.bf16 or args.important_neurons
+    ):
+        raise ValueError(
+            "--staged-blobs applies only to quantized HF or full-precision MFQ sources"
+        )
     if args.base_mfq:
         if source_format not in {"hf", "mfq"}:
             raise ValueError("--base-mfq requires an HF or full-precision MFQ source")
@@ -608,6 +623,7 @@ def run(args: argparse.Namespace) -> int:
                 "quantize_vision": args.quantize_vision,
                 "quantize_mtp": args.quantize_mtp,
                 "important_neurons": args.important_neurons or None,
+                "staged_blobs": args.staged_blobs,
             },
             ensure_ascii=False,
         ),

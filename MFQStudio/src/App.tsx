@@ -89,6 +89,7 @@ type LabPage = "models" | "evaluations" | "quantization";
 type UiLanguage = "system" | "zh-CN" | "en";
 type UiTheme = "system" | "light" | "dark";
 type PresetName = "precise" | "balanced" | "creative" | "custom";
+type ModelMonogramState = "idle" | "loading" | "ready" | "failed";
 
 interface GenerationSettings {
   language: UiLanguage;
@@ -941,6 +942,17 @@ function TMPanel({
   className?: string;
 }) {
   return <section className={`tm-panel ${className}`.trim()}>{children}</section>;
+}
+
+function ModelMonogram({
+  name,
+  state,
+}: {
+  name: string;
+  state: ModelMonogramState;
+}) {
+  const initial = Array.from(name.trim())[0]?.toLocaleUpperCase() || "E";
+  return <span aria-hidden="true" className={`model-monogram ${state}`}>{initial}</span>;
 }
 
 function MetricTile({
@@ -3377,6 +3389,77 @@ export default function App() {
   const last = runtime?.last_request;
   const lastPrefill = displayPrefillMetric(last);
   const lastTtftMs = preferPositiveMetric(last?.ttft_ms, last?.complete_prefill_ms);
+  const runtimeModelName = runtime?.model || "Empty";
+  const modelHero = useMemo(() => {
+    const activeLoadJob = jobs.find(
+      (job) => job.kind === "model.load"
+        && ["queued", "running", "cancelling"].includes(job.status),
+    );
+    const latestLifecycleJob = jobs.find(
+      (job) => job.kind === "model.load" || job.kind === "model.unload",
+    );
+    const currentInstance = instances.find((instance) => instance.id === runtime?.instance_id);
+    const loadingInstance = [...instances].reverse().find(
+      (instance) => instance.state === "loading",
+    );
+    const readyInstance = currentInstance?.state === "ready" || currentInstance?.state === "busy"
+      ? currentInstance
+      : [...instances].reverse().find(
+        (instance) => instance.state === "ready" || instance.state === "busy",
+      );
+    const failedInstance = currentInstance?.state === "failed"
+      ? currentInstance
+      : [...instances].reverse().find((instance) => instance.state === "failed");
+    const jobModel = typeof activeLoadJob?.payload.model === "string"
+      ? activeLoadJob.payload.model
+      : "";
+    const runtimeState = String(runtime?.runtime_state || "").toLowerCase();
+
+    if (runtime?.reloading || runtimeState === "loading" || loadingInstance || activeLoadJob) {
+      return {
+        name: loadingInstance?.model || jobModel || runtimeModelName,
+        state: "loading" as const,
+      };
+    }
+    if (runtimeState === "failed" || currentInstance?.state === "failed") {
+      return {
+        name: currentInstance?.model || runtimeModelName,
+        state: "failed" as const,
+      };
+    }
+    if (runtime?.model || readyInstance) {
+      return {
+        name: runtime?.model || readyInstance?.model || runtimeModelName,
+        state: "ready" as const,
+      };
+    }
+    if (failedInstance) {
+      return {
+        name: failedInstance.model || runtimeModelName,
+        state: "failed" as const,
+      };
+    }
+    if (
+      latestLifecycleJob?.kind === "model.load"
+      && latestLifecycleJob.status === "failed"
+    ) {
+      const failedJobModel = typeof latestLifecycleJob.payload.model === "string"
+        ? latestLifecycleJob.payload.model
+        : "";
+      return {
+        name: failedJobModel || runtimeModelName,
+        state: "failed" as const,
+      };
+    }
+    return { name: runtimeModelName, state: "idle" as const };
+  }, [instances, jobs, runtime, runtimeModelName]);
+  const modelHeroStatus = modelHero.state === "loading"
+    ? tr("加载中", "Loading")
+    : modelHero.state === "ready"
+      ? tr("运行中", "Running")
+      : modelHero.state === "failed"
+        ? tr("加载失败", "Failed")
+        : tr("空闲", "Idle");
   const activeJobs = jobs.filter((job) =>
     ["queued", "running", "cancelling"].includes(job.status),
   );
@@ -3872,9 +3955,9 @@ export default function App() {
               trailing={dashboardPage === "overview" ? <button disabled={busy} onClick={() => void refreshRuntime()} type="button"><Icon name="refresh" size={14} />{tr("刷新", "Refresh")}</button> : dashboardPage === "models" ? <button disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="plus" size={14} />{tr("添加模型", "Add model")}</button> : dashboardPage === "settings" ? <button className="primary" onClick={saveSettings} type="button">{tr("应用设置", "Apply settings")}</button> : undefined}
             />
             {dashboardPage === "overview" && <TMPanel className="runtime-hero">
-              <img src="/mfq-mark.svg" alt="" />
+              <ModelMonogram name={modelHero.name} state={modelHero.state} />
               <div className="runtime-hero-copy">
-                <div><h2>{runtime?.model || "Empty"}</h2><span className={`runtime-status-pill ${runtime?.model ? "running" : "stopped"}`}><i />{runtime?.model ? tr("运行中", "Running") : tr("空闲", "Idle")}</span></div>
+                <div><h2>{modelHero.name}</h2><span className={`runtime-status-pill ${modelHero.state}`}><i />{modelHeroStatus}</span></div>
                 <p className="runtime-endpoint">{studio?.service_url || "http://127.0.0.1:8090"}</p>
                 <small>{runtime?.model ? `${runtime?.model_type || "MFQ"} · ${formatNumber(runtime?.max_context)} ${tr("上下文", "context")} · ${formatDuration(runtime?.uptime_seconds)}` : tr("加载本地模型后即可开始推理。", "Load a local model to begin inference.")}</small>
               </div>
