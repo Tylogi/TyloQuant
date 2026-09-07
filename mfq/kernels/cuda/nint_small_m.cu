@@ -109,13 +109,21 @@ void launch_nint5_gs28_small_m(
 #undef MFQ_NINT5_CASE
 }
 
-template <int MROWS, bool FLOAT_OUTPUT = false>
+template <int MROWS, bool FLOAT_OUTPUT = false, bool SHARED_XS = false>
 __global__ void __launch_bounds__(128) nint8_gs48_small_m_kernel(
     NintSmallMProjection weight, const int8_t* __restrict__ qx,
     const float* __restrict__ xs, int ng, int kpad)
 {
     const int row = blockIdx.x * 4 + threadIdx.y, lane = threadIdx.x;
+    extern __shared__ float shared_xs[];
+    if constexpr (SHARED_XS) {
+        const int tid = threadIdx.y * 32 + lane;
+        for (int i = tid; i < MROWS * ng; i += 128) shared_xs[i] = xs[i];
+        __syncthreads();
+    }
     if (row >= weight.n) return;
+    const float* input_scales = xs;
+    if constexpr (SHARED_XS) input_scales = shared_xs;
     const auto* qrow = weight.q_packed + (size_t)row * ng * 48;
     const auto* ssrow = weight.sub_scale + (size_t)row * ng;
     const auto* smrow = weight.sub_min + (size_t)row * ng;
@@ -133,7 +141,7 @@ __global__ void __launch_bounds__(128) nint8_gs48_small_m_kernel(
             // 128*xsum. Its four-term integer range is exact in FP32.
             asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(di) : "r"(qv), "r"(xv), "r"(0));
             const int sumi = __dp4a(0x01010101, xv, 0);
-            acc[m] += xs[(size_t)m * ng + g] * (de * float(di) - me * float(sumi));
+            acc[m] += input_scales[(size_t)m * ng + g] * (de * float(di) - me * float(sumi));
         }
     }
     #pragma unroll
@@ -150,13 +158,31 @@ __global__ void __launch_bounds__(128) nint8_gs48_small_m_kernel(
     }
 }
 
+template <int MROWS, bool FLOAT_OUTPUT = false>
+static void launch_nint8_small_m_output(
+    NintSmallMProjection weight, const int8_t* qx, const float* xs,
+    int ng, int kpad, cudaStream_t stream)
+{
+    const size_t shared_bytes = (size_t)MROWS * ng * sizeof(float);
+    if constexpr (MROWS >= 4) {
+        if (shared_bytes <= 32768) {
+            nint8_gs48_small_m_kernel<MROWS, FLOAT_OUTPUT, true>
+                <<<dim3((weight.n + 3) / 4), dim3(32, 4), shared_bytes, stream>>>(
+                    weight, qx, xs, ng, kpad);
+            return;
+        }
+    }
+    nint8_gs48_small_m_kernel<MROWS, FLOAT_OUTPUT>
+        <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(
+            weight, qx, xs, ng, kpad);
+}
+
 void launch_nint8_gs48_small_m(
     NintSmallMProjection weight, const int8_t* qx, const float* xs,
     int m, int ng, int kpad, cudaStream_t stream)
 {
 #define MFQ_NINT8_CASE(M) \
-    case M: nint8_gs48_small_m_kernel<M> \
-        <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); break
+    case M: launch_nint8_small_m_output<M>(weight, qx, xs, ng, kpad, stream); break
     switch (m) {
         MFQ_NINT8_CASE(2);
         MFQ_NINT8_CASE(3);
@@ -175,8 +201,8 @@ static void launch_warprow_small_m_f32(
 {
 #define MFQ_NINT_WARPROW_F32_CASE(M) \
     case M: \
-        if constexpr (BITS == 8) nint8_gs48_small_m_kernel<M, true> \
-            <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); \
+        if constexpr (BITS == 8) launch_nint8_small_m_output<M, true>( \
+            weight, qx, xs, ng, kpad, stream); \
         else nint_group4_small_m_kernel<BITS, GS, M, true> \
             <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); break
     switch (m) {
