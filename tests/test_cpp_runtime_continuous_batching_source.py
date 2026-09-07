@@ -51,6 +51,12 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "environment == nullptr || std::atoi(environment) != 0" in BATCHING
     assert "continuous_batching_batched_greedy_batches" in BATCHING
     assert "sample_greedy_cuda(" in BATCHING
+    assert "MFQ_CONTINUOUS_BATCH_PACKED_METADATA" in BATCHING
+    assert BATCHING.count(
+        "environment == nullptr || std::atoi(environment) != 0"
+    ) >= 2
+    assert "continuous_batching_packed_metadata_batches" in BATCHING
+    assert "ensure_decode_metadata_buffers" in BATCHING
 
 
 def test_qwen_decode_accepts_independent_batch_positions():

@@ -74,6 +74,12 @@ static bool qwen_continuous_batch_greedy_enabled() {
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
+static bool qwen_continuous_batch_packed_metadata_enabled() {
+    const char * environment = std::getenv(
+        "MFQ_CONTINUOUS_BATCH_PACKED_METADATA");
+    return environment == nullptr || std::atoi(environment) != 0;
+}
+
 static QwenBatchState take_qwen_batch_state(Model & model, int64_t batch) {
     MFQ_RUNTIME_CHECK(model.speculative_start < 0,
         "continuous batching cannot detach speculative state");
@@ -404,6 +410,8 @@ public:
                 static_cast<double>(compactions_.load())},
             {"continuous_batching_batched_greedy_batches",
                 static_cast<double>(batched_greedy_batches_.load())},
+            {"continuous_batching_packed_metadata_batches",
+                static_cast<double>(packed_metadata_batches_.load())},
             {"continuous_batching_mtp_target_only_requests",
                 static_cast<double>(mtp_bypasses_.load())},
             {"continuous_batching_prefix_cache_bypasses",
@@ -640,6 +648,21 @@ private:
         }
     }
 
+    void ensure_decode_metadata_buffers(int primary) {
+        if (decode_metadata_host_.defined()) return;
+        const int64_t capacity = 3 * static_cast<int64_t>(max_sequences_);
+        decode_metadata_host_ = mfq_tensor_backend::empty(
+            {capacity}, mfq_tensor_backend::TensorOptions()
+                .dtype(mfq_tensor_backend::kInt64)
+                .device(mfq_tensor_backend::kCPU)
+                .pinned_memory(true));
+        decode_metadata_cuda_ = mfq_tensor_backend::empty(
+            {capacity}, mfq_tensor_backend::TensorOptions()
+                .dtype(mfq_tensor_backend::kInt64)
+                .device(mfq_tensor_backend::Device(
+                    mfq_tensor_backend::kCUDA, primary)));
+    }
+
     void decode_active() {
         if (active_.empty()) return;
         std::lock_guard<std::mutex> model_lock(model_mutex_);
@@ -651,29 +674,61 @@ private:
         std::vector<int64_t> input_tokens;
         std::vector<int64_t> positions;
         std::vector<int64_t> sequence_lengths;
-        input_tokens.reserve(active_.size());
-        positions.reserve(active_.size());
-        sequence_lengths.reserve(active_.size());
+        const bool packed_metadata =
+            qwen_continuous_batch_packed_metadata_enabled();
+        int64_t * packed_metadata_data = nullptr;
+        if (packed_metadata) {
+            ensure_decode_metadata_buffers(primary);
+            packed_metadata_data =
+                decode_metadata_host_.data_ptr<int64_t>();
+        } else {
+            input_tokens.reserve(active_.size());
+            positions.reserve(active_.size());
+            sequence_lengths.reserve(active_.size());
+        }
         int64_t max_position = 0;
         int64_t max_sequence_length = 0;
-        for (const auto & request : active_) {
-            input_tokens.push_back(request->pending_token);
-            positions.push_back(request->cache_length);
-            sequence_lengths.push_back(request->cache_length + 1);
+        for (size_t row = 0; row < active_.size(); ++row) {
+            const auto & request = active_[row];
+            if (packed_metadata_data != nullptr) {
+                packed_metadata_data[row] = request->pending_token;
+                packed_metadata_data[batch + row] = request->cache_length;
+                packed_metadata_data[2 * batch + row] =
+                    request->cache_length + 1;
+            } else {
+                input_tokens.push_back(request->pending_token);
+                positions.push_back(request->cache_length);
+                sequence_lengths.push_back(request->cache_length + 1);
+            }
             max_position = std::max(max_position, request->cache_length);
             max_sequence_length = std::max(
                 max_sequence_length, request->cache_length + 1);
         }
-        const auto options = mfq_tensor_backend::TensorOptions()
-            .dtype(mfq_tensor_backend::kInt64)
-            .device(mfq_tensor_backend::Device(
-                mfq_tensor_backend::kCUDA, primary));
-        auto ids = mfq_tensor_backend::tensor(input_tokens, options)
-            .reshape({batch, 1}).contiguous();
-        auto pos = mfq_tensor_backend::tensor(positions, options)
-            .reshape({batch, 1}).contiguous();
-        auto lengths = mfq_tensor_backend::tensor(
-            sequence_lengths, options).contiguous();
+        Tensor ids;
+        Tensor pos;
+        Tensor lengths;
+        if (packed_metadata_data != nullptr) {
+            const int64_t values = 3 * batch;
+            auto metadata_host = decode_metadata_host_.narrow(0, 0, values);
+            auto metadata_cuda = decode_metadata_cuda_.narrow(0, 0, values);
+            metadata_cuda.copy_(metadata_host);
+            auto matrix = metadata_cuda.reshape({3, batch});
+            ids = matrix.narrow(0, 0, 1).reshape({batch, 1});
+            pos = matrix.narrow(0, 1, 1).reshape({batch, 1});
+            lengths = matrix.narrow(0, 2, 1).reshape({batch});
+            ++packed_metadata_batches_;
+        } else {
+            const auto options = mfq_tensor_backend::TensorOptions()
+                .dtype(mfq_tensor_backend::kInt64)
+                .device(mfq_tensor_backend::Device(
+                    mfq_tensor_backend::kCUDA, primary));
+            ids = mfq_tensor_backend::tensor(input_tokens, options)
+                .reshape({batch, 1}).contiguous();
+            pos = mfq_tensor_backend::tensor(positions, options)
+                .reshape({batch, 1}).contiguous();
+            lengths = mfq_tensor_backend::tensor(
+                sequence_lengths, options).contiguous();
+        }
         Tensor logits;
         try {
             model_.cache_pos = max_position;
@@ -867,8 +922,11 @@ private:
     std::atomic<int64_t> admissions_{0};
     std::atomic<int64_t> compactions_{0};
     std::atomic<int64_t> batched_greedy_batches_{0};
+    std::atomic<int64_t> packed_metadata_batches_{0};
     std::atomic<int64_t> mtp_bypasses_{0};
     std::atomic<int64_t> prefix_cache_bypasses_{0};
+    Tensor decode_metadata_host_;
+    Tensor decode_metadata_cuda_;
 };
 
 static int run_qwen_continuous_batching_check(Model & model) {
@@ -1036,6 +1094,8 @@ static int run_qwen_continuous_batching_check(Model & model) {
               << metric("continuous_batching_compactions")
               << " batched_greedy_batches="
               << metric("continuous_batching_batched_greedy_batches")
+              << " packed_metadata_batches="
+              << metric("continuous_batching_packed_metadata_batches")
               << " active="
               << metric("continuous_batching_active")
               << " queued="
@@ -1044,6 +1104,8 @@ static int run_qwen_continuous_batching_check(Model & model) {
         metric("continuous_batching_compactions") >= 1.0 &&
         (!qwen_continuous_batch_greedy_enabled() ||
             metric("continuous_batching_batched_greedy_batches") >= 1.0) &&
+        (!qwen_continuous_batch_packed_metadata_enabled() ||
+            metric("continuous_batching_packed_metadata_batches") >= 1.0) &&
         metric("continuous_batching_active") == 0.0 &&
         metric("continuous_batching_queued") == 0.0,
         "continuous batching check did not exercise join and retire");
