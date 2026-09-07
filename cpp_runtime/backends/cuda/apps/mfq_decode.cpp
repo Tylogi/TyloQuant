@@ -22140,6 +22140,8 @@ static int run_qwen35_mtp_bench(Model& model, CudaQwen35Mtp& mtp,
     const char* batch_env = std::getenv("MFQ_QWEN_MTP_BATCH_FFN");
     const char* projection_env = std::getenv("MFQ_QWEN_MTP_BATCH_PROJECTIONS");
     const char* graph_env = std::getenv("MFQ_SERVER_CUDA_GRAPH");
+    const char* profiler_env = std::getenv("MFQ_CUDA_PROFILER_RANGE");
+    const bool profiler_range = profiler_env != nullptr && std::atoi(profiler_env) != 0;
     std::cout << "mtp_bench config mode=" << (enable_mtp ? "mtp" : "ordinary")
         << " batch_ffn=" << (batch_env != nullptr && batch_env[0] == '1')
         << " batch_projections=" << (projection_env != nullptr && projection_env[0] == '1')
@@ -22167,6 +22169,14 @@ static int run_qwen35_mtp_bench(Model& model, CudaQwen35Mtp& mtp,
             MfqPrefillTiming prefill;
             Clock::time_point first_token;
             mfq_cuda_synchronize();
+            // Capture only the actual request; its independent oracle, full
+            // warmup, model load and context construction remain unprofiled.
+            const bool capture_request = profiler_range && repeat >= 0;
+            if (capture_request) {
+                std::cout << "mtp_bench profiler_begin prompt=" << prompt.size()
+                    << " repeat=" << repeat << '\n';
+                MFQ_CUDA_CHECK(cudaProfilerStart());
+            }
             const auto started = Clock::now();
             const int produced = generate_server_tokens(model, model_mutex, graph_cache,
                 session_cache, prompt, params, [&](int64_t token) {
@@ -22176,6 +22186,11 @@ static int run_qwen35_mtp_bench(Model& model, CudaQwen35Mtp& mtp,
                 }, [&](const MfqPrefillTiming& timing) { prefill = timing; }, {}, {}, &mtp);
             mfq_cuda_synchronize();
             const auto finished = Clock::now();
+            if (capture_request) {
+                MFQ_CUDA_CHECK(cudaProfilerStop());
+                std::cout << "mtp_bench profiler_end prompt=" << prompt.size()
+                    << " repeat=" << repeat << '\n';
+            }
             MFQ_RUNTIME_CHECK(produced == generated_tokens && output == reference,
                 "MTP benchmark server output differs from ordinary serial oracle");
             MFQ_RUNTIME_CHECK(!enable_mtp || mtp.last_cycles > 0,
