@@ -67,6 +67,12 @@ def test_qwen35_mtp_accepts_dense_tensor_parallel_placement():
     assert "dense GPU-resident Qwen blocks" in COMPONENTS
 
 
+def test_quantized_tp_weights_and_workspaces_follow_the_shard_device():
+    assert SOURCE.count("mfq_current_cuda_device()") >= 3
+    assert "const auto workspace_options = q_packed.options();" in SOURCE
+    assert "const auto workspace_options = indices_packed.options();" in SOURCE
+
+
 def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
     assert 'p + "mlp.experts.gate.weight"' in SOURCE
     assert 'p + "mlp.experts.up.weight"' in SOURCE

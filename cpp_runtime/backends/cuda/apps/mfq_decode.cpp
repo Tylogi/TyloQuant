@@ -3003,9 +3003,13 @@ struct NintWeight {
         Workspace ws;
         ws.M = M;
         ws.K_pad = K_pad;
-        ws.qx = mfq_tensor_backend::empty({M, K_pad}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt8));
-        ws.xscale = mfq_tensor_backend::empty({M, ng}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
-        ws.xsum = mfq_tensor_backend::empty({M, ng}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt32));
+        const auto workspace_options = q_packed.options();
+        ws.qx = mfq_tensor_backend::empty(
+            {M, K_pad}, workspace_options.dtype(mfq_tensor_backend::kInt8));
+        ws.xscale = mfq_tensor_backend::empty(
+            {M, ng}, workspace_options.dtype(mfq_tensor_backend::kFloat32));
+        ws.xsum = mfq_tensor_backend::empty(
+            {M, ng}, workspace_options.dtype(mfq_tensor_backend::kInt32));
         auto res = workspaces.emplace(M, std::move(ws));
         return res.first->second;
     }
@@ -3014,23 +3018,28 @@ struct NintWeight {
         int nb = (int)((out + 3) / 4);
         if (ws.argmax_vals.defined() && ws.argmax_blocks >= nb) return;
         ws.argmax_blocks = nb;
-        ws.argmax_vals = mfq_tensor_backend::empty({nb}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
-        ws.argmax_idxs = mfq_tensor_backend::empty({nb}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt32));
+        ws.argmax_vals = mfq_tensor_backend::empty(
+            {nb}, q_packed.options().dtype(mfq_tensor_backend::kFloat32));
+        ws.argmax_idxs = mfq_tensor_backend::empty(
+            {nb}, q_packed.options().dtype(mfq_tensor_backend::kInt32));
     }
 
     void ensure_output_workspace(Workspace & ws) const {
         if (ws.out_buf.defined() && ws.out_buf.size(0) == 1 && ws.out_buf.size(1) == out) return;
-        ws.out_buf = mfq_tensor_backend::empty({1, out}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat16));
+        ws.out_buf = mfq_tensor_backend::empty(
+            {1, out}, q_packed.options().dtype(mfq_tensor_backend::kFloat16));
     }
 
     void ensure_rinv_workspace(Workspace & ws, int64_t n) const {
         if (ws.rinv.defined() && ws.rinv.numel() >= n) return;
-        ws.rinv = mfq_tensor_backend::empty({n}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
+        ws.rinv = mfq_tensor_backend::empty(
+            {n}, q_packed.options().dtype(mfq_tensor_backend::kFloat32));
     }
 
     void ensure_mmq_partial_workspace(Workspace & ws, int64_t n) const {
         if (ws.mmq_partial.defined() && ws.mmq_partial.numel() >= n) return;
-        ws.mmq_partial = mfq_tensor_backend::empty({n}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
+        ws.mmq_partial = mfq_tensor_backend::empty(
+            {n}, q_packed.options().dtype(mfq_tensor_backend::kFloat32));
     }
 
     void ensure_mmq_qx_workspace(Workspace & ws, int M) const {
@@ -3039,7 +3048,8 @@ struct NintWeight {
         int nchunks = ((int)ng + 7) / 8;
         int64_t n = (int64_t)nchunks * m_pad * kStride;
         if (ws.mmq_qx.defined() && ws.mmq_qx.numel() >= n) return;
-        ws.mmq_qx = mfq_tensor_backend::empty({n}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt32));
+        ws.mmq_qx = mfq_tensor_backend::empty(
+            {n}, q_packed.options().dtype(mfq_tensor_backend::kInt32));
     }
 };
 
@@ -3162,11 +3172,13 @@ static NintWeight to_device_nint(const NintCpu & c, bool cuda) {
     w.neuron_scale = cpu_f16_to_f32_tensor(c.neuron_scale_h, c.out);
     w.neuron_min = cpu_f16_to_f32_tensor(c.neuron_min_h, c.out);
     if (cuda) {
-        w.q_packed = w.q_packed.to(mfq_tensor_backend::kCUDA).contiguous();
-        w.sub_scale = w.sub_scale.to(mfq_tensor_backend::kCUDA).contiguous();
-        w.sub_min = w.sub_min.to(mfq_tensor_backend::kCUDA).contiguous();
-        w.neuron_scale = w.neuron_scale.to(mfq_tensor_backend::kCUDA).contiguous();
-        w.neuron_min = w.neuron_min.to(mfq_tensor_backend::kCUDA).contiguous();
+        const auto target = mfq_tensor_backend::Device(
+            mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
+        w.q_packed = w.q_packed.to(target).contiguous();
+        w.sub_scale = w.sub_scale.to(target).contiguous();
+        w.sub_min = w.sub_min.to(target).contiguous();
+        w.neuron_scale = w.neuron_scale.to(target).contiguous();
+        w.neuron_min = w.neuron_min.to(target).contiguous();
     }
     return w;
 }
@@ -3199,8 +3211,10 @@ static NintWeight to_device_nint8_zero(
     w.q_packed = cpu_u8_tensor(c.q, {c.out, c.ng, 32});
     w.q8_zero_scale = cpu_f16_tensor(c.scale_h, {c.out, c.ng});
     if (cuda) {
-        w.q_packed = w.q_packed.to(mfq_tensor_backend::kCUDA).contiguous();
-        w.q8_zero_scale = w.q8_zero_scale.to(mfq_tensor_backend::kCUDA).contiguous();
+        const auto target = mfq_tensor_backend::Device(
+            mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
+        w.q_packed = w.q_packed.to(target).contiguous();
+        w.q8_zero_scale = w.q8_zero_scale.to(target).contiguous();
     }
     return w;
 }
@@ -5042,8 +5056,11 @@ struct NvqWeight {
         NvqWorkspace ws;
         ws.M = M;
         ws.K_pad = K_pad;
-        ws.qx = mfq_tensor_backend::empty({M, K_pad}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt8));
-        ws.xscale = mfq_tensor_backend::empty({M, ng}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
+        const auto workspace_options = indices_packed.options();
+        ws.qx = mfq_tensor_backend::empty(
+            {M, K_pad}, workspace_options.dtype(mfq_tensor_backend::kInt8));
+        ws.xscale = mfq_tensor_backend::empty(
+            {M, ng}, workspace_options.dtype(mfq_tensor_backend::kFloat32));
         return workspaces.emplace(M, std::move(ws)).first->second;
     }
 };
@@ -5400,12 +5417,14 @@ static NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
         w.codebook = cpu_i8_tensor(c.codebook, {entries, dims});
     }
     if (cuda) {
-        w.indices_packed = w.indices_packed.to(mfq_tensor_backend::kCUDA).contiguous();
-        w.aux_packed = w.aux_packed.to(mfq_tensor_backend::kCUDA).contiguous();
+        const auto target = mfq_tensor_backend::Device(
+            mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
+        w.indices_packed = w.indices_packed.to(target).contiguous();
+        w.aux_packed = w.aux_packed.to(target).contiguous();
         w.sub_scale_packed =
-            w.sub_scale_packed.to(mfq_tensor_backend::kCUDA).contiguous();
-        w.neuron_scale = w.neuron_scale.to(mfq_tensor_backend::kCUDA).contiguous();
-        w.codebook = w.codebook.to(mfq_tensor_backend::kCUDA).contiguous();
+            w.sub_scale_packed.to(target).contiguous();
+        w.neuron_scale = w.neuron_scale.to(target).contiguous();
+        w.codebook = w.codebook.to(target).contiguous();
         (void)w.workspace(1);
     }
     return w;
@@ -10665,7 +10684,8 @@ static mfq_tensor_backend::Tensor nvq_ffn_swiglu_down(
     NvqWorkspace & output_ws = down.workspace(1);
     if (!input_ws.swiglu_scratch.defined() || input_ws.swiglu_scratch.numel() < gate.out) {
         input_ws.swiglu_scratch = mfq_tensor_backend::empty(
-            {gate.out}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
+            {gate.out}, gate.indices_packed.options().dtype(
+                mfq_tensor_backend::kFloat32));
     }
     g_profiler.measure("nvq.ffn_swiglu_quant", [&]() {
         nvq_ffn_swiglu_quant_ws_cuda(
