@@ -23,7 +23,7 @@ void values(std::initializer_list<const Tensor*> tensors) {
     }
 }
 
-Tensor mm(const Tensor& left, const Tensor& right) {
+Tensor promoted_matmul(const Tensor& left, const Tensor& right) {
     // MLX matmul promotes mixed floating operands, unlike ATen matmul.
     const auto dtype = left.scalar_type() == right.scalar_type()
         ? left.scalar_type() : tb::kFloat32;
@@ -221,15 +221,15 @@ std::vector<Tensor> qwen4_gated_residual_pre(
     }
     MfqCudaGuard guard(input.device());
     auto normalized = qwen4_grouped_rms_norm(input, norm, hidden, eps);
-    auto low = mm(normalized, down.transpose(-1, -2)) / streams;
+    auto low = promoted_matmul(normalized, down.transpose(-1, -2)) / streams;
     low = low * tb::sigmoid(low);
-    auto mixing = tb::sigmoid(mm(low, up.transpose(-1, -2)));
+    auto mixing = tb::sigmoid(promoted_matmul(low, up.transpose(-1, -2)));
     auto shape = input.sizes().vec();
     shape.back() = streams;
     shape.push_back(hidden);
     auto mixed = (mixing.reshape(shape) * normalized.reshape(shape)).mean(-2);
     auto injection = inject
-        ? 2.0 * tb::sigmoid(mm(normalized, inject->transpose(-1, -2)) / streams)
+        ? 2.0 * tb::sigmoid(promoted_matmul(normalized, inject->transpose(-1, -2)) / streams)
         : Tensor{};
     return {mixed, input, injection};
 }
@@ -291,7 +291,7 @@ Tensor glm5_mhc_post(const Tensor& branch, const Tensor& residual,
         combination.sizes().vec() == std::vector<int64_t>({b,t,c,c}),
         "GLM mHC post metadata dimensions disagree");
     MfqCudaGuard guard(branch.device());
-    auto mixed = mm(combination.transpose(-1, -2), residual);
+    auto mixed = promoted_matmul(combination.transpose(-1, -2), residual);
     return post.to(residual.scalar_type()).unsqueeze(-1) * branch.unsqueeze(-2) + mixed;
 }
 
@@ -304,8 +304,8 @@ Tensor glm5_kda_forget_gate(const Tensor& input, const Tensor& fa, const Tensor&
         bias.size(0) == heads * width && a_log.dim() == 1 && a_log.size(0) == heads &&
         std::isfinite(lower_bound), "GLM KDA forget-gate dimensions disagree");
     MfqCudaGuard guard(input.device());
-    auto reduced = mm(input, fa.transpose(-1, -2));
-    auto gate = mm(reduced, fb.transpose(-1, -2)).to(tb::kFloat32) + bias.to(tb::kFloat32);
+    auto reduced = promoted_matmul(input, fa.transpose(-1, -2));
+    auto gate = promoted_matmul(reduced, fb.transpose(-1, -2)).to(tb::kFloat32) + bias.to(tb::kFloat32);
     auto shape = input.sizes().vec();
     shape.back() = heads;
     shape.push_back(width);
