@@ -31,3 +31,7 @@ void launch_nint4_gs24_small_m_reuse(
 void launch_nint6_gs24_small_m_reuse(
     NintSmallMProjection weight, const int8_t* qx, const float* xs,
     int m, int ng, int kpad, cudaStream_t stream);
+
+void launch_nint8_gs48_small_m(
+    NintSmallMProjection weight, const int8_t* qx, const float* xs,
+    int m, int ng, int kpad, cudaStream_t stream);

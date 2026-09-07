@@ -20,13 +20,13 @@ def _exact(actual, expected):
                        expected.contiguous().view(integer))
 
 
-def _fixture(bits, gs, scale_bits, width):
+def _fixture(bits, gs, scale_bits, width, rows=34):
     groups = (width + gs - 1) // gs
-    r = torch.arange(34)[:, None]
+    r = torch.arange(rows)[:, None]
     g = torch.arange(groups)[None, :]
     codes = (r[:, :, None] * 17 + g[:, :, None] * 7
              + torch.arange(gs)[None, None, :] * 13) % (1 << bits)
-    packed = torch.zeros((34, groups, (gs * bits + 7) // 8), dtype=torch.uint8)
+    packed = torch.zeros((rows, groups, (gs * bits + 7) // 8), dtype=torch.uint8)
     for k in range(gs):
         byte, shift = divmod(k * bits, 8)
         packed[:, :, byte] |= ((codes[:, :, k] << shift) & 255).byte()
@@ -34,10 +34,10 @@ def _fixture(bits, gs, scale_bits, width):
             packed[:, :, byte + 1] |= (codes[:, :, k] >> (8 - shift)).byte()
     scales = ((r * 7 + g * 11) % (1 << scale_bits)).byte()
     minima = ((r * 13 + g * 3) % 9).byte()
-    ns = (1 + torch.arange(34) % 3).float() * (2. ** (-bits - 15))
-    nm = (1 + torch.arange(34) % 5).float() / 4096.
+    ns = (1 + torch.arange(rows) % 3).float() * (2. ** (-bits - 15))
+    nm = (1 + torch.arange(rows) % 5).float() / 4096.
     weights = (ns.double()[:, None, None] * scales[:, :, None] * codes
-               - nm.double()[:, None, None] * minima[:, :, None]).reshape(34, -1)
+               - nm.double()[:, None, None] * minima[:, :, None]).reshape(rows, -1)
     m = torch.arange(6)[:, None]
     k = torch.arange(width)[None, :]
     x = (((m * 29 + k * 17) % 255 - 127).float() / 64.).half().cuda()
@@ -48,19 +48,21 @@ def _fixture(bits, gs, scale_bits, width):
     return tensors, x, qx, xs, xm, weights
 
 
-@pytest.mark.parametrize("profile", PROFILES)
+@pytest.mark.parametrize("profile,rows", [(profile, 34) for profile in PROFILES] + [((8, 48, 7), 66)])
 @pytest.mark.parametrize("width", [47, 257, 4096])
 @torch.inference_mode()
-def test_nint_small_m_bridge(profile, width, monkeypatch):
+def test_nint_small_m_bridge(profile, rows, width, monkeypatch):
     bits, gs, scale_bits = profile
     module = ext()
     monkeypatch.setenv("MFQ_NINT4_SMALL_M_XSUM", "0")
-    tensors, x, qx, xs, xm, weights = _fixture(bits, gs, scale_bits, width)
+    tensors, x, qx, xs, xm, weights = _fixture(bits, gs, scale_bits, width, rows)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
 
     def invoke(value, operation):
         if operation == 2:
+            if bits == 8:
+                return module.nint_gemv_packed_u8_ws_cuda(*tensors, value, gs, qx, xs, xm)
             if bits in (2, 3, 5):
                 return module.nint_gemv_packed_bits_ws_cuda(
                     *tensors, value, gs, bits, qx, xs, xm)
@@ -81,7 +83,7 @@ def test_nint_small_m_bridge(profile, width, monkeypatch):
             *tensors, value, gs, bits, qx, xs, xm)
 
     with torch.cuda.stream(stream):
-        for operation in range(5 if bits in (4, 6) else (3 if bits in (2, 3, 5) else 2)):
+        for operation in range(5 if bits in (4, 6) else 3):
             reference = torch.cat([invoke(x[m:m + 1], operation) for m in range(6)])
             for m in range(1, 7):
                 _exact(invoke(x[:m], operation), reference[:m])
@@ -89,7 +91,7 @@ def test_nint_small_m_bridge(profile, width, monkeypatch):
                 actual = invoke(x, operation).double().cpu()
                 grouped = qx.double().reshape(6, -1, gs) * xs.double()[:, :, None]
                 projected = (grouped.flatten(1).cpu() @ weights.T).float().half().double()
-                gate, up = projected[:, :17], projected[:, 17:]
+                gate, up = projected[:, :rows // 2], projected[:, rows // 2:]
                 if operation == 0:
                     value = up * gate / (1. + torch.exp(-gate))
                 else:
@@ -97,7 +99,7 @@ def test_nint_small_m_bridge(profile, width, monkeypatch):
                         .7978845608028654 * gate * (1. + .044715 * gate * gate)))
                 expected = value.float().half().double()
                 torch.testing.assert_close(actual, expected, atol=.002, rtol=.002)
-            if operation == 2 and bits in (2, 3, 5, 6):
+            if operation == 2 and bits != 4:
                 actual = invoke(x, operation).double().cpu()
                 grouped = qx.double().reshape(6, -1, gs) * xs.double()[:, :, None]
                 expected = (grouped.flatten(1).cpu() @ weights.T).float().half().double()
@@ -111,6 +113,11 @@ def test_nint_small_m_bridge(profile, width, monkeypatch):
                 graph.replay()
                 graph.replay()
                 _exact(output, reference)
+                if bits == 8 and operation == 2:
+                    x.add_(.25)
+                    changed_reference = torch.cat([invoke(x[m:m + 1], operation) for m in range(6)])
+                    graph.replay()
+                    _exact(output, changed_reference)
 
         if bits in (4, 6):
             float_input = x.float() + .000123

@@ -24,6 +24,8 @@ Tensor nint_gemv_packed_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_int6_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
+Tensor nint_gemv_packed_u8_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
+    int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_bits_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_gate_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
@@ -46,8 +48,7 @@ void exact(const Tensor& actual, const Tensor& expected) {
         "small-M output differs from serial M=1 bits");
 }
 
-void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs, int& f32_cases) {
-    constexpr int rows = 17;
+void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs, int& f32_cases, int rows = 17) {
     constexpr int batch = 6;
     const int groups = (width + gs - 1) / gs, kpad = groups * gs;
     const int bytes = (gs * bits + 7) / 8;
@@ -87,6 +88,8 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
     auto invoke = [&](const Tensor& input, int operation) {
         if (operation == 2 && (bits == 2 || bits == 3 || bits == 5))
             return nint_gemv_packed_bits_ws_cuda(q, s, sm, ns, nm, input, gs, bits, qx, xs, xm);
+        if (operation == 2 && bits == 8)
+            return nint_gemv_packed_u8_ws_cuda(q, s, sm, ns, nm, input, gs, qx, xs, xm);
         if (operation == 2) return (bits == 4 ? nint_gemv_packed_ws_cuda
             : nint_gemv_packed_int6_ws_cuda)(q, s, sm, ns, nm, input,
             gs, qx, xs, xm);
@@ -99,7 +102,7 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
         return (operation == 0 ? nint_gemv_packed_bits_swiglu_ws_cuda
             : nint_gemv_packed_bits_geglu_ws_cuda)(q, s, sm, ns, nm, input, gs, bits, qx, xs, xm);
     };
-    const int operations = bits == 4 || bits == 6 ? 5 : (bits == 2 || bits == 3 || bits == 5 ? 3 : 2);
+    const int operations = bits == 4 || bits == 6 ? 5 : 3;
     for (int operation = 0; operation < operations; ++operation) {
         std::vector<Tensor> serial;
         for (int m = 0; m < batch; ++m) serial.push_back(invoke(x.narrow(0, m, 1), operation));
@@ -147,7 +150,7 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
                 }
             }
         }
-        if (operation == 2 && (bits == 2 || bits == 3 || bits == 5 || bits == 6)) {
+        if (operation == 2 && bits != 4) {
             auto actual = invoke(x, operation).to(kFloat32).cpu();
             auto aq = qx.cpu(), as = xs.cpu();
             for (int m = 0; m < batch; ++m) {
@@ -188,6 +191,14 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
             graph.replay();
             MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
             exact(output, reference);
+            if (bits == 8 && operation == 2) {
+                x.copy_(x + .25);
+                std::vector<Tensor> changed_serial;
+                for (int m = 0; m < batch; ++m) changed_serial.push_back(invoke(x.narrow(0, m, 1), operation));
+                auto changed_reference = cat(changed_serial, 0);
+                graph.replay();
+                exact(output, changed_reference);
+            }
             ++graphs;
         }
     }
@@ -221,7 +232,7 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
             ++graphs;
         }
     }
-    std::cout << "PASS NINT" << bits << " GS=" << gs << " K=" << width << '\n';
+    std::cout << "PASS NINT" << bits << " GS=" << gs << " N=" << rows * 2 << " K=" << width << '\n';
 }
 } // namespace
 
@@ -234,7 +245,8 @@ int main() {
         int cases = 0, graphs = 0, f32_cases = 0;
         for (const auto profile : std::vector<std::vector<int>>{{2,16,5},{3,24,5},{4,24,6},{5,28,7},{6,24,7},{8,48,7}})
             for (int width : {47, 257, 4096}) check(profile[0], profile[1], profile[2], width, cases, graphs, f32_cases);
-        require(cases == 378 && graphs == 23 && f32_cases == 30, "incomplete small-M coverage");
+        for (int width : {47, 257, 4096}) check(8, 48, 7, width, cases, graphs, f32_cases, 33);
+        require(cases == 450 && graphs == 27 && f32_cases == 30, "incomplete small-M coverage");
         std::cout << "PASS small_m_cases=" << cases << " f32_boundary_cases=" << f32_cases
             << " graphs=" << graphs << '\n';
     } catch (const std::exception& error) {

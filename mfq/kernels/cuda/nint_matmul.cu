@@ -6512,6 +6512,21 @@ mfq_tensor_backend::Tensor nint_gemv_packed_u8_ws_cuda(
         return out;
     }
 
+    const char* small_m_env = std::getenv("MFQ_NINT8_GS48_SMALL_M");
+    if (gs == 48 && M >= 2 && M <= 6 && small_m_env != nullptr && small_m_env[0] == '1') {
+        quantize_x_kernel<48, 64, true><<<dim3(M, ng), 64, 0, stream>>>(
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
+            qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
+            M, K_real, K_pad);
+        NintSmallMProjection weight{q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
+            sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(),
+            out.data_ptr<mfq_half>(), N};
+        launch_nint8_gs48_small_m(weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+            M, ng, K_pad, stream);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return out;
+    }
+
 #define QPU8LAUNCH(GSVAL)                                                               \
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \

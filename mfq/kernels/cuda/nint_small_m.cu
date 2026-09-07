@@ -103,6 +103,61 @@ void launch_nint5_gs28_small_m(
 #undef MFQ_NINT5_CASE
 }
 
+template <int MROWS>
+__global__ void __launch_bounds__(128) nint8_gs48_small_m_kernel(
+    NintSmallMProjection weight, const int8_t* __restrict__ qx,
+    const float* __restrict__ xs, int ng, int kpad)
+{
+    const int row = blockIdx.x * 4 + threadIdx.y, lane = threadIdx.x;
+    if (row >= weight.n) return;
+    const auto* qrow = weight.q_packed + (size_t)row * ng * 48;
+    const auto* ssrow = weight.sub_scale + (size_t)row * ng;
+    const auto* smrow = weight.sub_min + (size_t)row * ng;
+    const float ns = weight.neuron_scale[row], nm = weight.neuron_min[row];
+    float acc[MROWS] = {};
+    for (int base = lane * 4; base < kpad; base += 128) {
+        const uint32_t qv = *reinterpret_cast<const uint32_t*>(qrow + base);
+        const int g = base / 48;
+        const float de = ns * float(ssrow[g]), me = nm * float(smrow[g]);
+        #pragma unroll
+        for (int m = 0; m < MROWS; ++m) {
+            const int xv = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + base);
+            int di;
+            // The full unsigned-weight dot is exactly the old signed dot plus
+            // 128*xsum. Its four-term integer range is exact in FP32.
+            asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(di) : "r"(qv), "r"(xv), "r"(0));
+            const int sumi = __dp4a(0x01010101, xv, 0);
+            acc[m] += xs[(size_t)m * ng + g] * (de * float(di) - me * float(sumi));
+        }
+    }
+    #pragma unroll
+    for (int m = 0; m < MROWS; ++m) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc[m] += __shfl_xor_sync(0xffffffff, acc[m], offset);
+        if (lane == 0)
+            reinterpret_cast<__half*>(weight.out)[(size_t)m * weight.n + row] = __float2half(acc[m]);
+    }
+}
+
+void launch_nint8_gs48_small_m(
+    NintSmallMProjection weight, const int8_t* qx, const float* xs,
+    int m, int ng, int kpad, cudaStream_t stream)
+{
+#define MFQ_NINT8_CASE(M) \
+    case M: nint8_gs48_small_m_kernel<M> \
+        <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); break
+    switch (m) {
+        MFQ_NINT8_CASE(2);
+        MFQ_NINT8_CASE(3);
+        MFQ_NINT8_CASE(4);
+        MFQ_NINT8_CASE(5);
+        MFQ_NINT8_CASE(6);
+        default: MFQ_RUNTIME_CHECK(false, "NINT8 GS48 small-M requires M2-6");
+    }
+#undef MFQ_NINT8_CASE
+}
+
 __device__ __forceinline__ int small_m_unpack_int4(uint32_t packed, unsigned selector)
 {
     // Interleave low/high nibbles into signed dp4a's positive byte lanes.
