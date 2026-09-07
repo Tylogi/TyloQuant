@@ -70,7 +70,10 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
                 auto pos=a.at(10).narrow(-1,step.at("begin"),step.at("count"));
                 const bool cache=step.value("cache",true);
                 auto full=cache && history.defined()?cat({history,pos},-1):pos;
-                out.push_back(block.forward(a.at(0).narrow(1,step.at("begin"),step.at("count")),pos,full,cache));
+                std::vector<Tensor> trace;
+                out.push_back(block.forward(a.at(0).narrow(1,step.at("begin"),step.at("count")),pos,full,cache,
+                    p.value("trace",false)?&trace:nullptr));
+                out.insert(out.end(),trace.begin(),trace.end());
                 if (cache) history=full;
             }
         }

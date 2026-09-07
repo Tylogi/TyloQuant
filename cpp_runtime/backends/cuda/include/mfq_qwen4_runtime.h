@@ -91,7 +91,8 @@ public:
             "invalid Qwen4 QSA cache truncation");
         keys_.truncate(keep);values_.truncate(keep);index_.truncate(keep);
     }
-    Tensor forward(const Tensor& hidden,const Tensor& current_positions,const Tensor& full_positions,bool use_cache) {
+    Tensor forward(const Tensor& hidden,const Tensor& current_positions,const Tensor& full_positions,bool use_cache,
+        std::vector<Tensor>* selection_trace=nullptr) {
         MFQ_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim()==3 && hidden.size(0)>0 && hidden.size(1)>0,
             "Qwen4 QSA requires nonempty [B,T,H] input");
         const auto b=hidden.size(0),t=hidden.size(1),offset=use_cache?position():0;
@@ -130,6 +131,7 @@ public:
                 pooled=rotary_->forward(pooled.unsqueeze(1),positions).squeeze(1);
                 auto scores=mfq_flash_next::qsa_block_scores(iq,pooled);
                 auto ids=select_pooled_blocks(scores,offset,offset+t,c_.pool,c_.budget,true);
+                if (selection_trace) *selection_trace={scores,ids,iq,pooled};
                 attended=mfq_flash_next::qwen4_sparse_gqa_attention(query,key,value,ids);
             }
             auto gated=attended.to(tb::kFloat32)*tb::sigmoid(gate.to(tb::kFloat32));
