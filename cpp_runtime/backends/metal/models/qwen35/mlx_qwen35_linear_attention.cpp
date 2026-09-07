@@ -470,6 +470,7 @@ void MlxQwen35LinearAttentionBlock::restore_cache(
     recurrent_state_ = std::move(recurrent);
     cache_position_ = snapshot.position;
     cache_batch_ = snapshot.batch;
+    speculative_rollback_.reset();
 }
 
 array MlxQwen35LinearAttentionBlock::forward(
@@ -616,6 +617,21 @@ array MlxQwen35LinearAttentionBlock::forward(
     const auto gate =
         softplus *
         mlx::core::reshape(a_, Shape{1, 1, value_heads});
+    const auto recurrent_gate = mlx::core::transpose(gate, {0, 2, 1});
+    const auto recurrent_beta = mlx::core::transpose(beta, {0, 2, 1});
+
+    // A speculative verify runs the entire [confirmed, drafts...] window as
+    // one chunk.  Keep the already-computed recurrent inputs so rejection
+    // can restore the pre-forward state and replay only the retained prefix,
+    // without running the transformer block (or the whole backbone) again.
+    if (use_cache && speculative_rollback_ &&
+        speculative_rollback_->position == position_offset &&
+        speculative_rollback_->total_tokens == tokens) {
+        speculative_rollback_->qk = qk;
+        speculative_rollback_->value = value_input;
+        speculative_rollback_->gate = recurrent_gate;
+        speculative_rollback_->beta = recurrent_beta;
+    }
 
     const auto zero_convolution_state =
         mlx::core::zeros(
@@ -639,8 +655,8 @@ array MlxQwen35LinearAttentionBlock::forward(
         convolved.query,
         convolved.key,
         convolved.value,
-        mlx::core::transpose(gate, {0, 2, 1}),
-        mlx::core::transpose(beta, {0, 2, 1}),
+        recurrent_gate,
+        recurrent_beta,
         use_cache ? recurrent_state_ : std::nullopt,
         false,
         gguf_layout_);
@@ -681,42 +697,45 @@ array MlxQwen35LinearAttentionBlock::forward_speculative(
         throw std::runtime_error(
             "Qwen3.5 speculative linear-attention input is invalid");
     }
-    speculative_rollback_.reset();
     const int batch = input.shape(0);
     const int tokens = input.shape(1);
-    auto confirmed = mlx::core::slice(
-        input,
-        mlx::core::Shape{0, 0, 0},
-        mlx::core::Shape{batch, confirmed_tokens, input.shape(2)});
-    auto suffix = mlx::core::slice(
-        input,
-        mlx::core::Shape{0, confirmed_tokens, 0},
-        mlx::core::Shape{batch, tokens, input.shape(2)});
-    auto confirmed_output = forward(
-        confirmed,
-        position_offset,
-        true);
+    if (!convolution_state_ || !recurrent_state_) {
+        if (position_offset != 0) {
+            throw std::runtime_error(
+                "Qwen3.5 speculative cache must start at position zero");
+        }
+        reset_cache(batch);
+    }
+    if (cache_batch_ != batch || cache_position_ != position_offset) {
+        throw std::runtime_error(
+            "Qwen3.5 speculative cache append must be contiguous");
+    }
     if (!convolution_state_ || !recurrent_state_) {
         throw std::runtime_error(
             "Qwen3.5 speculative recurrent checkpoint is unavailable");
     }
+    speculative_rollback_.reset();
     speculative_rollback_.emplace(
         MlxQwen35LinearAttentionRollback{
             *convolution_state_,
             *recurrent_state_,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
             cache_position_,
             cache_batch_,
+            confirmed_tokens,
+            tokens,
         });
     try {
-        auto suffix_output = forward(
-            suffix,
-            position_offset + confirmed_tokens,
-            true);
-        return mlx::core::concatenate(
-            {confirmed_output, suffix_output},
-            1);
+        return forward(input, position_offset, true);
     } catch (...) {
-        rollback_speculative();
+        convolution_state_ = speculative_rollback_->convolution_state;
+        recurrent_state_ = speculative_rollback_->recurrent_state;
+        cache_position_ = speculative_rollback_->position;
+        cache_batch_ = speculative_rollback_->batch;
+        speculative_rollback_.reset();
         throw;
     }
 }
@@ -725,15 +744,68 @@ void MlxQwen35LinearAttentionBlock::commit_speculative() noexcept {
     speculative_rollback_.reset();
 }
 
-void MlxQwen35LinearAttentionBlock::rollback_speculative() {
+void MlxQwen35LinearAttentionBlock::rollback_speculative(
+    int accepted_tokens) {
     if (!speculative_rollback_) {
         throw std::runtime_error(
             "Qwen3.5 speculative recurrent checkpoint is unavailable");
     }
-    convolution_state_ = speculative_rollback_->convolution_state;
-    recurrent_state_ = speculative_rollback_->recurrent_state;
-    cache_position_ = speculative_rollback_->position;
-    cache_batch_ = speculative_rollback_->batch;
+    const auto& rollback = *speculative_rollback_;
+    const int speculative_tokens =
+        rollback.total_tokens - rollback.confirmed_tokens;
+    if (accepted_tokens < 0 || accepted_tokens > speculative_tokens ||
+        !rollback.qk || !rollback.value || !rollback.gate ||
+        !rollback.beta) {
+        throw std::runtime_error(
+            "Qwen3.5 speculative recurrent replay is invalid");
+    }
+    const int keep = rollback.confirmed_tokens + accepted_tokens;
+    const int key_size = static_cast<int>(config_.linear_key_size());
+    const int value_size = static_cast<int>(config_.linear_value_size());
+    const int key_heads = static_cast<int>(config_.linear_key_heads());
+    const int value_heads = static_cast<int>(config_.linear_value_heads());
+    const int dimension =
+        static_cast<int>(config_.linear_value_head_dim);
+    auto qk = mlx::core::slice(
+        *rollback.qk,
+        Shape{0, 0, 0},
+        Shape{rollback.batch, keep, 2 * key_size});
+    auto value = mlx::core::slice(
+        *rollback.value,
+        Shape{0, 0, 0},
+        Shape{rollback.batch, keep, value_size});
+    auto gate = mlx::core::slice(
+        *rollback.gate,
+        Shape{0, 0, 0},
+        Shape{rollback.batch, value_heads, keep});
+    auto beta = mlx::core::slice(
+        *rollback.beta,
+        Shape{0, 0, 0},
+        Shape{rollback.batch, value_heads, keep});
+    auto convolved = linear_conv_qkv(
+        rollback.convolution_state,
+        qk,
+        value,
+        convolution_weight_,
+        key_heads,
+        value_heads,
+        static_cast<int>(config_.linear_key_head_dim),
+        dimension,
+        convolution_bias_,
+        static_cast<float>(config_.rms_norm_eps));
+    auto recurrent = gated_delta_net(
+        convolved.query,
+        convolved.key,
+        convolved.value,
+        gate,
+        beta,
+        rollback.recurrent_state,
+        false,
+        gguf_layout_);
+    convolution_state_ = std::move(convolved.state);
+    recurrent_state_ = std::move(recurrent.state);
+    cache_position_ = rollback.position + keep;
+    cache_batch_ = rollback.batch;
     speculative_rollback_.reset();
 }
 

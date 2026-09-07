@@ -434,6 +434,18 @@ set_target_properties(mfq-metal-nint-benchmark PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 
+add_executable(mfq-metal-dense-smallm-benchmark
+    benchmarks/mlx_dense_smallm_benchmark.cpp
+)
+target_link_libraries(mfq-metal-dense-smallm-benchmark PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-dense-smallm-benchmark PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-dense-smallm-benchmark PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+
 add_executable(mfq-metal-vq-benchmark
     benchmarks/mlx_vq_benchmark.cpp
 )

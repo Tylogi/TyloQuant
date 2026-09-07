@@ -470,6 +470,46 @@ void test_host_sampling_distribution() {
             "host nucleus filtering mismatch");
 }
 
+void test_compact_top_k_distribution() {
+    const auto logits = floats(
+        {0.0f, 1.0f, 2.0f},
+        Shape{1, 3});
+    auto compact = mfq::metal::sample_top_k_distribution(
+        logits,
+        floats({0.2f}, Shape{1}),
+        1.0,
+        2,
+        1.0);
+    require_ids(
+        compact.sampled,
+        {2},
+        "compact top-k sampled token");
+    require_ids(
+        compact.indices,
+        {2, 1},
+        "compact top-k indices");
+    const auto probabilities = evaluated_floats(
+        compact.probabilities);
+    require(
+        probabilities.size() == 2 &&
+            std::abs(probabilities[0] - 0.7310586f) < 1e-5f &&
+            std::abs(probabilities[1] - 0.2689414f) < 1e-5f,
+        "compact top-k probabilities mismatch");
+
+    compact = mfq::metal::sample_top_k_distribution(
+        logits,
+        floats({0.9f}, Shape{1}),
+        1.0,
+        2,
+        0.7);
+    const auto nucleus = evaluated_floats(
+        compact.probabilities);
+    require(
+        nucleus.size() == 2 &&
+            nucleus[0] == 1.0f && nucleus[1] == 0.0f,
+        "compact top-p mask mismatch");
+}
+
 void benchmark_direct_top_k() {
     constexpr int vocab = 248320;
     constexpr int iterations = 20;
@@ -754,6 +794,7 @@ int main() {
         test_direct_top_k_large_vocab_and_stable_ties();
         test_sorted_top_k_and_global_top_p();
         test_host_sampling_distribution();
+        test_compact_top_k_distribution();
         test_seeded_sampler();
         test_counts_and_penalties();
         test_validation_and_greedy_precedence();

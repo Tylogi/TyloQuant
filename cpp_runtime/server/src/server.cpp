@@ -659,6 +659,9 @@ static MfqSamplingParams default_sampling_params(
     }
     if (profile.enable_vision) defaults.enable_vision = *profile.enable_vision;
     if (profile.enable_mtp) defaults.enable_mtp = *profile.enable_mtp;
+    if (profile.mtp_max_draft_tokens) {
+        defaults.mtp_max_draft_tokens = *profile.mtp_max_draft_tokens;
+    }
     return defaults;
 }
 
@@ -674,6 +677,7 @@ static json sampling_params_json(const MfqSamplingParams & sampling) {
         {"enable_thinking", sampling.enable_thinking},
         {"enable_vision", sampling.enable_vision},
         {"enable_mtp", sampling.enable_mtp},
+        {"mtp_max_draft_tokens", sampling.mtp_max_draft_tokens},
     };
 }
 
@@ -697,6 +701,7 @@ static void merge_runtime_profile(MfqRuntimeProfile & target,
     MFQ_MERGE(chat, enable_thinking);
     MFQ_MERGE(chat, enable_vision);
     MFQ_MERGE(chat, enable_mtp);
+    MFQ_MERGE(chat, mtp_max_draft_tokens);
     MFQ_MERGE(duplex, system_prompt);
     MFQ_MERGE(duplex, decode_mode);
     MFQ_MERGE(duplex, temperature);
@@ -908,6 +913,10 @@ static MfqRuntimeProfile parse_runtime_profile(const std::string & text,
             }
             result.chat.enable_mtp = value["enable_mtp"].get<bool>();
         }
+        if (value.contains("mtp_max_draft_tokens")) {
+            result.chat.mtp_max_draft_tokens =
+                profile_integer(value, "mtp_max_draft_tokens");
+        }
 #undef MFQ_CHAT_NUMBER
     }
     if (root.contains("duplex")) {
@@ -970,6 +979,12 @@ static MfqRuntimeProfile parse_runtime_profile(const std::string & text,
     bounded(result.tts.temperature, 0.0, 10.0, "tts.temperature");
     if (result.chat.top_k && *result.chat.top_k < 0) {
         throw std::runtime_error("runtime profile chat.top_k must be non-negative");
+    }
+    if (result.chat.mtp_max_draft_tokens &&
+        (*result.chat.mtp_max_draft_tokens < 1 ||
+         *result.chat.mtp_max_draft_tokens > 5)) {
+        throw std::runtime_error(
+            "runtime profile chat.mtp_max_draft_tokens must be in [1, 5]");
     }
     if (result.duplex.top_k && *result.duplex.top_k < 0) {
         throw std::runtime_error("runtime profile duplex.top_k must be non-negative");
@@ -1250,6 +1265,10 @@ static RequestWork parse_work(const json & body, bool chat, const MfqTokenizer &
         body, "enable_vision", defaults.enable_vision);
     work.sampling.enable_mtp = boolean_field(
         body, "enable_mtp", defaults.enable_mtp);
+    work.sampling.mtp_max_draft_tokens = static_cast<int32_t>(integer_field(
+        body,
+        "mtp_max_draft_tokens",
+        defaults.mtp_max_draft_tokens));
     if (work.sampling.temperature < 0.0 || work.sampling.temperature > 10.0) {
         throw ApiError(400, "invalid_request_error", "temperature must be in [0, 10]", "temperature");
     }
@@ -1258,6 +1277,14 @@ static RequestWork parse_work(const json & body, bool chat, const MfqTokenizer &
     }
     if (work.sampling.top_k < 0 || work.sampling.top_k > 1024) {
         throw ApiError(400, "invalid_request_error", "top_k must be in [0, 1024]", "top_k");
+    }
+    if (work.sampling.mtp_max_draft_tokens < 1 ||
+        work.sampling.mtp_max_draft_tokens > 5) {
+        throw ApiError(
+            400,
+            "invalid_request_error",
+            "mtp_max_draft_tokens must be in [1, 5]",
+            "mtp_max_draft_tokens");
     }
     if (work.sampling.temperature > 0.0 && work.sampling.top_k == 0 && work.sampling.top_p < 1.0) {
         throw ApiError(400, "invalid_request_error", "top_p below 1 requires top_k above 0 in this sampler", "top_p");
@@ -1593,6 +1620,8 @@ static json request_metric_values_json(
             {"repetition_penalty", sampling.repetition_penalty},
             {"seed", sampling.seed},
             {"enable_thinking", sampling.enable_thinking},
+            {"enable_mtp", sampling.enable_mtp},
+            {"mtp_max_draft_tokens", sampling.mtp_max_draft_tokens},
         }},
     };
 }
@@ -1669,6 +1698,8 @@ static void log_request_metrics(const std::string & id, bool chat, bool stream,
          << " presence_penalty=" << sampling.presence_penalty
          << " frequency_penalty=" << sampling.frequency_penalty
          << " repetition_penalty=" << sampling.repetition_penalty
+         << " mtp=" << (sampling.enable_mtp ? 1 : 0)
+         << " mtp_max_draft_tokens=" << sampling.mtp_max_draft_tokens
          << " seed=" << sampling.seed
          << " penalties=" << (penalties ? 1 : 0)
          << " finish_reason=" << result.finish_reason
@@ -3639,6 +3670,24 @@ int run_mfq_server(
             "mtp_drafted_tokens",
             "mtp_accepted_tokens",
             "mtp_acceptance_rate",
+            "mtp_selected_depth",
+            "mtp_depth_0_cycles",
+            "mtp_depth_1_cycles",
+            "mtp_depth_2_cycles",
+            "mtp_depth_3_cycles",
+            "mtp_depth_4_cycles",
+            "mtp_depth_5_cycles",
+            "mtp_position_1_acceptance_rate",
+            "mtp_position_2_acceptance_rate",
+            "mtp_position_3_acceptance_rate",
+            "mtp_position_4_acceptance_rate",
+            "mtp_position_5_acceptance_rate",
+            "mtp_depth_0_cycle_ms",
+            "mtp_depth_1_cycle_ms",
+            "mtp_depth_2_cycle_ms",
+            "mtp_depth_3_cycle_ms",
+            "mtp_depth_4_cycle_ms",
+            "mtp_depth_5_cycle_ms",
             "mtp_target_ms",
             "mtp_head_ms",
             "mtp_rollback_ms",

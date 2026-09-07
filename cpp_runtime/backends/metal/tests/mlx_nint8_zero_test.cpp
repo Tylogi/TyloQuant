@@ -273,6 +273,42 @@ int main() {
             }
         }
 
+        for (int rows = 3; rows <= 6; ++rows) {
+            std::vector<float> small_m_input_values(
+                static_cast<std::size_t>(rows) * 64);
+            for (std::size_t index = 0;
+                 index < small_m_input_values.size();
+                 ++index) {
+                small_m_input_values[index] = static_cast<float>(
+                    static_cast<int>((index * 5 + rows) % 19) - 9)
+                    / 8.0f;
+            }
+            auto small_m_output = astype(
+                weight.matmul(astype(
+                    array(
+                        small_m_input_values.begin(),
+                        Shape{rows, 64}),
+                    float16)),
+                float32);
+            small_m_output.eval();
+            for (int row = 0; row < rows; ++row) {
+                for (int output_index = 0;
+                     output_index < 3;
+                     ++output_index) {
+                    float expected = 0.0f;
+                    for (int column = 0; column < 64; ++column) {
+                        expected += small_m_input_values[row * 64 + column]
+                            * decoded(fixture, output_index, column);
+                    }
+                    require_close(
+                        small_m_output.data<float>()[
+                            row * 3 + output_index],
+                        expected,
+                        0.05f);
+                }
+            }
+        }
+
         const auto grouped_fixture = make_grouped_fixture();
         const auto grouped_weight =
             mfq::metal::MlxNint8ZeroWeight::from_blob(

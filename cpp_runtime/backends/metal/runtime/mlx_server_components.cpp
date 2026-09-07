@@ -39,6 +39,7 @@ MlxSamplingParams metal_sampling(const MfqSamplingParams& sampling) {
     result.frequency_penalty = sampling.frequency_penalty;
     result.repetition_penalty = sampling.repetition_penalty;
     result.enable_mtp = sampling.enable_mtp;
+    result.mtp_max_draft_tokens = sampling.mtp_max_draft_tokens;
     result.seed = sampling.seed;
     return result;
 }

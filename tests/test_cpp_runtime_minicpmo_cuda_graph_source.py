@@ -56,7 +56,8 @@ def test_minicpmo_persistent_decode_workspaces_are_warmed_before_capture() -> No
         r"model\.c\.is_glm_dsa\(\) \|\|\s+model\.c\.is_minicpmo45\(\)\) \{",
         SOURCE,
     )
-    assert len(warmup_gates) == 2
+    assert len(warmup_gates) == 1
+    assert SOURCE.count("prepare_decode_graph_memory(model,") == 2
 
 
 def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:

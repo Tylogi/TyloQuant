@@ -271,7 +271,8 @@ int main(int argc, char **argv) {
     const int requested_rows = argc >= 5 ? std::stoi(argv[4]) : -1;
     require(gemv_repetitions > 0 && dequant_repetitions > 0 &&
                 multirow_repetitions > 0 &&
-                (requested_rows == -1 || requested_rows >= 2),
+                (requested_rows == -1 || requested_rows == 0 ||
+                 requested_rows >= 2),
             "benchmark repetitions must be positive");
     constexpr int rows = 4096;
     constexpr int columns = 4096;
@@ -328,7 +329,9 @@ int main(int argc, char **argv) {
 
     const std::vector<int> row_counts = requested_rows == -1
         ? std::vector<int>{2, 6, 7, 16, 17, 32, 33, 64, 65, 128}
-        : std::vector<int>{requested_rows};
+        : (requested_rows == 0
+               ? std::vector<int>{2, 3, 4, 5, 6}
+               : std::vector<int>{requested_rows});
     for (const int input_rows : row_counts) {
       const auto multirow_input = make_input(columns, input_rows);
       verify_matmul(sq3, native, multirow_input, input_rows);

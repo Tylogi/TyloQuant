@@ -193,19 +193,20 @@ inline uint mfq_sq3_block_tag(
 }
 )METAL";
 
-// Multi-row packed decode-dot.  Eight lanes own one output row and complete
-// native 32-value blocks, so the XOR tag and state metadata are decoded once
-// per block and each scalar weight is reused across TILE_M activation rows.
+// Multi-row packed decode-dot.  A lane subgroup owns one output row and
+// complete native 32-value blocks, so the XOR tag and state metadata are
+// decoded once per block and each scalar is reused across TILE_M rows.
 constexpr const char *kSq3Mmq = R"METAL(
-    constexpr uint SIMD_GROUPS = 2u;
-    constexpr uint K_LANES = 8u;
-    constexpr uint OUTPUTS_PER_SIMD = 32u / K_LANES;
-    constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
+    constexpr uint K_LANES_VALUE = uint(K_LANES);
+    constexpr uint SIMD_GROUPS_VALUE = uint(SIMD_GROUPS);
+    constexpr uint OUTPUTS_PER_SIMD = 32u / K_LANES_VALUE;
+    constexpr uint OUTPUTS_PER_TG =
+        SIMD_GROUPS_VALUE * OUTPUTS_PER_SIMD;
 
     uint lane = thread_index_in_simdgroup;
     uint simd_group = simdgroup_index_in_threadgroup;
-    uint k_lane = lane & (K_LANES - 1u);
-    uint simd_output = lane / K_LANES;
+    uint k_lane = lane & (K_LANES_VALUE - 1u);
+    uint simd_output = lane / K_LANES_VALUE;
     uint output_index =
         threadgroup_position_in_grid.y * OUTPUTS_PER_TG
         + simd_group * OUTPUTS_PER_SIMD + simd_output;
@@ -217,7 +218,9 @@ constexpr const char *kSq3Mmq = R"METAL(
         accumulators[local_row] = 0.0f;
     }
 
-    for (uint block = k_lane; block < uint(BLOCKS); block += K_LANES) {
+    for (uint block = k_lane;
+         block < uint(BLOCKS);
+         block += K_LANES_VALUE) {
         uint block_index = output * uint(BLOCKS) + block;
         uint tag = mfq_sq3_scalar_block_tag(
             symbols, selectors, block_index);
@@ -269,8 +272,14 @@ constexpr const char *kSq3Mmq = R"METAL(
     }
 
     for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
-        accumulators[local_row] += simd_shuffle_down(
-            accumulators[local_row], 4u);
+        if (K_LANES_VALUE >= 16u) {
+            accumulators[local_row] += simd_shuffle_down(
+                accumulators[local_row], 8u);
+        }
+        if (K_LANES_VALUE >= 8u) {
+            accumulators[local_row] += simd_shuffle_down(
+                accumulators[local_row], 4u);
+        }
         accumulators[local_row] += simd_shuffle_down(
             accumulators[local_row], 2u);
         accumulators[local_row] += simd_shuffle_down(
@@ -834,13 +843,19 @@ array MlxMxfp4Sq3Weight::matmul(const array &input) const {
   std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> arguments;
   if (rows <= 16) {
     const bool first_bucket = rows <= 6;
+    const int k_lanes = first_bucket && rows <= 3 ? 16 : 8;
+    const int simd_groups = first_bucket && rows <= 3 ? 4 : 2;
     const int row_tiles = first_bucket
         ? 1
         : (static_cast<int>(rows) + 7) / 8;
     const int tile_rows =
         (static_cast<int>(rows) + row_tiles - 1) / row_tiles;
-    const auto grid_x = static_cast<std::size_t>(row_tiles) * 64;
-    const auto grid_y = static_cast<std::size_t>((output_size_ + 7) / 8);
+    const int outputs_per_threadgroup = simd_groups * 32 / k_lanes;
+    const auto grid_x = static_cast<std::size_t>(row_tiles) *
+                        static_cast<std::size_t>(simd_groups * 32);
+    const auto grid_y = static_cast<std::size_t>(
+        (output_size_ + outputs_per_threadgroup - 1) /
+        outputs_per_threadgroup);
     if (grid_x > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
         grid_y > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
       throw std::runtime_error("MXFP4-SQ3 MMQ grid exceeds MLX limits");
@@ -848,9 +863,11 @@ array MlxMxfp4Sq3Weight::matmul(const array &input) const {
     kernel = first_bucket ? &sq3_mmq_2_6_kernel()
                           : &sq3_mmq_7_16_kernel();
     grid = {static_cast<int>(grid_x), static_cast<int>(grid_y), 1};
-    threadgroup = {64, 1, 1};
+    threadgroup = {simd_groups * 32, 1, 1};
     arguments = mmq_templates(source.dtype(), input_size_, output_size_,
                               static_cast<int>(rows), tile_rows);
+    arguments.emplace_back("K_LANES", k_lanes);
+    arguments.emplace_back("SIMD_GROUPS", simd_groups);
   } else {
     int bm = 32;
     int bn = 32;

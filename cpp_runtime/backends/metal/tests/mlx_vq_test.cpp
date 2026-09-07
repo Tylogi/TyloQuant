@@ -1136,6 +1136,37 @@ void test_fixture(const Fixture& fixture) {
             fixture.dtype + " packed matmul");
     }
 
+    if (weight.execution_layout() == 2) {
+        for (int rows = 2; rows <= 6; ++rows) {
+            auto input = input_values(rows, fixture.input_size);
+            const auto expected = expected_matmul(fixture, input, rows);
+            auto output = weight.mmq(astype(
+                array(input.begin(), Shape{rows, fixture.input_size}),
+                float16));
+            check_values(
+                evaluated_float(std::move(output)),
+                expected,
+                0.05f,
+                fixture.dtype + " group64 FP16 M=" +
+                    std::to_string(rows));
+        }
+    }
+    if (weight.execution_layout() == 1) {
+        for (int rows = 2; rows <= 6; ++rows) {
+            auto input = input_values(rows, fixture.input_size);
+            const auto expected = expected_matmul(fixture, input, rows);
+            auto output = weight.mmq(astype(
+                array(input.begin(), Shape{rows, fixture.input_size}),
+                float16));
+            check_values(
+                evaluated_float(std::move(output)),
+                expected,
+                0.05f,
+                fixture.dtype + " streams FP16 M=" +
+                    std::to_string(rows));
+        }
+    }
+
     constexpr int large_rows = 64;
     auto large_input = input_values(
         large_rows,

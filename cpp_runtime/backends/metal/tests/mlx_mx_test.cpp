@@ -211,6 +211,58 @@ void test_grouped_mxfp8() {
 
 }
 
+void test_grouped_mx_small_m(const std::string& dtype) {
+    using namespace mlx::core;
+    const int bits = dtype == "MXFP4" ? 4 : 8;
+    const int inputs = bits == 4 ? 96 : 128;
+    constexpr int first_outputs = 17;
+    constexpr int second_outputs = 9;
+    const auto first = mfq::metal::MlxMxWeight::from_blob(
+        dtype, make_blob(bits, first_outputs, inputs));
+    const auto second = mfq::metal::MlxMxWeight::from_blob(
+        dtype, make_blob(bits, second_outputs, inputs));
+    const mfq::metal::MlxGroupedLinear grouped({&first, &second});
+    for (int rows = 2; rows <= 6; ++rows) {
+        std::vector<float> values(
+            static_cast<std::size_t>(rows) * inputs);
+        for (int row = 0; row < rows; ++row) {
+            for (int column = 0; column < inputs; ++column) {
+                values[static_cast<std::size_t>(row) * inputs + column] =
+                    static_cast<float>((row * 7 + column * 3) % 19 - 9)
+                    / 16.0f;
+            }
+        }
+        auto actual = grouped(astype(
+            array(values.begin(), Shape{rows, inputs}),
+            float16));
+        for (auto& projection : actual) {
+            projection = astype(projection, float32);
+        }
+        eval(actual);
+        require(
+            actual[0].shape() == Shape({rows, first_outputs}) &&
+                actual[1].shape() == Shape({rows, second_outputs}),
+            dtype + " grouped small-M output shape mismatch");
+        for (int row = 0; row < rows; ++row) {
+            float expected = 0.0f;
+            for (int column = 0; column < inputs; ++column) {
+                expected += values[
+                    static_cast<std::size_t>(row) * inputs + column];
+            }
+            for (const auto& projection : actual) {
+                const int outputs = projection.shape(-1);
+                for (int output = 0; output < outputs; ++output) {
+                    require(
+                        std::fabs(
+                            projection.data<float>()[row * outputs + output]
+                            - expected) < 0.05f,
+                        dtype + " grouped small-M value mismatch");
+                }
+            }
+        }
+    }
+}
+
 void test_grouped_mxfp8_swiglu() {
     using namespace mlx::core;
     constexpr int inputs = 128;
@@ -429,16 +481,24 @@ void test_grouped_row_mxfp8_prefill() {
 int main() {
     try {
         test_matmul("MXFP4", 96, 1);
+        for (int rows = 2; rows <= 6; ++rows) {
+            test_matmul("MXFP4", 96, rows, true);
+        }
         test_matmul("MXFP4", 96, 7);
         test_matmul("MXFP4", 96, 64);
         test_matmul("MXFP8", 128, 1);
         test_matmul("MXFP8", 128, 1, true);
+        for (int rows = 2; rows <= 6; ++rows) {
+            test_matmul("MXFP8", 128, rows, true);
+        }
         test_matmul("MXFP8", 128, 7);
         test_matmul("MXFP8", 128, 64);
         test_native_mxfp8_scale_expansion();
         test_embedding("MXFP4", 96);
         test_embedding("MXFP8", 128);
         test_grouped_mxfp8();
+        test_grouped_mx_small_m("MXFP4");
+        test_grouped_mx_small_m("MXFP8");
         test_grouped_mxfp8_swiglu();
         test_grouped_mxfp8_q8();
         test_grouped_mxfp8_inverse_rope();

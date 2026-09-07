@@ -196,6 +196,114 @@ constexpr const char* kMxMatmul = R"METAL(
     }
 )METAL";
 
+// Decode-oriented FP16 M=2..6 path.  Eight lanes own one output row and
+// complete native MX blocks, so each E8M0 scale is decoded once and every
+// decoded four-value vector is reused across all activation rows.  Two SIMD
+// groups produce eight output rows per threadgroup.
+constexpr const char* kMxSmallM = R"METAL(
+    constexpr uint K_LANES_VALUE = uint(K_LANES);
+    constexpr uint SIMD_GROUPS_VALUE = uint(SIMD_GROUPS);
+    constexpr uint OUTPUTS_PER_SIMD = 32u / K_LANES_VALUE;
+    constexpr uint OUTPUTS_PER_TG =
+        SIMD_GROUPS_VALUE * OUTPUTS_PER_SIMD;
+    constexpr uint BLOCK = MX_BITS == 4 ? 32u : 128u;
+    constexpr uint BLOCKS = uint(K) / BLOCK;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint k_lane = lane & (K_LANES_VALUE - 1u);
+    uint simd_output = lane / K_LANES_VALUE;
+    uint output_index =
+        threadgroup_position_in_grid.y * OUTPUTS_PER_TG
+        + simd_group * OUTPUTS_PER_SIMD + simd_output;
+    uint output = min(output_index, uint(OUT) - 1u);
+    uint first_row = threadgroup_position_in_grid.x * uint(TILE_M);
+
+    float accumulators[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators[local_row] = 0.0f;
+    }
+
+    for (uint block = k_lane; block < BLOCKS; block += K_LANES_VALUE) {
+        uint column_base = block * BLOCK;
+        float scale = MX_BITS == 4
+            ? mfq_mx_e8m0(scales[output * BLOCKS + block])
+            : mfq_mx_e8m0(scales[
+                (output / 128u) * BLOCKS + block]);
+        if (MX_BITS == 4) {
+            uint value_base = output * (uint(K) / 2u);
+            for (uint vector = 0u; vector < 8u; ++vector) {
+                uint column = column_base + vector * 4u;
+                uint packed = uint(*(device const ushort*)(
+                    values + value_base + (column >> 1u)));
+                float4 weights = scale * float4(
+                    mfq_mx_fp4(uchar(packed & 15u)),
+                    mfq_mx_fp4(uchar((packed >> 4u) & 15u)),
+                    mfq_mx_fp4(uchar((packed >> 8u) & 15u)),
+                    mfq_mx_fp4(uchar((packed >> 12u) & 15u)));
+                for (uint local_row = 0u;
+                     local_row < uint(TILE_M);
+                     ++local_row) {
+                    uint row = min(
+                        first_row + local_row,
+                        uint(M) - 1u);
+                    half4 activation = *(device const half4*)(
+                        x + row * uint(K) + column);
+                    accumulators[local_row] +=
+                        dot(float4(activation), weights);
+                }
+            }
+        } else {
+            uint value_base = output * uint(K);
+            for (uint vector = 0u; vector < 32u; ++vector) {
+                uint column = column_base + vector * 4u;
+                uchar4 codes = as_type<uchar4>(
+                    *(device const uint*)(values + value_base + column));
+                float4 weights = scale * float4(
+                    mfq_mx_fp8(codes.x),
+                    mfq_mx_fp8(codes.y),
+                    mfq_mx_fp8(codes.z),
+                    mfq_mx_fp8(codes.w));
+                for (uint local_row = 0u;
+                     local_row < uint(TILE_M);
+                     ++local_row) {
+                    uint row = min(
+                        first_row + local_row,
+                        uint(M) - 1u);
+                    half4 activation = *(device const half4*)(
+                        x + row * uint(K) + column);
+                    accumulators[local_row] +=
+                        dot(float4(activation), weights);
+                }
+            }
+        }
+    }
+
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        if (K_LANES_VALUE >= 16u) {
+            accumulators[local_row] +=
+                simd_shuffle_down(accumulators[local_row], 8u);
+        }
+        if (K_LANES_VALUE >= 8u) {
+            accumulators[local_row] +=
+                simd_shuffle_down(accumulators[local_row], 4u);
+        }
+        accumulators[local_row] +=
+            simd_shuffle_down(accumulators[local_row], 2u);
+        accumulators[local_row] +=
+            simd_shuffle_down(accumulators[local_row], 1u);
+        uint row = first_row + local_row;
+        if (
+            k_lane == 0u
+            && output_index < uint(OUT)
+            && row < uint(M)
+        ) {
+            y[row * uint(OUT) + output_index] =
+                T(accumulators[local_row]);
+        }
+    }
+)METAL";
+
 constexpr const char* kMxGemv = R"METAL(
     constexpr uint OUTPUTS_PER_SIMD = 4u;
     constexpr uint SIMD_GROUPS = 2u;
@@ -430,6 +538,12 @@ mlx::core::fast::CustomKernelFunction make_kernel(
 const mlx::core::fast::CustomKernelFunction& mx_matmul_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_mx_packed_matmul", kMxMatmul);
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& mx_small_m_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_mx_small_m", kMxSmallM);
     return kernel;
 }
 
@@ -703,37 +817,72 @@ array MlxMxWeight::matmul(const array& input) const {
     }
 
     const bool gemv = rows == 1;
+    const auto* small_m_layout =
+        std::getenv("MFQ_METAL_MX_SMALL_M_LAYOUT");
+    const bool small_m =
+        rows >= 2 && rows <= 6 &&
+        source.dtype() == mlx::core::float16 &&
+        (small_m_layout == nullptr ||
+         std::strcmp(small_m_layout, "scalar") != 0);
+    constexpr int small_m_k_lanes = 8;
+    constexpr int small_m_simd_groups = 2;
+    const int small_m_outputs_per_threadgroup =
+        small_m_simd_groups * 32 / small_m_k_lanes;
     const bool mxfp8_gemv =
         gemv && bits_ == 8 && source.dtype() == mlx::core::float16;
     const int tile_rows = gemv ? 1 : (rows <= 16 ? static_cast<int>(rows) : 8);
     const auto row_tiles = (rows + static_cast<std::size_t>(tile_rows) - 1) /
         static_cast<std::size_t>(tile_rows);
-    const auto grid = mxfp8_gemv
+    const auto grid_x = mxfp8_gemv
         ? static_cast<std::size_t>((output_size_ + 15) / 16) * 128
         : gemv
         ? static_cast<std::size_t>((output_size_ + 7) / 8) * 64
+        : small_m
+        ? row_tiles * static_cast<std::size_t>(small_m_simd_groups * 32)
         : row_tiles * static_cast<std::size_t>(output_size_) * 32;
-    if (grid > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    const auto grid_y = small_m
+        ? static_cast<std::size_t>(
+              (output_size_ + small_m_outputs_per_threadgroup - 1) /
+              small_m_outputs_per_threadgroup)
+        : std::size_t{1};
+    if (grid_x > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        grid_y > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("MX Metal grid exceeds MLX limits");
     }
     const auto& kernel = mxfp8_gemv
         ? mxfp8_gemv_kernel()
         : gemv
         ? mx_gemv_kernel()
+        : small_m
+        ? mx_small_m_kernel()
         : mx_matmul_kernel();
+    auto template_arguments = templates(
+        source.dtype(),
+        bits_,
+        input_size_,
+        output_size_,
+        static_cast<int>(rows),
+        tile_rows);
+    if (small_m) {
+        template_arguments.emplace_back("K_LANES", small_m_k_lanes);
+        template_arguments.emplace_back(
+            "SIMD_GROUPS", small_m_simd_groups);
+    }
     auto outputs = kernel(
         {values_, scales_, source},
         {Shape{static_cast<int>(rows), output_size_}},
         {source.dtype()},
-        {static_cast<int>(grid), 1, 1},
-        {mxfp8_gemv ? 128 : gemv ? 64 : 32, 1, 1},
-        templates(
-            source.dtype(),
-            bits_,
-            input_size_,
-            output_size_,
-            static_cast<int>(rows),
-            tile_rows),
+        {static_cast<int>(grid_x), static_cast<int>(grid_y), 1},
+        {
+            mxfp8_gemv
+                ? 128
+                : (small_m
+                       ? small_m_simd_groups * 32
+                       : (gemv ? 64 : 32)),
+            1,
+            1,
+        },
+        std::move(template_arguments),
         std::nullopt,
         false,
         {});

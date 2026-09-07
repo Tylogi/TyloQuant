@@ -216,7 +216,7 @@ ScaledFixture make_nint_gs24_scaled_blob(
     std::int32_t input_size) {
     constexpr std::int32_t group_size = 24;
     constexpr int sub_bits = 7;
-    if ((bits != 4 && bits != 6) ||
+    if ((bits != 3 && bits != 4 && bits != 6) ||
         output_size <= 0 ||
         input_size <= 0) {
         throw std::runtime_error("invalid NINT GS24 test fixture");
@@ -308,7 +308,7 @@ void test_nint5_gs28_decode() {
     const auto weight =
         mfq::metal::MlxNintWeight::from_blob(fixture.blob);
 
-    std::vector<float> input_values(2 * input_size);
+    std::vector<float> input_values(6 * input_size);
     for (std::size_t index = 0; index < input_values.size(); ++index) {
         input_values[index] =
             static_cast<float>(
@@ -316,8 +316,9 @@ void test_nint5_gs28_decode() {
             512.0f;
     }
 
-    for (const auto dtype : {float16, float32}) {
-        const int rows = dtype == float16 ? 1 : 2;
+    for (int pass = 0; pass < 7; ++pass) {
+        const int rows = pass >= 2 ? pass : 1;
+        const auto dtype = pass == 1 ? float32 : float16;
         const auto input = astype(
             array(
                 input_values.begin(),
@@ -382,7 +383,7 @@ void verify_nint_gs24_decode(
         mfq::metal::MlxNintWeight::from_blob(fixture.blob);
 
     std::vector<float> input_values(
-        2 * static_cast<std::size_t>(input_size));
+        6 * static_cast<std::size_t>(input_size));
     for (std::size_t index = 0; index < input_values.size(); ++index) {
         input_values[index] =
             static_cast<float>(
@@ -390,9 +391,9 @@ void verify_nint_gs24_decode(
             512.0f;
     }
 
-    const int passes = exercise_fallbacks ? 3 : 1;
+    const int passes = exercise_fallbacks ? 7 : 1;
     for (int pass = 0; pass < passes; ++pass) {
-        const int rows = pass == 2 ? 2 : 1;
+        const int rows = pass >= 2 ? pass : 1;
         const auto dtype = pass == 1 ? float32 : float16;
         const auto input = astype(
             array(
@@ -434,11 +435,18 @@ void verify_nint_gs24_decode(
                     ? 0.006f + 0.001f * std::fabs(expected)
                     : 0.0003f +
                         0.00003f * std::fabs(expected);
-                require_close(
-                    values[
-                        input_row * output_size + output_row],
-                    expected,
-                    tolerance);
+                const float actual = values[
+                    input_row * output_size + output_row];
+                if (std::fabs(actual - expected) > tolerance) {
+                    throw std::runtime_error(
+                        "NINT GS24 mismatch: bits=" +
+                        std::to_string(bits) + " rows=" +
+                        std::to_string(rows) + " input_row=" +
+                        std::to_string(input_row) + " output_row=" +
+                        std::to_string(output_row) + " actual=" +
+                        std::to_string(actual) + " expected=" +
+                        std::to_string(expected));
+                }
             }
         }
 
@@ -502,12 +510,18 @@ void verify_nint_gs24_decode(
 
 void test_nint4_gs24_decode() {
     // Both dimensions have tails: K is not a multiple of GS24 and OUT is not
-    // a multiple of the kernel's 16-row threadgroup tile. FP32 and M2 also
-    // exercise the retained NINT4 fallbacks.
+    // a multiple of the kernel's 16-row threadgroup tile. M=2..6 exercise
+    // the verify kernel; FP32 retains the generic fallback.
     verify_nint_gs24_decode(4, 37, 111, true);
 
     // Exercise direct byte addressing and a large non-aligned output grid.
     verify_nint_gs24_decode(4, 65'539, 25, false);
+}
+
+void test_nint3_gs24_decode() {
+    // Exercise the standard S3 profile across the specialized M=2..6 route,
+    // plus the retained single-row and FP32 paths.
+    verify_nint_gs24_decode(3, 37, 111, true);
 }
 
 void test_nint6_gs24_decode() {
@@ -733,6 +747,42 @@ int main() {
                 }
             }
 
+            for (int rows = 3; rows <= 6; ++rows) {
+                std::vector<float> small_m_values(
+                    static_cast<std::size_t>(rows) * input_size);
+                for (std::size_t index = 0;
+                     index < small_m_values.size();
+                     ++index) {
+                    small_m_values[index] = static_cast<float>(
+                        static_cast<int>((index * 7 + rows) % 23) - 11)
+                        / 16.0f;
+                }
+                auto small_m_output = astype(
+                    weight.matmul(astype(
+                        array(
+                            small_m_values.begin(),
+                            Shape{rows, input_size}),
+                        float16)),
+                    float32);
+                small_m_output.eval();
+                for (int input_row = 0; input_row < rows; ++input_row) {
+                    for (int output_row = 0; output_row < 2; ++output_row) {
+                        float expected = 0.0f;
+                        for (int index = 0; index < input_size; ++index) {
+                            expected += small_m_values[
+                                input_row * input_size + index] *
+                                fixture.quantized[
+                                    output_row * packed_row_size + index];
+                        }
+                        require_close(
+                            small_m_output.data<float>()[
+                                input_row * 2 + output_row],
+                            expected,
+                            0.05f);
+                    }
+                }
+            }
+
             std::vector<float> large_input_values(64 * input_size);
             for (std::size_t index = 0;
                  index < large_input_values.size();
@@ -782,12 +832,13 @@ int main() {
             }
         }
         test_nint5_gs28_decode();
+        test_nint3_gs24_decode();
         test_nint4_gs24_decode();
         test_nint6_gs24_decode();
         test_nint4_swiglu();
         std::cout
             << "MFQ C++ NINT1-NINT8 matmul/embedding and "
-               "NINT4/NINT6 GS24 and NINT5 GS28 decode and "
+               "NINT3/NINT4/NINT6 GS24 and NINT5 GS28 decode and "
                "NINT4 SwiGLU "
                "Metal tests passed\n";
         return 0;

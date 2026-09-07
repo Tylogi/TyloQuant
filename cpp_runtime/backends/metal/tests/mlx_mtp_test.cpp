@@ -8,7 +8,63 @@
 int main() {
     using mfq::metal::verify_greedy_mtp;
     using mfq::metal::verify_stochastic_mtp;
+    using mfq::metal::verify_stochastic_mtp_top_k_device;
+    using mfq::metal::verify_stochastic_mtp_top_k_chain_device;
     try {
+        {
+            mfq::metal::MlxMtpDepthController controller(3);
+            if (controller.depth() != 3) {
+                throw std::runtime_error(
+                    "adaptive MTP controller did not start deep");
+            }
+            controller.observe(3, 3, 30.0);
+            controller.observe(2, 2, 25.0);
+            controller.observe(1, 1, 22.0);
+            if (controller.depth() != 0 ||
+                !controller.measured_cycle_ms(3) ||
+                controller.conditional_acceptance(0) <= 0.6) {
+                throw std::runtime_error(
+                    "adaptive MTP controller warmup mismatch");
+            }
+        }
+        {
+            mfq::metal::MlxMtpDepthController controller(3);
+            controller.observe(3, 0, 70.0);
+            controller.observe(2, 0, 60.0);
+            controller.observe(1, 0, 50.0);
+            controller.observe(0, 0, 30.0);
+            controller.observe(0, 0, 29.0);
+            controller.observe(0, 0, 31.0);
+            if (controller.depth() != 0) {
+                throw std::runtime_error(
+                    "adaptive MTP controller did not select plain decode");
+            }
+            for (int cycle = 0; cycle < 15; ++cycle) {
+                controller.observe(0, 0, 30.0);
+            }
+            if (controller.should_exit()) {
+                throw std::runtime_error(
+                    "adaptive MTP controller exited before its streak gate");
+            }
+            controller.observe(0, 0, 30.0);
+            if (!controller.should_exit()) {
+                throw std::runtime_error(
+                    "adaptive MTP controller did not park losing speculation");
+            }
+        }
+        {
+            mfq::metal::MlxMtpDepthController controller(3);
+            controller.observe(3, 3, 45.0);
+            controller.observe(2, 2, 40.0);
+            controller.observe(1, 1, 35.0);
+            controller.observe(0, 0, 30.0);
+            controller.observe(0, 0, 30.0);
+            controller.observe(0, 0, 30.0);
+            if (controller.depth() < 2 || controller.should_exit()) {
+                throw std::runtime_error(
+                    "adaptive MTP controller rejected profitable depth");
+            }
+        }
         const std::array<std::int32_t, 4> drafts{11, 12, 13, 14};
         {
             const std::array<std::int32_t, 5> targets{11, 12, 99, 14, 15};
@@ -43,6 +99,94 @@ int main() {
             if (result.accepted_drafts != 4 || result.next_token != 15 ||
                 !result.bonus) {
                 throw std::runtime_error("MTP bonus acceptance mismatch");
+            }
+        }
+        {
+            const mlx::core::array proposal_indices(
+                {0, 1}, mlx::core::int32);
+            const mlx::core::array proposal_probabilities(
+                {0.8f, 0.2f}, mlx::core::float32);
+            const mlx::core::array target_indices(
+                {1, 0}, mlx::core::int32);
+            const mlx::core::array target_probabilities(
+                {0.6f, 0.4f}, mlx::core::float32);
+            const mlx::core::array bonus_indices(
+                {1, 0}, mlx::core::int32);
+            const mlx::core::array bonus_probabilities(
+                {0.9f, 0.1f}, mlx::core::float32);
+            const mlx::core::array draft(
+                {0}, mlx::core::int32);
+            auto accepted = verify_stochastic_mtp_top_k_device(
+                proposal_indices,
+                proposal_probabilities,
+                target_indices,
+                target_probabilities,
+                bonus_indices,
+                bonus_probabilities,
+                draft,
+                mlx::core::array({0.25f, 0.2f}, mlx::core::float32),
+                2);
+            accepted.eval();
+            const auto* accepted_values =
+                accepted.data<std::int32_t>();
+            if (accepted_values[0] != 1 || accepted_values[1] != 1 ||
+                accepted_values[2] != 0) {
+                throw std::runtime_error(
+                    "device stochastic MTP acceptance mismatch");
+            }
+
+            auto rejected = verify_stochastic_mtp_top_k_device(
+                proposal_indices,
+                proposal_probabilities,
+                target_indices,
+                target_probabilities,
+                bonus_indices,
+                bonus_probabilities,
+                draft,
+                mlx::core::array({0.75f, 0.0f}, mlx::core::float32),
+                2);
+            rejected.eval();
+            const auto* rejected_values =
+                rejected.data<std::int32_t>();
+            if (rejected_values[0] != 0 || rejected_values[1] != 1 ||
+                rejected_values[2] != 0) {
+                throw std::runtime_error(
+                    "device stochastic MTP correction mismatch");
+            }
+        }
+        {
+            const mlx::core::array proposal_indices(
+                {0, 1, 1, 0},
+                mlx::core::Shape{2, 2},
+                mlx::core::int32);
+            const mlx::core::array proposal_probabilities(
+                {0.8f, 0.2f, 0.8f, 0.2f},
+                mlx::core::Shape{2, 2},
+                mlx::core::float32);
+            const mlx::core::array target_indices(
+                {0, 1, 0, 1, 1, 0},
+                mlx::core::Shape{3, 2},
+                mlx::core::int32);
+            const mlx::core::array target_probabilities(
+                {0.9f, 0.1f, 0.9f, 0.1f, 0.7f, 0.3f},
+                mlx::core::Shape{3, 2},
+                mlx::core::float32);
+            auto result = verify_stochastic_mtp_top_k_chain_device(
+                proposal_indices,
+                proposal_probabilities,
+                target_indices,
+                target_probabilities,
+                mlx::core::array({0, 1}, mlx::core::int32),
+                mlx::core::array(
+                    {0.5f, 0.5f, 0.25f}, mlx::core::float32),
+                2,
+                2);
+            result.eval();
+            const auto* values = result.data<std::int32_t>();
+            if (values[0] != 1 || values[1] != 0 ||
+                values[2] != 0 || values[3] != 1) {
+                throw std::runtime_error(
+                    "device stochastic MTP chain mismatch");
             }
         }
         std::cout << "MFQ generic MTP verification tests passed\n";

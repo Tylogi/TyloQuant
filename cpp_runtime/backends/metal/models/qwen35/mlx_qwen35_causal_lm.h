@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <optional>
 #include <string_view>
@@ -55,6 +56,11 @@ struct MlxMtpGenerationStats {
     std::uint64_t cycles = 0;
     std::uint64_t drafted_tokens = 0;
     std::uint64_t accepted_tokens = 0;
+    std::array<std::uint64_t, 6> depth_cycles{};
+    std::array<std::uint64_t, 5> position_drafted{};
+    std::array<std::uint64_t, 5> position_accepted{};
+    std::array<double, 6> measured_depth_ms{};
+    int selected_depth = 0;
 };
 
 using MlxTokenCallback = std::function<bool(std::int64_t)>;
@@ -87,6 +93,7 @@ public:
         bool use_cache = true);
     void reset_cache(int batch = 1, int initial_capacity = 16);
     void materialize_cache();
+    void trim_cache_to(int position);
     void clear_cache() noexcept;
     int cache_position() const noexcept;
     std::size_t layer_count() const noexcept {
@@ -269,7 +276,9 @@ private:
         bool use_cache,
         int speculative_confirmed = 0);
     void commit_speculative();
-    void rollback_speculative(int rejected_tokens);
+    void rollback_speculative(
+        int accepted_tokens,
+        int draft_tokens);
     mlx::core::array project_logits(
         const mlx::core::array& hidden) const;
     mlx::core::array project_normalized(

@@ -1353,6 +1353,8 @@ int serve_loaded_runtime(
             parameters.repetition_penalty =
                 sampling.repetition_penalty;
             parameters.enable_mtp = sampling.enable_mtp;
+            parameters.mtp_max_draft_tokens =
+                sampling.mtp_max_draft_tokens;
             parameters.seed = sampling.seed;
             auto& loaded_runtime = runtime_holder->value();
             const auto stable_prefix_tokens = std::min(
@@ -1533,6 +1535,36 @@ int serve_loaded_runtime(
                             ? 0.0
                             : static_cast<double>(stats.accepted_tokens) /
                                   stats.drafted_tokens);
+                    metrics.emplace_back(
+                        "mtp_selected_depth",
+                        static_cast<double>(stats.selected_depth));
+                    for (std::size_t depth = 0;
+                         depth < stats.depth_cycles.size();
+                         ++depth) {
+                        metrics.emplace_back(
+                            "mtp_depth_" + std::to_string(depth) + "_cycles",
+                            static_cast<double>(stats.depth_cycles[depth]));
+                    }
+                    for (std::size_t position = 0;
+                         position < stats.position_drafted.size();
+                         ++position) {
+                        metrics.emplace_back(
+                            "mtp_position_" + std::to_string(position + 1) +
+                                "_acceptance_rate",
+                            stats.position_drafted[position] == 0
+                                ? 0.0
+                                : static_cast<double>(
+                                      stats.position_accepted[position]) /
+                                      stats.position_drafted[position]);
+                    }
+                    for (std::size_t depth = 0;
+                         depth < stats.measured_depth_ms.size();
+                         ++depth) {
+                        metrics.emplace_back(
+                            "mtp_depth_" + std::to_string(depth) +
+                                "_cycle_ms",
+                            stats.measured_depth_ms[depth]);
+                    }
                 }
             }
             if constexpr (requires(Runtime& value) {

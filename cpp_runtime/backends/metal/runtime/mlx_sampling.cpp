@@ -285,6 +285,13 @@ constexpr const char* kTopKSource = R"METAL(
             }
         }
         output[row] = chosen;
+        for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
+            uint destination = row * uint(TOP_K) + rank;
+            indices_out[destination] = top_indices[rank];
+            probabilities_out[destination] = rank < keep
+                ? probabilities[rank] / keep_sum
+                : 0.0f;
+        }
     }
 )METAL";
 
@@ -601,10 +608,19 @@ const mlx::core::fast::CustomKernelFunction& softmax_kernel() {
 }
 
 const mlx::core::fast::CustomKernelFunction& top_k_kernel() {
-    static const auto kernel = make_kernel(
-        "mfq_cpp_sample_top_k_top_p",
-        {"logits", "random", "params"},
-        kTopKSource);
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_sample_top_k_top_p",
+            {"logits", "random", "params"},
+            {"output", "indices_out", "probabilities_out"},
+            kTopKSource,
+            "",
+            true,
+            false,
+            options);
+    }();
     return kernel;
 }
 
@@ -758,6 +774,54 @@ base_templates(const LogitsView& view) {
         {"T", view.values.dtype()},
         {"ROWS", view.rows},
         {"VOCAB", view.vocab},
+    };
+}
+
+MlxTopKDistribution run_direct_top_k_distribution(
+    const LogitsView& view,
+    const array& random,
+    double temperature,
+    int top_k,
+    double top_p) {
+    const array params(
+        {
+            static_cast<float>(temperature),
+            static_cast<float>(top_p),
+        },
+        mlx::core::float32);
+    auto templates = base_templates(view);
+    templates.push_back({"TOP_K", top_k});
+    auto outputs = top_k_kernel()(
+        {view.values, random, params},
+        {
+            Shape{view.rows},
+            Shape{view.rows, top_k},
+            Shape{view.rows, top_k},
+        },
+        {
+            mlx::core::int32,
+            mlx::core::int32,
+            mlx::core::float32,
+        },
+        {view.rows * kThreads, 1, 1},
+        {kThreads, 1, 1},
+        std::move(templates),
+        std::nullopt,
+        false,
+        {});
+    auto sample_shape = view.prefix;
+    auto distribution_shape = view.prefix;
+    distribution_shape.push_back(top_k);
+    return {
+        mlx::core::reshape(
+            std::move(outputs.at(0)),
+            std::move(sample_shape)),
+        mlx::core::reshape(
+            std::move(outputs.at(1)),
+            distribution_shape),
+        mlx::core::reshape(
+            std::move(outputs.at(2)),
+            std::move(distribution_shape)),
     };
 }
 
@@ -984,27 +1048,39 @@ array sample_top_k_top_p(
             top_p);
     }
 
-    const array params(
-        {
-            static_cast<float>(temperature),
-            static_cast<float>(top_p),
-        },
-        mlx::core::float32);
-    auto templates = base_templates(view);
-    templates.push_back({"TOP_K", top_k});
-    auto outputs = top_k_kernel()(
-        {view.values, uniforms, params},
-        {Shape{view.rows}},
-        {mlx::core::int32},
-        {view.rows * kThreads, 1, 1},
-        {kThreads, 1, 1},
-        std::move(templates),
-        std::nullopt,
-        false,
-        {});
-    return mlx::core::reshape(
-        outputs.front(),
-        std::move(view.prefix));
+    return run_direct_top_k_distribution(
+        view,
+        uniforms,
+        temperature,
+        top_k,
+        top_p).sampled;
+}
+
+MlxTopKDistribution sample_top_k_distribution(
+    const array& logits,
+    const array& random,
+    double temperature,
+    int top_k,
+    double top_p) {
+    if (!std::isfinite(temperature) || temperature <= 0.0) {
+        throw std::invalid_argument(
+            "temperature must be finite and positive");
+    }
+    if (!std::isfinite(top_p) || top_p <= 0.0 || top_p > 1.0) {
+        throw std::invalid_argument("top_p must be in (0,1]");
+    }
+    auto view = normalize_logits(logits);
+    if (top_k < 1 || top_k > std::min(view.vocab, kDirectTopK)) {
+        throw std::invalid_argument(
+            "compact top_k must be in [1,min(vocab,64)]");
+    }
+    auto uniforms = normalize_random(random, view.rows);
+    return run_direct_top_k_distribution(
+        view,
+        uniforms,
+        temperature,
+        top_k,
+        top_p);
 }
 
 array sample(

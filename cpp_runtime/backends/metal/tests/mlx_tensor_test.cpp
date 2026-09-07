@@ -283,6 +283,61 @@ void require_close(float actual, float expected) {
     }
 }
 
+void test_dense_small_m() {
+    using namespace mlx::core;
+    constexpr int width = 256;
+    constexpr int output = 256;
+    std::vector<float> weight_values(
+        static_cast<std::size_t>(width) * output);
+    for (std::size_t index = 0; index < weight_values.size(); ++index) {
+        weight_values[index] =
+            static_cast<float>(static_cast<int>((index * 13 + 5) % 31) - 15)
+            / 128.0f;
+    }
+    for (const auto dtype : {float16, bfloat16}) {
+        auto weight = astype(
+            array(weight_values.begin(), Shape{output, width}),
+            dtype);
+        const mfq::metal::MlxLinear linear(weight);
+        auto weight32 = contiguous(astype(weight, float32));
+        weight32.eval();
+        for (int rows = 2; rows <= 6; ++rows) {
+            std::vector<float> input_values(
+                static_cast<std::size_t>(rows) * width);
+            for (std::size_t index = 0; index < input_values.size(); ++index) {
+                input_values[index] = static_cast<float>(
+                    static_cast<int>((index * 17 + 9) % 29) - 14) / 64.0f;
+            }
+            auto input = astype(
+                array(input_values.begin(), Shape{rows, width}),
+                dtype);
+            auto input32 = contiguous(astype(input, float32));
+            auto actual = contiguous(astype(linear(input), float32));
+            eval(input32, actual);
+            for (int row = 0; row < rows; ++row) {
+                for (int neuron = 0; neuron < output; ++neuron) {
+                    float expected = 0.0f;
+                    for (int column = 0; column < width; ++column) {
+                        expected += input32.data<float>()[
+                                        static_cast<std::size_t>(row) * width +
+                                        column] *
+                            weight32.data<float>()[
+                                static_cast<std::size_t>(neuron) * width +
+                                column];
+                    }
+                    const float difference = std::fabs(
+                        actual.data<float>()[
+                            static_cast<std::size_t>(row) * output + neuron] -
+                        expected);
+                    require(
+                        difference <= (dtype == float16 ? 2e-3f : 2e-2f),
+                        "dense small-M Metal result mismatch");
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -330,6 +385,8 @@ int main() {
         require_close(bf16_values[0], 0.0f);
         require_close(bf16_values[1], 2.0f);
         require_close(bf16_values[2], 4.0f);
+
+        test_dense_small_m();
 
         const array grouped_weight(
             {

@@ -2,6 +2,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 DECODE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(encoding="utf-8")
+CUDA_COMPONENTS = (
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "server_components.h"
+).read_text(encoding="utf-8")
 ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
 )
@@ -252,7 +255,7 @@ def test_minicpmo45_cuda_server_binds_the_realtime_backend():
     assert "if (server_components.minicpmo)" in DECODE
     assert "load_cuda_runtime_components(" in DECODE
     assert 'backend.name = "cuda"' in DECODE
-    assert "MiniCPMO45Runtime::load_with_language(" in DECODE
+    assert "MiniCPMO45Runtime::load_with_language(" in CUDA_COMPONENTS
     assert "session->prepare(" in DECODE
     assert "parameters.reference_audio_features" in DECODE
     assert "input.force_speak" in DECODE

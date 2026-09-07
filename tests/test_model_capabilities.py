@@ -10,6 +10,9 @@ CUDA_PLAN = (
 CUDA_DECODE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(
     encoding="utf-8"
 )
+CUDA_COMPONENTS = (
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "server_components.h"
+).read_text(encoding="utf-8")
 STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
     encoding="utf-8"
 )
@@ -155,7 +158,7 @@ def test_cuda_uses_one_architecture_and_optional_component_registry() -> None:
 
     assert "load_cuda_runtime_components(" in CUDA_DECODE
     assert "CudaRuntimeComponents server_components" in CUDA_DECODE
-    assert "switch (result.plan.vision)" in CUDA_DECODE
+    assert "switch (result.plan.vision)" in CUDA_COMPONENTS
     assert "server_minicpmo_runtime" not in CUDA_DECODE
 
 

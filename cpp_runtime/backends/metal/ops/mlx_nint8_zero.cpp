@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -61,6 +62,81 @@ constexpr const char* kNint8ZeroMatmul = R"METAL(
         uint row = first_row + local_row;
         if (lane == 0u && row < uint(M)) {
             y[row * uint(OUT) + output] = T(total);
+        }
+    }
+)METAL";
+
+// Decode-oriented FP16 M=2..6 path.  Eight lanes own complete 32-value
+// blocks for one output, loading each block scale once and reusing the
+// decoded char4 vectors across every activation row.  Two SIMD groups emit
+// eight output rows per threadgroup.
+constexpr const char* kNint8ZeroSmallM = R"METAL(
+    constexpr uint K_LANES_VALUE = uint(K_LANES);
+    constexpr uint SIMD_GROUPS_VALUE = uint(SIMD_GROUPS);
+    constexpr uint OUTPUTS_PER_SIMD = 32u / K_LANES_VALUE;
+    constexpr uint OUTPUTS_PER_TG =
+        SIMD_GROUPS_VALUE * OUTPUTS_PER_SIMD;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint k_lane = lane & (K_LANES_VALUE - 1u);
+    uint simd_output = lane / K_LANES_VALUE;
+    uint output_index =
+        threadgroup_position_in_grid.y * OUTPUTS_PER_TG
+        + simd_group * OUTPUTS_PER_SIMD + simd_output;
+    uint output = min(output_index, uint(OUT) - 1u);
+    uint first_row = threadgroup_position_in_grid.x * uint(TILE_M);
+
+    float accumulators[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators[local_row] = 0.0f;
+    }
+
+    for (uint block = k_lane;
+         block < uint(NG);
+         block += K_LANES_VALUE) {
+        float scale = float(scales[output * uint(NG) + block]);
+        uint column_base = block * 32u;
+        uint value_base = output * uint(K) + column_base;
+        for (uint vector = 0u; vector < 8u; ++vector) {
+            uint column = column_base + vector * 4u;
+            float4 weights = scale * float4(
+                *(device const char4*)(q + value_base + vector * 4u));
+            for (uint local_row = 0u;
+                 local_row < uint(TILE_M);
+                 ++local_row) {
+                uint row = min(
+                    first_row + local_row,
+                    uint(M) - 1u);
+                half4 activation = *(device const half4*)(
+                    x + row * uint(K) + column);
+                accumulators[local_row] +=
+                    dot(float4(activation), weights);
+            }
+        }
+    }
+
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        if (K_LANES_VALUE >= 16u) {
+            accumulators[local_row] +=
+                simd_shuffle_down(accumulators[local_row], 8u);
+        }
+        if (K_LANES_VALUE >= 8u) {
+            accumulators[local_row] +=
+                simd_shuffle_down(accumulators[local_row], 4u);
+        }
+        accumulators[local_row] +=
+            simd_shuffle_down(accumulators[local_row], 2u);
+        accumulators[local_row] +=
+            simd_shuffle_down(accumulators[local_row], 1u);
+        uint row = first_row + local_row;
+        if (
+            k_lane == 0u
+            && output_index < uint(OUT)
+            && row < uint(M)
+        ) {
+            y[row * uint(OUT) + output_index] =
+                T(accumulators[local_row]);
         }
     }
 )METAL";
@@ -406,6 +482,25 @@ const mlx::core::fast::CustomKernelFunction& matmul_kernel() {
     return kernel;
 }
 
+mlx::core::fast::CustomKernelFunction make_small_m_kernel() {
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    return mlx::core::fast::metal_kernel(
+        "mfq_cpp_nint8_zero_small_m",
+        {"q", "scales", "x"},
+        {"y"},
+        kNint8ZeroSmallM,
+        "",
+        true,
+        false,
+        options);
+}
+
+const mlx::core::fast::CustomKernelFunction& small_m_kernel() {
+    static const auto kernel = make_small_m_kernel();
+    return kernel;
+}
+
 mlx::core::fast::CustomKernelFunction make_gemv_kernel() {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
@@ -637,9 +732,28 @@ array MlxNint8ZeroWeight::matmul(const array& input) const {
         rows == 1 ? 1 : (rows <= 16 ? static_cast<int>(rows) : 8);
     const auto row_tiles =
         (rows + tile_rows - 1) / tile_rows;
+    const auto* small_m_layout =
+        std::getenv("MFQ_METAL_NINT8_ZERO_SMALL_M_LAYOUT");
+    const bool use_small_m =
+        rows >= 2 && rows <= 6 &&
+        source.dtype() == mlx::core::float16 &&
+        (small_m_layout == nullptr ||
+         std::strcmp(small_m_layout, "scalar") != 0);
+    constexpr int small_m_k_lanes = 8;
+    constexpr int small_m_simd_groups = 2;
+    const int small_m_outputs_per_threadgroup =
+        small_m_simd_groups * 32 / small_m_k_lanes;
     const auto grid_x =
-        row_tiles * static_cast<std::int64_t>(output_size_) * 32;
-    if (grid_x > std::numeric_limits<int>::max()) {
+        use_small_m
+        ? row_tiles * small_m_simd_groups * 32
+        : row_tiles * static_cast<std::int64_t>(output_size_) * 32;
+    const auto grid_y = use_small_m
+        ? (static_cast<std::int64_t>(output_size_) +
+               small_m_outputs_per_threadgroup - 1) /
+              small_m_outputs_per_threadgroup
+        : 1;
+    if (grid_x > std::numeric_limits<int>::max() ||
+        grid_y > std::numeric_limits<int>::max()) {
         throw std::runtime_error(
             "NINT8-0 Metal grid exceeds MLX limits");
     }
@@ -653,10 +767,17 @@ array MlxNint8ZeroWeight::matmul(const array& input) const {
             {"K", input_size_},
             {"NG", groups_},
         };
-    const auto* kernel =
-        rows == 1 ? &gemv_kernel() : &matmul_kernel();
-    const int threadgroup = static_cast<int>(
-        std::min<std::int64_t>(256, grid_x));
+    if (use_small_m) {
+        templates.emplace_back("K_LANES", small_m_k_lanes);
+        templates.emplace_back("SIMD_GROUPS", small_m_simd_groups);
+    }
+    const auto* kernel = rows == 1
+        ? &gemv_kernel()
+        : (use_small_m ? &small_m_kernel() : &matmul_kernel());
+    const int threadgroup = use_small_m
+        ? small_m_simd_groups * 32
+        : static_cast<int>(
+            std::min<std::int64_t>(256, grid_x));
     auto outputs = (*kernel)(
         {q_, scales_, source},
         {
@@ -666,7 +787,7 @@ array MlxNint8ZeroWeight::matmul(const array& input) const {
             },
         },
         {source.dtype()},
-        {static_cast<int>(grid_x), 1, 1},
+        {static_cast<int>(grid_x), static_cast<int>(grid_y), 1},
         {threadgroup, 1, 1},
         std::move(templates),
         std::nullopt,

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -300,6 +301,23 @@ void MlxQwen35MtpModule::reset_cache(
 void MlxQwen35MtpModule::materialize_cache() {
     for (auto& layer : layers_) {
         layer.materialize_cache();
+    }
+}
+
+void MlxQwen35MtpModule::trim_cache_to(int position) {
+    if (position < 0) {
+        throw std::runtime_error(
+            "Qwen3.5 MTP cache target position is invalid");
+    }
+    for (auto& layer : layers_) {
+        const int extra = layer.cache_position() - position;
+        if (extra < 0) {
+            throw std::runtime_error(
+                "Qwen3.5 MTP cache is behind committed history");
+        }
+        if (extra > 0) {
+            layer.trim_cache(extra);
+        }
     }
 }
 
@@ -743,19 +761,23 @@ void MlxQwen35CausalLm::commit_speculative() {
 }
 
 void MlxQwen35CausalLm::rollback_speculative(
-    int rejected_tokens) {
-    if (rejected_tokens <= 0 || rejected_tokens > cache_position_) {
+    int accepted_tokens,
+    int draft_tokens) {
+    if (accepted_tokens < 0 || draft_tokens <= 0 ||
+        accepted_tokens >= draft_tokens ||
+        draft_tokens > cache_position_) {
         throw std::runtime_error(
-            "Qwen3.5 speculative rollback length is invalid");
+            "Qwen3.5 speculative rollback range is invalid");
     }
+    const int rejected_tokens = draft_tokens - accepted_tokens;
     for (auto& layer : layers_) {
         std::visit(
-            [rejected_tokens](auto& block) {
+            [accepted_tokens, rejected_tokens](auto& block) {
                 using Block = std::decay_t<decltype(block)>;
                 if constexpr (std::is_same_v<
                                   Block,
                                   MlxQwen35LinearAttentionBlock>) {
-                    block.rollback_speculative();
+                    block.rollback_speculative(accepted_tokens);
                 } else {
                     block.trim_cache(rejected_tokens);
                 }
@@ -1202,14 +1224,16 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
     const auto generation_limit =
         std::min(max_tokens, context_samples);
 
-    const auto make_decode_positions = [&](int tokens) -> std::optional<array> {
+    const auto make_positions = [&] (
+            int cache_start,
+            int tokens) -> std::optional<array> {
         if (!prepared.positions && prepared.decode_position_delta == 0) {
             return std::nullopt;
         }
         if (tokens <= 0) {
             throw std::runtime_error("decode position length must be positive");
         }
-        const auto start = static_cast<std::int64_t>(cache_position_) +
+        const auto start = static_cast<std::int64_t>(cache_start) +
             prepared.decode_position_delta;
         if (start < 0 || start + tokens > maximum_sequence) {
             throw std::runtime_error(
@@ -1234,6 +1258,9 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
         }
         return array(
             values.begin(), Shape{axes, tokens}, mlx::core::int32);
+    };
+    const auto make_decode_positions = [&](int tokens) {
+        return make_positions(cache_position_, tokens);
     };
     const auto forward_decode = [&](const array& ids) {
         const auto positions = make_decode_positions(ids.shape(1));
@@ -1294,38 +1321,180 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
             }
             return token;
         };
-        struct DraftProposal {
-            std::int32_t token = -1;
-            std::vector<float> probabilities;
+        const auto finish_without_mtp = [&] (int pending_token) {
+            while (generated < generation_limit) {
+                const array ids(
+                    {pending_token}, Shape{1, 1}, mlx::core::int32);
+                const int next = sample_token(
+                    last_token_logits(forward_decode(ids), vocab), counts);
+                if (!emit(next)) {
+                    break;
+                }
+                pending_token = next;
+            }
+            return generated;
         };
-        const auto make_draft = [&](const array& hidden, int token) {
-            const array ids(
-                {token},
-                Shape{1, 1},
-                mlx::core::int32);
+        const bool compact_stochastic =
+            !sampling.greedy() && sampling.top_k > 0 &&
+            sampling.top_k <= 64;
+        MlxSamplingParams draft_sampling = sampling;
+        if (!sampling.greedy() && compact_stochastic) {
+            // A sharper proposal distribution is substantially more useful
+            // for a shallow MTP head.  Exact target sampling is preserved by
+            // the p/q acceptance ratio and residual correction below.
+            draft_sampling.temperature = 0.6;
+            draft_sampling.top_p = 0.95;
+        }
+        const int maximum_draft_depth = compact_stochastic || sampling.greedy()
+            ? std::clamp(sampling.mtp_max_draft_tokens, 1, 5)
+            : 1;
+        MlxMtpDepthController depth_controller(maximum_draft_depth);
+
+        struct DraftChain {
+            int depth = 0;
+            array tokens;
+            std::optional<array> compact_indices;
+            std::optional<array> compact_probabilities;
+            std::vector<std::vector<float>> host_probabilities;
+        };
+
+        int head_history_position = 0;
+        const auto make_chain = [&] (
+                const array& hidden_rows,
+                const array& committed_ids,
+                int logical_position,
+                int requested_depth) {
+            if (hidden_rows.ndim() != 3 || committed_ids.ndim() != 1 ||
+                hidden_rows.shape(0) != 1 ||
+                hidden_rows.shape(1) != committed_ids.shape(0) ||
+                hidden_rows.shape(2) != config_.hidden_size) {
+                throw std::runtime_error(
+                    "Qwen3.5 MTP history fold has incompatible shapes");
+            }
+            mtp_->trim_cache_to(head_history_position);
+            const int committed = committed_ids.shape(0);
+            auto committed_matrix = mlx::core::reshape(
+                committed_ids, Shape{1, committed});
             auto head_hidden = [&] {
-                const auto positions = make_decode_positions(1);
+                const auto positions = make_positions(
+                    logical_position, committed);
                 return positions
                     ? mtp_->forward(
-                          hidden, ids, *positions, embedding_, true)
-                    : mtp_->forward(hidden, ids, embedding_, true);
+                          hidden_rows,
+                          committed_matrix,
+                          *positions,
+                          embedding_,
+                          true)
+                    : mtp_->forward(
+                          hidden_rows,
+                          committed_matrix,
+                          embedding_,
+                          true);
             }();
-            auto head_logits = last_token_logits(
-                project_normalized(head_hidden),
-                vocab);
-            if (sampling.greedy()) {
-                return DraftProposal{
-                    sample_token(head_logits, counts),
-                    {}};
+            head_history_position += committed;
+
+            requested_depth = std::clamp(requested_depth, 0, 5);
+            std::vector<array> draft_tokens;
+            std::vector<array> compact_indices;
+            std::vector<array> compact_probabilities;
+            std::vector<std::vector<float>> host_probabilities;
+            draft_tokens.reserve(static_cast<std::size_t>(requested_depth));
+            compact_indices.reserve(static_cast<std::size_t>(requested_depth));
+            compact_probabilities.reserve(
+                static_cast<std::size_t>(requested_depth));
+            host_probabilities.reserve(
+                static_cast<std::size_t>(requested_depth));
+            auto prospective_counts = counts;
+
+            auto last_head = mlx::core::slice(
+                head_hidden,
+                Shape{0, committed - 1, 0},
+                Shape{1, committed,
+                      static_cast<int>(config_.hidden_size)});
+            auto draft_logits = last_token_logits(
+                project_normalized(last_head), vocab);
+            for (int position = 0; position < requested_depth; ++position) {
+                auto adjusted = adjusted_logits(
+                    draft_logits, prospective_counts);
+                array token = mlx::core::zeros(
+                    Shape{1}, mlx::core::int32);
+                if (sampling.greedy()) {
+                    token = sample_greedy(adjusted);
+                } else if (compact_stochastic) {
+                    const array random(
+                        {static_cast<float>(sampler.next_uniform())},
+                        Shape{1},
+                        mlx::core::float32);
+                    auto distribution = sample_top_k_distribution(
+                        adjusted,
+                        random,
+                        draft_sampling.temperature,
+                        draft_sampling.top_k,
+                        draft_sampling.top_p);
+                    token = std::move(distribution.sampled);
+                    compact_indices.push_back(
+                        std::move(distribution.indices));
+                    compact_probabilities.push_back(
+                        std::move(distribution.probabilities));
+                } else {
+                    auto probabilities = host_sampling_distribution(
+                        adjusted, draft_sampling);
+                    const auto host_token = sample_host_distribution(
+                        probabilities, sampler.next_uniform());
+                    token = array(
+                        {host_token}, Shape{1}, mlx::core::int32);
+                    host_probabilities.push_back(
+                        std::move(probabilities));
+                }
+                token = mlx::core::reshape(token, Shape{1});
+                draft_tokens.push_back(token);
+                if (prospective_counts) {
+                    prospective_counts = sample_token_counts_add(
+                        *prospective_counts, token);
+                }
+                if (position + 1 == requested_depth) {
+                    break;
+                }
+                const auto positions = make_positions(
+                    logical_position + committed + position,
+                    1);
+                head_hidden = positions
+                    ? mtp_->forward(
+                          last_head,
+                          mlx::core::reshape(token, Shape{1, 1}),
+                          *positions,
+                          embedding_,
+                          true)
+                    : mtp_->forward(
+                          last_head,
+                          mlx::core::reshape(token, Shape{1, 1}),
+                          embedding_,
+                          true);
+                last_head = head_hidden;
+                draft_logits = last_token_logits(
+                    project_normalized(last_head), vocab);
             }
-            auto probabilities = host_sampling_distribution(
-                adjusted_logits(head_logits, counts),
-                sampling);
-            const auto draft_token = sample_host_distribution(
-                probabilities, sampler.next_uniform());
-            return DraftProposal{
-                draft_token,
+
+            auto tokens = draft_tokens.empty()
+                ? mlx::core::zeros(Shape{0}, mlx::core::int32)
+                : mlx::core::concatenate(draft_tokens, 0);
+            std::optional<array> indices;
+            std::optional<array> probabilities;
+            std::vector<array> pending{tokens};
+            if (!compact_indices.empty()) {
+                indices = mlx::core::concatenate(compact_indices, 0);
+                probabilities = mlx::core::concatenate(
+                    compact_probabilities, 0);
+                pending.push_back(*indices);
+                pending.push_back(*probabilities);
+            }
+            mlx::core::async_eval(std::move(pending));
+            return DraftChain{
+                requested_depth,
+                std::move(tokens),
+                std::move(indices),
                 std::move(probabilities),
+                std::move(host_probabilities),
             };
         };
 
@@ -1379,85 +1548,231 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
             Shape{1, prompt_count,
                   static_cast<int>(config_.hidden_size)});
         int pending_main = next_main;
-        auto draft = make_draft(last_hidden, pending_main);
+        head_history_position = mtp_->cache_position();
+        const auto bounded_depth = [&] (int requested) {
+            const int context_depth = std::max(
+                0, maximum_sequence - cache_position_ - 1);
+            const int output_depth = std::max(
+                0, generation_limit - generated - 1);
+            return std::min({requested, context_depth, output_depth});
+        };
+        auto draft = make_chain(
+            last_hidden,
+            array({pending_main}, Shape{1}, mlx::core::int32),
+            cache_position_,
+            bounded_depth(depth_controller.depth()));
 
         while (generated < generation_limit) {
-            if (cache_position_ > maximum_sequence - 2) {
-                const array ids(
-                    {pending_main},
-                    Shape{1, 1},
-                    mlx::core::int32);
-                const int final_token = sample_token(
-                    last_token_logits(forward_decode(ids), vocab),
-                    counts);
-                emit(final_token);
-                return generated;
-            }
-            const array verify_ids(
-                {pending_main, draft.token},
-                Shape{1, 2},
+            const auto cycle_start = std::chrono::steady_clock::now();
+            const int cycle_cache_position = cache_position_;
+            const int draft_count = draft.depth;
+            const array pending_id(
+                {pending_main},
+                Shape{1},
                 mlx::core::int32);
+            auto verify_ids = mlx::core::reshape(
+                mlx::core::concatenate(
+                    {
+                        pending_id,
+                        mlx::core::reshape(
+                            draft.tokens, Shape{draft_count}),
+                    },
+                    0),
+                Shape{1, draft_count + 1});
             auto verified = forward_decode_with_hidden(
                 verify_ids,
-                1);
+                draft_count > 0 ? 1 : 0);
             ++last_mtp_stats_.cycles;
-            ++last_mtp_stats_.drafted_tokens;
+            last_mtp_stats_.drafted_tokens +=
+                static_cast<std::uint64_t>(draft_count);
+            ++last_mtp_stats_.depth_cycles.at(
+                static_cast<std::size_t>(draft_count));
+            for (int position = 0; position < draft_count; ++position) {
+                ++last_mtp_stats_.position_drafted.at(
+                    static_cast<std::size_t>(position));
+            }
             MlxMtpVerification verification;
             auto target_logits = mlx::core::reshape(
-                verified.first, Shape{2, vocab});
-            auto first = mlx::core::slice(
-                target_logits, Shape{0, 0}, Shape{1, vocab});
-            auto bonus = mlx::core::slice(
-                target_logits, Shape{1, 0}, Shape{2, vocab});
-            const auto bonus_counts = count_with(counts, draft.token);
-            if (sampling.greedy()) {
-                const std::array<std::int32_t, 1> drafts{draft.token};
-                const std::array<std::int32_t, 2> targets{
-                    sample_token(first, counts),
-                    sample_token(bonus, bonus_counts)};
+                verified.first, Shape{draft_count + 1, vocab});
+            std::vector<array> adjusted_rows;
+            adjusted_rows.reserve(
+                static_cast<std::size_t>(draft_count + 1));
+            auto row_counts = counts;
+            for (int row = 0; row <= draft_count; ++row) {
+                auto logits_row = mlx::core::slice(
+                    target_logits,
+                    Shape{row, 0},
+                    Shape{row + 1, vocab});
+                adjusted_rows.push_back(
+                    adjusted_logits(logits_row, row_counts));
+                if (row < draft_count && row_counts) {
+                    auto token = mlx::core::slice(
+                        draft.tokens, Shape{row}, Shape{row + 1});
+                    row_counts = sample_token_counts_add(
+                        *row_counts, token);
+                }
+            }
+            auto target_rows = mlx::core::concatenate(adjusted_rows, 0);
+            std::vector<std::int32_t> draft_ids;
+            draft_ids.reserve(static_cast<std::size_t>(draft_count));
+            if (draft_count == 0) {
+                verification = {
+                    0,
+                    sample_token(target_rows, std::nullopt),
+                    true,
+                };
+            } else if (sampling.greedy()) {
+                auto target_tokens = sample_greedy(target_rows);
+                auto compact = mlx::core::concatenate(
+                    {
+                        mlx::core::reshape(
+                            draft.tokens, Shape{draft_count}),
+                        mlx::core::reshape(
+                            target_tokens, Shape{draft_count + 1}),
+                    },
+                    0);
+                compact.eval();
+                const auto* resolved = compact.data<std::int32_t>();
+                for (int index = 0; index < draft_count; ++index) {
+                    draft_ids.push_back(resolved[index]);
+                }
+                const std::span<const std::int32_t> drafts(
+                    resolved, static_cast<std::size_t>(draft_count));
+                const std::span<const std::int32_t> targets(
+                    resolved + draft_count,
+                    static_cast<std::size_t>(draft_count + 1));
                 verification = verify_greedy_mtp(drafts, targets);
+            } else if (
+                draft_count > 0 && draft.compact_indices &&
+                draft.compact_probabilities && compact_stochastic) {
+                auto target_distribution = sample_top_k_distribution(
+                    target_rows,
+                    mlx::core::zeros(
+                        Shape{draft_count + 1}, mlx::core::float32),
+                    sampling.temperature,
+                    sampling.top_k,
+                    sampling.top_p);
+                std::vector<float> random_values;
+                random_values.reserve(
+                    static_cast<std::size_t>(draft_count + 1));
+                for (int index = 0; index <= draft_count; ++index) {
+                    random_values.push_back(
+                        static_cast<float>(sampler.next_uniform()));
+                }
+                const array random(
+                    random_values.begin(),
+                    Shape{draft_count + 1},
+                    mlx::core::float32);
+                auto compact = verify_stochastic_mtp_top_k_chain_device(
+                    *draft.compact_indices,
+                    *draft.compact_probabilities,
+                    target_distribution.indices,
+                    target_distribution.probabilities,
+                    draft.tokens,
+                    random,
+                    draft_count,
+                    sampling.top_k);
+                compact.eval();
+                const auto* resolved = compact.data<std::int32_t>();
+                for (int index = 0; index < draft_count; ++index) {
+                    draft_ids.push_back(resolved[2 + index]);
+                }
+                verification = {
+                    static_cast<std::size_t>(resolved[0]),
+                    resolved[1],
+                    resolved[0] == draft_count,
+                };
             } else {
+                if (draft_count != 1 ||
+                    draft.host_probabilities.size() != 1) {
+                    throw std::runtime_error(
+                        "Qwen3.5 host MTP fallback requires depth one");
+                }
+                draft.tokens.eval();
+                const auto draft_id =
+                    draft.tokens.data<std::int32_t>()[0];
+                draft_ids.push_back(draft_id);
                 verification = verify_stochastic_mtp(
-                    draft.token,
-                    draft.probabilities,
+                    draft_id,
+                    draft.host_probabilities.front(),
                     host_sampling_distribution(
-                        adjusted_logits(first, counts), sampling),
+                        mlx::core::slice(
+                            target_rows,
+                            Shape{0, 0},
+                            Shape{1, vocab}),
+                        sampling),
                     host_sampling_distribution(
-                        adjusted_logits(bonus, bonus_counts), sampling),
+                        mlx::core::slice(
+                            target_rows,
+                            Shape{1, 0},
+                            Shape{2, vocab}),
+                        sampling),
                     sampler.next_uniform(),
                     sampler.next_uniform());
             }
-            if (verification.accepted_drafts == 1) {
-                ++last_mtp_stats_.accepted_tokens;
-                commit_speculative();
-                if (!emit(draft.token) || generated == generation_limit) {
-                    return generated;
-                }
-                if (!emit(verification.next_token) ||
-                    generated == generation_limit) {
-                    return generated;
-                }
-                auto draft_hidden = mlx::core::slice(
-                    verified.second,
-                    Shape{0, 1, 0},
-                    Shape{1, 2,
-                          static_cast<int>(config_.hidden_size)});
-                pending_main = verification.next_token;
-                draft = make_draft(draft_hidden, pending_main);
-            } else {
-                rollback_speculative(1);
-                if (!emit(verification.next_token) ||
-                    generated == generation_limit) {
-                    return generated;
-                }
-                auto confirmed_hidden = mlx::core::slice(
-                    verified.second,
-                    Shape{0, 0, 0},
-                    Shape{1, 1,
-                          static_cast<int>(config_.hidden_size)});
-                pending_main = verification.next_token;
-                draft = make_draft(confirmed_hidden, pending_main);
+
+            const int accepted = static_cast<int>(
+                verification.accepted_drafts);
+            last_mtp_stats_.accepted_tokens +=
+                static_cast<std::uint64_t>(accepted);
+            for (int position = 0; position < accepted; ++position) {
+                ++last_mtp_stats_.position_accepted.at(
+                    static_cast<std::size_t>(position));
             }
+            if (draft_count > 0 && accepted == draft_count) {
+                commit_speculative();
+            } else if (draft_count > 0) {
+                rollback_speculative(accepted, draft_count);
+            }
+
+            std::vector<std::int32_t> committed_values;
+            committed_values.reserve(
+                static_cast<std::size_t>(accepted + 1));
+            for (int index = 0; index < accepted; ++index) {
+                const auto token = draft_ids[static_cast<std::size_t>(index)];
+                committed_values.push_back(token);
+                if (!emit(token) || generated == generation_limit) {
+                    return generated;
+                }
+            }
+            committed_values.push_back(verification.next_token);
+            if (!emit(verification.next_token) ||
+                generated == generation_limit) {
+                return generated;
+            }
+
+            const double cycle_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - cycle_start).count();
+            depth_controller.observe(draft_count, accepted, cycle_ms);
+            last_mtp_stats_.selected_depth = depth_controller.depth();
+            for (int depth = 0;
+                 depth <= depth_controller.maximum_depth();
+                 ++depth) {
+                const auto measured =
+                    depth_controller.measured_cycle_ms(depth);
+                if (measured) {
+                    last_mtp_stats_.measured_depth_ms.at(
+                        static_cast<std::size_t>(depth)) = *measured;
+                }
+            }
+            pending_main = verification.next_token;
+            if (depth_controller.should_exit()) {
+                return finish_without_mtp(pending_main);
+            }
+
+            auto committed_hidden = mlx::core::slice(
+                verified.second,
+                Shape{0, 0, 0},
+                Shape{1, accepted + 1,
+                      static_cast<int>(config_.hidden_size)});
+            draft = make_chain(
+                committed_hidden,
+                array(
+                    committed_values.begin(),
+                    Shape{accepted + 1},
+                    mlx::core::int32),
+                cycle_cache_position + 1,
+                bounded_depth(depth_controller.depth()));
         }
         return generated;
     }

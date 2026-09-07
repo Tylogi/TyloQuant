@@ -497,9 +497,9 @@ constexpr const char* kGemvSource = R"METAL(
 )METAL";
 
 constexpr const char* kMmqSource = R"METAL(
-    constexpr uint K_LANES = 8u;
+    constexpr uint K_LANES_VALUE = uint(K_LANES);
     constexpr uint ROWS_PER_SIMD =
-        32u / K_LANES;
+        32u / K_LANES_VALUE;
     constexpr uint ROWS_PER_TG =
         SIMD_GROUPS * ROWS_PER_SIMD;
     constexpr uint VECTORS_PER_GROUP =
@@ -509,8 +509,8 @@ constexpr const char* kMmqSource = R"METAL(
     uint lane = thread_index_in_simdgroup;
     uint simd_group =
         simdgroup_index_in_threadgroup;
-    uint k_lane = lane & (K_LANES - 1u);
-    uint simd_row = lane / K_LANES;
+    uint k_lane = lane & (K_LANES_VALUE - 1u);
+    uint simd_row = lane / K_LANES_VALUE;
     uint output_index =
         threadgroup_position_in_grid.y * ROWS_PER_TG
         + simd_group * ROWS_PER_SIMD
@@ -535,7 +535,7 @@ constexpr const char* kMmqSource = R"METAL(
 
     for (uint group = k_lane;
          group < uint(NG);
-         group += K_LANES) {
+         group += K_LANES_VALUE) {
         uint state_index = output_group_base + group;
         uint state = STATE_BITS == 4
             ? mfq_vq_read_4(state_packed, state_index)
@@ -673,10 +673,18 @@ constexpr const char* kMmqSource = R"METAL(
     for (uint input = 0u;
          input < uint(TILE_M);
          ++input) {
-        accumulators[input] +=
-            simd_shuffle_down(
-                accumulators[input],
-                4);
+        if (K_LANES_VALUE >= 16u) {
+            accumulators[input] +=
+                simd_shuffle_down(
+                    accumulators[input],
+                    8);
+        }
+        if (K_LANES_VALUE >= 8u) {
+            accumulators[input] +=
+                simd_shuffle_down(
+                    accumulators[input],
+                    4);
+        }
         accumulators[input] +=
             simd_shuffle_down(
                 accumulators[input],
@@ -1017,6 +1025,59 @@ constexpr const char* kResidualMatmulSource = R"METAL(
     residual = simd_sum(residual);
     if (lane == 0u) {
         y[logical] = T(float(base[logical]) + residual);
+    }
+)METAL";
+
+// M=2..6 residual pass.  The sparse record and dictionary vector are shared
+// by every verification row instead of replaying the same metadata M times.
+constexpr const char* kResidualSmallMSource = R"METAL(
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint output = threadgroup_position_in_grid.x * 4u + simd_group;
+    if (output >= uint(OUT)) {
+        return;
+    }
+    float residuals[M];
+    for (uint row = 0u; row < uint(M); ++row) {
+        residuals[row] = 0.0f;
+    }
+    for (uint block = lane; block < uint(RESIDUAL_BLOCKS); block += 32u) {
+        uint record_index = output * uint(RESIDUAL_BLOCKS) + block;
+        short records[2] = {
+            residual_first[record_index],
+            residual_second[record_index],
+        };
+        for (uint stream = 0u; stream < 2u; ++stream) {
+            int record = int(records[stream]);
+            if (record < 0) {
+                continue;
+            }
+            uint position = uint(record) & ((1u << uint(POSITION_BITS)) - 1u);
+            uint dictionary_id = uint(record) >> uint(POSITION_BITS);
+            uint vector = block * uint(BLOCK_VECTORS) + position;
+            if (dictionary_id >= 1024u || vector >= uint(NVEC)) {
+                continue;
+            }
+            uint input_column = vector * 8u;
+            uint dictionary_offset = dictionary_id * 8u;
+            for (uint component = 0u; component < 8u; ++component) {
+                float code = float(
+                    residual_codebook[dictionary_offset + component]);
+                for (uint row = 0u; row < uint(M); ++row) {
+                    residuals[row] = fma(
+                        float(x[row * uint(K) + input_column + component]),
+                        code,
+                        residuals[row]);
+                }
+            }
+        }
+    }
+    for (uint row = 0u; row < uint(M); ++row) {
+        residuals[row] = simd_sum(residuals[row]);
+        if (lane == 0u) {
+            uint logical = row * uint(OUT) + output;
+            y[logical] = T(float(base[logical]) + residuals[row]);
+        }
     }
 )METAL";
 
@@ -3147,6 +3208,33 @@ residual_matmul_kernel() {
 }
 
 mlx::core::fast::CustomKernelFunction
+make_residual_small_m_kernel() {
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    return mlx::core::fast::metal_kernel(
+        "mfq_cpp_nepq_sparse_residual_m2_6",
+        {
+            "base",
+            "x",
+            "residual_codebook",
+            "residual_first",
+            "residual_second",
+        },
+        {"y"},
+        kResidualSmallMSource,
+        "",
+        true,
+        false,
+        options);
+}
+
+const mlx::core::fast::CustomKernelFunction&
+residual_small_m_kernel() {
+    static const auto kernel = make_residual_small_m_kernel();
+    return kernel;
+}
+
+mlx::core::fast::CustomKernelFunction
 make_residual_dequantize_kernel() {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
@@ -3776,7 +3864,7 @@ array MlxVqWeight::packed_matmul(
         && execution_layout_ == kExecutionStreams;
     int group64_outputs_per_simd = 0;
     const bool supports_group64_mmq =
-        rows >= 2 && rows <= 4 &&
+        rows >= 2 && rows <= 6 &&
         tile_rows == rows &&
         source.dtype() == mlx::core::float16 &&
         (input_size_ % 8) == 0 &&
@@ -3790,7 +3878,9 @@ array MlxVqWeight::packed_matmul(
             aux_mode_ == kAuxSignIndexParity) &&
         code_bank_mode_ != kCodeBankAux;
     if (supports_group64_mmq) {
-        group64_outputs_per_simd = rows == 4 ? 4 : 3;
+        group64_outputs_per_simd = rows == 4 || rows == 5
+            ? 4
+            : (rows == 6 ? 2 : 3);
         if (const auto* value = std::getenv(
                 "MFQ_METAL_VQ_GROUP64_OUTPUT_TILE")) {
             group64_outputs_per_simd = 0;
@@ -3801,6 +3891,10 @@ array MlxVqWeight::packed_matmul(
     }
     const bool group64_mmq = group64_outputs_per_simd > 0;
     int effective_tile_rows = tile_rows;
+    const int mmq_k_lanes =
+        index_bits_ > 8 && rows == 6 ? 16 : 8;
+    const int mmq_simd_groups =
+        index_bits_ <= 8 || rows <= 3 ? 2 : 4;
     std::tuple<int, int, int> grid;
     std::tuple<int, int, int> threadgroup;
     if (fast_gemv) {
@@ -3849,9 +3943,8 @@ array MlxVqWeight::packed_matmul(
         };
         threadgroup = {64, 1, 1};
     } else if (wide_mmq) {
-        const int mmq_simd_groups = index_bits_ <= 8 ? 2 : 4;
-        constexpr int mmq_rows_per_simd = 4;
-        const int row_tiles = (rows + 4) / 5;
+        const int mmq_rows_per_simd = 32 / mmq_k_lanes;
+        const int row_tiles = rows <= 6 ? 1 : (rows + 4) / 5;
         effective_tile_rows =
             (rows + row_tiles - 1) / row_tiles;
         const auto grid_x = checked_product(
@@ -3928,7 +4021,8 @@ array MlxVqWeight::packed_matmul(
     if (wide_mmq) {
         templates.emplace_back(
             "SIMD_GROUPS",
-            index_bits_ <= 8 ? 2 : 4);
+            mmq_simd_groups);
+        templates.emplace_back("K_LANES", mmq_k_lanes);
     }
     if (group64_mmq) {
         templates.emplace_back(
@@ -3967,11 +4061,13 @@ array MlxVqWeight::packed_matmul(
         {});
     auto result = std::move(outputs.front());
     if (residual_position_bits_ != 0) {
-        const auto total = checked_product(
-            static_cast<std::size_t>(rows),
-            static_cast<std::size_t>(output_size_),
-            "NEPQ-A residual output size");
-        const auto workgroups = (total + 3) / 4;
+        const bool residual_small_m = rows >= 2 && rows <= 6;
+        const auto workgroups = residual_small_m
+            ? (static_cast<std::size_t>(output_size_) + 3) / 4
+            : (checked_product(
+                   static_cast<std::size_t>(rows),
+                   static_cast<std::size_t>(output_size_),
+                   "NEPQ-A residual output size") + 3) / 4;
         const auto residual_grid = checked_product(
             workgroups,
             std::size_t{128},
@@ -3981,7 +4077,10 @@ array MlxVqWeight::packed_matmul(
             throw std::runtime_error(
                 "NEPQ-A residual grid exceeds MLX limits");
         }
-        auto residual_outputs = residual_matmul_kernel()(
+        const auto& residual_kernel = residual_small_m
+            ? residual_small_m_kernel()
+            : residual_matmul_kernel();
+        auto residual_outputs = residual_kernel(
             {
                 result,
                 source,

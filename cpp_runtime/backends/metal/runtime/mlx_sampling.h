@@ -17,6 +17,7 @@ struct MlxSamplingParams {
     double frequency_penalty = 0.0;
     double repetition_penalty = 1.0;
     bool enable_mtp = true;
+    int mtp_max_draft_tokens = 3;
     std::uint64_t seed = 0;
 
     bool greedy() const noexcept {
@@ -30,6 +31,12 @@ struct MlxSamplingParams {
     }
 };
 
+struct MlxTopKDistribution {
+    mlx::core::array sampled;
+    mlx::core::array indices;
+    mlx::core::array probabilities;
+};
+
 mlx::core::array sample_greedy(const mlx::core::array& logits);
 
 mlx::core::array sample_softmax(
@@ -38,6 +45,17 @@ mlx::core::array sample_softmax(
     double temperature = 1.0);
 
 mlx::core::array sample_top_k_top_p(
+    const mlx::core::array& logits,
+    const mlx::core::array& random,
+    double temperature,
+    int top_k,
+    double top_p = 1.0);
+
+// Return the sampled token and the compact, filtered top-k distribution in a
+// single GPU pass.  The final dimension of indices/probabilities is top_k;
+// entries removed by top-p have zero probability.  This is used by
+// speculative verification to avoid materializing a full vocabulary on CPU.
+MlxTopKDistribution sample_top_k_distribution(
     const mlx::core::array& logits,
     const mlx::core::array& random,
     double temperature,

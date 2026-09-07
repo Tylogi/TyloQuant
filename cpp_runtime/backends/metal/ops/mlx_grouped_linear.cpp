@@ -2035,8 +2035,14 @@ std::string make_direct_small_m_blockwise_source(
                 " * float(sub_scale_" + suffix + "[metadata_index]);\n"
                 "            float minimum = output_minimum"
                 " * float(sub_min_" + suffix + "[metadata_index]);\n";
-            if (layout.bits == 4 && !layout.q5_execution &&
-                (layout.group_size % 4) == 0) {
+            const bool vectorized_nint =
+                (layout.group_size % 4) == 0 &&
+                ((!layout.q5_execution &&
+                  (layout.bits == 2 || layout.bits == 3 ||
+                   layout.bits == 4 ||
+                   layout.bits == 8)) ||
+                 (layout.q5_execution && layout.bits == 5));
+            if (vectorized_nint) {
                 source +=
                     "            for (uint element = 0u; element < uint(P"
                     + suffix + "_GS); element += 4u) {\n"
@@ -2044,17 +2050,89 @@ std::string make_direct_small_m_blockwise_source(
                     + "_GS) + element;\n"
                     "                if (column >= uint(K)) { break; }\n"
                     "                uint quantized_index = metadata_index"
-                    " * uint(P" + suffix + "_GS) + element;\n"
-                    "                uint packed = uint(q_packed_" + suffix
-                    + "[quantized_index >> 1u])"
-                    " | (uint(q_packed_" + suffix
-                    + "[(quantized_index >> 1u) + 1u]) << 8u);\n"
-                    "                float4 weights = scale * float4(\n"
-                    "                    float(packed & 15u),\n"
-                    "                    float((packed >> 4u) & 15u),\n"
-                    "                    float((packed >> 8u) & 15u),\n"
-                    "                    float((packed >> 12u) & 15u))"
-                    " - float4(minimum);\n"
+                    " * uint(P" + suffix + "_GS) + element;\n";
+                if (layout.bits == 2) {
+                    source +=
+                        "                uint packed = uint(q_packed_" + suffix
+                        + "[quantized_index >> 2u]);\n"
+                        "                float4 weights = scale * float4(\n"
+                        "                    float(packed & 3u),\n"
+                        "                    float((packed >> 2u) & 3u),\n"
+                        "                    float((packed >> 4u) & 3u),\n"
+                        "                    float((packed >> 6u) & 3u))"
+                        " - float4(minimum);\n";
+                } else if (layout.bits == 3) {
+                    source +=
+                        "                uint residual_bits ="
+                        " (quantized_index & 7u) * 3u;\n"
+                        "                uint byte_index ="
+                        " (quantized_index >> 3u) * 3u"
+                        " + (residual_bits >> 3u);\n"
+                        "                uint shift = residual_bits & 7u;\n"
+                        "                uint packed = uint(q_packed_" + suffix
+                        + "[byte_index]) | (uint(q_packed_" + suffix
+                        + "[byte_index + 1u]) << 8u);\n"
+                        "                float4 weights = scale * float4(\n"
+                        "                    float((packed >> shift) & 7u),\n"
+                        "                    float((packed >> (shift + 3u))"
+                        " & 7u),\n"
+                        "                    float((packed >> (shift + 6u))"
+                        " & 7u),\n"
+                        "                    float((packed >> (shift + 9u))"
+                        " & 7u)) - float4(minimum);\n";
+                } else if (layout.bits == 4) {
+                    source +=
+                        "                uint packed = uint(q_packed_" + suffix
+                        + "[quantized_index >> 1u])"
+                        " | (uint(q_packed_" + suffix
+                        + "[(quantized_index >> 1u) + 1u]) << 8u);\n"
+                        "                float4 weights = scale * float4(\n"
+                        "                    float(packed & 15u),\n"
+                        "                    float((packed >> 4u) & 15u),\n"
+                        "                    float((packed >> 8u) & 15u),\n"
+                        "                    float((packed >> 12u) & 15u))"
+                        " - float4(minimum);\n";
+                } else if (layout.bits == 5) {
+                    const int low_bytes = (layout.group_size + 1) / 2;
+                    const int high_bytes = (layout.group_size + 7) / 8;
+                    source +=
+                        "                constexpr uint LOW_BYTES = " +
+                        std::to_string(low_bytes) + "u;\n"
+                        "                constexpr uint EXEC_BYTES = " +
+                        std::to_string(low_bytes + high_bytes) + "u;\n"
+                        "                uint group_offset = metadata_index"
+                        " * EXEC_BYTES;\n"
+                        "                uint low0 = uint(q_packed_" + suffix
+                        + "[group_offset + (element >> 1u)]);\n"
+                        "                uint low1 = uint(q_packed_" + suffix
+                        + "[group_offset + (element >> 1u) + 1u]);\n"
+                        "                uint high = uint(q_packed_" + suffix
+                        + "[group_offset + LOW_BYTES + (element >> 3u)])"
+                        " >> (element & 7u);\n"
+                        "                float4 weights = scale * float4(\n"
+                        "                    float((low0 & 15u)"
+                        " | ((high & 1u) << 4u)),\n"
+                        "                    float((low0 >> 4u)"
+                        " | (((high >> 1u) & 1u) << 4u)),\n"
+                        "                    float((low1 & 15u)"
+                        " | (((high >> 2u) & 1u) << 4u)),\n"
+                        "                    float((low1 >> 4u)"
+                        " | (((high >> 3u) & 1u) << 4u)))"
+                        " - float4(minimum);\n";
+                } else {
+                    source +=
+                        "                float4 weights = scale * float4(\n"
+                        "                    float(q_packed_" + suffix
+                        + "[quantized_index]),\n"
+                        "                    float(q_packed_" + suffix
+                        + "[quantized_index + 1u]),\n"
+                        "                    float(q_packed_" + suffix
+                        + "[quantized_index + 2u]),\n"
+                        "                    float(q_packed_" + suffix
+                        + "[quantized_index + 3u]))"
+                        " - float4(minimum);\n";
+                }
+                source +=
                     "                for (uint row = 0u; row < uint(ROWS);"
                     " ++row) {\n"
                     "                    uint input_base = row * uint(K)"
@@ -2062,7 +2140,8 @@ std::string make_direct_small_m_blockwise_source(
                 if (vectorized_fp16) {
                     source +=
                         "                    float4 activation;\n"
-                        "                    if (element + 3u < uint(P" + suffix
+                        "                    if ((uint(K) & 3u) == 0u &&"
+                        " element + 3u < uint(P" + suffix
                         + "_GS) && column + 3u < uint(K)) {\n"
                         "                        activation = float4("
                         "*(device const half4*)(x + input_base));\n"
@@ -2135,6 +2214,63 @@ std::string make_direct_small_m_blockwise_source(
                 "            }\n";
             }
             source += "        }\n";
+        } else if (layout.family == kFamilyMx) {
+            const int block = layout.bits == 4 ? 32 : 128;
+            const int vectors = block / 4;
+            source +=
+                "        constexpr uint MX_BLOCK = "
+                + std::to_string(block) + "u;\n"
+                "        constexpr uint MX_BLOCKS = uint(K) / MX_BLOCK;\n"
+                "        for (uint block = k_lane; block < MX_BLOCKS;"
+                " block += K_LANES) {\n"
+                "            uint column_base = block * MX_BLOCK;\n";
+            if (layout.bits == 4) {
+                source +=
+                    "            float scale = mfq_grouped_mx_e8m0("
+                    "mx_scales_" + suffix
+                    + "[output * MX_BLOCKS + block]);\n"
+                    "            uint value_base = output * (uint(K) / 2u);\n";
+            } else {
+                source +=
+                    "            float scale = mfq_grouped_mx_e8m0("
+                    "mx_scales_" + suffix
+                    + "[(output / 128u) * MX_BLOCKS + block]);\n"
+                    "            uint value_base = output * uint(K);\n";
+            }
+            source +=
+                "            for (uint vector = 0u; vector < "
+                + std::to_string(vectors) + "u; ++vector) {\n"
+                "                uint column = column_base + vector * 4u;\n";
+            if (layout.bits == 4) {
+                source +=
+                    "                uint packed = uint(*(device const ushort*)("
+                    "mx_values_" + suffix
+                    + " + value_base + (column >> 1u)));\n"
+                    "                float4 weights = scale * float4(\n"
+                    "                    mfq_grouped_mx_fp4(uchar(packed & 15u)),\n"
+                    "                    mfq_grouped_mx_fp4(uchar((packed >> 4u) & 15u)),\n"
+                    "                    mfq_grouped_mx_fp4(uchar((packed >> 8u) & 15u)),\n"
+                    "                    mfq_grouped_mx_fp4(uchar((packed >> 12u) & 15u)));\n";
+            } else {
+                source +=
+                    "                uchar4 codes = as_type<uchar4>("
+                    "*(device const uint*)(mx_values_" + suffix
+                    + " + value_base + column));\n"
+                    "                float4 weights = scale * float4(\n"
+                    "                    mfq_grouped_mx_fp8(codes.x),\n"
+                    "                    mfq_grouped_mx_fp8(codes.y),\n"
+                    "                    mfq_grouped_mx_fp8(codes.z),\n"
+                    "                    mfq_grouped_mx_fp8(codes.w));\n";
+            }
+            source +=
+                "                for (uint row = 0u; row < uint(ROWS); ++row) {\n"
+                "                    half4 activation = *(device const half4*)(\n"
+                "                        x + row * uint(K) + column);\n"
+                "                    accumulators[row] += dot(\n"
+                "                        float4(activation), weights);\n"
+                "                }\n"
+                "            }\n"
+                "        }\n";
         } else {
             source +=
                 "        uint output_group_base = output * uint(P" + suffix
@@ -2688,14 +2824,14 @@ mlx::core::fast::CustomKernelFunction make_direct_kernel(
     options.math_mode = MathMode::Fast;
     const auto key = direct_kernel_key(layouts)
         + (group64_outputs_per_simd > 0
-            ? "_m234_group64_o" + std::to_string(group64_outputs_per_simd)
+            ? "_m2_6_group64_o" + std::to_string(group64_outputs_per_simd)
                 + "s" + std::to_string(group64_simd_groups)
             : (batch_rows
             ? (blockwise
                 ? (vectorized_fp16
-                    ? "_m234_block_vec"
-                    : "_m234_block")
-                : "_m234")
+                    ? "_m2_6_block_vec"
+                    : "_m2_6_block")
+                : "_m2_6")
             : "_rows"));
     return mlx::core::fast::metal_kernel(
         "mfq_cpp_zero_copy_grouped_linear_" + key,
@@ -2731,14 +2867,14 @@ mlx::core::fast::CustomKernelFunction direct_kernel(
 
     const auto key = direct_kernel_key(layouts)
         + (group64_outputs_per_simd > 0
-            ? "_m234_group64_o" + std::to_string(group64_outputs_per_simd)
+            ? "_m2_6_group64_o" + std::to_string(group64_outputs_per_simd)
                 + "s" + std::to_string(group64_simd_groups)
             : (batch_rows
             ? (blockwise
                 ? (vectorized_fp16
-                    ? "_m234_block_vec"
-                    : "_m234_block")
-                : "_m234")
+                    ? "_m2_6_block_vec"
+                    : "_m2_6_block")
+                : "_m2_6")
             : "_rows"));
     std::lock_guard<std::mutex> lock(mutex);
     const auto found = kernels.find(key);
@@ -4800,12 +4936,12 @@ std::vector<array> MlxGroupedLinear::matmul(
         rows == 1 &&
         source.dtype() == mlx::core::float16 &&
         impl_->has_single_row_mxfp8_fast_path();
-    // MTP verification overwhelmingly uses two through four rows. Keep all
-    // rows in one threadgroup tile so every decoded packed group is reused
-    // across M instead of replaying the same GEMV M times. Eight lanes reduce
-    // one output; this changes only the floating-point reduction order.
+    // MTP verification and small continuous batches use two through six rows.
+    // Keep all rows in one threadgroup tile so every decoded packed group is
+    // reused across M instead of replaying the same GEMV M times. Eight lanes
+    // reduce one output; this changes only the floating-point reduction order.
     const bool use_small_m_batched_path =
-        rows >= 2 && rows <= 4 &&
+        rows >= 2 && rows <= 6 &&
         impl_->uses_zero_copy_storage();
     const bool supports_small_m_blockwise =
         use_small_m_batched_path &&
@@ -4815,12 +4951,20 @@ std::vector<array> MlxGroupedLinear::matmul(
             [](const DirectProjectionLayout& layout) {
                 return layout.family == kFamilyNint
                     || layout.family == kFamilyNint8Zero
-                    || layout.family == kFamilyVq;
+                    || layout.family == kFamilyVq
+                    || layout.family == kFamilyMx;
             });
+    const bool small_m_has_mx = std::any_of(
+        impl_->direct_layouts.begin(),
+        impl_->direct_layouts.end(),
+        [](const DirectProjectionLayout& layout) {
+            return layout.family == kFamilyMx;
+        });
     const auto* grouped_small_m_layout =
         std::getenv("MFQ_METAL_GROUPED_SMALL_M_LAYOUT");
     const bool use_small_m_blockwise =
         supports_small_m_blockwise &&
+        (!small_m_has_mx || source.dtype() == mlx::core::float16) &&
         (grouped_small_m_layout == nullptr ||
          std::strcmp(grouped_small_m_layout, "scalar") != 0);
     const bool use_vectorized_fp16 =
@@ -4831,7 +4975,9 @@ std::vector<array> MlxGroupedLinear::matmul(
     if (use_vectorized_fp16 &&
         (impl_->input_size % 8) == 0 &&
         supports_small_m_group64_output_tile(impl_->direct_layouts)) {
-        group64_outputs_per_simd = rows == 4 ? 5 : 8;
+        group64_outputs_per_simd = rows >= 5
+            ? 2
+            : (rows == 4 ? 5 : 8);
         if (const auto* value = std::getenv(
                 "MFQ_METAL_GROUPED_GROUP64_OUTPUT_TILE")) {
             group64_outputs_per_simd = 0;

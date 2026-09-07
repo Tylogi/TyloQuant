@@ -17,10 +17,128 @@ namespace mfq::metal {
 namespace {
 
 using mlx::core::Dtype;
+using mlx::core::CompileOptions;
+using mlx::core::MathMode;
 using mlx::core::Shape;
 using mlx::core::array;
 
 std::atomic_bool g_predequantize_fp16{false};
+
+// Decode verification presents two through six hidden states at once.  MLX's
+// general GEMM path does not reuse a dense weight row efficiently at this M,
+// so one SIMD group owns an output and accumulates every input row while the
+// weight vector is resident in registers.
+constexpr const char* kDenseSmallM = R"METAL(
+    constexpr uint K_LANES_VALUE = uint(K_LANES);
+    constexpr uint SIMD_GROUPS_VALUE = uint(SIMD_GROUPS);
+    constexpr uint OUTPUTS_PER_SIMD = 32u / K_LANES_VALUE;
+    constexpr uint OUTPUTS_PER_TG =
+        SIMD_GROUPS_VALUE * OUTPUTS_PER_SIMD;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint k_lane = lane & (K_LANES_VALUE - 1u);
+    uint simd_output = lane / K_LANES_VALUE;
+    uint output_index =
+        threadgroup_position_in_grid.y * OUTPUTS_PER_TG
+        + simd_group * OUTPUTS_PER_SIMD + simd_output;
+    uint output = min(output_index, uint(OUT) - 1u);
+
+    float accumulators[M];
+    for (uint row = 0u; row < uint(M); ++row) {
+        accumulators[row] = 0.0f;
+    }
+
+    uint weight_base = output * uint(K);
+    for (uint vector = k_lane;
+         vector < uint(K) / 4u;
+         vector += K_LANES_VALUE) {
+        uint column = vector * 4u;
+        vec<T, 4> packed_weight = *(device const vec<T, 4>*)(
+            weight + weight_base + column);
+        float4 weight_values = float4(packed_weight);
+        for (uint row = 0u; row < uint(M); ++row) {
+            vec<T, 4> packed_input = *(device const vec<T, 4>*)(
+                x + row * uint(K) + column);
+            accumulators[row] += dot(float4(packed_input), weight_values);
+        }
+    }
+
+    for (uint row = 0u; row < uint(M); ++row) {
+        if (K_LANES_VALUE >= 32u) {
+            accumulators[row] += simd_shuffle_down(accumulators[row], 16u);
+        }
+        if (K_LANES_VALUE >= 16u) {
+            accumulators[row] += simd_shuffle_down(accumulators[row], 8u);
+        }
+        if (K_LANES_VALUE >= 8u) {
+            accumulators[row] += simd_shuffle_down(accumulators[row], 4u);
+        }
+        accumulators[row] += simd_shuffle_down(accumulators[row], 2u);
+        accumulators[row] += simd_shuffle_down(accumulators[row], 1u);
+        if (k_lane == 0u && output_index < uint(OUT)) {
+            y[row * uint(OUT) + output_index] = T(accumulators[row]);
+        }
+    }
+)METAL";
+
+const mlx::core::fast::CustomKernelFunction& dense_small_m_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_dense_small_m_m2_6",
+            {"weight", "x"},
+            {"y"},
+            kDenseSmallM,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+array dense_small_m_matmul(
+    const array& weight,
+    const array& input,
+    int rows,
+    int input_size,
+    int output_size) {
+    constexpr int simd_groups = 4;
+    const int k_lanes = input_size >= 16384 ? 16 : 32;
+    const int outputs_per_threadgroup = simd_groups * 32 / k_lanes;
+    auto source = mlx::core::reshape(
+        input.flags().row_contiguous ? input : mlx::core::contiguous(input),
+        Shape{rows, input_size});
+    auto outputs = dense_small_m_kernel()(
+        {weight, std::move(source)},
+        {Shape{rows, output_size}},
+        {weight.dtype()},
+        {
+            simd_groups * 32,
+            (output_size + outputs_per_threadgroup - 1) /
+                outputs_per_threadgroup,
+            1,
+        },
+        {simd_groups * 32, 1, 1},
+        {
+            {"T", weight.dtype()},
+            {"M", rows},
+            {"K", input_size},
+            {"OUT", output_size},
+            {"K_LANES", k_lanes},
+            {"SIMD_GROUPS", simd_groups},
+        },
+        std::nullopt,
+        false,
+        {});
+    Shape output_shape = input.shape();
+    output_shape.back() = output_size;
+    return mlx::core::reshape(
+        std::move(outputs.front()),
+        std::move(output_shape));
+}
 
 template <typename Variant>
 array materialize_weight_fp16(
@@ -355,6 +473,20 @@ array MlxLinear::operator()(const array& input) const {
     auto source = input;
     if (source.dtype() != dense.dtype()) {
         source = mlx::core::astype(source, dense.dtype());
+    }
+    const auto rows = source.size() / static_cast<std::size_t>(input_size_);
+    if (rows >= 2 && rows <= 6 &&
+        input_size_ % 4 == 0 &&
+        dense.size() >= 65536 &&
+        dense.flags().row_contiguous &&
+        (dense.dtype() == mlx::core::float16 ||
+         dense.dtype() == mlx::core::bfloat16)) {
+        return dense_small_m_matmul(
+            dense,
+            source,
+            static_cast<int>(rows),
+            input_size_,
+            output_size_);
     }
     return mlx::core::matmul(source, mlx::core::transpose(dense));
 }

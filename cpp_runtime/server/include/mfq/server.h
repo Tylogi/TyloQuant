@@ -21,6 +21,7 @@ struct MfqSamplingParams {
     bool enable_thinking = true;
     bool enable_vision = true;
     bool enable_mtp = true;
+    int32_t mtp_max_draft_tokens = 3;
     uint64_t seed = 0;
 };
 
@@ -35,6 +36,7 @@ struct MfqChatSamplingProfile {
     std::optional<bool> enable_thinking;
     std::optional<bool> enable_vision;
     std::optional<bool> enable_mtp;
+    std::optional<int32_t> mtp_max_draft_tokens;
 };
 
 struct MfqDuplexSamplingProfile {

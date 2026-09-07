@@ -25,8 +25,14 @@ struct MlxQwen35LinearAttentionCacheSnapshot {
 struct MlxQwen35LinearAttentionRollback {
     mlx::core::array convolution_state;
     mlx::core::array recurrent_state;
+    std::optional<mlx::core::array> qk;
+    std::optional<mlx::core::array> value;
+    std::optional<mlx::core::array> gate;
+    std::optional<mlx::core::array> beta;
     int position = 0;
     int batch = 0;
+    int confirmed_tokens = 0;
+    int total_tokens = 0;
 };
 
 // Qwen3.5/3.6 Gated DeltaNet decoder block.
@@ -71,14 +77,15 @@ public:
         int position_offset,
         bool use_cache);
 
-    // Verify a confirmed prefix and speculative suffix while retaining the
-    // exact functional recurrent state after the confirmed rows.
+    // Verify a confirmed prefix and speculative suffix in one recurrent
+    // chunk. Projected recurrent inputs and the pre-forward state are kept
+    // so a partial acceptance can cheaply replay only the committed prefix.
     mlx::core::array forward_speculative(
         const mlx::core::array& input,
         int position_offset,
         int confirmed_tokens);
     void commit_speculative() noexcept;
-    void rollback_speculative();
+    void rollback_speculative(int accepted_tokens = 0);
 
     // Gated DeltaNet has no RoPE dependency. These overloads preserve the
     // mixed-layer model interface while intentionally ignoring position
