@@ -10,6 +10,7 @@
 using mfq_tensor_backend::Tensor;
 Tensor nint4_gs24_small_m_f32_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
 Tensor nint6_gs24_small_m_f32_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
+Tensor nint_small_m_f32_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int64_t);
 Tensor nint_gemv_packed_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_int6_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
@@ -75,7 +76,9 @@ int main(int argc, char** argv) {
         std::cout << std::setprecision(10) << std::unitbuf;
         const char* fuse6_env = std::getenv("MFQ_NINT6_SMALL_M_F32_FUSE");
         const bool fuse6 = bits == 6 && boundary == "f32" && fuse6_env != nullptr && fuse6_env[0] == '1';
-        const char* entry = fuse6 ? "small_m_f32_ws" : bits == 4 ? (boundary == "f32" ? "small_m_f32_ws" : "packed_ws")
+        const char* fuse_env = std::getenv("MFQ_NINT_SMALL_M_F32_FUSE");
+        const bool fuse = bits != 4 && bits != 6 && boundary == "f32" && fuse_env != nullptr && fuse_env[0] == '1';
+        const char* entry = fuse || fuse6 ? "small_m_f32_ws" : bits == 4 ? (boundary == "f32" ? "small_m_f32_ws" : "packed_ws")
             : bits == 6 ? "packed_int6_ws" : bits == 8 ? "packed_u8_ws" : "packed_bits_ws";
         std::cout << "profile=NINT" << bits << " gs=" << gs << " scale_bits=" << scale_bits
             << " N=" << n << " K=" << k << " input_output=" << boundary
@@ -85,6 +88,8 @@ int main(int argc, char** argv) {
         for (int m = 2; m <= 6; ++m) {
             auto input = x.narrow(0, 0, m);
             auto invoke = [&]() {
+                if (fuse)
+                    return nint_small_m_f32_ws_cuda(q, s, sm, ns, nm, input, qx, xs, xm, bits);
                 if (fuse6)
                     return nint6_gs24_small_m_f32_ws_cuda(q, s, sm, ns, nm, input, qx, xs, xm);
                 if (bits == 4 && boundary == "f32")

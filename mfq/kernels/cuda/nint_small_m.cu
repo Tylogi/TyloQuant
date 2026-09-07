@@ -3,7 +3,7 @@
 #include "reduce.cuh"
 #include <climits>
 
-template <int BITS, int GS, int MROWS>
+template <int BITS, int GS, int MROWS, bool FLOAT_OUTPUT = false>
 __global__ void __launch_bounds__(128) nint_group4_small_m_kernel(
     NintSmallMProjection weight, const int8_t* __restrict__ qx,
     const float* __restrict__ xs, int ng, int kpad)
@@ -57,8 +57,12 @@ __global__ void __launch_bounds__(128) nint_group4_small_m_kernel(
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             acc[m] += __shfl_xor_sync(0xffffffff, acc[m], offset);
-        if (lane == 0)
-            reinterpret_cast<__half*>(weight.out)[(size_t)m * weight.n + row] = __float2half(acc[m]);
+        if (lane == 0) {
+            const __half rounded = __float2half(acc[m]);
+            if constexpr (FLOAT_OUTPUT)
+                reinterpret_cast<float*>(weight.out)[(size_t)m * weight.n + row] = __half2float(rounded);
+            else reinterpret_cast<__half*>(weight.out)[(size_t)m * weight.n + row] = rounded;
+        }
     }
 }
 
@@ -103,7 +107,7 @@ void launch_nint5_gs28_small_m(
 #undef MFQ_NINT5_CASE
 }
 
-template <int MROWS>
+template <int MROWS, bool FLOAT_OUTPUT = false>
 __global__ void __launch_bounds__(128) nint8_gs48_small_m_kernel(
     NintSmallMProjection weight, const int8_t* __restrict__ qx,
     const float* __restrict__ xs, int ng, int kpad)
@@ -135,8 +139,12 @@ __global__ void __launch_bounds__(128) nint8_gs48_small_m_kernel(
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             acc[m] += __shfl_xor_sync(0xffffffff, acc[m], offset);
-        if (lane == 0)
-            reinterpret_cast<__half*>(weight.out)[(size_t)m * weight.n + row] = __float2half(acc[m]);
+        if (lane == 0) {
+            const __half rounded = __float2half(acc[m]);
+            if constexpr (FLOAT_OUTPUT)
+                reinterpret_cast<float*>(weight.out)[(size_t)m * weight.n + row] = __half2float(rounded);
+            else reinterpret_cast<__half*>(weight.out)[(size_t)m * weight.n + row] = rounded;
+        }
     }
 }
 
@@ -156,6 +164,28 @@ void launch_nint8_gs48_small_m(
         default: MFQ_RUNTIME_CHECK(false, "NINT8 GS48 small-M requires M2-6");
     }
 #undef MFQ_NINT8_CASE
+}
+
+template <int BITS, int GS>
+static void launch_warprow_small_m_f32(
+    NintSmallMProjection weight, const int8_t* qx, const float* xs,
+    int m, int ng, int kpad, cudaStream_t stream)
+{
+#define MFQ_NINT_WARPROW_F32_CASE(M) \
+    case M: \
+        if constexpr (BITS == 8) nint8_gs48_small_m_kernel<M, true> \
+            <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); \
+        else nint_group4_small_m_kernel<BITS, GS, M, true> \
+            <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); break
+    switch (m) {
+        MFQ_NINT_WARPROW_F32_CASE(2);
+        MFQ_NINT_WARPROW_F32_CASE(3);
+        MFQ_NINT_WARPROW_F32_CASE(4);
+        MFQ_NINT_WARPROW_F32_CASE(5);
+        MFQ_NINT_WARPROW_F32_CASE(6);
+        default: MFQ_RUNTIME_CHECK(false, "NINT warprow F32 requires M2-6");
+    }
+#undef MFQ_NINT_WARPROW_F32_CASE
 }
 
 __device__ __forceinline__ int small_m_unpack_int4(uint32_t packed, unsigned selector)
@@ -308,67 +338,74 @@ void launch_nint6_gs24_small_m_reuse(
 #undef MFQ_NINT6_CASE
 }
 
+template <int GS>
 __global__ void small_m_quantize_f32_half_rn_kernel(
     const float* __restrict__ input, int8_t* __restrict__ qx,
     float* __restrict__ scales, int32_t* __restrict__ sums, int k, int kpad)
 {
     const int m = blockIdx.x, g = blockIdx.y, lane = threadIdx.x;
-    const bool valid = lane < 24 && g * 24 + lane < k;
-    const float x = valid ? __half2float(__float2half_rn(input[(size_t)m * k + g * 24 + lane])) : 0.f;
-    const float amax = block_max<1>(fabsf(x));
+    constexpr int WARPS = (GS + 31) / 32;
+    const bool valid = lane < GS && g * GS + lane < k;
+    const float x = valid ? __half2float(__float2half_rn(input[(size_t)m * k + g * GS + lane])) : 0.f;
+    const float amax = block_max<WARPS>(fabsf(x));
     const float scale = amax > 0.f ? amax / 127.f : 1.f;
     int code = 0;
     if (valid) code = (int)fminf(fmaxf(roundf(x / scale), -127.f), 127.f);
     if (sums != nullptr) {
-        const int sum = (int)block_sum<1>((float)code);
+        const int sum = (int)block_sum<WARPS>((float)code);
         if (lane == 0) sums[(size_t)m * gridDim.y + g] = sum;
     }
     if (lane == 0) scales[(size_t)m * gridDim.y + g] = scale;
-    if (lane < 24) qx[(size_t)m * kpad + g * 24 + lane] = (int8_t)code;
+    if (lane < GS) qx[(size_t)m * kpad + g * GS + lane] = (int8_t)code;
 }
 
-template <int BITS>
-static mfq_tensor_backend::Tensor nint_gs24_small_m_f32_ws_cuda(
+template <int BITS, int GS = 24>
+static mfq_tensor_backend::Tensor nint_canonical_small_m_f32_ws_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor s, mfq_tensor_backend::Tensor sm,
     mfq_tensor_backend::Tensor ns, mfq_tensor_backend::Tensor nm, mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xs, mfq_tensor_backend::Tensor xm)
 {
     using namespace mfq_tensor_backend;
     MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == kFloat32 && x.dim() == 2,
-        "NINT GS24 small-M F32 boundary requires contiguous CUDA F32 [M,K]");
+        "NINT small-M F32 boundary requires contiguous CUDA F32 [M,K]");
     MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == kUInt8 &&
-        q.dim() == 3 && q.size(2) == 24 * BITS / 8 && q.size(0) > 0 && q.size(1) > 0,
-        "NINT GS24 small-M F32 weights require canonical packed GS24 groups");
+        q.dim() == 3 && q.size(2) == (GS * BITS + 7) / 8 && q.size(0) > 0 && q.size(1) > 0,
+        "NINT small-M F32 weights require the canonical packed group width");
     const int64_t rows = x.size(0), columns = q.size(0), groups = q.size(1);
     MFQ_RUNTIME_CHECK(rows >= 2 && rows <= 6 && x.size(1) > 0 &&
-        groups <= INT_MAX / 24 && columns <= INT_MAX && x.size(1) <= groups * 24,
-        "NINT GS24 small-M F32 geometry exceeds supported bounds");
+        groups <= INT_MAX / GS && columns <= INT_MAX && x.size(1) <= groups * GS,
+        "NINT small-M F32 geometry exceeds supported bounds");
     for (const auto* value : {&q, &s, &sm, &ns, &nm, &qx, &xs, &xm}) {
         MFQ_RUNTIME_CHECK(value->is_cuda() && value->device() == x.device() && value->is_contiguous(),
-            "NINT GS24 small-M F32 tensors must be contiguous on one CUDA device");
+            "NINT small-M F32 tensors must be contiguous on one CUDA device");
     }
     for (const auto* value : {&s, &sm}) MFQ_RUNTIME_CHECK(value->scalar_type() == kUInt8 &&
         value->dim() == 2 && value->size(0) == columns && value->size(1) == groups,
-        "NINT GS24 small-M F32 submetadata shape or dtype mismatch");
+        "NINT small-M F32 submetadata shape or dtype mismatch");
     for (const auto* value : {&ns, &nm}) MFQ_RUNTIME_CHECK(value->scalar_type() == kFloat32 &&
         value->dim() == 1 && value->size(0) == columns,
-        "NINT GS24 small-M F32 neuron metadata shape or dtype mismatch");
+        "NINT small-M F32 neuron metadata shape or dtype mismatch");
     MFQ_RUNTIME_CHECK(qx.scalar_type() == kInt8 && qx.dim() == 2 &&
-        qx.size(0) >= rows && qx.size(1) == groups * 24 &&
+        qx.size(0) >= rows && qx.size(1) == groups * GS &&
         xs.scalar_type() == kFloat32 && xs.dim() == 2 && xs.size(0) >= rows && xs.size(1) == groups &&
         xm.scalar_type() == kInt32 && xm.dim() == 2 && xm.size(0) >= rows && xm.size(1) == groups,
-        "NINT GS24 small-M F32 workspace shape or dtype mismatch");
+        "NINT small-M F32 workspace shape or dtype mismatch");
     MfqCudaGuard guard(x.device());
     auto output = mfq_tensor_backend::empty({rows, columns}, x.options());
     auto stream = mfq_current_cuda_stream();
     const char* sum_env = std::getenv("MFQ_NINT4_SMALL_M_XSUM");
-    auto* sums = BITS == 4 && sum_env != nullptr && sum_env[0] == '1' ? xm.data_ptr<int32_t>() : nullptr;
-    small_m_quantize_f32_half_rn_kernel<<<dim3(rows, groups), 32, 0, stream>>>(
-        x.data_ptr<float>(), qx.data_ptr<int8_t>(), xs.data_ptr<float>(), sums, (int)x.size(1), (int)(groups * 24));
+    auto* sums = BITS == 8 || (BITS == 4 && sum_env != nullptr && sum_env[0] == '1')
+        ? xm.data_ptr<int32_t>() : nullptr;
+    constexpr int THREADS = ((GS + 31) / 32) * 32;
+    small_m_quantize_f32_half_rn_kernel<GS><<<dim3(rows, groups), THREADS, 0, stream>>>(
+        x.data_ptr<float>(), qx.data_ptr<int8_t>(), xs.data_ptr<float>(), sums, (int)x.size(1), (int)(groups * GS));
     Nint4Gs24Projection weight{q.data_ptr<uint8_t>(), s.data_ptr<uint8_t>(), sm.data_ptr<uint8_t>(),
         ns.data_ptr<float>(), nm.data_ptr<float>(), output.data_ptr<float>(), (int)columns, sums};
-    launch_small_m<true, BITS>(weight, qx.data_ptr<int8_t>(), xs.data_ptr<float>(),
-        (int)rows, (int)groups, (int)(groups * 24), stream);
+    if constexpr (BITS == 4 || BITS == 6)
+        launch_small_m<true, BITS>(weight, qx.data_ptr<int8_t>(), xs.data_ptr<float>(),
+            (int)rows, (int)groups, (int)(groups * GS), stream);
+    else launch_warprow_small_m_f32<BITS, GS>(weight, qx.data_ptr<int8_t>(), xs.data_ptr<float>(),
+            (int)rows, (int)groups, (int)(groups * GS), stream);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
@@ -378,7 +415,7 @@ mfq_tensor_backend::Tensor nint4_gs24_small_m_f32_ws_cuda(
     mfq_tensor_backend::Tensor ns, mfq_tensor_backend::Tensor nm, mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xs, mfq_tensor_backend::Tensor xm)
 {
-    return nint_gs24_small_m_f32_ws_cuda<4>(q, s, sm, ns, nm, x, qx, xs, xm);
+    return nint_canonical_small_m_f32_ws_cuda<4>(q, s, sm, ns, nm, x, qx, xs, xm);
 }
 
 mfq_tensor_backend::Tensor nint6_gs24_small_m_f32_ws_cuda(
@@ -386,5 +423,21 @@ mfq_tensor_backend::Tensor nint6_gs24_small_m_f32_ws_cuda(
     mfq_tensor_backend::Tensor ns, mfq_tensor_backend::Tensor nm, mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xs, mfq_tensor_backend::Tensor xm)
 {
-    return nint_gs24_small_m_f32_ws_cuda<6>(q, s, sm, ns, nm, x, qx, xs, xm);
+    return nint_canonical_small_m_f32_ws_cuda<6>(q, s, sm, ns, nm, x, qx, xs, xm);
+}
+
+mfq_tensor_backend::Tensor nint_small_m_f32_ws_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor s, mfq_tensor_backend::Tensor sm,
+    mfq_tensor_backend::Tensor ns, mfq_tensor_backend::Tensor nm, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xs, mfq_tensor_backend::Tensor xm,
+    int64_t bits)
+{
+    switch (bits) {
+        case 2: return nint_canonical_small_m_f32_ws_cuda<2, 16>(q, s, sm, ns, nm, x, qx, xs, xm);
+        case 3: return nint_canonical_small_m_f32_ws_cuda<3, 24>(q, s, sm, ns, nm, x, qx, xs, xm);
+        case 5: return nint_canonical_small_m_f32_ws_cuda<5, 28>(q, s, sm, ns, nm, x, qx, xs, xm);
+        case 8: return nint_canonical_small_m_f32_ws_cuda<8, 48>(q, s, sm, ns, nm, x, qx, xs, xm);
+        default: MFQ_RUNTIME_CHECK(false, "NINT small-M F32 bits must be 2, 3, 5 or 8");
+    }
+    return {};
 }

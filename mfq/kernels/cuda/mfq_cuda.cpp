@@ -173,6 +173,9 @@ torch::Tensor nint4_gs24_small_m_f32_ws_cuda(
 torch::Tensor nint6_gs24_small_m_f32_ws_cuda(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);
+torch::Tensor nint_small_m_f32_ws_cuda(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t);
 torch::Tensor nint_gemv_cuda(
     torch::Tensor q, torch::Tensor sub_scale, torch::Tensor sub_min,
     torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs);
@@ -640,6 +643,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "NINT4 GS24 M2-6 F32 boundaries with preserved FP16 rounding (CUDA)");
     m.def("nint6_gs24_small_m_f32_ws_cuda", &nint6_gs24_small_m_f32_ws_cuda,
         "NINT6 GS24 M2-6 F32 boundaries with preserved FP16 rounding (CUDA)");
+    m.def("nint_small_m_f32_ws_cuda", &nint_small_m_f32_ws_cuda,
+        "Canonical NINT2/3/5/8 M2-6 F32 boundaries with original quantization and FP16 rounding (CUDA)");
     m.def("nint_gemv_packed_int6_ws_cuda", &nint_gemv_packed_int6_ws_cuda, "NINT6 (6-bit) packed GEMV with caller workspace, requires 4|gs (CUDA)");
     m.def("nint_gemv_packed_qx_ws_cuda", &nint_gemv_packed_qx_ws_cuda, "NINT INT4-packed GEMV from prequantized activation workspace (CUDA)");
     m.def("nint_gemv_packed_gate_ws_cuda", &nint_gemv_packed_gate_ws_cuda, "NINT INT4-packed GEMV with fused input gate activation (CUDA)");

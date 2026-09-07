@@ -119,23 +119,38 @@ def test_nint_small_m_bridge(profile, rows, width, monkeypatch):
                     graph.replay()
                     _exact(output, changed_reference)
 
-        if bits in (4, 6):
+        if bits in (2, 3, 4, 5, 6, 8):
             float_input = x.float() + .000123
             reference = invoke(float_input.half(), 2).float()
-            float_function = getattr(module, f"nint{bits}_gs24_small_m_f32_ws_cuda")
+            reference_qx, reference_xs = qx.clone(), xs.clone()
+            reference_xm = xm.clone() if bits == 8 else None
+            float_function = (getattr(module, f"nint{bits}_gs24_small_m_f32_ws_cuda")
+                              if bits in (4, 6) else None)
 
             def invoke_float(value):
-                return float_function(*tensors, value, qx, xs, xm)
+                if float_function is not None:
+                    return float_function(*tensors, value, qx, xs, xm)
+                return module.nint_small_m_f32_ws_cuda(*tensors, value, qx, xs, xm, bits)
 
             for sum_flag in (("0", "1") if bits == 4 else ("0",)):
                 monkeypatch.setenv("MFQ_NINT4_SMALL_M_XSUM", sum_flag)
                 for m in range(2, 7):
                     _exact(invoke_float(float_input[:m]), reference[:m])
+                    _exact(qx[:m], reference_qx[:m])
+                    _exact(xs[:m], reference_xs[:m])
+                    if bits == 8:
+                        _exact(xm[:m], reference_xm[:m])
             monkeypatch.setenv("MFQ_NINT4_SMALL_M_XSUM", "0")
             with pytest.raises(RuntimeError):
                 invoke_float(float_input[:1])
             with pytest.raises(RuntimeError):
-                float_function(*tensors, float_input, qx, xs, xm.float())
+                if float_function is not None:
+                    float_function(*tensors, float_input, qx, xs, xm.float())
+                else:
+                    module.nint_small_m_f32_ws_cuda(*tensors, float_input, qx, xs, xm.float(), bits)
+            if float_function is None:
+                with pytest.raises(RuntimeError):
+                    module.nint_small_m_f32_ws_cuda(*tensors, float_input, qx, xs, xm, 7)
             if width == 257:
                 for _ in range(3):
                     invoke_float(float_input)
@@ -184,4 +199,13 @@ def test_nint8_large_k_and_padding(width):
         changed = torch.cat([invoke(x[m:m + 1]) for m in range(6)])
         graph.replay()
         _exact(output, changed)
+        float_input = x.float() + .000123
+        float_reference = invoke(float_input.half()).float()
+        reference_qx, reference_xs, reference_xm = qx.clone(), xs.clone(), xm.clone()
+        for m in range(2, 7):
+            actual = module.nint_small_m_f32_ws_cuda(*tensors, float_input[:m], qx, xs, xm, 8)
+            _exact(actual, float_reference[:m])
+            _exact(qx[:m], reference_qx[:m])
+            _exact(xs[:m], reference_xs[:m])
+            _exact(xm[:m], reference_xm[:m])
     stream.synchronize()
