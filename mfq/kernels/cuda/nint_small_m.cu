@@ -148,13 +148,110 @@ __global__ void __launch_bounds__(128) nint8_gs48_small_m_kernel(
     }
 }
 
+template <int MROWS, bool FLOAT_OUTPUT>
+__global__ void __launch_bounds__(128) nint8_gs48_small_m_imma_kernel(
+    NintSmallMProjection weight, const int8_t* __restrict__ qx,
+    const float* __restrict__ xs, int ng, int kpad)
+{
+    const int lane = threadIdx.x, warp = threadIdx.y;
+    const int quad = lane & 3, group = lane >> 2, first_row = blockIdx.x * 16;
+    const int col0 = quad * 2, col1 = col0 + 1;
+    float acc[MROWS][4] = {};
+    const float ns0 = first_row + group < weight.n ? weight.neuron_scale[first_row + group] : 0.f;
+    const float nm0 = first_row + group < weight.n ? weight.neuron_min[first_row + group] : 0.f;
+    const float ns1 = first_row + group + 8 < weight.n ? weight.neuron_scale[first_row + group + 8] : 0.f;
+    const float nm1 = first_row + group + 8 < weight.n ? weight.neuron_min[first_row + group + 8] : 0.f;
+    for (int base = warp * 32; base < kpad; base += 128) {
+        uint32_t a[4] = {};
+        float de[4] = {}, me[4] = {};
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row_a = first_row + group + (i & 1) * 8;
+            const int offset_a = base + quad * 4 + (i >> 1) * 16;
+            if (row_a < weight.n && offset_a < kpad)
+                a[i] = *reinterpret_cast<const uint32_t*>(weight.q_packed + (size_t)row_a * kpad + offset_a);
+            const int row_c = first_row + group + (i >> 1) * 8;
+            const int offset_c = base + (quad * 2 + (i & 1)) * 4;
+            if (row_c < weight.n && offset_c < kpad) {
+                const size_t meta = (size_t)row_c * ng + offset_c / 48;
+                de[i] = (i < 2 ? ns0 : ns1) * float(weight.sub_scale[meta]);
+                me[i] = (i < 2 ? nm0 : nm1) * float(weight.sub_min[meta]);
+            }
+        }
+        #pragma unroll
+        for (int m = 0; m < MROWS; ++m) {
+            // Each MMA column keeps just its original four-element dot.
+            // The other 28 activation entries are zero, so no FP sum changes.
+            int b0 = 0, b1 = 0;
+            if (quad == group && base + quad * 4 < kpad)
+                b0 = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + base + quad * 4);
+            if (quad + 4 == group && base + 16 + quad * 4 < kpad)
+                b1 = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + base + 16 + quad * 4);
+            int dot[4] = {};
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                : "+r"(dot[0]), "+r"(dot[1]), "+r"(dot[2]), "+r"(dot[3])
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+            const int xv0 = __shfl_sync(0xffffffff, b0 | b1, col0 * 4 + (col0 & 3));
+            const int xv1 = __shfl_sync(0xffffffff, b0 | b1, col1 * 4 + (col1 & 3));
+            const int sum0 = __dp4a(0x01010101, xv0, 0), sum1 = __dp4a(0x01010101, xv1, 0);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int offset = base + (quad * 2 + (i & 1)) * 4;
+                if (offset < kpad)
+                    acc[m][i] += xs[(size_t)m * ng + offset / 48] *
+                        (de[i] * float(dot[i]) - me[i] * float((i & 1) ? sum1 : sum0));
+            }
+        }
+    }
+    __shared__ float partial[MROWS][16][32];
+    #pragma unroll
+    for (int m = 0; m < MROWS; ++m) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            partial[m][group + (i >> 1) * 8][warp * 8 + quad * 2 + (i & 1)] = acc[m][i];
+    }
+    __syncthreads();
+    // Restore the legacy 32-lane partials before the original XOR sum tree.
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int local_row = warp + 4 * r, row = first_row + local_row;
+        if (row >= weight.n) continue;
+        #pragma unroll
+        for (int m = 0; m < MROWS; ++m) {
+            float value = partial[m][local_row][lane];
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                value += __shfl_xor_sync(0xffffffff, value, offset);
+            if (lane == 0) {
+                const __half rounded = __float2half(value);
+                if constexpr (FLOAT_OUTPUT)
+                    reinterpret_cast<float*>(weight.out)[(size_t)m * weight.n + row] = __half2float(rounded);
+                else reinterpret_cast<__half*>(weight.out)[(size_t)m * weight.n + row] = rounded;
+            }
+        }
+    }
+}
+
+template <int MROWS, bool FLOAT_OUTPUT = false>
+static void launch_nint8_small_m_output(
+    NintSmallMProjection weight, const int8_t* qx, const float* xs,
+    int ng, int kpad, cudaStream_t stream)
+{
+    const char* candidate = std::getenv("MFQ_NINT8_GS48_SMALL_M_IMMA");
+    if (candidate != nullptr && candidate[0] == '1')
+        nint8_gs48_small_m_imma_kernel<MROWS, FLOAT_OUTPUT>
+            <<<dim3((weight.n + 15) / 16), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad);
+    else nint8_gs48_small_m_kernel<MROWS, FLOAT_OUTPUT>
+            <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad);
+}
+
 void launch_nint8_gs48_small_m(
     NintSmallMProjection weight, const int8_t* qx, const float* xs,
     int m, int ng, int kpad, cudaStream_t stream)
 {
 #define MFQ_NINT8_CASE(M) \
-    case M: nint8_gs48_small_m_kernel<M> \
-        <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); break
+    case M: launch_nint8_small_m_output<M>(weight, qx, xs, ng, kpad, stream); break
     switch (m) {
         MFQ_NINT8_CASE(2);
         MFQ_NINT8_CASE(3);
@@ -173,8 +270,7 @@ static void launch_warprow_small_m_f32(
 {
 #define MFQ_NINT_WARPROW_F32_CASE(M) \
     case M: \
-        if constexpr (BITS == 8) nint8_gs48_small_m_kernel<M, true> \
-            <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); \
+        if constexpr (BITS == 8) launch_nint8_small_m_output<M, true>(weight, qx, xs, ng, kpad, stream); \
         else nint_group4_small_m_kernel<BITS, GS, M, true> \
             <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); break
     switch (m) {
