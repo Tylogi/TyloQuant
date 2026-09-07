@@ -32,8 +32,11 @@ def native():
     proc = subprocess.Popen([binary, "--json"], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    def call(op, inputs, **params):
-        row = dict(op=op, inputs=[descriptor(x) for x in inputs], params=params)
+    def call(op, inputs, dtype="float32", graph=False, **params):
+        descriptors=[descriptor(x) for x in inputs]
+        for d in descriptors:
+            if d["dtype"]!="int64":d["dtype"]=dtype
+        row = dict(op=op, inputs=descriptors, params=params, graph=graph)
         proc.stdin.write(json.dumps(row, allow_nan=False) + "\n")
         proc.stdin.flush()
         line = proc.stdout.readline()
@@ -416,3 +419,98 @@ def test_glm_native_rejects_inconsistent_config(tmp_path,error):
     result=run_glm_fixture(path)
     assert result.returncode!=0
     assert "flash_next_check " not in result.stdout
+
+
+def rotary_reference(x,positions,rotary,maximum,sections,interleaved,base=1e7):
+    pairs=rotary//2
+    f=x.astype(np.float32)
+    pos=np.asarray(positions,dtype=np.int32)
+    if pos.ndim==1:pos=pos[None,None]
+    elif pos.ndim==2:pos=pos[:,None]
+    frequencies=np.power(np.float32(base),-np.arange(0,rotary,2,dtype=np.float32)/rotary)
+    cs=[];ss=[]
+    for j in range(pairs):
+        if interleaved:
+            axis=1 if j%3==1 and j<sections[1]*3 else 2 if j%3==2 and j<sections[2]*3 else 0
+        else:axis=0 if j<sections[0] else 1 if j<sections[0]+sections[1] else 2
+        if axis>=pos.shape[0]:axis=0
+        angle=np.clip(pos[axis],0,maximum-1).astype(np.float32)*frequencies[j]
+        cs.append(np.cos(angle));ss.append(np.sin(angle))
+    cosine=np.stack(cs,axis=-1)[:,None];sine=np.stack(ss,axis=-1)[:,None]
+    first=f[...,:pairs];second=f[...,pairs:rotary]
+    return np.concatenate((first*cosine-second*sine,second*cosine+first*sine,f[...,rotary:]),axis=-1).astype(x.dtype)
+
+
+@pytest.mark.parametrize("dtype",["float32","float16"])
+@pytest.mark.parametrize("axes",[1,3,6])
+@pytest.mark.parametrize("interleaved",[False,True])
+def test_qwen_rotary_multi_axis_batch_and_partial(native,dtype,axes,interleaved):
+    rng=np.random.default_rng(3802)
+    x=rng.normal(size=(2,3,5,10)).astype(dtype)
+    positions=np.array([-2,1,7,30,42],np.int64)
+    if axes>=3:positions=np.stack((positions,positions+1,positions+3))
+    if axes==6:positions=np.stack((positions,positions+4),axis=1)
+    p=dict(rotary=8,maximum=32,sections=[2,1,1],interleaved=interleaved)
+    expected=rotary_reference(x,positions,**p)
+    actual=native("runtime_rotary",[x,positions],dtype=dtype,graph=True,**p)[0]
+    np.testing.assert_allclose(actual,expected,atol=2e-3 if dtype=="float16" else 2e-5,
+                               rtol=2e-3 if dtype=="float16" else 2e-5)
+    np.testing.assert_array_equal(actual[...,8:],x[...,8:])
+
+
+def qsa_fixture(axes,interleaved):
+    rng=np.random.default_rng(3802)
+    def rand(shape):return rng.normal(scale=.05,size=shape).astype(np.float32)
+    hidden,heads,kv,width,ih,iw=16,4,1,32,2,32
+    x=rand((2,7,hidden))*4
+    w=[rand((heads*2*width,hidden)),rand((kv*width,hidden)),rand((kv*width,hidden)),
+       rand((hidden,heads*width)),rand(((ih+1)*iw,hidden)),rand((width,)),rand((width,)),rand((iw,)),rand((iw,))]
+    pos=np.arange(7,dtype=np.int64)
+    if axes:pos=np.stack((pos,pos+2,pos+4))
+    p=dict(heads=heads,kv_heads=kv,width=width,index_heads=ih,index_width=iw,pool=2,budget=4,
+           maximum=32,rotary=8,sections=[2,1,1],interleaved=interleaved)
+    return [x,*w,pos],p
+
+
+def qsa_reference(inputs,p):
+    x,qw,kw,vw,ow,iqkw,qn,kn,iqn,ikn,pos=inputs
+    b,t,_=x.shape;h=p["heads"];kh=p["kv_heads"];d=p["width"];ih=p["index_heads"];iw=p["index_width"]
+    def norm(a,w):
+        f=a.astype(np.float32);return (f/np.sqrt(np.mean(f*f,axis=-1,keepdims=True)+1e-6)*(1+w)).astype(a.dtype)
+    def rope(a,positions):return rotary_reference(a,positions,p["rotary"],p["maximum"],p["sections"],p["interleaved"])
+    qp=(x@qw.T).reshape(b,t,h,2*d)
+    q=rope(norm(qp[...,:d],qn).transpose(0,2,1,3),pos)
+    k=rope(norm((x@kw.T).reshape(b,t,kh,d),kn).transpose(0,2,1,3),pos).astype(np.float16).astype(np.float32)
+    v=(x@vw.T).reshape(b,t,kh,d).transpose(0,2,1,3).astype(np.float16).astype(np.float32)
+    iqk=x@iqkw.T
+    iq=rope(norm(iqk[...,:ih*iw].reshape(b,t,ih,iw),iqn).transpose(0,2,1,3),pos).transpose(0,2,1,3)
+    raw=iqk[...,ih*iw:].astype(np.float16)
+    pools=t//p["pool"]
+    pooled=raw[:,:pools*p["pool"]].reshape(b,pools,p["pool"],iw).astype(np.float32).mean(axis=2).astype(np.float16)
+    pooled=rope(norm(pooled,ikn)[:,None],pos[...,np.arange(pools)*p["pool"]])[:,0].astype(np.float32)
+    scores=np.maximum(np.einsum("bthi,bpi->bthp",iq,pooled),0).sum(axis=2)/math.sqrt(iw)
+    attended=np.zeros((b,t,h,d),np.float32)
+    for bi in range(b):
+        for token in range(t):
+            visible=np.arange((token+1)//p["pool"])
+            chosen=visible[np.argsort(scores[bi,token,visible])[-(p["budget"]//p["pool"]):]]
+            indices=[int(i*p["pool"]+j) for i in chosen for j in range(p["pool"])]
+            indices+=list(range(token+1-(token+1)%p["pool"],token+1))
+            for head in range(h):
+                logits=q[bi,head,token]@k[bi,head//(h//kh),indices].T/math.sqrt(d)
+                probs=np.exp(logits-np.max(logits));probs/=probs.sum()
+                attended[bi,token,head]=probs@v[bi,head//(h//kh),indices]
+    return (attended*sigmoid(qp[...,d:])).reshape(b,t,h*d)@ow.T
+
+
+@pytest.mark.parametrize("axes",[False,True])
+@pytest.mark.parametrize("interleaved",[False,True])
+def test_qsa_equation_chunks_and_cache_rejection(native,axes,interleaved):
+    inputs,p=qsa_fixture(axes,interleaved)
+    full=native("runtime_qsa",inputs,**p,steps=[dict(begin=0,count=7)])[0]
+    np.testing.assert_allclose(full,qsa_reference(inputs,p),atol=5e-4,rtol=5e-4)
+    parts=native("runtime_qsa",inputs,**p,steps=[dict(begin=0,count=2),dict(begin=2,count=1),dict(begin=3,count=4)])
+    np.testing.assert_allclose(np.concatenate(parts,axis=1),full,atol=1.5e-2,rtol=1.5e-2)
+    rejected=native("runtime_qsa",inputs,**p,steps=[dict(begin=0,count=4),dict(truncate=3),dict(begin=5,count=1)])[-1]
+    expected=native("runtime_qsa",inputs,**p,steps=[dict(begin=0,count=3),dict(begin=5,count=1)])[-1]
+    np.testing.assert_allclose(rejected,expected,atol=2e-5,rtol=2e-5)

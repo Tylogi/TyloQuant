@@ -2,6 +2,7 @@
 // same NumPy oracle cases to this executable and the production Torch module.
 #include "mfq/kernels/cuda/flash_next.h"
 #include "mfq_flash_next_runtime.h"
+#include "mfq_qwen4_runtime.h"
 #include "mfq_cuda_context.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -42,6 +43,39 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
     };
     std::optional<double> scale;
     if (p.contains("scale") && !p.at("scale").is_null()) scale = p.at("scale").get<double>();
+    if (op == "runtime_rotary") {
+        mfq::flash_next::Rotary rotary(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
+            p.value("sections",std::vector<int64_t>{}),p.value("interleaved",false));
+        return {rotary.forward(a.at(0),a.at(1))};
+    }
+    if (op == "runtime_qsa") {
+        const auto linear = [&](int index) -> mfq::flash_next::Linear {
+            auto weight=a.at(index);
+            return [weight](const Tensor& x) {return matmul(x.to(weight.scalar_type()),weight.transpose(-1,-2));};
+        };
+        auto rotary=std::make_shared<mfq::flash_next::Rotary>(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
+            p.value("sections",std::vector<int64_t>{}),p.value("interleaved",false));
+        mfq::flash_next::QsaWeights weights{linear(1),linear(2),linear(3),linear(4),linear(5),a.at(6),a.at(7),a.at(8),a.at(9)};
+        mfq::flash_next::QsaConfig config{p.at("heads"),p.at("kv_heads"),p.at("width"),p.at("index_heads"),
+            p.at("index_width"),p.at("pool"),p.at("budget"),p.at("maximum"),p.value("eps",1e-6)};
+        mfq::flash_next::Qsa block(std::move(weights),config,rotary);
+        Tensor history;
+        std::vector<Tensor> out;
+        for (const auto& step:p.at("steps")) {
+            if (step.value("reset",false)) {block.reset();history={};}
+            else if (step.contains("truncate")) {
+                block.truncate(step.at("truncate"));
+                history=history.narrow(-1,0,step.at("truncate"));
+            } else {
+                auto pos=a.at(10).narrow(-1,step.at("begin"),step.at("count"));
+                const bool cache=step.value("cache",true);
+                auto full=cache && history.defined()?cat({history,pos},-1):pos;
+                out.push_back(block.forward(a.at(0).narrow(1,step.at("begin"),step.at("count")),pos,full,cache));
+                if (cache) history=full;
+            }
+        }
+        return out;
+    }
     if (op == "runtime_select_pooled_blocks") return {mfq::flash_next::select_pooled_blocks(
         a.at(0), p.at("query_offset"), p.at("logical_length"), p.at("pool"), p.at("budget"), p.at("tail"))};
     if (op == "runtime_sequence_cache") {
