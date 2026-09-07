@@ -4377,9 +4377,9 @@ mfq_tensor_backend::Tensor nint_gemv_packed_int6_ws_cuda(
     bool batch_group6 = nint_gs24_group_enabled("MFQ_NINT6_GS24_BATCH_GROUP", true);
     const char* split6_env = std::getenv("MFQ_NINT6_GS24_BATCH_SPLIT");
     int batch_group6_split = split6_env != nullptr ? std::atoi(split6_env) : (M >= 4 ? 2 : 1);
-    const char* reuse6_env = std::getenv("MFQ_NINT6_GS24_SMALL_M_REUSE");
+    const bool reuse6 = nint_gs24_group_enabled("MFQ_NINT6_GS24_SMALL_M_REUSE", true);
     if (gs == 24 && M >= 2 && M <= 6 && nwarps6 == 4 && u16_group6 &&
-            reuse6_env != nullptr && reuse6_env[0] == '1') {
+            reuse6) {
         quantize_x_kernel<24, 32><<<dim3(M, ng), 32, 0, stream>>>(
             reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
             xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), M, K_real, K_pad);
