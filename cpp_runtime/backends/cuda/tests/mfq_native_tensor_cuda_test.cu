@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -73,6 +74,37 @@ int main() {
     auto input = tensor<float>({1, 2, 3, 4, 5, 6})
         .reshape({2, 3})
         .to(cuda_device);
+    if (devices > 1) {
+        const Device second_device{DeviceType::cuda, 1};
+        for (const auto [source_device, destination_device] :
+             {std::pair{0, 1}, std::pair{1, 0}}) {
+            int can_access = 0;
+            MFQ_NATIVE_CUDA_CHECK(cudaDeviceCanAccessPeer(
+                &can_access, source_device, destination_device));
+            if (can_access) {
+                DeviceGuard source_guard(source_device);
+                const auto status = cudaDeviceEnablePeerAccess(
+                    destination_device, 0);
+                if (status == cudaErrorPeerAccessAlreadyEnabled) {
+                    (void)cudaGetLastError();
+                } else {
+                    MFQ_NATIVE_CUDA_CHECK(status);
+                }
+            }
+        }
+        auto round_trip = input.to(second_device).to(cuda_device);
+        require(
+            host_values(round_trip) ==
+                std::vector<float>({1, 2, 3, 4, 5, 6}),
+            "cross-device peer copy values");
+        auto strided_round_trip = input.narrow(1, 1, 2)
+            .to(second_device)
+            .to(cuda_device);
+        require(
+            host_values(strided_round_trip) ==
+                std::vector<float>({2, 3, 5, 6}),
+            "cross-device strided peer copy values");
+    }
     auto elementwise = (input + 2.0) * 3.0;
     const auto elementwise_host = host_values(elementwise);
     require_close(elementwise_host[0], 9.0f, 0.0f, "elementwise first value");

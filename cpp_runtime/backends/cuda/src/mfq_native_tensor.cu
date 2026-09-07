@@ -369,6 +369,52 @@ void copy_cuda(Tensor& destination, const Tensor& source) {
     auto context = default_context(device);
     const auto stream = current_stream(device);
     DeviceGuard guard(device);
+    if (destination.is_cuda() && source.is_cuda() &&
+        destination.device().index != source.device().index) {
+        const int source_device = source.device().index;
+        const int destination_device = destination.device().index;
+        Tensor staged_source;
+        StreamHandle source_stream;
+        {
+            DeviceGuard source_guard(source_device);
+            staged_source = source.is_contiguous()
+                ? source
+                : source.contiguous();
+            if (staged_source.scalar_type() != destination.scalar_type()) {
+                staged_source = staged_source
+                    .to(destination.scalar_type())
+                    .contiguous();
+            }
+            source_stream = current_stream(source_device);
+        }
+        Tensor staged_destination;
+        Tensor* peer_destination = &destination;
+        if (!destination.is_contiguous()) {
+            staged_destination = empty(
+                destination.sizes(), destination.options());
+            peer_destination = &staged_destination;
+        }
+        {
+            DeviceGuard source_guard(source_device);
+            Event source_ready;
+            source_ready.record(source_stream.stream());
+            {
+                DeviceGuard destination_guard(destination_device);
+                MFQ_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(
+                    stream.stream(), source_ready.get(), 0));
+                MFQ_NATIVE_CUDA_CHECK(cudaMemcpyPeerAsync(
+                    peer_destination->data_ptr(), destination_device,
+                    staged_source.data_ptr(), source_device,
+                    peer_destination->nbytes(), stream.stream()));
+                staged_source.record_stream(
+                    reinterpret_cast<std::uintptr_t>(stream.stream()));
+            }
+        }
+        if (staged_destination.defined()) {
+            copy_cuda(destination, staged_destination);
+        }
+        return;
+    }
     if (destination.scalar_type() == source.scalar_type() &&
         destination.is_contiguous() && source.is_contiguous()) {
         MFQ_NATIVE_CUDA_CHECK(cudaMemcpyAsync(
