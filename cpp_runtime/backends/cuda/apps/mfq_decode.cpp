@@ -1344,6 +1344,12 @@ static bool tensor_parallel_mirror_qwen35_attention_kv_enabled() {
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
+static bool tensor_parallel_reduce_to_primary_enabled() {
+    const char * environment = std::getenv(
+        "MFQ_TP_REDUCE_TO_PRIMARY");
+    return environment == nullptr || std::atoi(environment) != 0;
+}
+
 struct LayerPlacementConfig {
     std::vector<int> devices;
     std::vector<double> split;
@@ -12138,6 +12144,15 @@ static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
         const auto shape = outputs.front().sizes().vec();
         const auto output_dtype = outputs.front().scalar_type();
         const int64_t elements = outputs.front().numel();
+        const int primary = g_tensor_parallel.primary_device();
+        const auto primary_rank_it = std::find(
+            runtime.devices.begin(), runtime.devices.end(), primary);
+        if (primary_rank_it == runtime.devices.end()) {
+            throw std::runtime_error(
+                "tensor-parallel primary device is absent from NCCL ranks");
+        }
+        const auto primary_rank = static_cast<size_t>(
+            primary_rank_it - runtime.devices.begin());
         for (size_t index = 0; index < outputs.size(); ++index) {
             const int device = runtime.devices[index];
             if (!outputs[index].defined() || !outputs[index].is_cuda() ||
@@ -12171,19 +12186,30 @@ static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
         MFQ_NCCL_CHECK(ncclGroupStart());
         for (size_t index = 0; index < outputs.size(); ++index) {
             auto & buffer = runtime.reduction_buffers[index];
-            MFQ_NCCL_CHECK(ncclAllReduce(
-                buffer.data_ptr<float>(),
-                buffer.data_ptr<float>(),
-                static_cast<size_t>(elements),
-                ncclFloat32,
-                ncclSum,
-                runtime.communicators[index],
-                runtime.streams[index].stream()));
+            if (tensor_parallel_reduce_to_primary_enabled()) {
+                MFQ_NCCL_CHECK(ncclReduce(
+                    buffer.data_ptr<float>(),
+                    buffer.data_ptr<float>(),
+                    static_cast<size_t>(elements),
+                    ncclFloat32,
+                    ncclSum,
+                    static_cast<int>(primary_rank),
+                    runtime.communicators[index],
+                    runtime.streams[index].stream()));
+            } else {
+                MFQ_NCCL_CHECK(ncclAllReduce(
+                    buffer.data_ptr<float>(),
+                    buffer.data_ptr<float>(),
+                    static_cast<size_t>(elements),
+                    ncclFloat32,
+                    ncclSum,
+                    runtime.communicators[index],
+                    runtime.streams[index].stream()));
+            }
         }
         MFQ_NCCL_CHECK(ncclGroupEnd());
 
         mfq_tensor_backend::Tensor result;
-        const int primary = g_tensor_parallel.primary_device();
         for (size_t index = 0; index < outputs.size(); ++index) {
             MfqCudaGuard guard(runtime.devices[index]);
             const auto communication = runtime.streams[index];
@@ -12195,15 +12221,8 @@ static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
             MFQ_CUDA_CHECK(cudaEventRecord(
                 runtime.completed[index], communication.stream()));
         }
-        if (!result.defined()) {
-            throw std::runtime_error(
-                "tensor-parallel primary device is absent from NCCL ranks");
-        }
         MfqCudaGuard primary_guard(primary);
         const auto parent = mfq_get_current_cuda_stream(primary);
-        const auto primary_rank = static_cast<size_t>(
-            std::find(runtime.devices.begin(), runtime.devices.end(), primary) -
-            runtime.devices.begin());
         MFQ_CUDA_CHECK(cudaStreamWaitEvent(
             parent.stream(), runtime.completed[primary_rank], 0));
         mfq_cuda_record_stream(result, parent);
