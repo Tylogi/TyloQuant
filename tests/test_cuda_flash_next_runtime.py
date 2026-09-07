@@ -639,7 +639,7 @@ def ple_fixture():
     rng=np.random.default_rng(3804);rand=lambda shape:rng.normal(scale=.05,size=shape).astype(np.float32)
     p.update(hidden=8,streams=2)
     x=rand((2,7,16))*4
-    return [x,ids,weights,rand((16,8)),rand((8,8)),rand((16,)),rand((16,)),rand((16,)),rand((3,16))],p
+    return [x,ids,weights,rand((16,8)),rand((8,8)),rand((16,)),rand((16,)),rand((16,)),rand((3,16)).T.copy()],p
 
 
 def ple_reference(a,p):
@@ -652,15 +652,18 @@ def ple_reference(a,p):
     score=(k*q).sum(-1)/math.sqrt(h)
     root=np.sign(score)*np.sqrt(np.maximum(np.abs(score),1e-6))
     gated=(sigmoid(root)[...,None]*(embeddings@value.T)[:,:,None]).reshape(b,t,c*h)
-    normalized=norm(gated,cn);context=(conv.shape[0]-1)*p["ngram"]
+    taps=(conv[:,0] if conv.ndim==3 else conv).T
+    normalized=norm(gated,cn);context=(taps.shape[0]-1)*p["ngram"]
     history=np.pad(normalized,((0,0),(context,0),(0,0)))
-    convolved=sum(history[:,j*p["ngram"]:j*p["ngram"]+t]*conv[j] for j in range(conv.shape[0]))
+    convolved=sum(history[:,j*p["ngram"]:j*p["ngram"]+t]*taps[j] for j in range(taps.shape[0]))
     return (gated+convolved*sigmoid(convolved)).astype(x.dtype),history[:,-context:]
 
 
 @pytest.mark.parametrize("action",["rollback","commit"])
-def test_qwen_ple_equation_eos_chunks_and_transactions(native,action):
+@pytest.mark.parametrize("packed",[False,True])
+def test_qwen_ple_equation_eos_chunks_and_transactions(native,action,packed):
     a,p=ple_fixture()
+    if packed:a[-1]=a[-1][:,None,:]
     full=native("runtime_ple",a,**p,steps=[dict(begin=0,count=7)])
     for actual,expected in zip(full,ple_reference(a,p)):
         np.testing.assert_allclose(actual,expected,atol=2e-5,rtol=2e-5)
@@ -716,7 +719,7 @@ def qwen_model_fixture(interval=2,silu_gate=False,ple=True):
             w[a+".ngram.head_offsets"]=np.array([0,8,16,24],np.int64);w[a+".ngram.head_vocab_sizes"]=np.array([5,7,5,7],np.int64)
             w[a+".key.weight"]=rand((streams*h,h));w[a+".value.weight"]=rand((h,h))
             for key in ["key_norm","query_norm","conv_norm"]:w[a+f".{key}.weight"]=rand((streams*h,),.02)
-            w[a+".conv.weight"]=rand((3,streams*h))
+            w[a+".conv.weight"]=rand((3,streams*h)).T[:,None,:].copy()
     return outer,w
 
 
