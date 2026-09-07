@@ -4,12 +4,13 @@
 #include <climits>
 
 template <int BITS, int GS, int MROWS>
-__global__ void __launch_bounds__(128) nint23_group4_small_m_kernel(
+__global__ void __launch_bounds__(128) nint_group4_small_m_kernel(
     NintSmallMProjection weight, const int8_t* __restrict__ qx,
     const float* __restrict__ xs, int ng, int kpad)
 {
     constexpr int CHUNKS = GS / 4, GPW = 32 / CHUNKS;
-    constexpr int QBYTES = GS * BITS / 8;
+    constexpr int QBYTES = (GS * BITS + 7) / 8;
+    static_assert((BITS == 2 && GS == 16) || (BITS == 3 && GS == 24) || (BITS == 5 && GS == 28));
     const int row = blockIdx.x * 4 + threadIdx.y, lane = threadIdx.x;
     if (row >= weight.n) return;
     const int relg = lane / CHUNKS, chunk = lane % CHUNKS;
@@ -26,13 +27,20 @@ __global__ void __launch_bounds__(128) nint23_group4_small_m_kernel(
         if constexpr (BITS == 2) {
             const unsigned v = packed[chunk];
             qv = int((v & 3u) | ((v & 12u) << 6) | ((v & 48u) << 12) | ((v & 192u) << 18));
-        } else {
+        } else if constexpr (BITS == 3) {
             // Four 3-bit values occupy 12 bits. Both nibble alignments fit
             // exactly two bytes, including the last chunk of a GS24 group.
             const int byte = chunk * 3 / 2;
             const unsigned v = (unsigned(packed[byte]) | (unsigned(packed[byte + 1]) << 8))
                 >> ((chunk & 1) * 4);
             qv = int((v & 7u) | ((v & 56u) << 5) | ((v & 448u) << 10) | ((v & 3584u) << 15));
+        } else {
+            // Four 5-bit values fit three bytes, including GS28's final chunk.
+            const int byte = chunk * 5 / 2;
+            const unsigned v = (unsigned(packed[byte]) | (unsigned(packed[byte + 1]) << 8)
+                | (unsigned(packed[byte + 2]) << 16)) >> ((chunk & 1) * 4);
+            qv = int((v & 31u) | ((v & 992u) << 3) | ((v & 31744u) << 6)
+                | ((v & 1015808u) << 9));
         }
         const float ss = ssrow[g], sm = smrow[g];
         #pragma unroll
@@ -60,9 +68,9 @@ void launch_nint23_group4_small_m(
 {
 #define MFQ_NINT23_CASE(M) \
     case M: \
-        if (bits == 2) nint23_group4_small_m_kernel<2, 16, M> \
+        if (bits == 2) nint_group4_small_m_kernel<2, 16, M> \
             <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); \
-        else nint23_group4_small_m_kernel<3, 24, M> \
+        else nint_group4_small_m_kernel<3, 24, M> \
             <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); \
         break
     MFQ_RUNTIME_CHECK(bits == 2 || bits == 3, "NINT23 small-M bits must be 2 or 3");
@@ -75,6 +83,24 @@ void launch_nint23_group4_small_m(
         default: MFQ_RUNTIME_CHECK(false, "NINT23 small-M requires M2-6");
     }
 #undef MFQ_NINT23_CASE
+}
+
+void launch_nint5_gs28_small_m(
+    NintSmallMProjection weight, const int8_t* qx, const float* xs,
+    int m, int ng, int kpad, cudaStream_t stream)
+{
+#define MFQ_NINT5_CASE(M) \
+    case M: nint_group4_small_m_kernel<5, 28, M> \
+        <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); break
+    switch (m) {
+        MFQ_NINT5_CASE(2);
+        MFQ_NINT5_CASE(3);
+        MFQ_NINT5_CASE(4);
+        MFQ_NINT5_CASE(5);
+        MFQ_NINT5_CASE(6);
+        default: MFQ_RUNTIME_CHECK(false, "NINT5 GS28 small-M requires M2-6");
+    }
+#undef MFQ_NINT5_CASE
 }
 
 __device__ __forceinline__ int small_m_unpack_int4(uint32_t packed, unsigned selector)

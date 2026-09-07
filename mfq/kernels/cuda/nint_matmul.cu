@@ -5128,6 +5128,19 @@ mfq_tensor_backend::Tensor nint_gemv_packed_bits_ws_cuda(
     cudaStream_t stream = mfq_current_cuda_stream();
 
     const char* nint23_env = std::getenv("MFQ_NINT23_SMALL_M");
+    const char* nint5_env = std::getenv("MFQ_NINT5_GS28_SMALL_M");
+    if (nint5_env != nullptr && nint5_env[0] == '1' && bits == 5 && gs == 28 && M >= 2 && M <= 6) {
+        quantize_x_kernel<28, 32><<<dim3(M, ng), 32, 0, stream>>>(
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
+            xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), M, K_real, K_pad);
+        NintSmallMProjection weight{q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
+            sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(),
+            out.data_ptr<mfq_half>(), N};
+        launch_nint5_gs28_small_m(weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+            M, ng, K_pad, stream);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return out;
+    }
     if (nint23_env != nullptr && nint23_env[0] == '1' && M >= 2 && M <= 6 &&
             ((bits == 2 && gs == 16) || (bits == 3 && gs == 24))) {
         if (bits == 2) quantize_x_kernel<16, 32><<<dim3(M, ng), 32, 0, stream>>>(
