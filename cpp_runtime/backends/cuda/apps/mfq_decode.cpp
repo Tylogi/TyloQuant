@@ -17358,8 +17358,9 @@ struct LinearBlock : Block {
                     k = l2_norm_cuda(k.contiguous().reshape({-1, dk}), c.rms_norm_eps).reshape_as(k);
                 }
                 auto gd = g_profiler.measure("linear.mtp_gdn_step", [&]() {
-                    return recurrent_step(q, k, v, gate_t.narrow(1, t, 1).contiguous(),
-                        beta_t.narrow(1, t, 1).contiguous());
+                    // linear_gate_beta_cuda returns [B, value_heads, T].
+                    return recurrent_step(q, k, v, gate_t.narrow(2, t, 1).contiguous(),
+                        beta_t.narrow(2, t, 1).contiguous());
                 });
                 gdn_state = gd[1];
                 rows.push_back(gd[0]);
