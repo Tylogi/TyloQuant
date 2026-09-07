@@ -941,6 +941,18 @@ static int run_qwen_continuous_batching_check(Model & model) {
         "continuous batching first request differs from serial greedy oracle");
     MFQ_RUNTIME_CHECK(second_output == second_reference,
         "continuous batching second request differs from serial greedy oracle");
+    auto cancel_params = second_params;
+    cancel_params.max_tokens = 12;
+    int32_t cancellation_callbacks = 0;
+    const int32_t cancellation_produced = batcher.submit(
+        second_prompt, cancel_params,
+        [&](int64_t) {
+            ++cancellation_callbacks;
+            return false;
+        }, {}, {}, {});
+    MFQ_RUNTIME_CHECK(cancellation_produced == 1 &&
+        cancellation_callbacks == 1,
+        "continuous batching callback cancellation did not stop at one token");
     const auto values = batcher.metrics();
     auto metric = [&](const std::string & name) {
         const auto found = std::find_if(
@@ -950,9 +962,12 @@ static int run_qwen_continuous_batching_check(Model & model) {
         return found == values.end() ? 0.0 : found->second;
     };
     MFQ_RUNTIME_CHECK(metric("continuous_batching_max_batch") >= 2.0 &&
-        metric("continuous_batching_compactions") >= 1.0,
+        metric("continuous_batching_compactions") >= 1.0 &&
+        metric("continuous_batching_active") == 0.0 &&
+        metric("continuous_batching_queued") == 0.0,
         "continuous batching check did not exercise join and retire");
-    std::cout << "continuous_batching_check PASS requests=2 max_batch="
+    std::cout << "continuous_batching_check PASS concurrent_requests=2"
+              << " cancellation_tokens=1 max_batch="
               << metric("continuous_batching_max_batch")
               << " prompt_lengths=193,17 split_k=1"
               << " decode_batches="

@@ -66,6 +66,7 @@ def test_qwen_decode_accepts_independent_batch_positions():
 def test_real_weight_gate_exercises_join_and_compaction():
     assert "run_qwen_continuous_batching_check" in BATCHING
     assert "a blocked response callback stalled the scheduler" in BATCHING
+    assert "cancellation_produced == 1" in BATCHING
     assert 'metric("continuous_batching_max_batch") >= 2.0' in BATCHING
     assert 'metric("continuous_batching_compactions") >= 1.0' in BATCHING
     assert "std::vector<int64_t> first_prompt(193)" in BATCHING
