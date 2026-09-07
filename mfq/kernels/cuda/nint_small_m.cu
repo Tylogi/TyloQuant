@@ -106,7 +106,7 @@ void launch_nint5_gs28_small_m(
 template <int MROWS>
 struct Nint8SmallMStage {
     uint32_t qv;
-    float de, me;
+    uint32_t ss, sm;
     int xv[MROWS];
     float scale[MROWS];
 };
@@ -114,13 +114,13 @@ struct Nint8SmallMStage {
 template <int MROWS>
 __device__ __forceinline__ Nint8SmallMStage<MROWS> nint8_small_m_load_stage(
     const uint8_t* qrow, const uint8_t* ssrow, const uint8_t* smrow,
-    const int8_t* qx, const float* xs, float ns, float nm, int base, int ng, int kpad)
+    const int8_t* qx, const float* xs, int base, int ng, int kpad)
 {
     Nint8SmallMStage<MROWS> stage;
     stage.qv = *reinterpret_cast<const uint32_t*>(qrow + base);
     const int g = base / 48;
-    stage.de = ns * float(ssrow[g]);
-    stage.me = nm * float(smrow[g]);
+    stage.ss = ssrow[g];
+    stage.sm = smrow[g];
     #pragma unroll
     for (int m = 0; m < MROWS; ++m) {
         stage.xv[m] = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + base);
@@ -131,15 +131,18 @@ __device__ __forceinline__ Nint8SmallMStage<MROWS> nint8_small_m_load_stage(
 
 template <int MROWS>
 __device__ __forceinline__ void nint8_small_m_consume_stage(
-    const Nint8SmallMStage<MROWS>& stage, float (&acc)[MROWS])
+    const Nint8SmallMStage<MROWS>& stage, float (&acc)[MROWS], float ns, float nm)
 {
+    // Keep metadata raw during lookahead: computing next-slice scales there
+    // would wait for its new loads before the current slice can be consumed.
+    const float de = ns * float(stage.ss), me = nm * float(stage.sm);
     #pragma unroll
     for (int m = 0; m < MROWS; ++m) {
         int di;
         asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(di)
             : "r"(stage.qv), "r"(stage.xv[m]), "r"(0));
         const int sumi = __dp4a(0x01010101, stage.xv[m], 0);
-        acc[m] += stage.scale[m] * (stage.de * float(di) - stage.me * float(sumi));
+        acc[m] += stage.scale[m] * (de * float(di) - me * float(sumi));
     }
 }
 
@@ -159,15 +162,15 @@ __global__ void __launch_bounds__(128) nint8_gs48_small_m_kernel(
         int base = lane * 4;
         Nint8SmallMStage<MROWS> current = {};
         if (base < kpad)
-            current = nint8_small_m_load_stage<MROWS>(qrow, ssrow, smrow, qx, xs, ns, nm, base, ng, kpad);
+            current = nint8_small_m_load_stage<MROWS>(qrow, ssrow, smrow, qx, xs, base, ng, kpad);
         for (; base < kpad; base += 128) {
             // Issue the next K slice's independent loads before consuming this
             // slice. Weights remain shared across tokens; each lane accumulates
             // in exactly the original K order. Guard the entire padded tail.
             Nint8SmallMStage<MROWS> next = {};
             if (base + 128 < kpad)
-                next = nint8_small_m_load_stage<MROWS>(qrow, ssrow, smrow, qx, xs, ns, nm, base + 128, ng, kpad);
-            nint8_small_m_consume_stage(current, acc);
+                next = nint8_small_m_load_stage<MROWS>(qrow, ssrow, smrow, qx, xs, base + 128, ng, kpad);
+            nint8_small_m_consume_stage(current, acc, ns, nm);
             current = next;
         }
     } else {
