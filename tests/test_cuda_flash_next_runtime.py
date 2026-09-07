@@ -472,7 +472,7 @@ def qsa_fixture(axes,interleaved):
     return [x,*w,pos],p
 
 
-def qsa_reference(inputs,p):
+def qsa_reference(inputs,p,selected=None):
     x,qw,kw,vw,ow,iqkw,qn,kn,iqn,ikn,pos=inputs
     b,t,_=x.shape;h=p["heads"];kh=p["kv_heads"];d=p["width"];ih=p["index_heads"];iw=p["index_width"]
     def norm(a,w):
@@ -496,6 +496,22 @@ def qsa_reference(inputs,p):
             chosen=visible[np.argsort(scores[bi,token,visible])[-(p["budget"]//p["pool"]):]]
             indices=[int(i*p["pool"]+j) for i in chosen for j in range(p["pool"])]
             indices+=list(range(token+1-(token+1)%p["pool"],token+1))
+            if selected is not None:
+                actual=selected[bi,token].astype(np.int64)
+                assert np.all(actual==selected[bi,token])
+                indices=actual[actual>=0].tolist()
+                assert len(set(indices))==len(indices) and all(i<=token for i in indices)
+                complete=[i for i in indices if i<(token+1)//p["pool"]*p["pool"]]
+                blocks=sorted(set(i//p["pool"] for i in complete))
+                assert set(complete)=={i*p["pool"]+j for i in blocks for j in range(p["pool"])}
+                assert len(blocks)==min(len(visible),p["budget"]//p["pool"])
+                remaining=[i for i in visible if i not in blocks]
+                # argpartition leaves equal-score selection unspecified. Check
+                # the top-k property itself, without choosing a tie policy.
+                if remaining:
+                    assert min(scores[bi,token,blocks])>=max(scores[bi,token,remaining])-1e-5
+                tail=list(range(token+1-(token+1)%p["pool"],token+1))
+                assert set(indices)-set(complete)==set(tail)
             for head in range(h):
                 logits=q[bi,head,token]@k[bi,head//(h//kh),indices].T/math.sqrt(d)
                 probs=np.exp(logits-np.max(logits));probs/=probs.sum()
@@ -507,8 +523,8 @@ def qsa_reference(inputs,p):
 @pytest.mark.parametrize("interleaved",[False,True])
 def test_qsa_equation_chunks_and_cache_rejection(native,axes,interleaved):
     inputs,p=qsa_fixture(axes,interleaved)
-    full=native("runtime_qsa",inputs,**p,steps=[dict(begin=0,count=7)])[0]
-    np.testing.assert_allclose(full,qsa_reference(inputs,p),atol=5e-4,rtol=5e-4)
+    full,_scores,selected,_iq,_pooled=native("runtime_qsa",inputs,**p,steps=[dict(begin=0,count=7)],trace=True)
+    np.testing.assert_allclose(full,qsa_reference(inputs,p,selected),atol=5e-4,rtol=5e-4)
     parts=native("runtime_qsa",inputs,**p,steps=[dict(begin=0,count=2),dict(begin=2,count=1),dict(begin=3,count=4)])
     np.testing.assert_allclose(np.concatenate(parts,axis=1),full,atol=1.5e-2,rtol=1.5e-2)
     rejected=native("runtime_qsa",inputs,**p,steps=[dict(begin=0,count=4),dict(truncate=3),dict(begin=5,count=1)])[-1]

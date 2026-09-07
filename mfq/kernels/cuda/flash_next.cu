@@ -37,7 +37,9 @@ Tensor dots(const Tensor& query, const Tensor& pooled) {
     MFQ_RUNTIME_CHECK(query.size(0) == pooled.size(0) &&
         query.size(3) == pooled.size(2) && query.size(2) > 0 && query.size(3) > 0,
         "Flash-Next score dimensions disagree");
-    return tb::matmul(query.to(tb::kFloat32),
+    // QSA rotates [B,H,T,D] then permutes back to [B,T,H,D]. Native
+    // batched GEMM requires the leading batch axes to have compact strides.
+    return tb::matmul(query.to(tb::kFloat32).contiguous(),
         pooled.to(tb::kFloat32).transpose(-1, -2).unsqueeze(1)).clamp_min(0.0);
 }
 
