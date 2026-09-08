@@ -23,6 +23,44 @@ inline uint read_bits(
     return (packed >> shift) & ((1u << bits) - 1u);
 }
 
+#ifdef MFQ_ENABLE_LEGACY_VQ_VECTOR
+template <uint BITS>
+inline uint3 read_vq_group_indices(
+    const device uchar* stream,
+    uint row,
+    uint group,
+    uint vectors) {
+    uint first = group * 3u;
+    if (first + 2u >= vectors) {
+        return uint3(
+            first < vectors
+                ? read_bits(stream, row * vectors + first, BITS)
+                : 0u,
+            first + 1u < vectors
+                ? read_bits(stream, row * vectors + first + 1u, BITS)
+                : 0u,
+            0u);
+    }
+    uint bit = (row * vectors + first) * BITS;
+    uint byte = bit >> 3u;
+    uint shift = bit & 7u;
+    ulong packed = ulong(stream[byte])
+        | (ulong(stream[byte + 1u]) << 8u)
+        | (ulong(stream[byte + 2u]) << 16u);
+    if (shift + 3u * BITS > 24u) {
+        packed |= ulong(stream[byte + 3u]) << 24u;
+    }
+    if (shift + 3u * BITS > 32u) {
+        packed |= ulong(stream[byte + 4u]) << 32u;
+    }
+    ulong mask = (1ul << BITS) - 1ul;
+    return uint3(
+        uint((packed >> shift) & mask),
+        uint((packed >> (shift + BITS)) & mask),
+        uint((packed >> (shift + 2u * BITS)) & mask));
+}
+#endif
+
 inline uint read_nint_value(
     const device uchar* stream,
     uint value_index,
@@ -769,6 +807,110 @@ inline void decode_jsc_group24(
     }
 }
 
+#ifdef MFQ_ENABLE_LEGACY_VQ_VECTOR
+template <uint STATE_WIDTH, uint INDEX_WIDTH, uint TABLE_SIZE>
+inline void decode_npq_group24(
+    const device int* d,
+    const device uchar* indices,
+    const device uchar* state_stream,
+    const device float* anchors,
+    const device int8_t* codebooks,
+    const device float* scales,
+    threadgroup half* target,
+    uint row,
+    uint group) {
+    uint groups = uint(d[5]);
+    uint vectors = uint(d[7]);
+    uint indices_offset = uint(d[18]);
+    uint state_offset = uint(d[19]);
+    uint anchor_offset = uint(d[21]);
+    uint codebook_offset = uint(d[22]);
+    uint scale_offset = uint(d[23]);
+    uint state = read_bits(
+        state_stream + state_offset,
+        row * groups + group,
+        STATE_WIDTH);
+    float scale = anchors[anchor_offset + row]
+        * scales[scale_offset + state];
+    uint3 group_indices = read_vq_group_indices<INDEX_WIDTH>(
+        indices + indices_offset, row, group, vectors);
+
+#pragma clang loop unroll(full)
+    for (uint chunk = 0u; chunk < 3u; ++chunk) {
+        uint index = group_indices[chunk];
+        uint code_base = codebook_offset
+            + (state * TABLE_SIZE + index) * 8u;
+        char4 first_code = *reinterpret_cast<device const char4*>(
+            codebooks + code_base);
+        char4 second_code = *reinterpret_cast<device const char4*>(
+            codebooks + code_base + 4u);
+        *reinterpret_cast<threadgroup half4*>(
+            target + chunk * 8u) = half4(
+                scale * float4(first_code));
+        *reinterpret_cast<threadgroup half4*>(
+            target + chunk * 8u + 4u) = half4(
+                scale * float4(second_code));
+    }
+}
+
+template <
+    uint STATE_WIDTH,
+    uint INDEX_WIDTH,
+    uint ENTRIES_PER_BANK,
+    bool DUAL_BANK>
+inline void decode_nvq1_group24(
+    const device int* d,
+    const device uchar* indices,
+    const device uchar* state_stream,
+    const device uchar* aux,
+    const device float* anchors,
+    const device int8_t* codebooks,
+    const device float* scales,
+    const device float* parameters,
+    threadgroup half* target,
+    uint row,
+    uint group) {
+    uint groups = uint(d[5]);
+    uint vectors = uint(d[7]);
+    uint indices_offset = uint(d[18]);
+    uint state_offset = uint(d[19]);
+    uint aux_offset = uint(d[20]);
+    uint anchor_offset = uint(d[21]);
+    uint codebook_offset = uint(d[22]);
+    uint scale_offset = uint(d[23]);
+    uint parameter_offset = uint(d[26]);
+    uint state_index = row * groups + group;
+    uint state = read_bits(
+        state_stream + state_offset, state_index, STATE_WIDTH);
+    uint bank = read_bits(aux + aux_offset, state_index, 1u);
+    float delta = parameters[parameter_offset];
+    float signed_delta = bank != 0u ? -delta : delta;
+    float scale = anchors[anchor_offset + row]
+        * scales[scale_offset + state];
+    uint3 group_indices = read_vq_group_indices<INDEX_WIDTH>(
+        indices + indices_offset, row, group, vectors);
+
+#pragma clang loop unroll(full)
+    for (uint chunk = 0u; chunk < 3u; ++chunk) {
+        uint entry = group_indices[chunk];
+        if constexpr (DUAL_BANK) {
+            entry += bank * ENTRIES_PER_BANK;
+        }
+        uint code_base = codebook_offset + entry * 8u;
+        float4 first_code = float4(
+            *reinterpret_cast<device const char4*>(
+                codebooks + code_base)) + signed_delta;
+        float4 second_code = float4(
+            *reinterpret_cast<device const char4*>(
+                codebooks + code_base + 4u)) + signed_delta;
+        *reinterpret_cast<threadgroup half4*>(
+            target + chunk * 8u) = half4(scale * first_code);
+        *reinterpret_cast<threadgroup half4*>(
+            target + chunk * 8u + 4u) = half4(scale * second_code);
+    }
+}
+#endif
+
 inline void decode_vq_group24(
     const device int* d,
     const device uchar* indices,
@@ -825,6 +967,33 @@ inline void decode_vq_group24(
         return;
     }
 
+#ifdef MFQ_ENABLE_LEGACY_VQ_VECTOR
+    if (profile == 2u) {
+        decode_npq_group24<2u, 6u, 64u>(
+            d, indices, state_stream, anchors, codebooks, scales,
+            target, row, group);
+        return;
+    }
+    if (profile == 5u) {
+        decode_npq_group24<3u, 7u, 128u>(
+            d, indices, state_stream, anchors, codebooks, scales,
+            target, row, group);
+        return;
+    }
+
+    if (profile == 3u) {
+        decode_nvq1_group24<3u, 11u, 2048u, false>(
+            d, indices, state_stream, aux, anchors, codebooks, scales,
+            parameters, target, row, group);
+        return;
+    }
+    if (profile == 6u) {
+        decode_nvq1_group24<4u, 9u, 512u, true>(
+            d, indices, state_stream, aux, anchors, codebooks, scales,
+            parameters, target, row, group);
+        return;
+    }
+#else
     if (profile == 2u || profile == 5u) {
         uint state_width = profile == 2u ? 2u : 3u;
         uint index_width = profile == 2u ? 6u : 7u;
@@ -839,8 +1008,8 @@ inline void decode_vq_group24(
                 indices + indices_offset,
                 row * vectors + group * 3u + chunk,
                 index_width);
-            uint code_base =
-                codebook_offset + (state * table_size + index) * 8u;
+            uint code_base = codebook_offset
+                + (state * table_size + index) * 8u;
             for (uint inner = 0u; inner < 8u; ++inner) {
                 target[chunk * 8u + inner] = half(
                     scale * float(codebooks[code_base + inner]));
@@ -874,6 +1043,7 @@ inline void decode_vq_group24(
         }
         return;
     }
+#endif
 
     uint state = read_bits(
         state_stream + state_offset,
@@ -892,6 +1062,142 @@ inline void decode_vq_group24(
         : (code_bank_mode == 2u ? delta_value : 0u);
     float scale = anchor * scales[
         scale_offset + table_bank * state_count + state];
+#ifdef MFQ_ENABLE_LEGACY_VQ_VECTOR
+    if (profile == 0u && vector_size == 8u) {
+#pragma clang loop unroll(full)
+        for (uint chunk = 0u; chunk < 3u; ++chunk) {
+            uint column_base = group * 24u + chunk * 8u;
+            if (column_base >= k_size) {
+                *reinterpret_cast<threadgroup half4*>(
+                    target + chunk * 8u) = half4(0.0h);
+                *reinterpret_cast<threadgroup half4*>(
+                    target + chunk * 8u + 4u) = half4(0.0h);
+                continue;
+            }
+            uint sign_value = 0u;
+            if (aux_mode == 1u || aux_mode == 2u) {
+                sign_value = read_bits(
+                    aux + aux_offset,
+                    row * signs + group * 3u + chunk,
+                    7u);
+            }
+            uint vector = group * 3u + chunk;
+            uint index = read_bits(
+                indices + indices_offset,
+                row * vectors + vector,
+                index_bits);
+            uint code_base = codebook_offset
+                + (((table_bank * code_banks + selected_bank) * entries
+                  + index) * 8u);
+            float4 first_code = float4(
+                *reinterpret_cast<device const char4*>(
+                    codebooks + code_base));
+            float4 second_code = float4(
+                *reinterpret_cast<device const char4*>(
+                    codebooks + code_base + 4u));
+            if (aux_mode == 1u || aux_mode == 2u) {
+                first_code = select(
+                    first_code,
+                    -first_code,
+                    (uint4(sign_value) & uint4(1u, 2u, 4u, 8u))
+                        != uint4(0u));
+                uint parity = popcount(sign_value) & 1u;
+                if (aux_mode == 2u) {
+                    parity ^= (index >> 7u) & 1u;
+                }
+                second_code = select(
+                    second_code,
+                    -second_code,
+                    bool4(
+                        (sign_value & 16u) != 0u,
+                        (sign_value & 32u) != 0u,
+                        (sign_value & 64u) != 0u,
+                        parity != 0u));
+            } else if (aux_mode == 3u) {
+                float delta = parameters[parameter_offset];
+                float signed_delta = delta_value != 0u
+                    ? -delta : delta;
+                first_code += signed_delta;
+                second_code += signed_delta;
+            }
+            *reinterpret_cast<threadgroup half4*>(
+                target + chunk * 8u) = half4(scale * first_code);
+            *reinterpret_cast<threadgroup half4*>(
+                target + chunk * 8u + 4u) = half4(
+                    scale * second_code);
+        }
+        return;
+    }
+    if (profile == 0u && vector_size == 4u) {
+#pragma clang loop unroll(full)
+        for (uint chunk = 0u; chunk < 3u; ++chunk) {
+            uint column_base = group * 24u + chunk * 8u;
+            if (column_base >= k_size) {
+                *reinterpret_cast<threadgroup half4*>(
+                    target + chunk * 8u) = half4(0.0h);
+                *reinterpret_cast<threadgroup half4*>(
+                    target + chunk * 8u + 4u) = half4(0.0h);
+                continue;
+            }
+            uint sign_value = 0u;
+            if (aux_mode == 1u || aux_mode == 2u) {
+                sign_value = read_bits(
+                    aux + aux_offset,
+                    row * signs + group * 3u + chunk,
+                    7u);
+            }
+#pragma clang loop unroll(full)
+            for (uint local = 0u; local < 2u; ++local) {
+                uint vector = group * 6u + chunk * 2u + local;
+                if (vector >= vectors) {
+                    *reinterpret_cast<threadgroup half4*>(
+                        target + chunk * 8u + local * 4u) = half4(0.0h);
+                    continue;
+                }
+                uint index = read_bits(
+                    indices + indices_offset,
+                    row * vectors + vector,
+                    index_bits);
+                uint code_base = codebook_offset
+                    + (((table_bank * code_banks + selected_bank) * entries
+                      + index) * 4u);
+                float4 code = float4(
+                    *reinterpret_cast<device const char4*>(
+                        codebooks + code_base));
+                if (aux_mode == 1u || aux_mode == 2u) {
+                    if (local == 0u) {
+                        code = select(
+                            code,
+                            -code,
+                            (uint4(sign_value)
+                                & uint4(1u, 2u, 4u, 8u))
+                                != uint4(0u));
+                    } else {
+                        uint parity = popcount(sign_value) & 1u;
+                        if (aux_mode == 2u) {
+                            parity ^= (index >> 7u) & 1u;
+                        }
+                        code = select(
+                            code,
+                            -code,
+                            bool4(
+                                (sign_value & 16u) != 0u,
+                                (sign_value & 32u) != 0u,
+                                (sign_value & 64u) != 0u,
+                                parity != 0u));
+                    }
+                } else if (aux_mode == 3u) {
+                    float delta = parameters[parameter_offset];
+                    code += delta_value != 0u ? -delta : delta;
+                }
+                *reinterpret_cast<threadgroup half4*>(
+                    target + chunk * 8u + local * 4u) = half4(
+                        scale * code);
+            }
+        }
+        return;
+    }
+#endif
     uint vectors_per_chunk = 8u / vector_size;
     for (uint chunk = 0u; chunk < 3u; ++chunk) {
         uint sign_value = 0u;

@@ -294,6 +294,12 @@ constexpr int kVqProfileJsc8 = 4;
 constexpr int kVqProfileNpqL = 5;
 constexpr int kVqProfileNvq1S = 6;
 constexpr int kVqProfileJscExtended8 = 7;
+constexpr std::uint32_t kGroupedVqVectorProfileMask =
+    (std::uint32_t{1} << kVqProfileGeneric)
+    | (std::uint32_t{1} << kVqProfileNpqS)
+    | (std::uint32_t{1} << kVqProfileNvq1L)
+    | (std::uint32_t{1} << kVqProfileNpqL)
+    | (std::uint32_t{1} << kVqProfileNvq1S);
 
 constexpr const char* kMoeHeader = R"METAL(
 template <typename Stream>
@@ -2864,6 +2870,7 @@ struct GroupedMmqConfig {
     int input_sorted = 0;
     int fused_swiglu = 0;
     int has_nepq_residual = 0;
+    int vq_profile_mask = 0;
     bool use_nax = false;
     bool direct_nax = false;
     float swiglu_limit = 0.0f;
@@ -3297,12 +3304,19 @@ public:
             selected_stream.device);
         CompileOptions compile_options;
         compile_options.math_mode = MathMode::Fast;
+        const bool vector_vq =
+            (static_cast<std::uint32_t>(config_.vq_profile_mask)
+                & kGroupedVqVectorProfileMask) != 0;
         auto* library = device.get_library(
             config_.use_nax
-                ? "mfq_grouped_nint4_nax_v1"
-                : "mfq_grouped_mmq_v12",
+                ? (vector_vq
+                    ? "mfq_grouped_nint4_nax_v2_legacy_vq_vector"
+                    : "mfq_grouped_nint4_nax_v2")
+                : (vector_vq
+                    ? "mfq_grouped_mmq_v13_legacy_vq_vector"
+                    : "mfq_grouped_mmq_v13"),
             compile_options,
-            [use_nax = config_.use_nax] {
+            [use_nax = config_.use_nax, vector_vq] {
                 std::string source;
                 source.reserve(
                     (use_nax
@@ -3317,6 +3331,10 @@ public:
                     source += "#include <MetalPerformancePrimitives/"
                         "MetalPerformancePrimitives.h>\n";
                     source += "#define MFQ_ENABLE_NAX 1\n";
+                }
+                if (vector_vq) {
+                    source +=
+                        "#define MFQ_ENABLE_LEGACY_VQ_VECTOR 1\n";
                 }
                 source += "using namespace metal;\n";
                 source += "using bfloat16_t = bfloat;\n";
@@ -8044,6 +8062,8 @@ array MlxNintMoeWeight::routed_matmul_sorted(
             .fused_swiglu = static_cast<int>(fused_swiglu),
             .has_nepq_residual = static_cast<int>(
                 impl_->has_nepq_residual),
+            .vq_profile_mask = static_cast<int>(
+                impl_->vq_profile_mask),
             .use_nax = use_grouped_nax,
             .direct_nax = use_direct_nax,
             .swiglu_limit = swiglu_limit,
@@ -8339,6 +8359,8 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .fused_swiglu = static_cast<int>(fused_swiglu),
                 .has_nepq_residual = static_cast<int>(
                     impl_->has_nepq_residual),
+                .vq_profile_mask = static_cast<int>(
+                    impl_->vq_profile_mask),
                 .use_nax = use_grouped_nax,
                 .direct_nax = use_direct_nax,
                 .swiglu_limit = swiglu_limit,

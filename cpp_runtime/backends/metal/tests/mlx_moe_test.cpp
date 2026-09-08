@@ -461,6 +461,50 @@ VqFixture make_plain_nvq(
     };
 }
 
+VqFixture make_plain_nvq3(
+    int output,
+    int input) {
+    constexpr std::uint8_t custom_codebook = 0x40;
+    std::vector<std::uint8_t> blob;
+    append_vq_matrix_header(
+        blob,
+        "NVQ1",
+        static_cast<std::uint8_t>(2 | custom_codebook),
+        4,
+        24,
+        output,
+        input);
+    for (int entry = 0; entry < 256; ++entry) {
+        append<std::uint16_t>(
+            blob,
+            static_cast<std::uint16_t>(entry));
+    }
+    append_vq_matrix_streams(
+        blob,
+        output,
+        input,
+        24,
+        4,
+        4,
+        8,
+        7,
+        true);
+    return {
+        "NVQ3",
+        std::move(blob),
+        {},
+        repeated_vq_dense(
+            output,
+            input,
+            std::vector<float>(4, 1.0f)),
+        {},
+        0,
+        0,
+        output,
+        input,
+    };
+}
+
 VqFixture make_jsc_nvq(
     int output,
     int input,
@@ -584,6 +628,46 @@ void append_nvq1_s_table(
     }
 }
 
+VqFixture make_nvq1_l(
+    int output,
+    int input) {
+    std::vector<std::uint8_t> blob;
+    append_vq_matrix_header(
+        blob,
+        "NQ1L",
+        1,
+        3,
+        24,
+        output,
+        input);
+    append_vq_matrix_streams(
+        blob,
+        output,
+        input,
+        24,
+        8,
+        3,
+        11,
+        1,
+        false);
+    auto vector = decode_ternary_word(
+        mfq::nvq_codebooks::kNvq1LCodebookPacked[0]);
+    for (auto& value : vector) {
+        value += 0.125f;
+    }
+    return {
+        "NVQ1-L",
+        std::move(blob),
+        {},
+        repeated_vq_dense(output, input, vector),
+        {},
+        0,
+        0,
+        output,
+        input,
+    };
+}
+
 VqFixture make_nvq1_s(
     int output,
     int input) {
@@ -673,29 +757,30 @@ std::vector<std::uint8_t> npq_table(
 
 VqFixture make_npq(
     int output,
-    int input) {
+    int input,
+    bool short_profile = false) {
     std::vector<std::uint8_t> blob;
     append_vq_matrix_header(
         blob,
-        "NPQL",
-        1,
-        3,
+        short_profile ? "NPQS" : "NPQL",
+        static_cast<std::uint8_t>(short_profile ? 2 : 1),
+        static_cast<std::uint8_t>(short_profile ? 2 : 3),
         24,
         output,
         input);
-    append_bytes(blob, npq_table(false, 0));
+    append_bytes(blob, npq_table(short_profile, 0));
     append_vq_matrix_streams(
         blob,
         output,
         input,
         24,
         8,
-        3,
-        7,
+        short_profile ? 2 : 3,
+        short_profile ? 6 : 7,
         0,
         false);
     return {
-        "NPQ0-L",
+        short_profile ? "NPQ0-S" : "NPQ0-L",
         std::move(blob),
         {},
         repeated_vq_dense(
@@ -4320,6 +4405,66 @@ void test_grouped_mmq_prefill() {
     }
 }
 
+void test_grouped_vq_decoder_tail_prefill() {
+    constexpr int output = 16;
+    constexpr int input_width = 640;
+    auto fixture = make_vq_moe_fixture({
+        make_npq(output, input_width, true),
+        make_npq(output, input_width, false),
+        make_nvq1_s(output, input_width),
+        make_nvq1_l(output, input_width),
+        make_plain_nvq(output, input_width),
+        make_plain_nvq(output, input_width, true),
+        make_plain_nvq3(output, input_width),
+        make_jsc_nvq(
+            output,
+            input_width,
+            "NVQ3J-512",
+            3,
+            4,
+            9),
+    });
+    const auto weight = mfq::metal::MlxMoeWeight::from_blob(
+        fixture.blob);
+    require(
+        weight.supports_grouped_mmq(),
+        "mixed VQ decoder tail fixture must support grouped prefill");
+    const auto exercise = [&](int tokens) {
+        std::vector<float> input(tokens * input_width);
+        for (std::size_t index = 0; index < input.size(); ++index) {
+            input[index] = static_cast<float>(
+                static_cast<int>((index * 13 + 7) % 29) - 14)
+                / 1024.0f;
+        }
+        std::vector<std::int32_t> ids(tokens);
+        for (int token = 0; token < tokens; ++token) {
+            ids[token] = token % fixture.experts;
+        }
+        const auto actual = evaluated_floats(
+            weight.routed_matmul(
+                mlx::core::astype(
+                    mlx::core::array(
+                        input.begin(),
+                        mlx::core::Shape{tokens, input_width}),
+                    mlx::core::float16),
+                mlx::core::array(
+                    ids.begin(), mlx::core::Shape{tokens, 1})));
+        for (int token = 0; token < tokens; ++token) {
+            const std::vector<float> source(
+                input.begin() + token * input_width,
+                input.begin() + (token + 1) * input_width);
+            for (int row = 0; row < output; ++row) {
+                require_close(
+                    actual[token * output + row],
+                    routed_vq_dot(source, fixture, ids[token], row),
+                    6e-2f);
+            }
+        }
+    };
+    exercise(49);
+    exercise(1025);
+}
+
 void test_grouped_nint_mmq_prefill() {
     // Cross the heterogeneous NAX threshold on supported Apple GPUs while
     // retaining the same reference coverage on compatibility-only devices.
@@ -5015,6 +5160,7 @@ int main(int argc, char** argv) {
         test_vq_cohorts_and_ffn();
         test_nepq_a_routed_and_fused_swiglu();
         test_grouped_mmq_prefill();
+        test_grouped_vq_decoder_tail_prefill();
         test_grouped_nint_mmq_prefill();
         test_grouped_nint2_pair_prefill();
         test_grouped_nint8_group48_tail_prefill();
