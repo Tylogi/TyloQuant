@@ -23,6 +23,10 @@ DECLARE_BITS_GLU(nint_gemv_packed_bits_geglu_ws_cuda);
 #undef DECLARE_BITS_GLU
 Tensor nint_gemv_packed_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
+Tensor nint_gemv_packed_qx_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor,
+    int64_t, Tensor, Tensor, Tensor);
+Tensor nint_gemv_packed_bits_qx_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor,
+    int64_t, int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_int6_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_u8_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
@@ -111,6 +115,23 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
         for (int m = 1; m <= batch; ++m) {
             exact(invoke(x.narrow(0, 0, m), operation), reference.narrow(0, 0, m));
             ++cases;
+        }
+        if (operation == 2 && (bits == 4 || bits == 6)) {
+            // Reuse one activation quantization across independent GS24
+            // projections without changing the small-M reduction order.
+            (void)invoke(x, operation);
+            for (int m = 2; m <= batch; ++m) {
+                auto reused = bits == 4
+                    ? nint_gemv_packed_qx_ws_cuda(
+                        q, s, sm, ns, nm, gs,
+                        qx.narrow(0, 0, m), xs.narrow(0, 0, m),
+                        xm.narrow(0, 0, m))
+                    : nint_gemv_packed_bits_qx_ws_cuda(
+                        q, s, sm, ns, nm, gs, bits,
+                        qx.narrow(0, 0, m), xs.narrow(0, 0, m),
+                        xm.narrow(0, 0, m));
+                exact(reused, reference.narrow(0, 0, m));
+            }
         }
         // Independent CPU packed-weight/INT8-input oracle for fused GLU.
         // Uses actual CUDA input codes/scales, isolating the changed projection

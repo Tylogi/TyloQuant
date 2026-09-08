@@ -11204,6 +11204,19 @@ static mfq_tensor_backend::Tensor nint_matmul_qx(const NintWeight & w, Workspace
     throw std::runtime_error("NINT prequantized GEMV unsupported bit width");
 }
 
+static bool nint_small_m_qx_compatible(
+        const NintWeight & source,
+        const NintWeight & target) {
+    const auto supported = [](const NintWeight & weight) {
+        return !weight.q8_zero && !weight.q5_exec &&
+            weight.gs == 24 &&
+            (weight.bits == 4 || weight.bits == 6);
+    };
+    return supported(source) && supported(target) &&
+        source.neuron_len == target.neuron_len &&
+        source.q_packed.get_device() == target.q_packed.get_device();
+}
+
 static mfq_tensor_backend::Tensor nint_matmul_swiglu(const NintWeight & w, mfq_tensor_backend::Tensor x) {
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
@@ -11266,6 +11279,14 @@ struct NintLinear {
     }
     mfq_tensor_backend::Tensor forward_bf16_output(mfq_tensor_backend::Tensor x) const {
         return nint_matmul_bf16_output(w, x);
+    }
+    mfq_tensor_backend::Tensor forward_qx(
+            mfq_tensor_backend::Tensor x,
+            Workspace & workspace) const {
+        auto shape = x.sizes().vec();
+        auto y = nint_matmul_qx(w, workspace);
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
     }
     mfq_tensor_backend::Tensor forward_input_mul(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) const {
         auto shape = x.sizes().vec();
@@ -11417,6 +11438,28 @@ struct NintLinearGroup {
     mutable std::shared_ptr<CudaIndependentBranchExecutor>
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
+    const NintWeight * shared_qx_weight() const {
+        return split_w.empty() && !w.q8_zero && !w.q5_exec &&
+                w.gs == 24 && (w.bits == 4 || w.bits == 6)
+            ? &w
+            : nullptr;
+    }
+    std::vector<mfq_tensor_backend::Tensor> forward_qx(
+            mfq_tensor_backend::Tensor x,
+            Workspace & workspace) const {
+        MFQ_RUNTIME_CHECK(
+            shared_qx_weight() != nullptr,
+            "shared-qx NINT group requires one compatible packed weight");
+        auto shape = x.sizes().vec();
+        auto y = nint_matmul_qx(w, workspace);
+        auto parts = y.split_with_sizes(outs, -1);
+        for (auto & part : parts) {
+            auto part_shape = shape;
+            part_shape.back() = part.size(-1);
+            part = part.reshape(part_shape);
+        }
+        return parts;
+    }
     std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
         std::vector<mfq_tensor_backend::Tensor> parts;
@@ -12285,6 +12328,24 @@ struct QuantLinear {
     bool is_tpq() const { return kind == QuantLinearKind::Tpq; }
     bool is_dense() const { return kind == QuantLinearKind::Dense; }
 
+    const NintWeight * shared_qx_weight() const {
+        return !tensor_parallel() && is_nint() &&
+                !nint.w.q8_zero && !nint.w.q5_exec &&
+                nint.w.gs == 24 &&
+                (nint.w.bits == 4 || nint.w.bits == 6)
+            ? &nint.w
+            : nullptr;
+    }
+
+    mfq_tensor_backend::Tensor forward_qx(
+            mfq_tensor_backend::Tensor x,
+            Workspace & workspace) const {
+        MFQ_RUNTIME_CHECK(
+            shared_qx_weight() != nullptr,
+            "shared-qx projection requires one local NINT weight");
+        return nint.forward_qx(x, workspace);
+    }
+
     mfq_tensor_backend::Tensor forward_tensor_parallel_flat(
             mfq_tensor_backend::Tensor x,
             MfqOptional<mfq_tensor_backend::Tensor> gate,
@@ -12714,6 +12775,19 @@ struct QuantLinearGroup {
             mfq_tensor_backend::Tensor x) const {
         return forward_tensor_parallel_output_projections(
             x, tensor_parallel_output_projections());
+    }
+
+    const NintWeight * shared_qx_weight() const {
+        return nint_grouped ? nint.shared_qx_weight() : nullptr;
+    }
+
+    std::vector<mfq_tensor_backend::Tensor> forward_qx(
+            mfq_tensor_backend::Tensor x,
+            Workspace & workspace) const {
+        MFQ_RUNTIME_CHECK(
+            shared_qx_weight() != nullptr,
+            "shared-qx projection group requires local packed NINT weights");
+        return nint.forward_qx(x, workspace);
     }
 
     std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
@@ -17797,8 +17871,53 @@ struct LinearBlock : Block {
             alpha_raw = ab[0];
             beta_raw = ab[1];
         } else if (split_in_proj) {
-            bool shared_tp_projection_input = false;
+            bool shared_projection_input = false;
+            const char * shared_qx_environment = std::getenv(
+                "MFQ_LINEAR_ATTN_SMALL_M_QX_REUSE");
+            const int64_t projection_rows = B * T;
             if (!split_dense_zab && ab_is_nint &&
+                    g_kl_mmq_mode == KlMmqMode::Default &&
+                    projection_rows >= 2 && projection_rows <= 6 &&
+                    (shared_qx_environment == nullptr ||
+                     shared_qx_environment[0] != '0')) {
+                const NintWeight * qkv_weight =
+                    qkv_proj.shared_qx_weight();
+                const NintWeight * z_weight =
+                    z_proj.shared_qx_weight();
+                const NintWeight * ab_weight =
+                    ab_nint_proj.shared_qx_weight();
+                if (qkv_weight != nullptr && z_weight != nullptr &&
+                        ab_weight != nullptr &&
+                        nint_small_m_qx_compatible(
+                            *qkv_weight, *z_weight) &&
+                        nint_small_m_qx_compatible(
+                            *qkv_weight, *ab_weight)) {
+                    auto qkv_parts = g_profiler.measure(
+                        "linear.qkv_proj", [&]() {
+                            return qkv_proj.forward(xn);
+                        });
+                    qk_part = qkv_parts[0];
+                    v_part = qkv_parts[1];
+                    Workspace & shared_workspace =
+                        qkv_weight->workspace(
+                            static_cast<int>(projection_rows));
+                    z = g_profiler.measure(
+                        "linear.z_proj", [&]() {
+                            return z_proj.forward_qx(
+                                xn, shared_workspace);
+                        });
+                    auto ab = g_profiler.measure(
+                        "linear.ab_proj", [&]() {
+                            return ab_nint_proj.forward_qx(
+                                xn, shared_workspace);
+                        });
+                    alpha_raw = ab[0];
+                    beta_raw = ab[1];
+                    shared_projection_input = true;
+                }
+            }
+            if (!shared_projection_input &&
+                    !split_dense_zab && ab_is_nint &&
                     tensor_parallel_grouped_projections_enabled() &&
                     tensor_parallel_shared_linear_attention_input_enabled() &&
                     qkv_proj.layers.size() == 2) {
@@ -17835,10 +17954,10 @@ struct LinearBlock : Block {
                         alpha_raw = ab[0];
                         beta_raw = ab[1];
                     }
-                    shared_tp_projection_input = true;
+                    shared_projection_input = true;
                 }
             }
-            if (!shared_tp_projection_input) {
+            if (!shared_projection_input) {
                 if (split_dense_zab) {
                     auto qkv_parts = g_profiler.measure("linear.qkv_proj", [&]() { return qkv_proj.forward(xn); });
                     qk_part = qkv_parts[0];

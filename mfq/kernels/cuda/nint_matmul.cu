@@ -4551,7 +4551,18 @@ mfq_tensor_backend::Tensor nint_gemv_packed_qx_ws_cuda(
 
 #define QXLAUNCH(GSVAL)                                                                \
     do {                                                                               \
-        if (GSVAL == 24 && M == 1 && nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true)) { \
+        if (GSVAL == 24 && M >= 2 && M <= 6 && \
+                nint_gs24_group_enabled("MFQ_NINT4_GS24_SMALL_M_REUSE", true) && \
+                nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true)) { \
+            Nint4Gs24Projection projection{q_packed.data_ptr<uint8_t>(), \
+                sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
+                neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), N, \
+                nint_gs24_group_enabled("MFQ_NINT4_SMALL_M_XSUM", false) \
+                    ? xsum.data_ptr<int32_t>() : nullptr}; \
+            launch_nint4_gs24_small_m_reuse(projection, qx.data_ptr<int8_t>(), \
+                xscale.data_ptr<float>(), M, ng, K_pad, stream); \
+        } else if (GSVAL == 24 && M == 1 && nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true)) { \
             gemv_packed_gs24_group_kernel<4, true><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),           \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),           \
@@ -5413,7 +5424,17 @@ mfq_tensor_backend::Tensor nint_gemv_packed_bits_qx_ws_cuda(
 
 #define QPBITSQXLAUNCH(BITSVAL, GSVAL)                                                 \
     do {                                                                                \
-        if ((BITSVAL) == 5 && (GSVAL) == 28) {                                          \
+        if ((BITSVAL) == 6 && (GSVAL) == 24 && M >= 2 && M <= 6 &&                     \
+                nint_multiwarp_count("MFQ_NINT6_GEMV_WARPS", 4) == 4 &&               \
+                nint_gs24_group_enabled("MFQ_NINT6_GS24_U16_GROUP", true) &&           \
+                nint_gs24_group_enabled("MFQ_NINT6_GS24_SMALL_M_REUSE", true)) {       \
+            NintSmallMProjection weight{q_packed.data_ptr<uint8_t>(),                   \
+                sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),             \
+                neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(),           \
+                out.data_ptr<mfq_half>(), N};                                           \
+            launch_nint6_gs24_small_m_reuse(weight, qx.data_ptr<int8_t>(),              \
+                xscale.data_ptr<float>(), M, ng, K_pad, stream);                        \
+        } else if ((BITSVAL) == 5 && (GSVAL) == 28) {                                   \
             gemv_nint5_gs28_batch_kernel<1><<<dim3((N + 3) / 4, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
