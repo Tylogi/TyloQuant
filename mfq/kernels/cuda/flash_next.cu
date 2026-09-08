@@ -2,6 +2,7 @@
 // Keep its explicit FP32/FP16 boundaries, pool truncation, causal offset,
 // selected-index order, GR averaging and Sinkhorn iteration order.
 #include "flash_next.h"
+#include "mfq_sparse_attn_mma_f16.cuh"
 
 #include <cmath>
 #include <limits>
@@ -51,6 +52,29 @@ void attention_shapes(const Tensor& query, const Tensor& key, const Tensor& valu
         query.size(1) > 0 && query.size(1) % key.size(1) == 0 &&
         query.size(3) == key.size(3) && query.size(3) > 0,
         "Flash-Next GQA dimensions disagree");
+}
+
+__global__ void prepare_sparse_indices_kernel(
+    const int32_t * __restrict__ source,
+    int32_t * __restrict__ indices,
+    half * __restrict__ mask,
+    int64_t rows,
+    int source_count,
+    int padded_count,
+    int cache_length) {
+    const int64_t total = rows * padded_count;
+    for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int slot = static_cast<int>(linear % padded_count);
+        const int64_t row = linear / padded_count;
+        const int index = slot < source_count
+            ? source[row * source_count + slot]
+            : -1;
+        const bool valid = index >= 0 && index < cache_length;
+        indices[linear] = valid ? index : 0;
+        mask[linear] = valid ? __float2half(0.0f) : __float2half(-INFINITY);
+    }
 }
 
 // Each CTA retains the Metal kernel's eight warp partials and online-softmax
@@ -139,7 +163,8 @@ __global__ void sparse_attention_kernel(
 }
 
 Tensor sparse_attention(const Tensor& q, const Tensor& k, const Tensor& v,
-                        const Tensor& selected, double scale) {
+                        const Tensor& selected, double scale,
+                        bool v_is_k_view = false) {
     attention_shapes(q, k, v);
     MFQ_RUNTIME_CHECK(selected.defined() && selected.is_cuda() &&
         selected.device() == q.device() && selected.dim() == 3 &&
@@ -151,8 +176,59 @@ Tensor sparse_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     MfqCudaGuard guard(q.device());
     auto query = q.to(tb::kFloat32).contiguous();
     auto key = k.to(tb::kFloat16).contiguous();
-    auto value = v.to(tb::kFloat16).contiguous();
+    auto value = v_is_k_view ? key : v.to(tb::kFloat16).contiguous();
     auto indices = selected.to(tb::kInt32).contiguous();
+    if (q.size(0) == 0 || q.size(2) == 0) {
+        return tb::empty({q.size(0), q.size(2), q.size(1), q.size(3)},
+            q.options().dtype(tb::kFloat32));
+    }
+    if (key.size(2) == 0) {
+        return tb::zeros({q.size(0), q.size(2), q.size(1), q.size(3)},
+            q.options().dtype(tb::kFloat32));
+    }
+
+    const bool use_qsa_mma = !v_is_k_view && q.size(3) == 256;
+    const bool use_mla_mma = v_is_k_view && q.size(3) == 512;
+    if (use_qsa_mma || use_mla_mma) {
+        constexpr int index_tile = 32;
+        const int64_t source_count = indices.size(2);
+        MFQ_RUNTIME_CHECK(
+            source_count <= std::numeric_limits<int>::max() - index_tile &&
+            key.size(2) <= std::numeric_limits<int>::max(),
+            "Flash-Next sparse attention exceeds 32-bit index geometry");
+        const int64_t padded_count =
+            ((source_count + index_tile - 1) / index_tile) * index_tile;
+        auto shape = indices.sizes().vec();
+        shape[2] = padded_count;
+        auto safe_indices = tb::empty(shape, indices.options());
+        auto mask = tb::empty(shape, query.options().dtype(tb::kFloat16));
+        MFQ_RUNTIME_CHECK(
+            indices.size(0) <= std::numeric_limits<int64_t>::max() /
+                indices.size(1),
+            "Flash-Next sparse attention row count is too large");
+        const int64_t rows = indices.size(0) * indices.size(1);
+        MFQ_RUNTIME_CHECK(
+            rows <= std::numeric_limits<int64_t>::max() / padded_count,
+            "Flash-Next sparse attention index workspace is too large");
+        const int64_t total = rows * padded_count;
+        const int blocks = static_cast<int>(std::min<int64_t>(
+            65535, std::max<int64_t>(1, (total + 255) / 256)));
+        prepare_sparse_indices_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
+            indices.data_ptr<int32_t>(), safe_indices.data_ptr<int32_t>(),
+            reinterpret_cast<half *>(mask.data_ptr<mfq_half>()), rows,
+            static_cast<int>(source_count), static_cast<int>(padded_count),
+            static_cast<int>(key.size(2)));
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        if (use_qsa_mma) {
+            return mfq_sparse_attn_mma::launch<256, 256, 1, 16, false>(
+                query, key, value, safe_indices, mask, Tensor{}, Tensor{},
+                scale, "qwen4_sparse_gqa_attention");
+        }
+        return mfq_sparse_attn_mma::launch<512, 512, 1, 16, true>(
+            query, key, key, safe_indices, mask, Tensor{}, Tensor{},
+            scale, "glm5_sparse_mla_attention");
+    }
+
     auto output = tb::empty({q.size(0), q.size(2), q.size(1), q.size(3)},
         q.options().dtype(tb::kFloat32));
     if (output.numel() == 0) return output;
@@ -392,7 +468,8 @@ Tensor qwen4_dense_gqa_attention(const Tensor& q, const Tensor& k, const Tensor&
 
 Tensor qwen4_sparse_gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& indices) {
     attention_shapes(q, k, v);
-    return sparse_attention(q, k, v, indices, 1.0 / std::sqrt(double(q.size(3))));
+    return sparse_attention(q, k, v, indices,
+        1.0 / std::sqrt(double(q.size(3))), false);
 }
 
 Tensor glm5_dense_mla_attention(const Tensor& query, const Tensor& cache,
@@ -410,6 +487,6 @@ Tensor glm5_sparse_mla_attention(const Tensor& query, const Tensor& cache,
     MFQ_RUNTIME_CHECK(query.dim() == 4 && cache.dim() == 3,
         "GLM MLA requires [B,H,T,D] query and [B,K,D] cache");
     return sparse_attention(query, cache.unsqueeze(1), cache.unsqueeze(1), indices,
-        scale.value_or(1.0 / std::sqrt(double(query.size(3)))));
+        scale.value_or(1.0 / std::sqrt(double(query.size(3)))), true);
 }
 } // namespace mfq_flash_next

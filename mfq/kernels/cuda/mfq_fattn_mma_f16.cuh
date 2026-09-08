@@ -595,10 +595,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
-    constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2);
+    constexpr int  configured_nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
+    // Selected-token GQA gathers K and V through the same row index. Keep the
+    // single-buffer synchronous loader when K and V are separate tensors.
+    constexpr int  nstages         = use_indirect && !V_is_K_view ? 0 : configured_nstages;
 
-    static_assert(!use_indirect || V_is_K_view,
-                  "indirect attention requires V to be a K view");
     static_assert(!use_indirect || nstages <= 1,
                   "indirect attention does not support a multi-stage loader");
 
@@ -1223,10 +1224,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
-    constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2);
+    constexpr int  configured_nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
+    constexpr int  nstages         = use_indirect && !V_is_K_view ? 0 : configured_nstages;
 
-    static_assert(!use_indirect || V_is_K_view,
-                  "indirect attention requires V to be a K view");
     static_assert(!use_indirect || nstages <= 1,
                   "indirect attention does not support a multi-stage loader");
 
@@ -1760,8 +1760,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
                         if (!needs_fixup && !is_fixup) {
                             const float KQ_rowsum_j = meta_j[1];
-                            dstk_val.x /= KQ_rowsum_j;
-                            dstk_val.y /= KQ_rowsum_j;
+                            if (KQ_rowsum_j != 0.0f) {
+                                dstk_val.x /= KQ_rowsum_j;
+                                dstk_val.y /= KQ_rowsum_j;
+                            } else {
+                                dstk_val = make_float2(0.0f, 0.0f);
+                            }
                         }
 
                         if (is_fixup) {

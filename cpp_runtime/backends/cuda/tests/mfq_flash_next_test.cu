@@ -6,12 +6,127 @@
 #include "mfq_cuda_context.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <limits>
 #include <string>
+
+mfq_tensor_backend::Tensor attention_glm_mla_sparse_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv,
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor meta,
+    double scale);
+mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv,
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor mask,
+    mfq_tensor_backend::Tensor sinks, mfq_tensor_backend::Tensor meta,
+    double scale);
 
 namespace {
 using namespace mfq::cuda;
 using Json = nlohmann::json;
+
+void require_constant(
+    const Tensor& value, float expected, float tolerance, const char * name) {
+    const auto host = value.to(kFloat32).contiguous().cpu();
+    float maximum_error = 0.0f;
+    for (int64_t index = 0; index < host.numel(); ++index) {
+        maximum_error = std::max(
+            maximum_error,
+            std::abs(host.data_ptr<float>()[index] - expected));
+    }
+    if (maximum_error > tolerance) {
+        throw std::runtime_error(
+            std::string(name) + " mismatch, max_abs=" +
+            std::to_string(maximum_error));
+    }
+}
+
+void require_qsa_gqa_means(
+    const Tensor& value, float first, float second, float tolerance) {
+    const auto host = value.to(kFloat32).contiguous().cpu();
+    float maximum_error = 0.0f;
+    for (int head = 0; head < 24; ++head) {
+        const float expected = head < 12 ? first : second;
+        for (int width = 0; width < 256; ++width) {
+            maximum_error = std::max(
+                maximum_error,
+                std::abs(host.data_ptr<float>()[head * 256 + width] - expected));
+        }
+    }
+    if (maximum_error > tolerance) {
+        throw std::runtime_error(
+            "QSA sparse GQA mismatch, max_abs=" +
+            std::to_string(maximum_error));
+    }
+}
+
+void check_shared_sparse_attention() {
+    const auto float_cuda = TensorOptions{}.dtype(kFloat32).device(kCUDA);
+    const auto half_cuda = TensorOptions{}.dtype(kFloat16).device(kCUDA);
+    const auto int_cuda = TensorOptions{}.dtype(kInt32).device(kCUDA);
+    constexpr int selected_count = 2048;
+    std::vector<int32_t> selected(selected_count);
+    float glm_expected = 0.0f;
+    for (int index = 0; index < selected_count; ++index) {
+        selected[index] = (index * 37 + 11) % 256;
+        glm_expected += static_cast<float>(selected[index]);
+    }
+    glm_expected /= selected.size();
+    const auto indices = tensor(selected)
+        .reshape({1, 1, selected_count}).to(int_cuda);
+    auto meta = empty({4 << 20}, float_cuda);
+
+    const auto qsa_q = zeros({1, 24, 1, 256}, float_cuda);
+    const auto qsa_k = zeros({1, 2, 256, 256}, half_cuda);
+    const auto qsa_v = arange(512, float_cuda)
+        .reshape({1, 2, 256, 1}).expand({1, 2, 256, 256})
+        .contiguous().to(kFloat16);
+    require_qsa_gqa_means(
+        mfq_flash_next::qwen4_sparse_gqa_attention(
+            qsa_q, qsa_k, qsa_v, indices),
+        glm_expected, glm_expected + 256.0f, 6.0e-2f);
+
+    const auto glm_q = zeros({1, 64, 1, 576}, float_cuda);
+    const auto glm_kv = arange(256, float_cuda)
+        .reshape({1, 256, 1}).expand({1, 256, 576}).contiguous().to(kFloat16);
+    require_constant(
+        attention_glm_mla_sparse_cuda(glm_q, glm_kv, indices, meta, 1.0),
+        glm_expected, 2.0e-2f, "GLM sparse MLA");
+
+    const auto dsv_q = zeros({1, 64, 1, 512}, float_cuda);
+    const auto dsv_kv = arange(256, float_cuda)
+        .reshape({1, 256, 1}).expand({1, 256, 512}).contiguous().to(kFloat16);
+    std::vector<float> mask_values(selected_count, 0.0f);
+    float dsv_sum = 0.0f;
+    int dsv_count = 0;
+    for (int index = 0; index < selected_count; ++index) {
+        if (index % 5 == 0) {
+            mask_values[index] = -std::numeric_limits<float>::infinity();
+        } else {
+            dsv_sum += static_cast<float>(selected[index]);
+            ++dsv_count;
+        }
+    }
+    const auto mask = tensor(mask_values)
+        .reshape({1, 1, selected_count}).to(half_cuda);
+    const auto sinks = zeros({64}, float_cuda);
+    require_constant(
+        attention_dsv4_sparse_cuda(
+            dsv_q, dsv_kv, indices, mask, sinks, meta, 1.0),
+        dsv_sum / static_cast<float>(dsv_count + 1),
+        2.0e-2f, "DSV4 sparse attention");
+
+    const auto all_invalid_mask = full(
+        {1, 1, selected_count},
+        -std::numeric_limits<float>::infinity(), half_cuda);
+    const auto all_invalid_sinks = full(
+        {64}, -std::numeric_limits<float>::infinity(), float_cuda);
+    require_constant(
+        attention_dsv4_sparse_cuda(
+            dsv_q, dsv_kv, indices, all_invalid_mask,
+            all_invalid_sinks, meta, 1.0),
+        0.0f, 0.0f, "fully masked DSV4 sparse attention");
+}
 
 Tensor input(const Json& j) {
     if (j.is_null()) return {};
@@ -220,7 +335,8 @@ int main(int argc, char** argv) {
             auto got = mfq_flash_next::qsa_block_scores(q,k).cpu();
             for (int i = 0; i < 3; ++i)
                 if (got.data_ptr<float>()[i] != 4.f) throw std::runtime_error("QSA smoke mismatch");
-            std::cout << "Flash-Next native smoke passed\n";
+            check_shared_sparse_attention();
+            std::cout << "Flash-Next and shared sparse-attention native smoke passed\n";
             return 0;
         }
         if (std::string(argv[1]) != "--json") throw std::runtime_error("expected --json");
