@@ -534,7 +534,7 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                 static_cast<size_t>(local_page) * page_elements : nullptr;
         const int page_end = min(
             end, token + active_page_size - offset);
-        #pragma unroll 8
+        #pragma unroll 4
         for (; token < page_end; ++token, ++offset) {
             const size_t first_element =
                 (static_cast<size_t>(kv_head) * active_page_size + offset) * D +
