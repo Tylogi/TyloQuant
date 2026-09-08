@@ -476,20 +476,18 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
         }
     }
     __shared__ float warp_dot[Rep][Warps];
-    __shared__ float maximum[Rep];
-    __shared__ float denominator[Rep];
     __shared__ float previous_factor[Rep];
     __shared__ float probability[Rep];
     __shared__ uintptr_t key_page_address;
     __shared__ uintptr_t value_page_address;
-    if (tid < Rep) {
-        maximum[tid] = -1e30f;
-        denominator[tid] = 0.0f;
-    }
-    if constexpr (Warps == 1) {
-        __syncwarp();
-    } else {
-        __syncthreads();
+    float maximum[Rep];
+    float denominator[Rep];
+    if (tid == 0) {
+        #pragma unroll
+        for (int index = 0; index < Rep; ++index) {
+            maximum[index] = -1e30f;
+            denominator[index] = 0.0f;
+        }
     }
     const size_t page_elements =
         static_cast<size_t>(Hk) * active_page_size * D;
