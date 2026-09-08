@@ -705,15 +705,15 @@ __global__ void paged_attention_decode_reduce_kernel(
         if (tid == 0) denominator = sum;
     }
     __syncthreads();
-    float value_sum = 0.0f;
-    if (tid < D) {
+    for (int dimension = tid; dimension < D; dimension += Block) {
+        float value_sum = 0.0f;
         for (int part = 0; part < active_parts; ++part) {
             const size_t statistic =
                 static_cast<size_t>(query) * workspace_parts + part;
             value_sum += part_weight[part] *
-                partial_o[statistic * D + tid];
+                partial_o[statistic * D + dimension];
         }
-        output[static_cast<size_t>(query) * D + tid] =
+        output[static_cast<size_t>(query) * D + dimension] =
             static_cast<scalar_t>(value_sum /
                 (denominator > 0.0f ? denominator : 1.0f));
     }
@@ -988,8 +988,8 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
                     seq_len.data_ptr<int64_t>(), output.data_ptr<scalar_t>(), total,
                     Hq, D, split_parts, workspace_parts, dynamic_parts ? 1 : 0);
             } else if (D <= 256) {
-                paged_attention_decode_reduce_kernel<256, scalar_t><<<
-                    total, 256, 0, stream>>>(partial_o.data_ptr<float>(),
+                paged_attention_decode_reduce_kernel<128, scalar_t><<<
+                    total, 128, 0, stream>>>(partial_o.data_ptr<float>(),
                     partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),
                     seq_len.data_ptr<int64_t>(), output.data_ptr<scalar_t>(), total,
                     Hq, D, split_parts, workspace_parts, dynamic_parts ? 1 : 0);
