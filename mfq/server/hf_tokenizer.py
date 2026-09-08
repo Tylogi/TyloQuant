@@ -9,7 +9,16 @@ import secrets
 from pathlib import Path
 from typing import Any
 
-from mfq.formats.assets import minicpmo45_resampler_pos_embed_asset
+from mfq.formats.assets import (
+    HF_CHAT_TEMPLATE_ASSET,
+    HF_GENERATION_CONFIG_ASSET,
+    HF_TOKENIZER_CONFIG_ASSET,
+    HF_TOKENIZER_JSON_ASSET,
+    MODEL_CONFIG_ASSET,
+    TOKENIZER_GGUF_ASSET,
+    minicpmo45_resampler_pos_embed_asset,
+)
+from mfq.formats.io import open_mmap
 
 
 class HfTokenizerError(RuntimeError):
@@ -45,7 +54,7 @@ def _integer(value: object) -> int | None:
 
 
 def _tokenizer_pre(model_type: str) -> str:
-    if model_type in {"qwen3_5", "qwen3_6", "qwen3_8"}:
+    if model_type in {"qwen3_5", "qwen3_6", "qwen3_8", "qwen4_exp"}:
         return "qwen35"
     if model_type.startswith("minicpmo"):
         return "qwen2"
@@ -73,55 +82,66 @@ def _special_id(
     return next((value for item in candidates if (value := _integer(item)) is not None), None)
 
 
-def _fingerprint(root: Path) -> str:
+def _fingerprint_payloads(payloads: tuple[tuple[str, bytes], ...]) -> str:
     digest = hashlib.sha256()
     digest.update(b"mfq-hf-tokenizer-gguf-v2\0")
-    for name in (
-        "config.json",
-        "generation_config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-    ):
-        path = root / name
-        if path.is_file():
-            digest.update(name.encode("utf-8"))
-            digest.update(path.read_bytes())
+    for name, payload in payloads:
+        digest.update(name.encode("utf-8"))
+        digest.update(payload)
     return digest.hexdigest()[:20]
 
 
-def ensure_hf_tokenizer_gguf(
-    model_directory: str | Path,
-    cache_directory: str | Path | None = None,
-) -> Path:
-    """Return a reusable tokenizer-only GGUF for a supported HF checkpoint."""
+def _fingerprint(root: Path) -> str:
+    payloads = tuple(
+        (name, path.read_bytes())
+        for name in (
+            "config.json",
+            "generation_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        )
+        if (path := root / name).is_file()
+    )
+    return _fingerprint_payloads(payloads)
 
-    root = Path(model_directory).expanduser().resolve()
-    bundled = root / "tokenizer.gguf"
-    if bundled.is_file():
-        return bundled
-    if not root.is_dir():
-        raise HfTokenizerError(f"HF model directory does not exist: {root}")
 
-    tokenizer = _read_json(root / "tokenizer.json")
-    tokenizer_config = _read_json(root / "tokenizer_config.json")
-    config = _read_json(root / "config.json")
-    generation_path = root / "generation_config.json"
-    generation_config = _read_json(generation_path) if generation_path.is_file() else {}
-    model_type = config.get("model_type")
-    if not isinstance(model_type, str) or not model_type:
-        raise HfTokenizerError("HF config.json has no model_type")
-
-    cache_root = (
+def _cache_root(cache_directory: str | Path | None) -> Path:
+    root = (
         Path(cache_directory).expanduser().resolve()
         if cache_directory is not None
         else Path(os.environ.get("MFQ_SERVER_TOKENIZER_CACHE_DIR", "~/.cache/mfq/tokenizers"))
         .expanduser()
         .resolve()
     )
-    cache_root.mkdir(parents=True, exist_ok=True)
-    output = cache_root / f"{root.name}-{_fingerprint(root)}.tokenizer.gguf"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _json_payload(payload: bytes, name: str) -> dict[str, Any]:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HfTokenizerError(f"cannot read embedded {name}") from error
+    if not isinstance(value, dict):
+        raise HfTokenizerError(f"invalid embedded {name}")
+    return value
+
+
+def _write_tokenizer_gguf(
+    *,
+    output: Path,
+    model_name: str,
+    tokenizer: dict[str, Any],
+    tokenizer_config: dict[str, Any],
+    config: dict[str, Any],
+    generation_config: dict[str, Any],
+) -> Path:
     if output.is_file() and output.stat().st_size > 0:
         return output
+
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str) or not model_type:
+        raise HfTokenizerError("HF config.json has no model_type")
 
     model = tokenizer.get("model")
     if not isinstance(model, dict) or model.get("type") != "BPE":
@@ -197,7 +217,7 @@ def ensure_hf_tokenizer_gguf(
     try:
         writer = GGUFWriter(temporary, "llama")
         try:
-            writer.add_name(root.name)
+            writer.add_name(model_name)
             writer.add_tokenizer_model("gpt2")
             writer.add_tokenizer_pre(_tokenizer_pre(model_type))
             writer.add_token_list(tokens)
@@ -231,6 +251,123 @@ def ensure_hf_tokenizer_gguf(
         temporary.unlink(missing_ok=True)
         raise
     return output
+
+
+def ensure_hf_tokenizer_gguf(
+    model_directory: str | Path,
+    cache_directory: str | Path | None = None,
+) -> Path:
+    """Return a reusable tokenizer-only GGUF for a supported HF checkpoint."""
+
+    root = Path(model_directory).expanduser().resolve()
+    bundled = root / "tokenizer.gguf"
+    if bundled.is_file():
+        return bundled
+    if not root.is_dir():
+        raise HfTokenizerError(f"HF model directory does not exist: {root}")
+
+    tokenizer = _read_json(root / "tokenizer.json")
+    tokenizer_config = _read_json(root / "tokenizer_config.json")
+    config = _read_json(root / "config.json")
+    generation_path = root / "generation_config.json"
+    generation_config = _read_json(generation_path) if generation_path.is_file() else {}
+    output = _cache_root(cache_directory) / (
+        f"{root.name}-{_fingerprint(root)}.tokenizer.gguf"
+    )
+    return _write_tokenizer_gguf(
+        output=output,
+        model_name=root.name,
+        tokenizer=tokenizer,
+        tokenizer_config=tokenizer_config,
+        config=config,
+        generation_config=generation_config,
+    )
+
+
+def ensure_mfq_tokenizer_gguf(
+    model_file: str | Path,
+    cache_directory: str | Path | None = None,
+) -> Path:
+    """Build a reusable tokenizer GGUF from assets embedded in an MFQ model."""
+
+    path = Path(model_file).expanduser().resolve()
+    if not path.is_file():
+        raise HfTokenizerError(f"MFQ model does not exist: {path}")
+    with open_mmap(path) as store:
+        if TOKENIZER_GGUF_ASSET in store.records:
+            payload = store.read_blob(TOKENIZER_GGUF_ASSET)
+            fingerprint = hashlib.sha256(payload).hexdigest()[:20]
+            output = _cache_root(cache_directory) / (
+                f"{path.stem}-{fingerprint}.tokenizer.gguf"
+            )
+            if output.is_file() and output.stat().st_size > 0:
+                return output
+            temporary = output.with_name(
+                f".{output.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+            )
+            temporary.unlink(missing_ok=True)
+            try:
+                temporary.write_bytes(payload)
+                os.replace(temporary, output)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return output
+        required = (
+            MODEL_CONFIG_ASSET,
+            HF_TOKENIZER_JSON_ASSET,
+            HF_TOKENIZER_CONFIG_ASSET,
+        )
+        missing = [name for name in required if name not in store.records]
+        if missing:
+            raise HfTokenizerError(
+                "MFQ model has no embedded native tokenizer metadata: "
+                + ", ".join(missing)
+            )
+        payloads = tuple(
+            (name, store.read_blob(name))
+            for name in (
+                MODEL_CONFIG_ASSET,
+                HF_TOKENIZER_JSON_ASSET,
+                HF_TOKENIZER_CONFIG_ASSET,
+                HF_GENERATION_CONFIG_ASSET,
+                HF_CHAT_TEMPLATE_ASSET,
+            )
+            if name in store.records
+        )
+
+    values = dict(payloads)
+    tokenizer = _json_payload(values[HF_TOKENIZER_JSON_ASSET], "tokenizer.json")
+    tokenizer_config = _json_payload(
+        values[HF_TOKENIZER_CONFIG_ASSET], "tokenizer_config.json"
+    )
+    config = _json_payload(values[MODEL_CONFIG_ASSET], "model_config.json")
+    generation_config = (
+        _json_payload(values[HF_GENERATION_CONFIG_ASSET], "generation_config.json")
+        if HF_GENERATION_CONFIG_ASSET in values
+        else {}
+    )
+    if not isinstance(tokenizer_config.get("chat_template"), (str, list)):
+        template = values.get(HF_CHAT_TEMPLATE_ASSET)
+        if template is not None:
+            try:
+                tokenizer_config["chat_template"] = template.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise HfTokenizerError(
+                    "cannot read embedded chat_template.jinja"
+                ) from error
+
+    model_name = path.stem
+    output = _cache_root(cache_directory) / (
+        f"{model_name}-{_fingerprint_payloads(payloads)}.tokenizer.gguf"
+    )
+    return _write_tokenizer_gguf(
+        output=output,
+        model_name=model_name,
+        tokenizer=tokenizer,
+        tokenizer_config=tokenizer_config,
+        config=config,
+        generation_config=generation_config,
+    )
 
 
 def native_hf_asset_environment(
@@ -271,5 +408,6 @@ def native_hf_asset_environment(
 __all__ = [
     "HfTokenizerError",
     "ensure_hf_tokenizer_gguf",
+    "ensure_mfq_tokenizer_gguf",
     "native_hf_asset_environment",
 ]

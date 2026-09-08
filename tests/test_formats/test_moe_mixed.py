@@ -5,6 +5,7 @@ import pytest
 
 from mfq.formats import io
 from mfq.formats.moe import NintMoePool, NintMoeTensor
+from mfq.formats.mx import MxTensor
 from mfq.formats.nepq import NEPQ0_L, NEPQ0_S, NEPQ1_L, NEPQ1_S
 from mfq.formats.nint import NintSpec
 from mfq.quantize.nint_quant import quantize
@@ -61,3 +62,23 @@ def test_nintm_v2_roundtrips_every_nint_family(spec):
     )
     restored = io.unpack_nint_moe(io.pack_nint_moe(container))
     assert restored.expert_profiles == (spec.profile_label, spec.profile_label)
+
+
+def test_nintm_v2_roundtrips_native_mxfp8_and_dense_expert_cohorts():
+    values = np.tile(np.arange(128, dtype=np.uint8) % 127, (2, 1))
+    scales = np.full((1, 1), 127, dtype=np.uint8)
+    mxfp8 = MxTensor("MXFP8", (2, 128), values, scales)
+    bf16 = np.full((2, 128), 0x3F80, dtype="<u2").view(io.BFloat16Array)
+    f16 = np.full((2, 128), np.float16(0.5), dtype=np.float16)
+    container = NintMoeTensor(
+        (3, 2, 128),
+        (
+            NintMoePool(np.asarray([1], dtype=np.int32), bf16),
+            NintMoePool(np.asarray([2], dtype=np.int32), f16),
+            NintMoePool(np.asarray([0], dtype=np.int32), mxfp8),
+        ),
+    )
+    blob = io.pack_nint_moe(container)
+    restored = io.unpack_nint_moe(blob)
+    assert restored.expert_profiles == ("MXFP8", "BF16", "F16")
+    assert io.pack_nint_moe(restored) == blob

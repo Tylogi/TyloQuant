@@ -416,6 +416,27 @@ constexpr const char* kReduceSharedGateSource = R"METAL(
         T(float(routed_value) + gate * float(shared[index]));
 )METAL";
 
+constexpr const char* kReduceSharedGateSortedSource = R"METAL(
+    uint index = thread_position_in_grid.x;
+    if (index >= uint(TOKENS * WIDTH)) {
+        return;
+    }
+    uint token = index / uint(WIDTH);
+    uint column = index - token * uint(WIDTH);
+    float value = 0.0f;
+    for (uint route = 0u; route < uint(ROUTES); ++route) {
+        uint original_row = token * uint(ROUTES) + route;
+        uint sorted_row = uint(inverse_route_order[original_row]);
+        value += float(sorted_pair_output[
+            sorted_row * uint(WIDTH) + column
+        ]) * weights[original_row];
+    }
+    T routed_value = T(value);
+    float gate = 1.0f / (1.0f + exp(-gate_logits[token]));
+    output[index] =
+        T(float(routed_value) + gate * float(shared[index]));
+)METAL";
+
 constexpr const char* kExpertScaleSource = R"METAL(
     uint index = thread_position_in_grid.x;
     if (index >= uint(SIZE)) {
@@ -552,6 +573,22 @@ reduce_shared_gate_kernel() {
         {"pair_output", "weights", "shared", "gate_logits"},
         {"output"},
         kReduceSharedGateSource);
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+reduce_shared_gate_sorted_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_moe_reduce_shared_gate_sorted",
+        {
+            "sorted_pair_output",
+            "inverse_route_order",
+            "weights",
+            "shared",
+            "gate_logits",
+        },
+        {"output"},
+        kReduceSharedGateSortedSource);
     return kernel;
 }
 
@@ -1180,6 +1217,59 @@ array moe_weighted_reduce_shared_gate(
         "fused reduce/shared gate size");
     auto outputs = reduce_shared_gate_kernel()(
         {pairs, route_weights, shared_values, gates},
+        {Shape{tokens, width}},
+        {pairs.dtype()},
+        {size, 1, 1},
+        {std::min(kThreads, size), 1, 1},
+        {
+            {"T", pairs.dtype()},
+            {"TOKENS", tokens},
+            {"ROUTES", routes},
+            {"WIDTH", width},
+        },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
+array moe_weighted_reduce_shared_gate_sorted(
+    const array& sorted_pair_output,
+    const array& inverse_route_order,
+    const array& weights,
+    const array& shared,
+    const array& gate_logits) {
+    auto pairs = floating_contiguous(sorted_pair_output);
+    auto inverse = int32_contiguous(inverse_route_order);
+    auto route_weights = float32_contiguous(weights);
+    auto shared_values = floating_contiguous(shared);
+    if (pairs.ndim() != 2 || inverse.ndim() != 1
+        || route_weights.ndim() != 2) {
+        throw std::invalid_argument(
+            "MoE sorted fused reduction rank mismatch");
+    }
+    const int tokens = route_weights.shape(0);
+    const int routes = route_weights.shape(1);
+    const int width = pairs.shape(1);
+    const auto route_count = static_cast<std::size_t>(tokens)
+        * static_cast<std::size_t>(routes);
+    if (tokens <= 0 || routes <= 0 || width <= 0
+        || pairs.shape(0) != checked_int(route_count, "sorted route count")
+        || inverse.size() != route_count
+        || shared_values.shape() != Shape{tokens, width}) {
+        throw std::invalid_argument(
+            "MoE sorted fused reduce/shared gate shape mismatch");
+    }
+    if (shared_values.dtype() != pairs.dtype()) {
+        shared_values = mlx::core::contiguous(
+            mlx::core::astype(shared_values, pairs.dtype()));
+    }
+    auto gates = reshape_gate_logits(gate_logits, tokens);
+    const int size = checked_int(
+        static_cast<std::size_t>(tokens) * width,
+        "sorted fused reduce/shared gate size");
+    auto outputs = reduce_shared_gate_sorted_kernel()(
+        {pairs, inverse, route_weights, shared_values, gates},
         {Shape{tokens, width}},
         {pairs.dtype()},
         {size, 1, 1},

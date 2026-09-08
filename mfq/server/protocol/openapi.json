@@ -4774,6 +4774,13 @@
             "title": "Max Tokens",
             "type": "integer"
           },
+          "mtp_max_draft_tokens": {
+            "default": 3,
+            "maximum": 5,
+            "minimum": 1,
+            "title": "Mtp Max Draft Tokens",
+            "type": "integer"
+          },
           "presence_penalty": {
             "default": 0.0,
             "maximum": 2.0,

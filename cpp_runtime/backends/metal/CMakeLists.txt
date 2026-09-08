@@ -8,6 +8,7 @@ set(MFQ_METAL_INCLUDE_DIRS
     ${MFQ_METAL_ROOT}/ops
     ${MFQ_METAL_ROOT}/legacy/tpq
     ${MFQ_METAL_ROOT}/models/deepseek_v4
+    ${MFQ_METAL_ROOT}/models/flash_next
     ${MFQ_METAL_ROOT}/models/qwen35
     ${MFQ_METAL_ROOT}/models/minicpmo45
 )
@@ -95,6 +96,10 @@ foreach(_MFQ_METAL_SYSTEM_HEADER
     file(TOUCH
         "${_MFQ_STEEL_STUB_DIR}/${_MFQ_METAL_SYSTEM_HEADER}")
 endforeach()
+file(MAKE_DIRECTORY
+    "${_MFQ_STEEL_STUB_DIR}/MetalPerformancePrimitives")
+file(TOUCH
+    "${_MFQ_STEEL_STUB_DIR}/MetalPerformancePrimitives/MetalPerformancePrimitives.h")
 set(_MFQ_STEEL_ENTRY
     "${CMAKE_CURRENT_BINARY_DIR}/mfq_steel_mma_entry.h")
 file(WRITE "${_MFQ_STEEL_ENTRY}"
@@ -113,6 +118,26 @@ if(NOT _MFQ_STEEL_EXPAND_RESULT EQUAL 0)
     message(FATAL_ERROR
         "Failed to embed MLX Steel MMA headers: "
         "${_MFQ_STEEL_EXPAND_ERROR}")
+endif()
+set(_MFQ_STEEL_NAX_ENTRY
+    "${CMAKE_CURRENT_BINARY_DIR}/mfq_steel_nax_entry.h")
+file(WRITE "${_MFQ_STEEL_NAX_ENTRY}"
+    "#include \"mlx/backend/metal/kernels/complex.h\"\n"
+    "#include \"mlx/backend/metal/kernels/steel/gemm/mma.h\"\n"
+    "#include \"mlx/backend/metal/kernels/steel/gemm/nax.h\"\n")
+execute_process(
+    COMMAND "${CMAKE_CXX_COMPILER}" -E -P -x c++
+        -D__METAL_VERSION__=320
+        "-I${MFQ_MLX_ROOT}/include"
+        "-I${_MFQ_STEEL_STUB_DIR}"
+        "${_MFQ_STEEL_NAX_ENTRY}"
+    RESULT_VARIABLE _MFQ_STEEL_NAX_EXPAND_RESULT
+    OUTPUT_VARIABLE MFQ_STEEL_NAX_SOURCE
+    ERROR_VARIABLE _MFQ_STEEL_NAX_EXPAND_ERROR)
+if(NOT _MFQ_STEEL_NAX_EXPAND_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "Failed to embed MLX Steel NAX headers: "
+        "${_MFQ_STEEL_NAX_EXPAND_ERROR}")
 endif()
 set(_MFQ_STEEL_ATTN_ENTRY
     "${CMAKE_CURRENT_BINARY_DIR}/mfq_steel_attn_entry.h")
@@ -152,11 +177,22 @@ string(REPLACE
     ""
     MFQ_DSV4_SPARSE_PREFILL_SOURCE
     "${MFQ_DSV4_SPARSE_PREFILL_SOURCE}")
+set(_MFQ_SPARSE_BLOCK_GQA_METAL
+    "${MFQ_METAL_ROOT}/kernels/mfq_sparse_block_gqa.metal")
+file(READ "${_MFQ_SPARSE_BLOCK_GQA_METAL}"
+    MFQ_SPARSE_BLOCK_GQA_SOURCE)
+string(REPLACE
+    "#include \"mlx/backend/metal/kernels/steel/attn/attn.h\""
+    ""
+    MFQ_SPARSE_BLOCK_GQA_SOURCE
+    "${MFQ_SPARSE_BLOCK_GQA_SOURCE}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_MFQ_NINTM_PREFILL_METAL}"
     "${_MFQ_DSV4_SPARSE_PREFILL_METAL}"
+    "${_MFQ_SPARSE_BLOCK_GQA_METAL}"
     "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/attn/attn.h"
-    "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/gemm/mma.h")
+    "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/gemm/mma.h"
+    "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/gemm/nax.h")
 configure_file(
     "${MFQ_METAL_ROOT}/kernels/mfq_nintm_prefill_embedded.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/mfq_nintm_prefill_embedded.h"
@@ -185,6 +221,7 @@ add_library(mfq-metal-runtime STATIC
     ops/mlx_mxfp4_sq3.cpp
     ops/mlx_nint.cpp
     ops/mlx_nint8_zero.cpp
+    ops/mlx_sparse_attention.cpp
     ops/mlx_vq.cpp
     # Isolated compatibility reader/operator for old TPQ artifacts only.
     legacy/tpq/mlx_tpq.cpp
@@ -196,6 +233,8 @@ add_library(mfq-metal-runtime STATIC
     models/deepseek_v4/mlx_deepseek_v4_moe.cpp
     models/deepseek_v4/mlx_deepseek_v4_sparse.cpp
     models/deepseek_v4/mlx_deepseek_v4_vision.cpp
+    models/flash_next/mlx_qwen4_causal_lm.cpp
+    models/flash_next/qwen4_ops.cpp
     models/minicpmo45/mlx_minicpmo45.cpp
     models/qwen35/mlx_qwen35_causal_lm.cpp
     models/qwen35/mlx_qwen35_full_attention.cpp
@@ -923,6 +962,54 @@ set_target_properties(mfq-metal-qwen35-config-test PROPERTIES
 add_test(
     NAME mfq-metal-qwen35-config-test
     COMMAND mfq-metal-qwen35-config-test
+)
+
+add_executable(mfq-metal-qwen4-config-test
+    tests/qwen4_config_test.cpp
+)
+target_link_libraries(mfq-metal-qwen4-config-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-qwen4-config-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-qwen4-config-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-qwen4-config-test
+    COMMAND mfq-metal-qwen4-config-test
+)
+
+add_executable(mfq-metal-sparse-attention-test
+    tests/mlx_sparse_attention_test.cpp
+)
+target_link_libraries(mfq-metal-sparse-attention-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-sparse-attention-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-sparse-attention-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-sparse-attention-test
+    COMMAND mfq-metal-sparse-attention-test
+)
+
+add_executable(mfq-metal-qwen-gated-hc-test
+    tests/qwen_gated_hc_test.cpp
+)
+target_link_libraries(mfq-metal-qwen-gated-hc-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-qwen-gated-hc-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-qwen-gated-hc-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-qwen-gated-hc-test
+    COMMAND mfq-metal-qwen-gated-hc-test
 )
 
 add_executable(mfq-metal-grid-vision-test

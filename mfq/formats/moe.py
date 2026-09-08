@@ -30,6 +30,7 @@ ExpertPoolTensor: TypeAlias = (
     | NepqTensor
     | TpqPqTensor
     | MxTensor
+    | np.ndarray
 )
 
 
@@ -39,11 +40,18 @@ def expert_tensor_family(tensor: ExpertPoolTensor) -> str:
     if isinstance(tensor, Nint8ZeroTensor):
         return "NINT8-0"
     if isinstance(tensor, MxTensor):
-        if tensor.dtype != "MXFP4":
-            raise ValueError(
-                f"NINTM supports native MXFP4 expert pools, got {tensor.dtype}"
-            )
+        if tensor.dtype not in {"MXFP4", "MXFP8"}:
+            raise ValueError(f"NINTM supports native MXFP4/MXFP8 expert pools, got {tensor.dtype}")
         return tensor.dtype
+    if isinstance(tensor, np.ndarray):
+        if tensor.dtype == np.dtype(np.float16):
+            return "F16"
+        # BF16 is represented by io.BFloat16Array, a tagged uint16 ndarray.
+        # Avoid importing io here because io owns the NINTM codec and imports
+        # this module.
+        if tensor.dtype == np.dtype("<u2") and type(tensor).__name__ == "BFloat16Array":
+            return "BF16"
+        raise ValueError(f"NINTM dense expert pools support BF16/F16, got {tensor.dtype}")
     if isinstance(tensor, NintTensor):
         return tensor.spec.profile_label
     if isinstance(tensor, NepqTensor):
@@ -73,9 +81,7 @@ def expert_tensor_family(tensor: ExpertPoolTensor) -> str:
             "d4_256": "NVQ3",
         }.get(tensor.spec.codebook)
         if family is None:
-            raise ValueError(
-                f"{tensor.spec.codebook} requires an NvqJscTensor expert profile"
-            )
+            raise ValueError(f"{tensor.spec.codebook} requires an NvqJscTensor expert profile")
         return family
     raise TypeError(f"unsupported NINTM cohort tensor: {type(tensor)!r}")
 
@@ -119,7 +125,7 @@ class NintMoeTensor:
             if isinstance(tensor, NepqTensor):
                 expected_shape = (expert_ids.size, out_per_expert, neuron_len)
                 valid = tuple(tensor.shape) == expected_shape
-            elif isinstance(tensor, MxTensor):
+            elif isinstance(tensor, (MxTensor, np.ndarray)):
                 expected_shape = (expert_ids.size * out_per_expert, neuron_len)
                 valid = tuple(tensor.shape) == expected_shape
             else:

@@ -769,10 +769,10 @@ class MlxNintModel:
         )
 
     def routed(self, name: str):
-        """Load one NINTM routed projection, preserving mmap bit-packing."""
+        """Load one packed or source-precision routed projection."""
 
         from mfq.kernels.metal.moe import UnsupportedGroupedMoeError
-        from mfq.runtime.mlx_moe import MlxRoutedLinear
+        from mfq.runtime.mlx_moe import MlxDenseRoutedLinear, MlxRoutedLinear
 
         if hasattr(self.tensors, "records") and hasattr(self.tensors, "blob_view"):
             if name not in self.tensors.records:
@@ -787,10 +787,15 @@ class MlxNintModel:
                         pass
                 finally:
                     view.release()
+                    evict_blob = getattr(self.tensors, "evict_blob", None)
+                    if callable(evict_blob):
+                        evict_blob(record)
         tensor = self._require(name)
-        if not isinstance(tensor, NintMoeTensor):
-            raise TypeError(f"tensor {name!r} must use NINTM")
-        return MlxRoutedLinear(tensor)
+        if isinstance(tensor, NintMoeTensor):
+            return MlxRoutedLinear(tensor)
+        if isinstance(tensor, np.ndarray) and tensor.ndim == 3:
+            return MlxDenseRoutedLinear(tensor)
+        raise TypeError(f"tensor {name!r} must use NINTM or a dense 3D expert bank")
 
     def close(self) -> None:
         close = getattr(self.tensors, "close", None)

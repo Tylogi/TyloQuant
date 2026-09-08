@@ -629,4 +629,19 @@ MlxServerComponentCallbacks make_mlx_server_components(
     return result;
 }
 
+MlxServerComponentCallbacks make_mlx_server_components(
+    const MfqModelGraph* graph,
+    std::shared_ptr<std::mutex>,
+    std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime_holder,
+    mlx::core::Stream) {
+    MlxServerComponentCallbacks result;
+    result.duplex.name = "metal";
+    result.mtp_available =
+        component_with_implementation(
+            graph, "predictor", "next_token_prediction") != nullptr &&
+        runtime_holder->has_value() &&
+        runtime_holder->value().supports_mtp();
+    return result;
+}
+
 } // namespace mfq::metal

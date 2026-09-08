@@ -1,4 +1,5 @@
 #include "mlx_deepseek_v4_sparse.h"
+#include "mlx_sparse_attention.h"
 #include "mfq_nintm_prefill_embedded.h"
 
 #include <mlx/backend/metal/device.h>
@@ -185,134 +186,6 @@ constexpr int kIndexerDimension = 128;
 constexpr int kAttentionHeads = 64;
 constexpr int kAttentionDimension = 512;
 
-struct Dsv4SparsePrefillParams {
-    std::int32_t batch = 0;
-    std::int32_t queries = 0;
-    std::int32_t keys = 0;
-    std::int32_t selected = 0;
-    float scale = 0.0f;
-};
-
-class Dsv4SparsePrefillPrimitive final
-    : public mlx::core::UnaryPrimitive {
-public:
-    Dsv4SparsePrefillPrimitive(
-        mlx::core::Stream stream,
-        Dsv4SparsePrefillParams params)
-        : UnaryPrimitive(stream),
-          params_(params) {}
-
-    void eval_cpu(
-        const std::vector<array>&,
-        array&) override {
-        throw std::runtime_error(
-            "Steel DSV4 sparse prefill has no CPU path");
-    }
-
-    void eval_gpu(
-        const std::vector<array>& inputs,
-        array& output) override {
-        if (inputs.size() != 5) {
-            throw std::logic_error(
-                "Steel DSV4 sparse prefill input count mismatch");
-        }
-        output.set_data(
-            mlx::core::allocator::malloc(output.nbytes()));
-        auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(
-            selected_stream.device);
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(
-            "mfq_dsv4_sparse_prefill_v1",
-            options,
-            [] {
-                std::string source;
-                source.reserve(
-                    sizeof(detail::kSteelAttentionSource)
-                    + sizeof(detail::kDsv4SparsePrefillSource)
-                    + 160);
-                source += "#include <metal_stdlib>\n";
-                source += "#include <metal_simdgroup>\n";
-                source += "#include <metal_simdgroup_matrix>\n";
-                source += "using namespace metal;\n";
-                source += "using bfloat16_t = bfloat;\n";
-                source += detail::kSteelAttentionSource;
-                source += detail::kDsv4SparsePrefillSource;
-                return source;
-            });
-        auto* kernel = device.get_kernel(
-            "mfq_dsv4_sparse_prefill_f16_bk256_dc32",
-            library);
-        auto& encoder =
-            mlx::core::metal::get_command_encoder(
-                selected_stream);
-        encoder.set_compute_pipeline_state(kernel);
-        for (int index = 0; index < 5; ++index) {
-            encoder.set_input_array(
-                inputs[static_cast<std::size_t>(index)],
-                index);
-        }
-        encoder.set_output_array(output, 5);
-        encoder.set_bytes(params_, 6);
-        encoder.dispatch_threadgroups(
-            MTL::Size(params_.queries, params_.batch, 1),
-            MTL::Size(32, 8, 1));
-    }
-
-    const char* name() const override {
-        return "Dsv4SparsePrefillPrimitive";
-    }
-
-    bool is_equivalent(
-        const mlx::core::Primitive& other) const override {
-        const auto* primitive = dynamic_cast<
-            const Dsv4SparsePrefillPrimitive*>(&other);
-        return primitive != nullptr
-            && primitive->params_.batch == params_.batch
-            && primitive->params_.queries == params_.queries
-            && primitive->params_.keys == params_.keys
-            && primitive->params_.selected == params_.selected
-            && primitive->params_.scale == params_.scale;
-    }
-
-    std::vector<Shape> output_shapes(
-        const std::vector<array>&) override {
-        return {Shape{
-            params_.batch,
-            params_.queries,
-            kAttentionHeads,
-            kAttentionDimension,
-        }};
-    }
-
-private:
-    Dsv4SparsePrefillParams params_;
-};
-
-array dsv4_sparse_prefill_steel(
-    std::vector<array> inputs,
-    Dsv4SparsePrefillParams params) {
-    auto stream = mlx::core::default_stream(
-        mlx::core::default_device());
-    if (stream.device != mlx::core::Device::gpu) {
-        throw std::invalid_argument(
-            "Steel DSV4 sparse prefill requires Metal");
-    }
-    return array(
-        Shape{
-            params.batch,
-            params.queries,
-            kAttentionHeads,
-            kAttentionDimension,
-        },
-        mlx::core::float16,
-        std::make_shared<Dsv4SparsePrefillPrimitive>(
-            stream,
-            params),
-        std::move(inputs));
-}
-
 #include "mlx_deepseek_v4_sparse_kernels.inc"
 
 Kernel make_kernel(
@@ -447,50 +320,6 @@ const Kernel& decode_plan_kernel() {
         {"topk", "seq_len"},
         {"indices", "mask"},
         kDecodePlanSource);
-    return kernel;
-}
-
-const Kernel& sparse_attention_kernel() {
-    static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_sparse_attention",
-        {"q", "kv", "indices", "mask", "sinks", "params"},
-        {"out"},
-        kSparseAttentionSource);
-    return kernel;
-}
-
-const Kernel& sparse_attention_prefill_mma_kernel() {
-    static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_sparse_attention_prefill_mma",
-        {"q", "kv", "indices", "mask", "sinks", "params"},
-        {"out"},
-        kSparseAttentionPrefillMmaSource);
-    return kernel;
-}
-
-const Kernel& sparse_attention_decode_kernel() {
-    static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_sparse_attention_decode",
-        {"q", "kv", "indices", "mask", "sinks", "params"},
-        {"out"},
-        kSparseAttentionDecodeSource);
-    return kernel;
-}
-
-const Kernel& sparse_attention_direct_decode_kernel() {
-    static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_sparse_attention_direct_decode",
-        {
-            "q",
-            "local_kv",
-            "pooled_kv",
-            "topk",
-            "sinks",
-            "params",
-            "decode_params",
-        },
-        {"out"},
-        kSparseAttentionDirectDecodeSource);
     return kernel;
 }
 
@@ -1493,138 +1322,13 @@ array attention_dsv4_sparse(
     const std::optional<array>& meta,
     std::optional<float> scale) {
     (void)meta;
-    auto query = typed_contiguous(
+    return mlx_sparse_selected_mla_attention(
         q,
-        mlx::core::float32);
-    auto cache = typed_contiguous(
         kv,
-        mlx::core::float16);
-    auto selected_indices = typed_contiguous(
         indices,
-        mlx::core::int32);
-    auto selected_mask = typed_contiguous(
         mask,
-        mlx::core::float16);
-    auto sink_logits = typed_contiguous(
         sinks,
-        mlx::core::float32);
-    if (query.ndim() != 4 ||
-        query.shape(0) <= 0 ||
-        query.shape(1) != kAttentionHeads ||
-        query.shape(2) <= 0 ||
-        query.shape(3) != kAttentionDimension ||
-        cache.ndim() != 3 ||
-        cache.shape(0) != query.shape(0) ||
-        cache.shape(1) <= 0 ||
-        cache.shape(2) != kAttentionDimension ||
-        selected_indices.ndim() != 3 ||
-        selected_mask.shape() !=
-            selected_indices.shape() ||
-        selected_indices.shape(0) != query.shape(0) ||
-        selected_indices.shape(1) != query.shape(2) ||
-        selected_indices.shape(2) <= 0 ||
-        selected_indices.shape(2) % 32 != 0 ||
-        sink_logits.size() != kAttentionHeads) {
-        throw std::invalid_argument(
-            "DSV4 sparse attention shape mismatch");
-    }
-    const float selected_scale = scale.value_or(
-        1.0f /
-        std::sqrt(
-            static_cast<float>(
-                kAttentionDimension)));
-    if (!std::isfinite(selected_scale) ||
-        selected_scale <= 0.0f) {
-        throw std::invalid_argument(
-            "DSV4 sparse attention scale must be finite and positive");
-    }
-    const int batch = query.shape(0);
-    const int queries = query.shape(2);
-    const int max_seq = cache.shape(1);
-    const int selected = selected_indices.shape(2);
-    const array params(
-        {selected_scale},
-        mlx::core::float32);
-    const Shape output_shape{
-        batch,
-        queries,
-        kAttentionHeads,
-        kAttentionDimension,
-    };
-    const TemplateArgs templates{
-        {"B", batch},
-        {"M", queries},
-        {"MAX_SEQ", max_seq},
-        {"SELECTED", selected},
-    };
-    if (queries >= 32) {
-        auto half_query = typed_contiguous(
-            q,
-            mlx::core::float16);
-        auto half_sinks = typed_contiguous(
-            sinks,
-            mlx::core::float16);
-        return dsv4_sparse_prefill_steel(
-            {
-                std::move(half_query),
-                cache,
-                selected_indices,
-                selected_mask,
-                std::move(half_sinks),
-            },
-            Dsv4SparsePrefillParams{
-                .batch = batch,
-                .queries = queries,
-                .keys = max_seq,
-                .selected = selected,
-                .scale = selected_scale,
-            });
-    }
-    if (queries == 1) {
-        const int grid = checked_product(
-            {batch, queries, 16, 128},
-            "sparse decode attention grid");
-        auto outputs =
-            sparse_attention_decode_kernel()(
-                {
-                    query,
-                    cache,
-                    selected_indices,
-                    selected_mask,
-                    sink_logits,
-                    params,
-                },
-                {output_shape},
-                {mlx::core::float32},
-                {grid, 1, 1},
-                {128, 1, 1},
-                templates,
-                std::nullopt,
-                false,
-                {});
-        return std::move(outputs.front());
-    }
-    const int grid = checked_product(
-        {batch, queries, kAttentionHeads, 256},
-        "sparse attention grid");
-    auto outputs = sparse_attention_kernel()(
-        {
-            query,
-            cache,
-            selected_indices,
-            selected_mask,
-            sink_logits,
-            params,
-        },
-        {output_shape},
-        {mlx::core::float32},
-        {grid, 1, 1},
-        {256, 1, 1},
-        templates,
-        std::nullopt,
-        false,
-        {});
-    return std::move(outputs.front());
+        scale);
 }
 
 array attention_dsv4_sparse_decode(
@@ -1638,98 +1342,17 @@ array attention_dsv4_sparse_decode(
     int ratio,
     int window,
     std::optional<float> scale) {
-    auto query = typed_contiguous(
+    return mlx_sparse_circular_mla_decode_attention(
         q,
-        mlx::core::float32);
-    auto local = typed_contiguous(
         local_kv,
-        mlx::core::float16);
-    auto selected_topk = typed_contiguous(
+        pooled_kv,
+        pool_len,
         topk,
-        mlx::core::int32);
-    auto sink_logits = typed_contiguous(
         sinks,
-        mlx::core::float32);
-    auto pool = pooled_kv
-        ? typed_contiguous(
-              *pooled_kv,
-              mlx::core::float16)
-        : local;
-    if (query.ndim() != 4 ||
-        query.shape(0) <= 0 ||
-        query.shape(1) != kAttentionHeads ||
-        query.shape(2) != 1 ||
-        query.shape(3) != kAttentionDimension ||
-        local.shape() != Shape{
-            query.shape(0),
-            window,
-            kAttentionDimension,
-        } ||
-        pool.ndim() != 3 ||
-        pool.shape(0) != query.shape(0) ||
-        pool.shape(2) != kAttentionDimension ||
-        pool_len < 0 ||
-        pool_len > pool.shape(1) ||
-        selected_topk.ndim() != 3 ||
-        selected_topk.shape(0) != query.shape(0) ||
-        selected_topk.shape(1) != 1 ||
-        sink_logits.size() != kAttentionHeads ||
-        seq_len <= 0 ||
-        ratio <= 0 ||
-        window <= 0) {
-        throw std::invalid_argument(
-            "DSV4 direct decode attention shape mismatch");
-    }
-    const float selected_scale = scale.value_or(
-        1.0f /
-        std::sqrt(
-            static_cast<float>(
-                kAttentionDimension)));
-    if (!std::isfinite(selected_scale) ||
-        selected_scale <= 0.0f) {
-        throw std::invalid_argument(
-            "DSV4 direct decode attention scale must be finite and positive");
-    }
-    const int batch = query.shape(0);
-    const int topk_count = selected_topk.shape(2);
-    const int grid = checked_product(
-        {batch, 16, 128},
-        "direct sparse decode attention grid");
-    const array params(
-        {selected_scale},
-        mlx::core::float32);
-    const array decode_params(
-        {seq_len, pool_len, topk_count},
-        mlx::core::int32);
-    auto outputs = sparse_attention_direct_decode_kernel()(
-        {
-            query,
-            local,
-            pool,
-            selected_topk,
-            sink_logits,
-            params,
-            decode_params,
-        },
-        {Shape{
-            batch,
-            1,
-            kAttentionHeads,
-            kAttentionDimension,
-        }},
-        {mlx::core::float32},
-        {grid, 1, 1},
-        {128, 1, 1},
-        {
-            {"B", batch},
-            {"POOL_CAPACITY", pool.shape(1)},
-            {"RATIO", ratio},
-            {"WINDOW", window},
-        },
-        std::nullopt,
-        false,
-        {});
-    return std::move(outputs.front());
+        seq_len,
+        ratio,
+        window,
+        scale);
 }
 
 } // namespace mfq::metal

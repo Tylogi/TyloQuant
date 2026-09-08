@@ -946,6 +946,41 @@ def test_runtime_route_uses_graph_backbone_and_native_qwen_components(
     assert not flash_next.requires_mfq
 
 
+def test_runtime_route_selects_native_cpp_for_qwen4_exp(tmp_path: Path) -> None:
+    model = tmp_path / "qwen4.mfq"
+    io.save(
+        model,
+        FileHeader(version=2, model_arch="legacy-name-is-ignored"),
+        {
+            MODEL_GRAPH_ASSET: json.dumps(
+                {
+                    "schema_version": 1,
+                    "architecture": "qwen4_exp",
+                    "graph": {"kind": "causal_lm", "backbone": "qwen4_exp"},
+                    "components": [
+                        {
+                            "kind": "text",
+                            "tensor_root": "model",
+                            "implementation": "qwen4_exp",
+                        }
+                    ],
+                    "canonical_naming": {
+                        "namespace": "mfq.tensor",
+                        "version": 1,
+                        "component_roots": ["model"],
+                    },
+                }
+            ).encode(),
+        },
+    )
+
+    route = resolve_runtime_route("qwen4_exp-hf-mfq-nint-recipe", model)
+    assert route.architecture_family == "qwen4_exp"
+    assert route.backbone == "qwen4_exp"
+    assert not route.python_mlx_worker
+    assert not route.requires_mfq
+
+
 class _FakeWorker:
     model_name = "Flash"
     model_type = "qwen4_exp"

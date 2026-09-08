@@ -99,6 +99,7 @@ export interface SamplingParams {
   enable_thinking: boolean;
   enable_vision: boolean;
   enable_mtp: boolean;
+  mtp_max_draft_tokens?: number;
   reasoning_effort?: string | null;
 }
 

@@ -6,6 +6,10 @@ inline constexpr char kSteelMmaSource[] = R"MFQ_STEEL(
 @MFQ_STEEL_MMA_SOURCE@
 )MFQ_STEEL";
 
+inline constexpr char kSteelNaxSource[] = R"MFQ_NAX_STEEL(
+@MFQ_STEEL_NAX_SOURCE@
+)MFQ_NAX_STEEL";
+
 inline constexpr char kSteelAttentionSource[] = R"MFQ_ATTN_STEEL(
 @MFQ_STEEL_ATTN_SOURCE@
 )MFQ_ATTN_STEEL";
@@ -17,5 +21,9 @@ inline constexpr char kNintmPrefillSource[] = R"MFQ_NINTM(
 inline constexpr char kDsv4SparsePrefillSource[] = R"MFQ_SPARSE(
 @MFQ_DSV4_SPARSE_PREFILL_SOURCE@
 )MFQ_SPARSE";
+
+inline constexpr char kSparseBlockGqaSource[] = R"MFQ_BLOCK_GQA(
+@MFQ_SPARSE_BLOCK_GQA_SOURCE@
+)MFQ_BLOCK_GQA";
 
 } // namespace mfq::metal::detail

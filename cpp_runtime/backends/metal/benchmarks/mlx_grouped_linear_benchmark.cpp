@@ -309,6 +309,7 @@ int main(int argc, char** argv) {
         const double mean_ms = elapsed_ms(started) / repetitions;
         const double gbps = static_cast<double>(bytes) /
             (mean_ms * 1.0e6);
+
         const auto hash = output_hash(std::move(outputs));
 
         std::cout

@@ -616,7 +616,7 @@ def _unpack_nint_moe_v2(
         runtime_payload = bytes(blob[off:runtime_end])
         off = runtime_end
         tensor = _unpack_tensor(dtype, blob[off:payload_end])
-        if isinstance(tensor, (NintMoeTensor, np.ndarray)):
+        if isinstance(tensor, NintMoeTensor):
             raise ValueError(f"unsupported nested NINTM cohort dtype: {dtype}")
         _validate_nint_moe_runtime(tensor, runtime_payload)
         off = payload_end
@@ -971,6 +971,26 @@ class MMapTensorStore(Mapping[str, MfqTensor]):
         rec = self.records[record] if isinstance(record, str) else record
         return memoryview(self.mmap_for(rec))[rec.offset : rec.offset + rec.nbytes]
 
+    def evict_blob(self, record: MMapTensorRecord | str) -> None:
+        """Release file-backed pages after a tensor has been copied elsewhere."""
+
+        advice = getattr(mmap, "MADV_DONTNEED", None)
+        rec = self.records[record] if isinstance(record, str) else record
+        mapping = self.mmap_for(rec)
+        if advice is None or not hasattr(mapping, "madvise"):
+            return
+        try:
+            page = int(getattr(mmap, "PAGESIZE", os.sysconf("SC_PAGE_SIZE")))
+            start = int(rec.offset) - int(rec.offset) % page
+            end = min(
+                len(mapping),
+                ((int(rec.offset) + int(rec.nbytes) + page - 1) // page) * page,
+            )
+            mapping.madvise(advice, start, end - start)
+        except (OSError, TypeError, ValueError):
+            # Page residency is an optimization; the tensor copy remains valid.
+            pass
+
     def __getitem__(self, name: str) -> MfqTensor:
         if self._cache_enabled and name in self._cache:
             return self._cache[name]
@@ -980,6 +1000,7 @@ class MMapTensorStore(Mapping[str, MfqTensor]):
             tensor = _unpack_tensor(rec.dtype, blob)
         finally:
             blob.release()
+        self.evict_blob(rec)
         if self._cache_enabled:
             self._cache[name] = tensor
         return tensor
@@ -994,9 +1015,11 @@ class MMapTensorStore(Mapping[str, MfqTensor]):
         """Copy one tensor's original packed payload without decoding it."""
 
         rec = self.records[name]
-        return bytes(
+        payload = bytes(
             self.mmap_for(rec)[rec.offset : rec.offset + rec.nbytes]
         )
+        self.evict_blob(rec)
+        return payload
 
     def embedding_reader(self, name: str) -> MMapEmbeddingReader:
         """Open a row-selective reader without copying the tensor payload."""

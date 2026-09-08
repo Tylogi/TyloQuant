@@ -30,6 +30,7 @@ from mfq.quantize.nvq_jsc import NvqJscTables
 from mfq.tools.quantize_hf_to_mfq import (
     _ExpertPoolRowSource,
     _mixed_moe_blob_nbytes,
+    _parse_expert_mix_profiles,
     _write_flat_family_axis0_blob,
     _write_mixed_moe_axis0_blob,
 )
@@ -280,6 +281,45 @@ def test_mixed_moe_preserves_native_mxfp4_bytes(tmp_path):
     assert isinstance(pool, MxTensor)
     np.testing.assert_array_equal(pool.values, values.reshape(-1, 16))
     np.testing.assert_array_equal(pool.scales, scales.reshape(-1, 1))
+
+
+def test_synthetic_mixed_moe_writer_covers_all_runtime_families(tmp_path):
+    shape = (9, 2, 96)
+    precisions = _parse_expert_mix_profiles(
+        "NINT2,NINT3,NINT4,NINT5,NINT6,NINT8,NVQ2J,NVQ3J,MXFP4"
+    )
+
+    class NoReadSource:
+        def read_rows(self, *_args, **_kwargs):
+            raise AssertionError("synthetic expert writer must not read source weights")
+
+    path = tmp_path / "synthetic-mixed.blob"
+    nbytes = _write_mixed_moe_axis0_blob(
+        NoReadSource(),
+        shape,
+        shape,
+        precisions,
+        path,
+        row_chunk=8,
+        quant_backend="cpu",
+        device="cpu",
+        artifact_root=None,
+        synthetic=True,
+    )
+
+    assert nbytes == _mixed_moe_blob_nbytes(shape, precisions, None)
+    restored = io.unpack_nint_moe(path.read_bytes())
+    assert restored.expert_profiles == (
+        "NINT2-16",
+        "NINT3-24",
+        "NINT4-24",
+        "NINT5-28",
+        "NINT6-24",
+        "NINT8-48",
+        "NVQ2J",
+        "NVQ3J",
+        "MXFP4",
+    )
 
 
 @pytest.mark.parametrize(

@@ -9,11 +9,18 @@ import numpy as np
 import pytest
 from gguf import GGUFReader
 
+from mfq.formats.assets import (
+    HF_GENERATION_CONFIG_ASSET,
+    HF_TOKENIZER_CONFIG_ASSET,
+    HF_TOKENIZER_JSON_ASSET,
+    MODEL_CONFIG_ASSET,
+)
 from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.server.catalog import ModelCatalog, native_hf_model_type_supported
 from mfq.server.hf_tokenizer import (
     ensure_hf_tokenizer_gguf,
+    ensure_mfq_tokenizer_gguf,
     native_hf_asset_environment,
 )
 from mfq.server.native import native_tokenizer_arguments
@@ -164,6 +171,48 @@ def test_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     arguments = native_tokenizer_arguments(model)
     assert arguments[0] == "--tokenizer-gguf"
     assert Path(arguments[1]).is_file()
+
+
+def test_mfq_embedded_hf_tokenizer_cache_is_reusable_and_runtime_selected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "Qwen-Source"
+    cache = tmp_path / "cache"
+    _hf_fixture(source)
+    model = tmp_path / "Qwen-Converted.mfq"
+    save(
+        model,
+        FileHeader(version=2, model_arch="qwen4_exp-hf-mfq-nint-recipe"),
+        {
+            "weight": np.ones((1,), dtype=np.float16),
+            MODEL_CONFIG_ASSET: (source / "config.json").read_bytes(),
+            HF_TOKENIZER_JSON_ASSET: (source / "tokenizer.json").read_bytes(),
+            HF_TOKENIZER_CONFIG_ASSET: (
+                source / "tokenizer_config.json"
+            ).read_bytes(),
+            HF_GENERATION_CONFIG_ASSET: (
+                source / "generation_config.json"
+            ).read_bytes(),
+        },
+    )
+
+    tokenizer = ensure_mfq_tokenizer_gguf(model, cache)
+    assert ensure_mfq_tokenizer_gguf(model, cache) == tokenizer
+    reader = GGUFReader(tokenizer, "r")
+    assert reader.get_field("tokenizer.ggml.pre").contents() == "qwen35"
+    assert reader.get_field("tokenizer.ggml.tokens").contents() == [
+        "a",
+        "b",
+        "ab",
+        "<bos>",
+        "<eos>",
+        "[PAD5]",
+    ]
+
+    monkeypatch.setenv("MFQ_SERVER_TOKENIZER_CACHE_DIR", str(cache))
+    arguments = native_tokenizer_arguments(model)
+    assert arguments == ["--tokenizer-gguf", str(tokenizer)]
 
 
 def test_minicpmo_native_runtime_materializes_exact_resampler_asset(

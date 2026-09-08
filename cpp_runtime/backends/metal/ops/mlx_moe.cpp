@@ -74,9 +74,13 @@ constexpr int kQ8QOffset = 5;
 constexpr int kQ8ScaleOffset = 6;
 
 constexpr int kFamilyMxfp4 = 3;
+constexpr int kFamilyMxfp8 = 4;
+constexpr int kFamilyBf16 = 5;
+constexpr int kFamilyF16 = 6;
 constexpr int kMxGroups = 4;
 constexpr int kMxValueOffset = 5;
 constexpr int kMxScaleOffset = 6;
+constexpr int kDenseValueOffset = 4;
 
 bool apple_m5_family() noexcept {
     static const bool is_m5 = [] {
@@ -101,6 +105,75 @@ bool apple_m5_family() noexcept {
         return name.rfind("Apple M5", 0) == 0;
     }();
     return is_m5;
+}
+
+bool nint_grouped_nax_enabled() noexcept {
+    const char* value = std::getenv("MFQ_METAL_NINT_PREFILL_NAX");
+    if (value != nullptr) {
+        return std::string_view(value) != "0"
+            && std::string_view(value) != "false"
+            && std::string_view(value) != "off";
+    }
+    return apple_m5_family();
+}
+
+bool nint_grouped_nax_direct_enabled(
+    int input_width,
+    int output_width) noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_NINT_PREFILL_NAX_DIRECT");
+    if (value != nullptr) {
+        return std::string_view(value) != "0"
+            && std::string_view(value) != "false"
+            && std::string_view(value) != "off";
+    }
+    // The WM=2/WN=2 cooperative staging path is faster on current M5
+    // hardware.  Keep direct packed-fragment decode available for explicit
+    // architecture experiments without selecting it in production.
+    (void)input_width;
+    (void)output_width;
+    return false;
+}
+
+bool mixed_grouped_nax_enabled(int route_count) noexcept {
+    // The heterogeneous NAX path is a large-M prefill kernel.  Keep small-M
+    // and short-tail shapes on the compatibility kernel, whose boundary
+    // handling is both cheaper and already exhaustive.
+    constexpr int kMinRoutes = 1024;
+    if (route_count < kMinRoutes) {
+        return false;
+    }
+    const char* value = std::getenv(
+        "MFQ_METAL_MIXED_PREFILL_NAX");
+    if (value == nullptr) {
+        return apple_m5_family();
+    }
+    return std::string_view(value) != "0"
+        && std::string_view(value) != "false"
+        && std::string_view(value) != "off";
+}
+
+int grouped_mmq_tile_columns(
+    int block_rows,
+    int output_width) noexcept {
+    if (block_rows != 64) {
+        return 64;
+    }
+    const char* value = std::getenv(
+        "MFQ_METAL_GROUPED_MMQ_TILE_COLUMNS");
+    if (value != nullptr) {
+        if (std::string_view(value) == "96") {
+            return 96;
+        }
+        if (std::string_view(value) == "64") {
+            return 64;
+        }
+    }
+    // BN96 amortizes activation staging and dispatch overhead for wide
+    // projections.  Narrow outputs do not expose enough column work to pay
+    // for its third column SIMD group, so retain the higher-occupancy BN64
+    // shape there.
+    return output_width >= 1024 ? 96 : 64;
 }
 
 bool mxfp4_nax_prefill_enabled(int route_count) noexcept {
@@ -342,6 +415,20 @@ inline float mfq_moe_e8m0(uchar raw) {
     }
     uint bits = raw == 0u ? 0x00400000u : uint(raw) << 23u;
     return as_type<float>(bits);
+}
+
+inline float mfq_moe_mxfp8_value(uchar raw) {
+    uint magnitude = uint(raw & 0x7fu);
+    uint exponent = magnitude >> 3u;
+    uint mantissa = magnitude & 7u;
+    if (exponent == 15u && mantissa == 7u) {
+        return NAN;
+    }
+    float value = exponent == 0u
+        ? float(mantissa) * 0.001953125f
+        : as_type<float>((exponent + 120u) << 23u)
+            * (1.0f + float(mantissa) * 0.125f);
+    return (raw & 0x80u) == 0u ? value : -value;
 }
 
 inline float4 mfq_moe_load_code4(
@@ -2112,6 +2199,95 @@ constexpr const char* kMoeSource = R"METAL(
                 }
             }
         }
+    } else if (
+        (uint(FAMILY_MASK) & 16u) != 0u
+        && family == 4u
+    ) {
+        uint groups =
+            uint(descriptors[descriptor_base + 4u]);
+        uint value_offset =
+            uint(descriptors[descriptor_base + 5u]);
+        uint scale_offset =
+            uint(descriptors[descriptor_base + 6u]);
+        for (
+            uint group = k_lane;
+            group < groups;
+            group += K_LANES
+        ) {
+            uint column_base = group * 128u;
+            ulong outputs[MATRIX_ROWS];
+            float scales[MATRIX_ROWS];
+            for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+                uint output = min(
+                    output_base + (
+                        uint(FUSED_SWIGLU) != 0u
+                            ? (row / ROWS_PER_SIMD) * uint(OUT)
+                                + row % ROWS_PER_SIMD
+                            : row
+                    ),
+                    uint(MATRIX_OUT) - 1u);
+                ulong pool_output =
+                    ulong(local_expert) * ulong(MATRIX_OUT) + ulong(output);
+                outputs[row] = pool_output;
+                scales[row] = mfq_moe_e8m0(mx_scales[
+                    ulong(scale_offset)
+                    + (pool_output >> 7u) * ulong(groups)
+                    + ulong(group)
+                ]);
+            }
+            for (uint component = 0u; component < 128u; ++component) {
+                uint column = column_base + component;
+                float activation = column < uint(K)
+                    ? float(x[x_offset + column])
+                    : 0.0f;
+                for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+                    uchar code = mx_values[
+                        ulong(value_offset)
+                        + outputs[row] * ulong(K)
+                        + ulong(column)];
+                    accumulators[row] = fma(
+                        activation,
+                        scales[row] * mfq_moe_mxfp8_value(code),
+                        accumulators[row]);
+                }
+            }
+        }
+    } else if (
+        (uint(FAMILY_MASK) & 96u) != 0u
+        && (family == 5u || family == 6u)
+    ) {
+        uint value_offset =
+            uint(descriptors[descriptor_base + 4u]);
+        for (
+            uint column = k_lane;
+            column < uint(K);
+            column += K_LANES
+        ) {
+            float activation = float(x[x_offset + column]);
+            for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+                uint output = min(
+                    output_base + (
+                        uint(FUSED_SWIGLU) != 0u
+                            ? (row / ROWS_PER_SIMD) * uint(OUT)
+                                + row % ROWS_PER_SIMD
+                            : row
+                    ),
+                    uint(MATRIX_OUT) - 1u);
+                ulong pool_output =
+                    ulong(local_expert) * ulong(MATRIX_OUT) + ulong(output);
+                ulong byte_offset = ulong(value_offset)
+                    + (pool_output * ulong(K) + ulong(column)) * 2u;
+                ushort raw = *reinterpret_cast<device const ushort*>(
+                    q8_q + byte_offset);
+                float weight = family == 5u
+                    ? as_type<float>(uint(raw) << 16u)
+                    : float(as_type<half>(raw));
+                accumulators[row] = fma(
+                    activation,
+                    weight,
+                    accumulators[row]);
+            }
+        }
     }
 
     if (
@@ -2663,10 +2839,12 @@ struct NativeMoeConfig {
     int workgroups = 0;
 };
 
-struct GroupedVqMmqConfig {
+struct GroupedMmqConfig {
     Shape output_shape;
     int route_count = 0;
     int max_blocks = 0;
+    int block_rows = 32;
+    int tile_columns = 64;
     int tokens = 0;
     int routes = 0;
     int experts = 0;
@@ -2679,10 +2857,12 @@ struct GroupedVqMmqConfig {
     int input_sorted = 0;
     int fused_swiglu = 0;
     int has_nepq_residual = 0;
+    bool use_nax = false;
+    bool direct_nax = false;
     float swiglu_limit = 0.0f;
 };
 
-struct GroupedVqMmqParameters {
+struct GroupedMmqParameters {
     int route_count = 0;
     int tokens = 0;
     int routes = 0;
@@ -2697,18 +2877,18 @@ struct GroupedVqMmqParameters {
     float swiglu_limit = 0.0f;
 };
 
-static_assert(sizeof(GroupedVqMmqParameters) == 48);
+static_assert(sizeof(GroupedMmqParameters) == 48);
 
 // Adapted from oMLX's DeepSeek-V4 block-list builder.  The expert IDs have
 // already been sorted, so one GPU thread can find each expert's contiguous
 // range and split it into independently schedulable BM-row blocks.
 const mlx::core::fast::CustomKernelFunction&
-grouped_vq_block_builder() {
+grouped_mmq_block_builder() {
     static const auto builder = [] {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         return mlx::core::fast::metal_kernel(
-            "mfq_grouped_vq_block_builder_bm32",
+            "mfq_grouped_mmq_block_builder",
             {"indices"},
             {"block_meta", "block_count"},
             R"METAL(
@@ -2778,14 +2958,18 @@ grouped_vq_block_builder() {
     return builder;
 }
 
-MlxGroupedVqMmqPlan make_grouped_vq_mmq_plan(
+MlxGroupedMmqPlan make_grouped_mmq_plan(
     const array& expert_ids,
     const array& route_order_value,
-    int experts) {
-    constexpr int block_rows = 32;
+    int experts,
+    int block_rows = 32) {
+    if (block_rows != 32 && block_rows != 64) {
+        throw std::invalid_argument(
+            "grouped MMQ block rows must be 32 or 64");
+    }
     if (experts <= 0 || experts > 1024) {
         throw std::invalid_argument(
-            "grouped VQ MMQ block builder requires 1..1024 experts");
+            "grouped MMQ block builder requires 1..1024 experts");
     }
     auto ids = mlx::core::contiguous(
         mlx::core::astype(expert_ids, mlx::core::int32));
@@ -2813,13 +2997,13 @@ MlxGroupedVqMmqPlan make_grouped_vq_mmq_plan(
         static_cast<std::size_t>(
             (route_count + block_rows - 1) / block_rows)
             + static_cast<std::size_t>(experts),
-        "grouped VQ MMQ max blocks");
+        "grouped MMQ max blocks");
     auto sorted_ids = mlx::core::contiguous(
         mlx::core::take(
             mlx::core::reshape(ids, Shape{route_count}),
             route_order,
             0));
-    auto outputs = grouped_vq_block_builder()(
+    auto outputs = grouped_mmq_block_builder()(
         {std::move(sorted_ids)},
         {
             Shape{max_blocks, 3},
@@ -2840,7 +3024,7 @@ MlxGroupedVqMmqPlan make_grouped_vq_mmq_plan(
         std::nullopt,
         false,
         {});
-    return MlxGroupedVqMmqPlan{
+    return MlxGroupedMmqPlan{
         .block_meta = std::move(outputs.at(0)),
         .block_count = std::move(outputs.at(1)),
         .max_blocks = max_blocks,
@@ -3075,12 +3259,12 @@ array native_moe_dispatch(
         std::move(inputs));
 }
 
-class GroupedVqMmqPrimitive final
+class GroupedMmqPrimitive final
     : public mlx::core::UnaryPrimitive {
 public:
-    GroupedVqMmqPrimitive(
+    GroupedMmqPrimitive(
         mlx::core::Stream stream,
-        GroupedVqMmqConfig config)
+        GroupedMmqConfig config)
         : UnaryPrimitive(stream),
           config_(std::move(config)) {}
 
@@ -3088,7 +3272,7 @@ public:
         const std::vector<array>&,
         array&) override {
         throw std::runtime_error(
-            "grouped VQ MMQ primitive has no CPU path");
+            "grouped MMQ primitive has no CPU path");
     }
 
     void eval_gpu(
@@ -3096,7 +3280,7 @@ public:
         array& output) override {
         if (inputs.size() != 28) {
             throw std::logic_error(
-                "grouped VQ MMQ primitive input count mismatch");
+                "grouped MMQ primitive input count mismatch");
         }
         output.set_data(
             mlx::core::allocator::malloc(output.nbytes()));
@@ -3106,20 +3290,31 @@ public:
         CompileOptions compile_options;
         compile_options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
-            "mfq_grouped_vq_mmq_v9",
+            config_.use_nax
+                ? "mfq_grouped_nint4_nax_v1"
+                : "mfq_grouped_mmq_v12",
             compile_options,
-            [] {
+            [use_nax = config_.use_nax] {
                 std::string source;
                 source.reserve(
-                    sizeof(detail::kSteelMmaSource)
+                    (use_nax
+                        ? sizeof(detail::kSteelNaxSource)
+                        : sizeof(detail::kSteelMmaSource))
                     + sizeof(detail::kNintmPrefillSource)
-                    + 128);
+                    + 256);
                 source += "#include <metal_stdlib>\n";
                 source += "#include <metal_simdgroup>\n";
                 source += "#include <metal_simdgroup_matrix>\n";
+                if (use_nax) {
+                    source += "#include <MetalPerformancePrimitives/"
+                        "MetalPerformancePrimitives.h>\n";
+                    source += "#define MFQ_ENABLE_NAX 1\n";
+                }
                 source += "using namespace metal;\n";
                 source += "using bfloat16_t = bfloat;\n";
-                source += detail::kSteelMmaSource;
+                source += use_nax
+                    ? detail::kSteelNaxSource
+                    : detail::kSteelMmaSource;
                 source += detail::kNintmPrefillSource;
                 return source;
             });
@@ -3137,7 +3332,7 @@ public:
                 inputs[static_cast<std::size_t>(source)],
                 source - 12);
         }
-        const GroupedVqMmqParameters parameters{
+        const GroupedMmqParameters parameters{
             .route_count = config_.route_count,
             .tokens = config_.tokens,
             .routes = config_.routes,
@@ -3160,36 +3355,71 @@ public:
         encoder.set_input_array(inputs[27], 19);
         encoder.set_input_array(inputs[20], 20);
         encoder.set_input_array(inputs[21], 21);
-        const char* kernel_name = config_.fused_swiglu != 0
-            ? (config_.has_nepq_residual != 0
-                ? "mfq_grouped_vq_swiglu_f16_bm32_bn64_bk96_nr"
-                : "mfq_grouped_vq_swiglu_f16_bm32_bn64_bk96")
-            : (config_.has_nepq_residual != 0
-                ? "mfq_grouped_vq_mmq_f16_bm32_bn64_bk96_nr"
-                : "mfq_grouped_vq_mmq_f16_bm32_bn64_bk96");
+        for (int source = 1; source <= 5; ++source) {
+            encoder.set_input_array(
+                inputs[static_cast<std::size_t>(source)],
+                source + 21);
+        }
+        encoder.set_input_array(inputs[6], 27);
+        encoder.set_input_array(inputs[7], 28);
+        const bool block64 = config_.block_rows == 64;
+        const bool columns96 = config_.tile_columns == 96;
+        const char* kernel_name = config_.use_nax
+            ? (config_.direct_nax
+                ? (config_.fused_swiglu != 0
+                    ? "mfq_grouped_nint4_nax_direct_swiglu_f16_bm32_bn64_bk96"
+                    : "mfq_grouped_nint4_nax_direct_f16_bm32_bn64_bk96")
+                : (config_.fused_swiglu != 0
+                    ? (columns96
+                        ? "mfq_grouped_nint4_nax_swiglu_f16_bm64_bn96_bk96"
+                        : block64
+                        ? "mfq_grouped_nint4_nax_swiglu_f16_bm64_bn64_bk96"
+                        : "mfq_grouped_nint4_nax_swiglu_f16_bm32_bn64_bk96")
+                    : (columns96
+                        ? "mfq_grouped_nint4_nax_f16_bm64_bn96_bk96"
+                        : block64
+                        ? "mfq_grouped_nint4_nax_f16_bm64_bn64_bk96"
+                        : "mfq_grouped_nint4_nax_f16_bm32_bn64_bk96")))
+            : (config_.fused_swiglu != 0
+                ? (config_.has_nepq_residual != 0
+                    ? "mfq_grouped_mmq_swiglu_f16_bm32_bn64_bk96_nr"
+                    : "mfq_grouped_mmq_swiglu_f16_bm32_bn64_bk96")
+                : (config_.has_nepq_residual != 0
+                    ? "mfq_grouped_mmq_f16_bm32_bn64_bk96_nr"
+                    : "mfq_grouped_mmq_f16_bm32_bn64_bk96"));
         auto* kernel = device.get_kernel(
             kernel_name,
             library);
         encoder.set_compute_pipeline_state(kernel);
         encoder.dispatch_threadgroups(
             MTL::Size(
-                (config_.output_width + 63) / 64,
+                (config_.output_width + config_.tile_columns - 1)
+                    / config_.tile_columns,
                 config_.max_blocks,
                 1),
-            MTL::Size(256, 1, 1));
+            MTL::Size(
+                config_.use_nax && columns96
+                    ? 384
+                    : (config_.use_nax && config_.block_rows == 32
+                        ? 128
+                        : 256),
+                1,
+                1));
     }
 
     const char* name() const override {
-        return "GroupedVqMmqPrimitive";
+        return "GroupedMmqPrimitive";
     }
 
     bool is_equivalent(
         const mlx::core::Primitive& other) const override {
         const auto* primitive =
-            dynamic_cast<const GroupedVqMmqPrimitive*>(&other);
+            dynamic_cast<const GroupedMmqPrimitive*>(&other);
         return primitive != nullptr
             && primitive->config_.route_count == config_.route_count
             && primitive->config_.max_blocks == config_.max_blocks
+            && primitive->config_.block_rows == config_.block_rows
+            && primitive->config_.tile_columns == config_.tile_columns
             && primitive->config_.experts == config_.experts
             && primitive->config_.output_width == config_.output_width
             && primitive->config_.input_width == config_.input_width
@@ -3199,6 +3429,8 @@ public:
             && primitive->config_.fused_swiglu == config_.fused_swiglu
             && primitive->config_.has_nepq_residual
                 == config_.has_nepq_residual
+            && primitive->config_.use_nax == config_.use_nax
+            && primitive->config_.direct_nax == config_.direct_nax
             && primitive->config_.swiglu_limit == config_.swiglu_limit;
     }
 
@@ -3208,23 +3440,23 @@ public:
     }
 
 private:
-    GroupedVqMmqConfig config_;
+    GroupedMmqConfig config_;
 };
 
-array grouped_vq_mmq_dispatch(
+array grouped_mmq_dispatch(
     std::vector<array> inputs,
-    GroupedVqMmqConfig config) {
+    GroupedMmqConfig config) {
     auto stream = mlx::core::default_stream(
         mlx::core::default_device());
     if (stream.device != mlx::core::Device::gpu) {
         throw std::invalid_argument(
-            "grouped VQ MMQ requires the Metal device");
+            "grouped MMQ requires the Metal device");
     }
     auto shape = config.output_shape;
     return array(
         std::move(shape),
         mlx::core::float16,
-        std::make_shared<GroupedVqMmqPrimitive>(
+        std::make_shared<GroupedMmqPrimitive>(
             stream,
             std::move(config)),
         std::move(inputs));
@@ -3357,11 +3589,28 @@ struct PackedStreams {
     detail::StagingVector<std::uint8_t> mx_scales;
 };
 
+struct DenseReferenceMoeWeight {
+    array values;
+
+    array embedding(
+        const array& rows,
+        Dtype dtype) const {
+        return mlx::core::astype(
+            mlx::core::take(values, rows, 0),
+            dtype);
+    }
+
+    std::size_t packed_nbytes() const noexcept {
+        return values.nbytes();
+    }
+};
+
 using ReferenceMoeWeight = std::variant<
     MlxNintWeight,
     MlxNint8ZeroWeight,
     MlxVqWeight,
-    MlxMxWeight>;
+    MlxMxWeight,
+    DenseReferenceMoeWeight>;
 
 struct ReferenceMoeCohort {
     std::vector<std::int32_t> expert_ids;
@@ -3701,7 +3950,8 @@ MlxNint8ZeroWeight add_q8_pool(
     return weight;
 }
 
-std::optional<MlxMxWeight> add_mxfp4_pool(
+std::optional<MlxMxWeight> add_mx_pool(
+    std::string_view dtype,
     std::span<const std::uint8_t> payload,
     const std::vector<std::int32_t>& expert_ids,
     int out_per_expert,
@@ -3709,69 +3959,109 @@ std::optional<MlxMxWeight> add_mxfp4_pool(
     PackedStreams& streams,
     std::vector<std::int32_t>& descriptors,
     bool pack_execution = true) {
+    const bool mxfp4 = dtype == "MXFP4";
+    const bool mxfp8 = dtype == "MXFP8";
+    if (!mxfp4 && !mxfp8) {
+        throw std::invalid_argument("unsupported NINTM MX cohort dtype");
+    }
+    const std::string label(dtype);
+    const auto field = [&](const char* suffix) {
+        return label + " " + suffix;
+    };
     BlobCursor cursor(payload);
-    const auto magic = cursor.bytes(4, "MXFP4 magic");
+    const auto magic_name = field("magic");
+    const auto magic = cursor.bytes(4, magic_name.c_str());
+    const auto version_name = field("version");
+    const auto kind_name = field("kind");
+    const auto reserved_name = field("reserved");
     if (
         magic.size() != 4
         || std::memcmp(magic.data(), "MXT1", 4) != 0
-        || cursor.scalar<std::uint8_t>("MXFP4 version") != 1
-        || cursor.scalar<std::uint8_t>("MXFP4 kind") != 4
-        || cursor.scalar<std::uint16_t>("MXFP4 reserved") != 0
+        || cursor.scalar<std::uint8_t>(version_name.c_str()) != 1
+        || cursor.scalar<std::uint8_t>(kind_name.c_str())
+            != static_cast<std::uint8_t>(mxfp4 ? 4 : 8)
+        || cursor.scalar<std::uint16_t>(reserved_name.c_str()) != 0
     ) {
         throw std::runtime_error(
-            "invalid NINTM MXFP4 payload header");
+            "invalid NINTM " + label + " payload header");
     }
-    const auto rows = cursor.scalar<std::uint64_t>("MXFP4 rows");
-    const auto columns = cursor.scalar<std::uint64_t>("MXFP4 columns");
+    const auto rows_name = field("rows");
+    const auto columns_name = field("columns");
+    const auto storage_rows_name = field("storage rows");
+    const auto storage_columns_name = field("storage columns");
+    const auto scale_rows_name = field("scale rows");
+    const auto scale_columns_name = field("scale columns");
+    const auto rows = cursor.scalar<std::uint64_t>(rows_name.c_str());
+    const auto columns = cursor.scalar<std::uint64_t>(columns_name.c_str());
     const auto storage_rows =
-        cursor.scalar<std::uint64_t>("MXFP4 storage rows");
+        cursor.scalar<std::uint64_t>(storage_rows_name.c_str());
     const auto storage_columns =
-        cursor.scalar<std::uint64_t>("MXFP4 storage columns");
+        cursor.scalar<std::uint64_t>(storage_columns_name.c_str());
     const auto scale_rows =
-        cursor.scalar<std::uint64_t>("MXFP4 scale rows");
+        cursor.scalar<std::uint64_t>(scale_rows_name.c_str());
     const auto scale_columns =
-        cursor.scalar<std::uint64_t>("MXFP4 scale columns");
+        cursor.scalar<std::uint64_t>(scale_columns_name.c_str());
     const auto expected_rows = checked_product(
         expert_ids.size(),
         static_cast<std::size_t>(out_per_expert),
-        "MXFP4 cohort row count");
+        "MX cohort row count");
+    const auto block = static_cast<std::uint64_t>(mxfp4 ? 32 : 128);
     if (
-        neuron_len % 32 != 0
+        neuron_len % static_cast<int>(block) != 0
         || rows != expected_rows
         || columns != static_cast<std::uint64_t>(neuron_len)
         || storage_rows != rows
-        || storage_columns != columns / 2
-        || scale_rows != rows
-        || scale_columns != columns / 32
+        || storage_columns != (mxfp4 ? columns / 2 : columns)
+        || scale_rows != (mxfp4 ? rows : (rows + 127) / 128)
+        || scale_columns != columns / block
     ) {
         throw std::runtime_error(
-            "NINTM MXFP4 cohort shape is inconsistent");
+            "NINTM " + label + " cohort shape is inconsistent");
     }
     const auto value_count = checked_product(
-        checked_size(storage_rows, "MXFP4 storage rows"),
-        checked_size(storage_columns, "MXFP4 storage columns"),
-        "MXFP4 value bytes");
+        checked_size(storage_rows, "MX storage rows"),
+        checked_size(storage_columns, "MX storage columns"),
+        "MX value bytes");
     const auto scale_count = checked_product(
-        checked_size(scale_rows, "MXFP4 scale rows"),
-        checked_size(scale_columns, "MXFP4 scale columns"),
-        "MXFP4 scale bytes");
-    const auto values = cursor.bytes(value_count, "MXFP4 values");
-    const auto scales = cursor.bytes(scale_count, "MXFP4 scales");
+        checked_size(scale_rows, "MX scale rows"),
+        checked_size(scale_columns, "MX scale columns"),
+        "MX scale bytes");
+    const auto values_name = field("values");
+    const auto scales_name = field("scales");
+    const auto values = cursor.bytes(value_count, values_name.c_str());
+    const auto scales = cursor.bytes(scale_count, scales_name.c_str());
+    if (std::find(scales.begin(), scales.end(), std::uint8_t{255})
+        != scales.end()) {
+        throw std::runtime_error(
+            "NINTM " + label + " contains an E8M0 NaN scale");
+    }
+    if (
+        mxfp8
+        && std::any_of(
+            values.begin(),
+            values.end(),
+            [](std::uint8_t value) {
+                return (value & 0x7fu) == 0x7fu;
+            })
+    ) {
+        throw std::runtime_error(
+            "NINTM MXFP8 contains an E4M3 NaN code");
+    }
     if (cursor.remaining() != 0) {
         throw std::runtime_error(
-            "trailing bytes in NINTM MXFP4 cohort");
+            "trailing bytes in NINTM " + label + " cohort");
     }
     if (!pack_execution) {
-        return MlxMxWeight::from_blob("MXFP4", payload);
+        return MlxMxWeight::from_blob(label, payload);
     }
 
     const int value_offset = checked_int(
         streams.mx_values.size(),
-        "MXFP4 value offset");
+        "MX value offset");
     const int scale_offset = checked_int(
         streams.mx_scales.size(),
-        "MXFP4 scale offset");
-    const int groups = neuron_len / 32;
+        "MX scale offset");
+    const int groups = neuron_len / static_cast<int>(block);
     for (
         std::size_t local_expert = 0;
         local_expert < expert_ids.size();
@@ -3782,7 +4072,8 @@ std::optional<MlxMxWeight> add_mxfp4_pool(
             static_cast<std::size_t>(expert),
             static_cast<std::size_t>(kDescriptorSize),
             "descriptor offset");
-        descriptors[base + kFamily] = kFamilyMxfp4;
+        descriptors[base + kFamily] =
+            mxfp4 ? kFamilyMxfp4 : kFamilyMxfp8;
         descriptors[base + kLocalExpert] =
             checked_int(local_expert, "local expert");
         descriptors[base + kOut] = out_per_expert;
@@ -3791,8 +4082,91 @@ std::optional<MlxMxWeight> add_mxfp4_pool(
         descriptors[base + kMxValueOffset] = value_offset;
         descriptors[base + kMxScaleOffset] = scale_offset;
     }
-    append_bytes(streams.mx_values, values, "MXFP4 values");
-    append_bytes(streams.mx_scales, scales, "MXFP4 scales");
+    append_bytes(streams.mx_values, values, "MX values");
+    append_bytes(streams.mx_scales, scales, "MX scales");
+    return std::nullopt;
+}
+
+std::optional<DenseReferenceMoeWeight> add_dense_pool(
+    std::string_view dtype,
+    std::span<const std::uint8_t> payload,
+    const std::vector<std::int32_t>& expert_ids,
+    int out_per_expert,
+    int neuron_len,
+    PackedStreams& streams,
+    std::vector<std::int32_t>& descriptors,
+    bool pack_execution = true) {
+    const bool bf16 = dtype == "BF16";
+    if (!bf16 && dtype != "F16") {
+        throw std::invalid_argument("unsupported NINTM dense cohort dtype");
+    }
+    BlobCursor cursor(payload);
+    if (cursor.scalar<std::uint32_t>("dense dimension count") != 2) {
+        throw std::runtime_error(
+            "NINTM dense expert cohort must be rank 2");
+    }
+    const auto rows = cursor.scalar<std::int64_t>("dense rows");
+    const auto columns = cursor.scalar<std::int64_t>("dense columns");
+    const auto expected_rows = checked_product(
+        expert_ids.size(),
+        static_cast<std::size_t>(out_per_expert),
+        "dense cohort row count");
+    const auto value_count = checked_product(
+        expected_rows,
+        static_cast<std::size_t>(neuron_len),
+        "dense cohort value count");
+    const auto value_bytes = checked_product(
+        value_count,
+        sizeof(std::uint16_t),
+        "dense cohort value bytes");
+    if (
+        rows != static_cast<std::int64_t>(expected_rows)
+        || columns != neuron_len
+        || cursor.remaining() != value_bytes
+    ) {
+        throw std::runtime_error(
+            "NINTM dense expert cohort shape is inconsistent");
+    }
+    const auto values = cursor.bytes(value_bytes, "dense values");
+    if (!pack_execution) {
+        std::vector<std::uint8_t> copied(values.begin(), values.end());
+        auto array_value = make_raw_array(
+            std::move(copied),
+            bf16 ? mlx::core::bfloat16 : mlx::core::float16);
+        return DenseReferenceMoeWeight{
+            mlx::core::reshape(
+                std::move(array_value),
+                Shape{
+                    checked_int(expected_rows, "dense cohort rows"),
+                    neuron_len,
+                }),
+        };
+    }
+
+    if ((streams.q8_q.size() & 1u) != 0u) {
+        streams.q8_q.push_back(0);
+    }
+    const int value_offset = checked_int(
+        streams.q8_q.size(),
+        "dense value offset");
+    for (
+        std::size_t local_expert = 0;
+        local_expert < expert_ids.size();
+        ++local_expert
+    ) {
+        const int expert = expert_ids[local_expert];
+        const auto base = checked_product(
+            static_cast<std::size_t>(expert),
+            static_cast<std::size_t>(kDescriptorSize),
+            "descriptor offset");
+        descriptors[base + kFamily] = bf16 ? kFamilyBf16 : kFamilyF16;
+        descriptors[base + kLocalExpert] =
+            checked_int(local_expert, "local expert");
+        descriptors[base + kOut] = out_per_expert;
+        descriptors[base + kInput] = neuron_len;
+        descriptors[base + kDenseValueOffset] = value_offset;
+    }
+    append_bytes(streams.q8_q, values, "dense values");
     return std::nullopt;
 }
 
@@ -5996,7 +6370,8 @@ struct MlxNintMoeWeight::Impl {
     bool jsc_execution_layout = false;
     bool npq_grouped_indices = true;
     bool native_primitive = true;
-    bool grouped_vq_mmq = false;
+    bool grouped_mmq = false;
+    bool grouped_nint4_group24 = false;
     bool has_nepq_residual = false;
     std::optional<array> mxfp4_slot_ids;
     bool mxfp4_slot_ids_sorted = false;
@@ -6069,7 +6444,8 @@ struct MlxNintMoeWeight::Impl {
           out_per_expert(output_width),
           neuron_len(input_width),
           projections(projection_count) {
-        grouped_vq_mmq = !descriptor_values.empty();
+        grouped_mmq = !descriptor_values.empty();
+        grouped_nint4_group24 = grouped_mmq;
         for (
             std::size_t base = 0;
             base + kDescriptorSize
@@ -6078,7 +6454,7 @@ struct MlxNintMoeWeight::Impl {
         ) {
             const auto family = descriptor_values[
                 base + kFamily];
-            if (family >= 0 && family < 4) {
+            if (family >= 0 && family < 7) {
                 family_mask |= std::uint32_t{1}
                     << static_cast<unsigned>(family);
             }
@@ -6093,6 +6469,20 @@ struct MlxNintMoeWeight::Impl {
                     has_nepq_residual = true;
                 }
             }
+            const bool supported_nint =
+                family == kFamilyNint;
+            if (
+                family != kFamilyNint
+                || descriptor_values[base + kNintBits] != 4
+                || descriptor_values[base + kNintGroupSize] != 24
+                || descriptor_values[base + kNintQ5Execution] != 0
+            ) {
+                grouped_nint4_group24 = false;
+            }
+            const bool supported_q8 =
+                family == kFamilyNint8Zero
+                && descriptor_values[base + kQ8Groups]
+                    == neuron_len / 32;
             const bool supported_vq =
                 family == kFamilyVq
                 && descriptor_values[base + kVqGroupSize] == 24
@@ -6104,8 +6494,17 @@ struct MlxNintMoeWeight::Impl {
                 family == kFamilyMxfp4
                 && descriptor_values[base + kMxGroups]
                     == neuron_len / 32;
-            if (!supported_vq && !supported_mxfp4) {
-                grouped_vq_mmq = false;
+            const bool supported_mxfp8 =
+                family == kFamilyMxfp8
+                && neuron_len % 128 == 0
+                && descriptor_values[base + kMxGroups]
+                    == neuron_len / 128;
+            const bool supported_dense =
+                family == kFamilyBf16 || family == kFamilyF16;
+            if (!supported_nint && !supported_q8
+                && !supported_vq && !supported_mxfp4
+                && !supported_mxfp8 && !supported_dense) {
+                grouped_mmq = false;
             }
             if (
                 descriptor_values[
@@ -6114,6 +6513,8 @@ struct MlxNintMoeWeight::Impl {
                 jsc_execution_layout = true;
             }
         }
+        grouped_nint4_group24 =
+            grouped_nint4_group24 && grouped_mmq;
         if (
             family_mask == (std::uint32_t{1} << kFamilyMxfp4)
             && descriptor_values.size()
@@ -6139,7 +6540,7 @@ struct MlxNintMoeWeight::Impl {
             specialize_env != nullptr
             && std::string_view(specialize_env) == "0"
         ) {
-            family_mask = 15;
+            family_mask = 127;
             vq_profile_mask = 255;
         }
         const char* npq_indices_env = std::getenv(
@@ -6384,12 +6785,33 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
                     std::move(weight),
                 });
             }
-        } else if (dtype == "MXFP4") {
+        } else if (dtype == "MXFP4" || dtype == "MXFP8") {
             if (!runtime.empty()) {
                 throw std::runtime_error(
-                    "unexpected NINTM MXFP4 runtime metadata");
+                    "unexpected NINTM MX runtime metadata");
             }
-            auto weight = add_mxfp4_pool(
+            auto weight = add_mx_pool(
+                dtype,
+                payload,
+                expert_ids,
+                output_width,
+                input_width,
+                streams,
+                descriptors,
+                !reference);
+            if (reference) {
+                reference_cohorts.push_back({
+                    expert_ids,
+                    std::move(*weight),
+                });
+            }
+        } else if (dtype == "BF16" || dtype == "F16") {
+            if (!runtime.empty()) {
+                throw std::runtime_error(
+                    "unexpected NINTM dense runtime metadata");
+            }
+            auto weight = add_dense_pool(
+                dtype,
                 payload,
                 expert_ids,
                 output_width,
@@ -6522,7 +6944,7 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
     impl->reference_cohorts =
         std::move(reference_cohorts);
     if (reference) {
-        impl->grouped_vq_mmq = false;
+        impl->grouped_mmq = false;
         impl->native_primitive = false;
         impl->packed_bytes = 0;
         for (const auto& cohort :
@@ -6743,6 +7165,12 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
                     source.rotations[index],
                     combined_rotations);
         }
+        if ((q8_q_offset & 1u) != 0u) {
+            q8_q_arrays.push_back(make_raw_array(
+                std::vector<std::uint8_t>{0},
+                mlx::core::int8));
+            ++q8_q_offset;
+        }
         for (
             int expert = 0;
             expert < first.experts;
@@ -6797,6 +7225,15 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
                         descriptor[kQ8ScaleOffset],
                         q8_scale_offset,
                         "NINT8-0 scale offset");
+            } else if (
+                descriptor[kFamily] == kFamilyBf16
+                || descriptor[kFamily] == kFamilyF16
+            ) {
+                descriptor[kDenseValueOffset] =
+                    descriptor_with_offset(
+                        descriptor[kDenseValueOffset],
+                        q8_q_offset,
+                        "dense value offset");
             } else if (
                 descriptor[kFamily] == kFamilyVq
             ) {
@@ -6876,17 +7313,18 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
                             local_rotation)];
             } else if (
                 descriptor[kFamily] == kFamilyMxfp4
+                || descriptor[kFamily] == kFamilyMxfp8
             ) {
                 descriptor[kMxValueOffset] =
                     descriptor_with_offset(
                         descriptor[kMxValueOffset],
                         mx_value_offset,
-                        "MXFP4 value offset");
+                        "MX value offset");
                 descriptor[kMxScaleOffset] =
                     descriptor_with_offset(
                         descriptor[kMxScaleOffset],
                         mx_scale_offset,
-                        "MXFP4 scale offset");
+                        "MX scale offset");
             } else {
                 throw std::runtime_error(
                     "unsupported NINTM descriptor family");
@@ -7162,8 +7600,8 @@ array MlxNintMoeWeight::routed_swiglu_packed(
         true);
 }
 
-bool MlxNintMoeWeight::supports_grouped_vq_mmq() const noexcept {
-    return impl_->projections == 1 && impl_->grouped_vq_mmq;
+bool MlxNintMoeWeight::supports_grouped_mmq() const noexcept {
+    return impl_->projections == 1 && impl_->grouped_mmq;
 }
 
 bool MlxNintMoeWeight::prefers_mxfp4_smallm_nax(
@@ -7178,17 +7616,52 @@ bool MlxNintMoeWeight::prefers_mxfp4_smallm_nax(
             impl_->experts);
 }
 
-MlxGroupedVqMmqPlan MlxNintMoeWeight::build_grouped_vq_mmq_plan(
-    const array& expert_ids,
-    const array& route_order) const {
-    if (!supports_grouped_vq_mmq()) {
-        throw std::invalid_argument(
-            "weight does not support grouped VQ MMQ");
+int MlxNintMoeWeight::recommended_grouped_mmq_block_rows(
+    int route_count) const noexcept {
+    const bool use_nax = nint_grouped_nax_enabled()
+        && (impl_->grouped_nint4_group24
+            || (!impl_->has_nepq_residual
+                && mixed_grouped_nax_enabled(route_count)));
+    const bool direct_nax = (impl_->grouped_nint4_group24
+            || (mixed_grouped_nax_enabled(route_count)
+                && impl_->family_mask
+                    == (std::uint32_t{1} << kFamilyNint)))
+        && use_nax
+        && nint_grouped_nax_direct_enabled(
+            impl_->neuron_len,
+            impl_->out_per_expert);
+    if (!use_nax || direct_nax || impl_->experts <= 0) {
+        return 32;
     }
-    return make_grouped_vq_mmq_plan(
+    if (const char* value = std::getenv(
+            "MFQ_METAL_GROUPED_MMQ_BLOCK_ROWS")) {
+        if (std::string_view(value) == "64") {
+            return 64;
+        }
+        if (std::string_view(value) == "32") {
+            return 32;
+        }
+    }
+    // With four row SIMD groups BM64 preserves the BM32 per-group accumulator
+    // shape while sharing each decoded weight tile across twice as many
+    // routes.  Select it only once the mean expert population reaches one
+    // full BM32 block; below that point row underfill still dominates.
+    return route_count >= impl_->experts * 32 ? 64 : 32;
+}
+
+MlxGroupedMmqPlan MlxNintMoeWeight::build_grouped_mmq_plan(
+    const array& expert_ids,
+    const array& route_order,
+    int block_rows) const {
+    if (!supports_grouped_mmq()) {
+        throw std::invalid_argument(
+            "weight does not support grouped MMQ");
+    }
+    return make_grouped_mmq_plan(
         expert_ids,
         route_order,
-        impl_->experts);
+        impl_->experts,
+        block_rows);
 }
 
 array MlxNintMoeWeight::routed_matmul_sorted(
@@ -7198,11 +7671,11 @@ array MlxNintMoeWeight::routed_matmul_sorted(
     bool input_is_sorted,
     bool fused_swiglu,
     float swiglu_limit,
-    const MlxGroupedVqMmqPlan* plan,
+    const MlxGroupedMmqPlan* plan,
     bool force_mxfp4_nax) const {
-    if (!supports_grouped_vq_mmq()) {
+    if (!supports_grouped_mmq()) {
         throw std::invalid_argument(
-            "weight does not support grouped VQ MMQ");
+            "weight does not support grouped MMQ");
     }
     if (
         fused_swiglu
@@ -7441,12 +7914,25 @@ array MlxNintMoeWeight::routed_matmul_sorted(
     const int output_width = fused_swiglu
         ? impl_->out_per_expert / 2
         : impl_->out_per_expert;
+    const bool use_grouped_nax = nint_grouped_nax_enabled()
+        && (impl_->grouped_nint4_group24
+            || (!impl_->has_nepq_residual
+                && mixed_grouped_nax_enabled(route_count)));
+    const bool use_direct_nax = (impl_->grouped_nint4_group24
+            || (mixed_grouped_nax_enabled(route_count)
+                && impl_->family_mask
+                    == (std::uint32_t{1} << kFamilyNint)))
+        && use_grouped_nax
+        && nint_grouped_nax_direct_enabled(
+            impl_->neuron_len,
+            output_width);
     auto owned_plan = plan == nullptr
-        ? std::optional<MlxGroupedVqMmqPlan>(
-            make_grouped_vq_mmq_plan(
+        ? std::optional<MlxGroupedMmqPlan>(
+            make_grouped_mmq_plan(
                 ids,
                 route_order,
-                impl_->experts))
+                impl_->experts,
+                recommended_grouped_mmq_block_rows(route_count)))
         : std::nullopt;
     const auto& selected_plan = plan != nullptr
         ? *plan
@@ -7454,23 +7940,30 @@ array MlxNintMoeWeight::routed_matmul_sorted(
     if (
         selected_plan.route_count != route_count
         || selected_plan.experts != impl_->experts
-        || selected_plan.block_rows != 32
+        || (selected_plan.block_rows != 32
+            && selected_plan.block_rows != 64)
+        || (selected_plan.block_rows == 64
+            && (!use_grouped_nax || use_direct_nax))
         || selected_plan.max_blocks <= 0
     ) {
         throw std::invalid_argument(
-            "grouped VQ MMQ block plan does not match routed projection");
+            "grouped MMQ block plan does not match routed projection");
     }
     kernel_inputs.push_back(selected_plan.block_meta);
     kernel_inputs.push_back(selected_plan.block_count);
-    return grouped_vq_mmq_dispatch(
+    return grouped_mmq_dispatch(
         std::move(kernel_inputs),
-        GroupedVqMmqConfig{
+        GroupedMmqConfig{
             .output_shape = Shape{
                 route_count,
                 output_width,
             },
             .route_count = route_count,
             .max_blocks = selected_plan.max_blocks,
+            .block_rows = selected_plan.block_rows,
+            .tile_columns = grouped_mmq_tile_columns(
+                selected_plan.block_rows,
+                output_width),
             .tokens = tokens,
             .routes = routes,
             .experts = impl_->experts,
@@ -7484,6 +7977,8 @@ array MlxNintMoeWeight::routed_matmul_sorted(
             .fused_swiglu = static_cast<int>(fused_swiglu),
             .has_nepq_residual = static_cast<int>(
                 impl_->has_nepq_residual),
+            .use_nax = use_grouped_nax,
+            .direct_nax = use_direct_nax,
             .swiglu_limit = swiglu_limit,
         });
 }
@@ -7740,24 +8235,40 @@ array MlxNintMoeWeight::routed_matmul_impl(
         && tokens >= 32
         && source.dtype() == mlx::core::float16
         && impl_->projections == 1
-        && impl_->grouped_vq_mmq
-        && !fused_swiglu
+        && impl_->grouped_mmq
     ) {
-        auto plan = make_grouped_vq_mmq_plan(
+        const bool use_grouped_nax = nint_grouped_nax_enabled()
+            && (impl_->grouped_nint4_group24
+                || (!impl_->has_nepq_residual
+                    && mixed_grouped_nax_enabled(variant_stride)));
+        const bool use_direct_nax = (impl_->grouped_nint4_group24
+                || (mixed_grouped_nax_enabled(variant_stride)
+                    && impl_->family_mask
+                        == (std::uint32_t{1} << kFamilyNint)))
+            && use_grouped_nax
+            && nint_grouped_nax_direct_enabled(
+                impl_->neuron_len,
+                logical_output_width);
+        auto plan = make_grouped_mmq_plan(
             ids,
             route_order,
-            impl_->experts);
+            impl_->experts,
+            recommended_grouped_mmq_block_rows(variant_stride));
         kernel_inputs.push_back(plan.block_meta);
         kernel_inputs.push_back(plan.block_count);
-        auto sorted_outputs = grouped_vq_mmq_dispatch(
+        auto sorted_outputs = grouped_mmq_dispatch(
             std::move(kernel_inputs),
-            GroupedVqMmqConfig{
+            GroupedMmqConfig{
                 .output_shape = Shape{
                     variant_stride,
                     logical_output_width,
                 },
                 .route_count = variant_stride,
                 .max_blocks = plan.max_blocks,
+                .block_rows = plan.block_rows,
+                .tile_columns = grouped_mmq_tile_columns(
+                    plan.block_rows,
+                    logical_output_width),
                 .tokens = tokens,
                 .routes = routes,
                 .experts = impl_->experts,
@@ -7767,8 +8278,12 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .descriptor_size = kDescriptorSize,
                 .variant_stride = variant_stride,
                 .shared_input = static_cast<int>(shared_input),
+                .fused_swiglu = static_cast<int>(fused_swiglu),
                 .has_nepq_residual = static_cast<int>(
                     impl_->has_nepq_residual),
+                .use_nax = use_grouped_nax,
+                .direct_nax = use_direct_nax,
+                .swiglu_limit = swiglu_limit,
             });
         auto inverse_order = mlx::core::argsort(route_order);
         auto restored = mlx::core::take(

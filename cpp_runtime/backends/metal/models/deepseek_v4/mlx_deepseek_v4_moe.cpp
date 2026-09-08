@@ -1462,13 +1462,13 @@ MlxDeepseekV4Moe::forward_branches(
         }
         const bool gate_up_grouped =
             split_resident
-            ? gate->supports_grouped_vq_mmq()
-                && up->supports_grouped_vq_mmq()
-            : gate_up->supports_grouped_vq_mmq();
+            ? gate->supports_grouped_mmq()
+                && up->supports_grouped_mmq()
+            : gate_up->supports_grouped_mmq();
         const bool grouped_prefill =
             rows >= 32
             && gate_up_grouped
-            && down->supports_grouped_vq_mmq();
+            && down->supports_grouped_mmq();
         const bool smallm_nax =
             !split_resident
             && precomputed_hidden == nullptr
@@ -1534,10 +1534,10 @@ MlxDeepseekV4Moe::forward_branches(
                     mlx::core::int32));
             auto block_plan =
                 split_resident
-                ? gate->build_grouped_vq_mmq_plan(
+                ? gate->build_grouped_mmq_plan(
                       route_ids,
                       route_order)
-                : gate_up->build_grouped_vq_mmq_plan(
+                : gate_up->build_grouped_mmq_plan(
                       route_ids,
                       route_order);
             array routed_hidden = [&]() {

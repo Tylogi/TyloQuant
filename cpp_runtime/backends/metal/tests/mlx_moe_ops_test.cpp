@@ -543,6 +543,34 @@ void test_reduce_and_shared_gate() {
     for (std::size_t index = 0; index < fused.size(); ++index) {
         require_close(fused[index], separate[index], 1e-6f);
     }
+
+    const std::vector<std::int32_t> route_order{4, 0, 5, 2, 1, 3};
+    std::vector<std::int32_t> inverse_order(route_order.size());
+    std::vector<float> sorted_pairs(pairs.size());
+    for (std::size_t sorted = 0; sorted < route_order.size(); ++sorted) {
+        const auto original = static_cast<std::size_t>(route_order[sorted]);
+        inverse_order[original] = static_cast<std::int32_t>(sorted);
+        std::copy_n(
+            pairs.begin() + static_cast<std::ptrdiff_t>(original * width),
+            width,
+            sorted_pairs.begin() + static_cast<std::ptrdiff_t>(sorted * width));
+    }
+    const auto sorted_fused = floats(
+        mfq::metal::moe_weighted_reduce_shared_gate_sorted(
+            mlx::core::astype(
+                array(
+                    sorted_pairs.begin(),
+                    Shape{tokens * routes, width}),
+                mlx::core::float16),
+            array(
+                inverse_order.begin(),
+                Shape{tokens * routes}),
+            weight_array,
+            shared_array,
+            gate_array));
+    for (std::size_t index = 0; index < fused.size(); ++index) {
+        require_close(sorted_fused[index], fused[index], 1e-6f);
+    }
 }
 
 void test_glu_and_expert_scale() {

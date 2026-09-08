@@ -203,6 +203,7 @@ class OpenAIChatBackend:
             "repetition_penalty": sampling.repetition_penalty,
             "enable_vision": sampling.enable_vision,
             "enable_mtp": sampling.enable_mtp,
+            "mtp_max_draft_tokens": sampling.mtp_max_draft_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
             "reasoning_format": "auto",

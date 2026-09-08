@@ -1,6 +1,8 @@
 #include "mlx_linear_attention.h"
 
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -27,11 +29,116 @@ float silu(float value) {
     return value / (1.0f + std::exp(-value));
 }
 
+mlx::core::array patterned_bfloat(
+    std::size_t count,
+    const mlx::core::Shape& shape,
+    int multiplier,
+    float scale) {
+    std::vector<float> values(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        const int centered =
+            static_cast<int>((index * multiplier) % 257) - 128;
+        values[index] = static_cast<float>(centered) * scale;
+    }
+    return mlx::core::astype(
+        mlx::core::array(
+            values.begin(), shape, mlx::core::float32),
+        mlx::core::bfloat16);
+}
+
+void require_bit_exact(
+    mlx::core::array actual,
+    mlx::core::array expected,
+    const char* name) {
+    if (actual.shape() != expected.shape() ||
+        actual.dtype() != mlx::core::bfloat16 ||
+        expected.dtype() != mlx::core::bfloat16) {
+        throw std::runtime_error(
+            std::string(name) + " shape/dtype mismatch");
+    }
+    mlx::core::eval(actual, expected);
+    const auto* actual_bits = actual.data<std::uint16_t>();
+    const auto* expected_bits = expected.data<std::uint16_t>();
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        if (actual_bits[index] != expected_bits[index]) {
+            throw std::runtime_error(
+                std::string(name) + " changed element " +
+                std::to_string(index));
+        }
+    }
+}
+
+void test_cached_depthwise_dilated_decode() {
+    using namespace mlx::core;
+    constexpr int batch = 1;
+    constexpr int channels = 10240;
+    constexpr int kernel = 4;
+    constexpr int dilation = 3;
+    constexpr int state_length = (kernel - 1) * dilation;
+    const auto input = patterned_bfloat(
+        channels,
+        Shape{batch, 1, channels},
+        37,
+        1.0f / 53.0f);
+    const auto weight = patterned_bfloat(
+        static_cast<std::size_t>(channels) * kernel,
+        Shape{channels, kernel},
+        29,
+        1.0f / 4096.0f);
+    const auto state = patterned_bfloat(
+        static_cast<std::size_t>(batch) * state_length * channels,
+        Shape{batch, state_length, channels},
+        43,
+        1.0f / 61.0f);
+
+    auto combined = concatenate({state, input}, 1);
+    auto reference_output = zeros(
+        Shape{batch, 1, channels}, float32);
+    auto weight_float = astype(weight, float32);
+    for (int tap = 0; tap < kernel; ++tap) {
+        auto source = slice(
+            combined,
+            Shape{0, tap * dilation, 0},
+            Shape{batch, tap * dilation + 1, channels});
+        auto coefficient = reshape(
+            slice(
+                weight_float,
+                Shape{0, tap},
+                Shape{channels, tap + 1}),
+            Shape{1, 1, channels});
+        reference_output = reference_output +
+            astype(source, float32) * coefficient;
+    }
+    reference_output = astype(
+        reference_output * sigmoid(reference_output),
+        bfloat16);
+    auto reference_state = contiguous(slice(
+        combined,
+        Shape{0, 1, 0},
+        Shape{batch, state_length + 1, channels}));
+
+    auto actual = mfq::metal::cached_depthwise_conv_silu(
+        input,
+        weight,
+        std::optional<array>(state),
+        dilation);
+    require_bit_exact(
+        std::move(actual.output),
+        std::move(reference_output),
+        "cached depthwise convolution output");
+    require_bit_exact(
+        std::move(actual.state),
+        std::move(reference_state),
+        "cached depthwise convolution state");
+}
+
 } // namespace
 
 int main() {
     try {
         using namespace mlx::core;
+
+        test_cached_depthwise_dilated_decode();
 
         const array conv_input(
             {

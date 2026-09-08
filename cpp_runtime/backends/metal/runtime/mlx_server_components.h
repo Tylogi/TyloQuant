@@ -2,6 +2,7 @@
 
 #include "mlx_deepseek_v4_causal_lm.h"
 #include "mlx_minicpmo45.h"
+#include "mlx_qwen4_causal_lm.h"
 #include "mlx_qwen35_causal_lm.h"
 
 #include "mfq_model_graph.h"
@@ -40,6 +41,12 @@ MlxServerComponentCallbacks make_mlx_server_components(
     const MfqModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV4CausalLm>> runtime,
+    mlx::core::Stream runtime_stream);
+
+MlxServerComponentCallbacks make_mlx_server_components(
+    const MfqModelGraph* graph,
+    std::shared_ptr<std::mutex> runtime_mutex,
+    std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime,
     mlx::core::Stream runtime_stream);
 
 } // namespace mfq::metal

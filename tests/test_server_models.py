@@ -116,73 +116,6 @@ def _fake_runtime(path: Path) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def _fake_flash_next_controller(path: Path) -> None:
-    path.write_text(
-        textwrap.dedent(
-            """\
-            #!/usr/bin/env python3
-            import argparse
-            import json
-            import os
-            from http.server import BaseHTTPRequestHandler, HTTPServer
-            from pathlib import Path
-
-            parser = argparse.ArgumentParser()
-            parser.add_argument('command')
-            parser.add_argument('--mfq')
-            parser.add_argument('--host')
-            parser.add_argument('--port', type=int)
-            parser.add_argument('--ctx-size', type=int)
-            parser.add_argument('--prefill-chunk-size', type=int)
-            parser.add_argument('--model-name')
-            args = parser.parse_args()
-            assert args.command == '_flash-next-worker'
-            marker = os.environ.get('MFQ_TEST_FLASH_NEXT_MARKER')
-            if marker:
-                Path(marker).write_text(json.dumps(vars(args)), encoding='utf-8')
-
-            class Handler(BaseHTTPRequestHandler):
-                def do_GET(self):
-                    if self.path == '/health':
-                        payload = {
-                            'status': 'ok',
-                            'ready': True,
-                            'model': args.model_name,
-                            'model_type': 'qwen4_exp',
-                            'max_context': args.ctx_size,
-                            'model_capabilities': {
-                                'architecture_family': 'qwen4_exp',
-                                'source': 'test',
-                                'features': {'text': True},
-                            },
-                        }
-                    elif self.path == '/v1/models':
-                        payload = {
-                            'object': 'list',
-                            'data': [{'id': args.model_name}],
-                        }
-                    else:
-                        self.send_response(404)
-                        self.end_headers()
-                        return
-                    body = json.dumps(payload).encode()
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-
-                def log_message(self, *args):
-                    pass
-
-            HTTPServer((args.host, args.port), Handler).serve_forever()
-            """
-        ),
-        encoding="utf-8",
-    )
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
-
-
 async def _wait_for_job(
     client: httpx.AsyncClient,
     operation_id: str,
@@ -641,17 +574,16 @@ def test_managed_runtime_loads_and_unloads_through_persistent_jobs(tmp_path: Pat
     asyncio.run(run())
 
 
-def test_managed_runtime_dispatches_flash_next_mfq_to_controller(tmp_path: Path) -> None:
+def test_managed_runtime_dispatches_qwen4_mfq_to_native_cpp(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
         model = model_dir / "Qwen3.8-Flash-Next.mfq"
         _model(model, architecture="qwen4_exp-hf-mfq-nint-recipe")
-        native_executable = tmp_path / "native-runtime-must-not-run"
-        native_executable.write_text("not executable", encoding="utf-8")
-        controller = tmp_path / "fake-mfq"
-        _fake_flash_next_controller(controller)
-        marker = tmp_path / "flash-next-command.json"
+        native_executable = tmp_path / "fake-native-runtime"
+        _fake_runtime(native_executable)
+        controller = tmp_path / "python-worker-must-not-run"
+        controller.write_text("not executable", encoding="utf-8")
         catalog = ModelCatalog([model_dir], cache_seconds=0)
         pool = ManagedRuntimePool(
             catalog,
@@ -659,7 +591,6 @@ def test_managed_runtime_dispatches_flash_next_mfq_to_controller(tmp_path: Path)
             startup_timeout_seconds=5,
             max_instances=1,
             controller_command=(str(controller),),
-            runtime_environment={"MFQ_TEST_FLASH_NEXT_MARKER": str(marker)},
         )
         store = SessionStore(tmp_path / "mfq.server.sqlite3")
         service = ServerService(store, pool, catalog=catalog, runtime_manager=pool)
@@ -674,14 +605,6 @@ def test_managed_runtime_dispatches_flash_next_mfq_to_controller(tmp_path: Path)
                 assert accepted.status_code == 202
                 job = await _wait_for_job(client, accepted.json()["operation_id"])
                 assert job["status"] == "succeeded", job
-                command = json.loads(marker.read_text(encoding="utf-8"))
-                assert command["command"] == "_flash-next-worker"
-                assert command["mfq"] == str(model)
-                assert command["host"] == "127.0.0.1"
-                assert isinstance(command["port"], int)
-                assert command["ctx_size"] == 8192
-                assert command["prefill_chunk_size"] == 2048
-                assert command["model_name"] == artifact["name"]
                 instance_id = job["result"]["instance_id"]
                 unload = await client.post(
                     "/api/v1/models/unload",

@@ -266,6 +266,13 @@ struct Mxfp4Fixture {
     int input = 0;
 };
 
+struct Mxfp8Fixture {
+    std::vector<std::uint8_t> blob;
+    std::vector<float> dense;
+    int rows = 0;
+    int input = 0;
+};
+
 float decode_mxfp4_code(std::uint8_t code) {
     constexpr std::array<float, 8> table{
         0.0f, 0.5f, 1.0f, 1.5f,
@@ -324,6 +331,77 @@ Mxfp4Fixture make_mxfp4(int rows, int input) {
     append<std::uint64_t>(blob, input / 2);
     append<std::uint64_t>(blob, rows);
     append<std::uint64_t>(blob, input / 32);
+    append_bytes(blob, values);
+    append_bytes(blob, scales);
+    return {
+        std::move(blob),
+        std::move(dense),
+        rows,
+        input,
+    };
+}
+
+float decode_mxfp8_code(std::uint8_t code) {
+    const auto magnitude = static_cast<std::uint8_t>(code & 0x7fu);
+    const int exponent = magnitude >> 3;
+    const int mantissa = magnitude & 7;
+    if (exponent == 15 && mantissa == 7) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    const float value = exponent == 0
+        ? static_cast<float>(mantissa) / 512.0f
+        : std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f,
+              exponent - 7);
+    return (code & 0x80u) == 0u ? value : -value;
+}
+
+Mxfp8Fixture make_mxfp8(int rows, int input, int salt = 0) {
+    if (rows <= 0 || input <= 0 || input % 128 != 0) {
+        throw std::runtime_error("invalid MXFP8 fixture geometry");
+    }
+    const int groups = input / 128;
+    const int scale_rows = (rows + 127) / 128;
+    std::vector<std::uint8_t> values(
+        static_cast<std::size_t>(rows) * input);
+    std::vector<std::uint8_t> scales(
+        static_cast<std::size_t>(scale_rows) * groups);
+    std::vector<float> dense(
+        static_cast<std::size_t>(rows) * input);
+    constexpr std::array<std::uint8_t, 12> codes{
+        0x00, 0x30, 0x34, 0x38, 0x3c, 0x40,
+        0x80, 0xb0, 0xb4, 0xb8, 0xbc, 0xc0,
+    };
+    for (int scale_row = 0; scale_row < scale_rows; ++scale_row) {
+        for (int group = 0; group < groups; ++group) {
+            scales[static_cast<std::size_t>(scale_row) * groups + group] =
+                static_cast<std::uint8_t>(126 + (scale_row + group + salt) % 3);
+        }
+    }
+    for (int row = 0; row < rows; ++row) {
+        for (int column = 0; column < input; ++column) {
+            const auto code = codes[static_cast<std::size_t>(
+                row * 7 + column * 5 + salt) % codes.size()];
+            values[static_cast<std::size_t>(row) * input + column] = code;
+            const float scale = std::ldexp(
+                1.0f,
+                static_cast<int>(scales[
+                    static_cast<std::size_t>(row / 128) * groups
+                    + column / 128]) - 127);
+            dense[static_cast<std::size_t>(row) * input + column] =
+                decode_mxfp8_code(code) * scale;
+        }
+    }
+    std::vector<std::uint8_t> blob;
+    append_magic(blob, "MXT1");
+    append<std::uint8_t>(blob, 1);
+    append<std::uint8_t>(blob, 8);
+    append<std::uint16_t>(blob, 0);
+    append<std::uint64_t>(blob, rows);
+    append<std::uint64_t>(blob, input);
+    append<std::uint64_t>(blob, rows);
+    append<std::uint64_t>(blob, input);
+    append<std::uint64_t>(blob, scale_rows);
+    append<std::uint64_t>(blob, groups);
     append_bytes(blob, values);
     append_bytes(blob, scales);
     return {
@@ -926,20 +1004,63 @@ struct TensorFixture {
     int columns = 0;
 };
 
+TensorFixture make_dense_tensor(
+    std::string_view dtype,
+    int rows,
+    int columns,
+    int salt) {
+    constexpr std::array<float, 9> values{
+        0.0f, 0.25f, -0.25f, 0.5f, -0.5f,
+        1.0f, -1.0f, 2.0f, -2.0f,
+    };
+    constexpr std::array<std::uint16_t, 9> f16_bits{
+        0x0000, 0x3400, 0xb400, 0x3800, 0xb800,
+        0x3c00, 0xbc00, 0x4000, 0xc000,
+    };
+    constexpr std::array<std::uint16_t, 9> bf16_bits{
+        0x0000, 0x3e80, 0xbe80, 0x3f00, 0xbf00,
+        0x3f80, 0xbf80, 0x4000, 0xc000,
+    };
+    const bool bf16 = dtype == "BF16";
+    if ((!bf16 && dtype != "F16") || rows <= 0 || columns <= 0) {
+        throw std::runtime_error("invalid dense expert fixture");
+    }
+    std::vector<std::uint8_t> blob;
+    append<std::uint32_t>(blob, 2);
+    append<std::int64_t>(blob, rows);
+    append<std::int64_t>(blob, columns);
+    std::vector<float> dense(static_cast<std::size_t>(rows) * columns);
+    for (std::size_t index = 0; index < dense.size(); ++index) {
+        const auto selected = (index * 5 + static_cast<std::size_t>(salt))
+            % values.size();
+        dense[index] = values[selected];
+        append<std::uint16_t>(
+            blob,
+            bf16 ? bf16_bits[selected] : f16_bits[selected]);
+    }
+    return {
+        std::move(blob),
+        std::move(dense),
+        rows,
+        columns,
+    };
+}
+
 TensorFixture make_nint_tensor(
     int bits,
     int rows,
     int columns,
-    int salt) {
-    if (columns % kGroupSize != 0) {
+    int salt,
+    int group_size = kGroupSize) {
+    if (group_size <= 0 || columns % group_size != 0) {
         throw std::runtime_error(
-            "test NINT width must be a multiple of 16");
+            "test NINT width must be a multiple of its group size");
     }
-    const int groups = columns / kGroupSize;
+    const int groups = columns / group_size;
     const auto metadata_count =
         static_cast<std::size_t>(rows) * groups;
     const auto value_count =
-        metadata_count * kGroupSize;
+        metadata_count * group_size;
     const auto maximum = (1u << bits) - 1u;
 
     std::vector<std::uint8_t> sub_scale(
@@ -983,7 +1104,7 @@ TensorFixture make_nint_tensor(
     append<std::uint8_t>(blob, 2);
     append<std::int32_t>(
         blob,
-        kGroupSize);
+        group_size);
     append<std::int32_t>(blob, 0);
     append<std::int32_t>(blob, columns);
     append<std::uint32_t>(blob, 2);
@@ -1030,14 +1151,14 @@ TensorFixture make_nint_tensor(
             ++column
         ) {
             const int group =
-                column / kGroupSize;
+                column / group_size;
             const auto metadata =
                 static_cast<std::size_t>(row)
                     * groups
                 + group;
             const auto value =
-                metadata * kGroupSize
-                + column % kGroupSize;
+                metadata * group_size
+                + column % group_size;
             dense[
                 static_cast<std::size_t>(row)
                     * columns
@@ -1190,7 +1311,8 @@ MoeFixture make_moe_fixture(
     const std::vector<std::string>& profiles,
     int output,
     int input,
-    int salt) {
+    int salt,
+    int nint_group_size = kGroupSize) {
     const int experts =
         static_cast<int>(profiles.size());
     std::vector<PoolFixture> pools;
@@ -1214,7 +1336,8 @@ MoeFixture make_moe_fixture(
                   std::stoi(profile.substr(4)),
                   output,
                   input,
-                  salt + expert);
+                  salt + expert,
+                  nint_group_size);
         pools.push_back({
             {expert},
             profile,
@@ -3201,13 +3324,13 @@ void test_mxfp4_nintm_and_projection_offsets() {
     const auto actual = evaluated_floats(
         weight.routed_matmul(input_array, id_array));
     require(
-        weight.supports_grouped_vq_mmq(),
+        weight.supports_grouped_mmq(),
         "MXFP4 NINTM must support grouped matrix prefill");
     const std::vector<std::int32_t> order{0, 3, 1, 2};
     const auto order_array = mlx::core::array(
         order.begin(),
         mlx::core::Shape{tokens * routes});
-    const auto plan = weight.build_grouped_vq_mmq_plan(
+    const auto plan = weight.build_grouped_mmq_plan(
         id_array,
         order_array);
     const auto matrix_actual = evaluated_floats(
@@ -3713,7 +3836,7 @@ void test_nepq_a_routed_and_fused_swiglu() {
     const auto weight =
         mfq::metal::MlxMoeWeight::from_blob(fixture.blob);
     require(
-        weight.supports_grouped_vq_mmq(),
+        weight.supports_grouped_mmq(),
         "NEPQ-A must support residual-aware grouped prefill");
     std::vector<float> input(tokens * width);
     for (std::size_t index = 0; index < input.size(); ++index) {
@@ -4059,7 +4182,7 @@ void benchmark_v4f_nepq_a() {
         << "%\n";
 }
 
-void test_grouped_vq_mmq_prefill() {
+void test_grouped_mmq_prefill() {
     constexpr int tokens = 49;
     constexpr int routes = 2;
     constexpr int width = 24;
@@ -4107,7 +4230,7 @@ void test_grouped_vq_mmq_prefill() {
                     ids_array,
                     mlx::core::Shape{tokens * routes})),
             mlx::core::int32));
-    auto block_plan = weight.build_grouped_vq_mmq_plan(
+    auto block_plan = weight.build_grouped_mmq_plan(
         ids_array,
         route_order);
     require(block_plan.block_rows == 32, "unexpected block row size");
@@ -4142,6 +4265,8 @@ void test_grouped_vq_mmq_prefill() {
                 mlx::core::argsort(route_order),
                 0),
             mlx::core::Shape{tokens, routes, width / 2}));
+    const auto fused_automatic = evaluated_floats(
+        weight.routed_swiglu(input_array, ids_array));
     for (int token = 0; token < tokens; ++token) {
         std::vector<float> source(
             input.begin() + token * width,
@@ -4180,9 +4305,194 @@ void test_grouped_vq_mmq_prefill() {
                         + output],
                     gate / (1.0f + std::exp(-gate)) * up,
                     6e-3f);
+                require_close(
+                    fused_automatic[
+                        (token * routes + route) * (width / 2)
+                        + output],
+                    fused_actual[
+                        (token * routes + route) * (width / 2)
+                        + output],
+                    1e-6f);
             }
         }
     }
+}
+
+void test_grouped_nint_mmq_prefill() {
+    constexpr int tokens = 49;
+    constexpr int routes = 2;
+    constexpr int output = 48;
+    constexpr int input_width = 96;
+    const std::vector<std::string> profiles{
+        "NINT1", "NINT2", "NINT3", "NINT4", "NINT5",
+        "NINT6", "NINT7", "NINT8", "NINT8-0"};
+    auto fixture = make_moe_fixture(
+        profiles, output, input_width, 9, 24);
+    const auto weight = mfq::metal::MlxMoeWeight::from_blob(
+        fixture.blob);
+    require(
+        weight.supports_grouped_mmq(),
+        "NINT and NINT8-0 cohorts must support grouped prefill");
+    std::vector<float> input(tokens * input_width);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<float>(
+            static_cast<int>((index * 11 + 3) % 29) - 14)
+            / 128.0f;
+    }
+    std::vector<std::int32_t> ids(tokens * routes);
+    for (int row = 0; row < tokens * routes; ++row) {
+        ids[row] = row % static_cast<int>(profiles.size());
+    }
+    const auto input_array = mlx::core::astype(
+        mlx::core::array(
+            input.begin(),
+            mlx::core::Shape{tokens, input_width}),
+        mlx::core::float16);
+    const auto ids_array = mlx::core::array(
+        ids.begin(), mlx::core::Shape{tokens, routes});
+    const auto plain = evaluated_floats(
+        weight.routed_matmul(input_array, ids_array));
+    const auto fused = evaluated_floats(
+        weight.routed_swiglu(input_array, ids_array));
+    for (int token = 0; token < tokens; ++token) {
+        for (int route = 0; route < routes; ++route) {
+            const int expert = ids[token * routes + route];
+            for (int row = 0; row < output; ++row) {
+                float expected = 0.0f;
+                for (int column = 0; column < input_width; ++column) {
+                    expected += input[token * input_width + column]
+                        * fixture.dense[
+                            (expert * output + row) * input_width + column];
+                }
+                require_close(
+                    plain[(token * routes + route) * output + row],
+                    expected,
+                    2e-2f);
+            }
+            for (int row = 0; row < output / 2; ++row) {
+                const float gate = plain[
+                    (token * routes + route) * output + row];
+                const float up = plain[
+                    (token * routes + route) * output + output / 2 + row];
+                require_close(
+                    fused[(token * routes + route) * (output / 2) + row],
+                    gate / (1.0f + std::exp(-gate)) * up,
+                    2e-2f);
+            }
+        }
+    }
+}
+
+void test_mixed_nintm_native_and_grouped_dispatch() {
+    constexpr int experts = 4;
+    constexpr int routes = 2;
+    constexpr int output = 48;
+    constexpr int input_width = 128;
+    const auto nint = make_nint_tensor(4, output, input_width, 3, 32);
+    const auto mxfp8 = make_mxfp8(output, input_width, 5);
+    const auto bf16 = make_dense_tensor("BF16", output, input_width, 7);
+    const auto f16 = make_dense_tensor("F16", output, input_width, 11);
+
+    std::vector<std::uint8_t> blob;
+    append_magic(blob, "NIM2");
+    append<std::uint32_t>(blob, experts);
+    append<std::uint32_t>(blob, output);
+    append<std::uint32_t>(blob, input_width);
+    append<std::uint32_t>(blob, experts);
+    auto append_pool = [&blob](
+        int expert,
+        std::string_view dtype,
+        const std::vector<std::uint8_t>& payload) {
+        append<std::uint32_t>(blob, 1);
+        append<std::uint32_t>(
+            blob,
+            static_cast<std::uint32_t>(dtype.size()));
+        append<std::uint64_t>(blob, payload.size());
+        append<std::uint64_t>(blob, 0);
+        append<std::int32_t>(blob, expert);
+        blob.insert(blob.end(), dtype.begin(), dtype.end());
+        append_bytes(blob, payload);
+    };
+    // Reverse and mix pool order so descriptor-local and global expert rows
+    // cannot accidentally coincide.
+    append_pool(3, "F16", f16.blob);
+    append_pool(1, "MXFP8", mxfp8.blob);
+    append_pool(0, "NINT4", nint.blob);
+    append_pool(2, "BF16", bf16.blob);
+
+    std::vector<float> dense(
+        static_cast<std::size_t>(experts) * output * input_width);
+    const auto copy_expert = [&](int expert, const std::vector<float>& source) {
+        std::copy(
+            source.begin(),
+            source.end(),
+            dense.begin() + static_cast<std::ptrdiff_t>(
+                static_cast<std::size_t>(expert) * output * input_width));
+    };
+    copy_expert(0, nint.dense);
+    copy_expert(1, mxfp8.dense);
+    copy_expert(2, bf16.dense);
+    copy_expert(3, f16.dense);
+
+    const auto weight = mfq::metal::MlxMoeWeight::from_blob(blob);
+    require(
+        weight.supports_grouped_mmq(),
+        "NINT/MXFP8/BF16/F16 cohorts must share grouped prefill");
+    const auto exercise = [&](int tokens) {
+        std::vector<float> input(
+            static_cast<std::size_t>(tokens) * input_width);
+        for (std::size_t index = 0; index < input.size(); ++index) {
+            input[index] = static_cast<float>(
+                static_cast<int>((index * 13 + 5) % 31) - 15)
+                / 1024.0f;
+        }
+        std::vector<std::int32_t> ids(tokens * routes);
+        for (int row = 0; row < tokens * routes; ++row) {
+            ids[row] = (row * 3 + row / 5) % experts;
+        }
+        const auto input_array = mlx::core::astype(
+            mlx::core::array(
+                input.begin(),
+                mlx::core::Shape{tokens, input_width}),
+            mlx::core::float16);
+        const auto ids_array = mlx::core::array(
+            ids.begin(),
+            mlx::core::Shape{tokens, routes});
+        const auto plain = evaluated_floats(
+            weight.routed_matmul(input_array, ids_array));
+        const auto fused = evaluated_floats(
+            weight.routed_swiglu(input_array, ids_array));
+        for (int token = 0; token < tokens; ++token) {
+            for (int route = 0; route < routes; ++route) {
+                const int expert = ids[token * routes + route];
+                for (int row = 0; row < output; ++row) {
+                    float expected = 0.0f;
+                    for (int column = 0; column < input_width; ++column) {
+                        expected += input[token * input_width + column]
+                            * dense[
+                                (expert * output + row) * input_width
+                                + column];
+                    }
+                    require_close(
+                        plain[(token * routes + route) * output + row],
+                        expected,
+                        8e-2f);
+                }
+                for (int row = 0; row < output / 2; ++row) {
+                    const float gate = plain[
+                        (token * routes + route) * output + row];
+                    const float up = plain[
+                        (token * routes + route) * output + output / 2 + row];
+                    require_close(
+                        fused[(token * routes + route) * (output / 2) + row],
+                        gate / (1.0f + std::exp(-gate)) * up,
+                        8e-2f);
+                }
+            }
+        }
+    };
+    exercise(3);
+    exercise(49);
 }
 
 void test_grouped_mxfp4_vq_mmq_prefill() {
@@ -4225,7 +4535,7 @@ void test_grouped_mxfp4_vq_mmq_prefill() {
     const auto weight =
         mfq::metal::MlxMoeWeight::from_blob(blob);
     require(
-        weight.supports_grouped_vq_mmq(),
+        weight.supports_grouped_mmq(),
         "mixed MXFP4/VQ NINTM must support grouped matrix prefill");
     std::vector<float> source(tokens * input);
     for (std::size_t index = 0; index < source.size(); ++index) {
@@ -4253,7 +4563,7 @@ void test_grouped_mxfp4_vq_mmq_prefill() {
                     ids_array,
                     mlx::core::Shape{tokens * routes})),
             mlx::core::int32));
-    const auto plan = weight.build_grouped_vq_mmq_plan(
+    const auto plan = weight.build_grouped_mmq_plan(
         ids_array,
         order);
     const auto matrix = evaluated_floats(
@@ -4558,7 +4868,9 @@ int main(int argc, char** argv) {
         test_mxfp4_smallm_nax_policy();
         test_vq_cohorts_and_ffn();
         test_nepq_a_routed_and_fused_swiglu();
-        test_grouped_vq_mmq_prefill();
+        test_grouped_mmq_prefill();
+        test_grouped_nint_mmq_prefill();
+        test_mixed_nintm_native_and_grouped_dispatch();
         test_grouped_mxfp4_vq_mmq_prefill();
         test_container_validation();
         test_streamed_tpq_residency();

@@ -98,6 +98,53 @@ class _MlxMoePool:
         return value.reshape((*x.shape[:-1], self.experts, self.out_per_expert))
 
 
+class MlxDenseRoutedLinear:
+    """Execute one source-precision ``[experts,out,K]`` routed projection."""
+
+    def __init__(self, tensor: np.ndarray) -> None:
+        if tensor.ndim != 3:
+            raise ValueError(
+                f"MlxDenseRoutedLinear expects a 3D tensor, got {tensor.shape}"
+            )
+        from mfq.runtime.mlx_linear import mlx_dense_array
+
+        self.n_experts, self.out_per_expert, self.neuron_len = map(int, tensor.shape)
+        self.weight = mlx_dense_array(tensor)
+
+    def forward(
+        self,
+        x: mx.array | np.ndarray,
+        expert_ids: mx.array | np.ndarray,
+    ) -> mx.array:
+        source = x if isinstance(x, mx.array) else mx.array(x)
+        ids = expert_ids if isinstance(expert_ids, mx.array) else mx.array(expert_ids)
+        if ids.dtype not in (mx.int32, mx.uint32):
+            ids = ids.astype(mx.int32)
+        if ids.ndim != 2:
+            raise ValueError("routed expert IDs must have [tokens,routes] shape")
+        tokens, routes = map(int, ids.shape)
+        if source.ndim == 2:
+            if tuple(map(int, source.shape)) != (tokens, self.neuron_len):
+                raise ValueError("shared routed input must have [tokens,neuron_len] shape")
+            source = source[:, None, :]
+        elif source.ndim != 3 or tuple(map(int, source.shape)) != (
+            tokens,
+            routes,
+            self.neuron_len,
+        ):
+            raise ValueError("routed input must have [tokens,K] or [tokens,routes,K] shape")
+        source = source.astype(self.weight.dtype)
+        selected = mx.take(self.weight, ids, axis=0)
+        return mx.matmul(selected, source[..., None]).squeeze(-1)
+
+    def __call__(
+        self,
+        x: mx.array | np.ndarray,
+        expert_ids: mx.array | np.ndarray,
+    ) -> mx.array:
+        return self.forward(x, expert_ids)
+
+
 class MlxRoutedLinear:
     """Execute one NINTM tensor for explicit ``[token,route]`` expert IDs."""
 

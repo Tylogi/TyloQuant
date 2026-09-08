@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -18,6 +19,82 @@ using mlx::core::Dtype;
 using mlx::core::MathMode;
 using mlx::core::Shape;
 using mlx::core::array;
+
+constexpr const char* kCachedDepthwiseConvHeader = R"METAL(
+template <
+    typename StateT,
+    typename FirstT,
+    typename SecondT,
+    typename WeightT,
+    typename BiasT>
+inline float mfq_cached_depthwise_conv_value(
+    const device StateT* state,
+    const device FirstT* first,
+    const device SecondT* second,
+    const device WeightT* weight,
+    const device BiasT* bias,
+    uint batch,
+    uint token,
+    uint channel,
+    uint tokens,
+    uint channels,
+    uint first_channels,
+    uint kernel_size,
+    uint dilation,
+    uint state_length,
+    bool has_bias) {
+    float value = has_bias ? float(bias[channel]) : 0.0f;
+    for (uint tap = 0u; tap < kernel_size; ++tap) {
+        int source_token = int(token) + int(tap * dilation) -
+            int(state_length);
+        float source;
+        if (source_token < 0) {
+            uint state_row = uint(source_token + int(state_length));
+            source = float(state[
+                (batch * state_length + state_row) * channels + channel]);
+        } else if (channel < first_channels) {
+            source = float(first[
+                (batch * tokens + uint(source_token)) * first_channels +
+                channel]);
+        } else {
+            uint second_channels = channels - first_channels;
+            source = float(second[
+                (batch * tokens + uint(source_token)) * second_channels +
+                channel - first_channels]);
+        }
+        value += source * float(weight[channel * kernel_size + tap]);
+    }
+    return value;
+}
+
+template <typename StateT, typename FirstT, typename SecondT>
+inline float mfq_cached_depthwise_state_value(
+    const device StateT* state,
+    const device FirstT* first,
+    const device SecondT* second,
+    uint batch,
+    uint state_row,
+    uint channel,
+    uint tokens,
+    uint channels,
+    uint first_channels,
+    uint state_length) {
+    uint combined = tokens + state_row;
+    if (combined < state_length) {
+        return float(state[
+            (batch * state_length + combined) * channels + channel]);
+    }
+    uint source_token = combined - state_length;
+    if (channel < first_channels) {
+        return float(first[
+            (batch * tokens + source_token) * first_channels + channel]);
+    }
+    uint second_channels = channels - first_channels;
+    return float(second[
+        (batch * tokens + source_token) * second_channels +
+        channel - first_channels]);
+}
+)METAL";
 
 constexpr const char* kGatedDeltaNetSource = R"METAL(
     constexpr uint SIMD_WIDTH = 32u;
@@ -154,6 +231,55 @@ constexpr const char* kSsmConvSiluSource = R"METAL(
     out[index] = value / (1.0f + exp(-value));
 )METAL";
 
+constexpr const char* kCachedDepthwiseConvDecodeSource = R"METAL(
+    uint index = thread_position_in_grid.x;
+    uint total = uint(B) * uint(C);
+    if (index >= total) return;
+    uint batch = index / uint(C);
+    uint channel = index % uint(C);
+    uint state_base =
+        (batch * uint(STATE_LENGTH)) * uint(C) + channel;
+    uint input_index = batch * uint(C) + channel;
+
+    float convolution = mfq_cached_depthwise_conv_value(
+        state_in,
+        input,
+        input,
+        weight,
+        bias,
+        batch,
+        0u,
+        channel,
+        1u,
+        uint(C),
+        uint(C),
+        uint(K),
+        uint(DILATION),
+        uint(STATE_LENGTH),
+        HAS_BIAS != 0);
+    float tail = 1.0f /
+        (1.0f + metal::exp(metal::abs(convolution)));
+    float gate = convolution < 0.0f ? tail : 1.0f - tail;
+    output[input_index] = T(convolution * gate);
+
+    for (uint position = 0u;
+         position < uint(STATE_LENGTH);
+         ++position) {
+        state_out[state_base + position * uint(C)] = T(
+            mfq_cached_depthwise_state_value(
+                state_in,
+                input,
+                input,
+                batch,
+                position,
+                channel,
+                1u,
+                uint(C),
+                uint(C),
+                uint(STATE_LENGTH)));
+    }
+)METAL";
+
 constexpr const char* kLinearConvQkvSource = R"METAL(
     constexpr uint QK_TASKS = uint(B * TOKENS * 2 * NK);
     constexpr uint V_GROUPS = (uint(NV * DV) + 31u) / 32u;
@@ -180,29 +306,22 @@ constexpr const char* kLinearConvQkvSource = R"METAL(
              dimension < uint(DK);
              dimension += 32u) {
             uint channel = channel_base + dimension;
-            float value = HAS_BIAS != 0 ? bias[channel] : 0.0f;
-            for (uint tap = 0u; tap < uint(K); ++tap) {
-                int source_token =
-                    int(token) + int(tap) - int(K - 1);
-                float source;
-                if (source_token < 0) {
-                    uint state_row =
-                        uint(source_token + int(K - 1));
-                    source = state_in[
-                        (batch * uint(K - 1) + state_row) *
-                            uint(C) +
-                        channel
-                    ];
-                } else {
-                    source = float(qk[
-                        (batch * uint(TOKENS) +
-                         uint(source_token)) *
-                            uint(QKC) +
-                        channel
-                    ]);
-                }
-                value += source * weight[channel * uint(K) + tap];
-            }
+            float value = mfq_cached_depthwise_conv_value(
+                state_in,
+                qk,
+                v_in,
+                weight,
+                bias,
+                batch,
+                token,
+                channel,
+                uint(TOKENS),
+                uint(C),
+                uint(QKC),
+                uint(K),
+                1u,
+                uint(K - 1),
+                HAS_BIAS != 0);
             value = value / (1.0f + exp(-value));
             values[local++] = value;
             square_sum += value * value;
@@ -235,29 +354,22 @@ constexpr const char* kLinearConvQkvSource = R"METAL(
         uint value_index = value_group * 32u + lane;
         if (value_index < uint(NV * DV)) {
             uint channel = uint(QKC) + value_index;
-            float value = HAS_BIAS != 0 ? bias[channel] : 0.0f;
-            for (uint tap = 0u; tap < uint(K); ++tap) {
-                int source_token =
-                    int(token) + int(tap) - int(K - 1);
-                float source;
-                if (source_token < 0) {
-                    uint state_row =
-                        uint(source_token + int(K - 1));
-                    source = state_in[
-                        (batch * uint(K - 1) + state_row) *
-                            uint(C) +
-                        channel
-                    ];
-                } else {
-                    source = float(v_in[
-                        (batch * uint(TOKENS) +
-                         uint(source_token)) *
-                            uint(NV * DV) +
-                        value_index
-                    ]);
-                }
-                value += source * weight[channel * uint(K) + tap];
-            }
+            float value = mfq_cached_depthwise_conv_value(
+                state_in,
+                qk,
+                v_in,
+                weight,
+                bias,
+                batch,
+                token,
+                channel,
+                uint(TOKENS),
+                uint(C),
+                uint(QKC),
+                uint(K),
+                1u,
+                uint(K - 1),
+                HAS_BIAS != 0);
             value = value / (1.0f + exp(-value));
             uint head = value_index / uint(DV);
             uint dimension = value_index - head * uint(DV);
@@ -278,29 +390,17 @@ constexpr const char* kLinearConvQkvSource = R"METAL(
             uint row = index / uint(C);
             uint state_row = row % uint(K - 1);
             uint batch = row / uint(K - 1);
-            uint combined = uint(TOKENS) + state_row;
-            if (combined < uint(K - 1)) {
-                state_out[index] = state_in[
-                    (batch * uint(K - 1) + combined) *
-                        uint(C) +
-                    channel
-                ];
-            } else {
-                uint source_token = combined - uint(K - 1);
-                if (channel < uint(QKC)) {
-                    state_out[index] = float(qk[
-                        (batch * uint(TOKENS) + source_token) *
-                            uint(QKC) +
-                        channel
-                    ]);
-                } else {
-                    state_out[index] = float(v_in[
-                        (batch * uint(TOKENS) + source_token) *
-                            uint(NV * DV) +
-                        channel - uint(QKC)
-                    ]);
-                }
-            }
+            state_out[index] = mfq_cached_depthwise_state_value(
+                state_in,
+                qk,
+                v_in,
+                batch,
+                state_row,
+                channel,
+                uint(TOKENS),
+                uint(C),
+                uint(QKC),
+                uint(K - 1));
         }
     }
 )METAL";
@@ -343,6 +443,24 @@ const mlx::core::fast::CustomKernelFunction& ssm_conv_kernel() {
     return kernel;
 }
 
+const mlx::core::fast::CustomKernelFunction&
+cached_depthwise_conv_decode_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_cached_depthwise_conv_decode",
+            {"input", "weight", "bias", "state_in"},
+            {"output", "state_out"},
+            kCachedDepthwiseConvDecodeSource,
+            kCachedDepthwiseConvHeader,
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
 mlx::core::fast::CustomKernelFunction make_linear_conv_kernel() {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
@@ -351,7 +469,7 @@ mlx::core::fast::CustomKernelFunction make_linear_conv_kernel() {
         {"state_in", "qk", "v_in", "weight", "bias", "params"},
         {"q_out", "k_out", "v_out", "state_out"},
         kLinearConvQkvSource,
-        "",
+        kCachedDepthwiseConvHeader,
         true,
         false,
         options);
@@ -373,6 +491,16 @@ array float32_contiguous(const array& value) {
 array floating_contiguous(const array& value) {
     auto result = value;
     if (result.dtype() != mlx::core::float16 &&
+        result.dtype() != mlx::core::float32) {
+        result = mlx::core::astype(result, mlx::core::float16);
+    }
+    return mlx::core::contiguous(result);
+}
+
+array real_contiguous(const array& value) {
+    auto result = value;
+    if (result.dtype() != mlx::core::float16 &&
+        result.dtype() != mlx::core::bfloat16 &&
         result.dtype() != mlx::core::float32) {
         result = mlx::core::astype(result, mlx::core::float16);
     }
@@ -426,6 +554,35 @@ ConvWeight normalize_conv_weight(
     };
 }
 
+ConvWeight normalize_cached_conv_weight(
+    const array& weight,
+    int channels) {
+    auto source = real_contiguous(weight);
+    int kernel = 0;
+    if (source.ndim() == 3 &&
+        source.shape(0) == channels &&
+        source.shape(1) == 1) {
+        kernel = source.shape(2);
+        source = mlx::core::reshape(source, Shape{channels, kernel});
+    } else if (source.ndim() == 2 &&
+               source.shape(0) == channels) {
+        kernel = source.shape(1);
+    } else if (source.ndim() == 2 &&
+               source.shape(1) == channels) {
+        kernel = source.shape(0);
+        source = mlx::core::transpose(source);
+    } else {
+        throw std::runtime_error(
+            "cached depthwise convolution weight must have [C,1,K], "
+            "[C,K], or [K,C] shape");
+    }
+    if (kernel <= 0) {
+        throw std::runtime_error(
+            "cached depthwise convolution kernel width must be positive");
+    }
+    return {mlx::core::contiguous(source), kernel};
+}
+
 struct ConvBias {
     array values;
     bool present;
@@ -446,6 +603,15 @@ ConvBias normalize_conv_bias(
             "SSM convolution bias width mismatch");
     }
     return {std::move(result), true};
+}
+
+bool cached_depthwise_conv_fast_path_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* setting =
+            std::getenv("MFQ_METAL_CACHED_DEPTHWISE_CONV_FAST");
+        return setting == nullptr || std::atoi(setting) != 0;
+    }();
+    return enabled;
 }
 
 std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
@@ -629,6 +795,127 @@ array ssm_conv_silu(
         false,
         {});
     return std::move(outputs.front());
+}
+
+MlxCachedDepthwiseConvResult cached_depthwise_conv_silu(
+    const array& input,
+    const array& weight,
+    const std::optional<array>& state,
+    int dilation,
+    const std::optional<array>& bias) {
+    auto source = real_contiguous(input);
+    if (source.ndim() != 3) {
+        throw std::runtime_error(
+            "cached depthwise convolution input must have [B,T,C] shape");
+    }
+    const int batch = source.shape(0);
+    const int tokens = source.shape(1);
+    const int channels = source.shape(2);
+    if (batch <= 0 || tokens <= 0 || channels <= 0 || dilation <= 0) {
+        throw std::runtime_error(
+            "cached depthwise convolution dimensions are invalid");
+    }
+    const auto packed_weight =
+        normalize_cached_conv_weight(weight, channels);
+    const auto bias_values = normalize_conv_bias(bias, channels);
+    const std::int64_t state_length_wide =
+        static_cast<std::int64_t>(packed_weight.kernel - 1) * dilation;
+    if (state_length_wide < 0 ||
+        state_length_wide > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(
+            "cached depthwise convolution state length is invalid");
+    }
+    const int state_length = static_cast<int>(state_length_wide);
+    const Shape state_shape{batch, state_length, channels};
+    auto state_values = state
+        ? (state->dtype() == source.dtype()
+               ? mlx::core::contiguous(*state)
+               : mlx::core::contiguous(
+                     mlx::core::astype(*state, source.dtype())))
+        : mlx::core::zeros(state_shape, source.dtype());
+    if (state_values.shape() != state_shape) {
+        throw std::runtime_error(
+            "cached depthwise convolution state shape mismatch");
+    }
+
+    const bool fast_decode =
+        cached_depthwise_conv_fast_path_enabled() &&
+        tokens == 1 && packed_weight.kernel >= 2 &&
+        packed_weight.kernel <= 16 && state_length <= 64;
+    if (fast_decode) {
+        const std::int64_t size =
+            static_cast<std::int64_t>(batch) * channels;
+        auto outputs = cached_depthwise_conv_decode_kernel()(
+            {
+                source,
+                packed_weight.values,
+                bias_values.values,
+                state_values,
+            },
+            {source.shape(), state_shape},
+            {source.dtype(), source.dtype()},
+            {checked_int(size, "cached depthwise convolution grid"), 1, 1},
+            {
+                checked_int(
+                    std::min<std::int64_t>(256, size),
+                    "cached depthwise convolution threadgroup"),
+                1,
+                1,
+            },
+            {
+                {"T", source.dtype()},
+                {"B", batch},
+                {"C", channels},
+                {"K", packed_weight.kernel},
+                {"DILATION", dilation},
+                {"STATE_LENGTH", state_length},
+                {"HAS_BIAS", static_cast<int>(bias_values.present)},
+            },
+            std::nullopt,
+            false,
+            {});
+        return {
+            std::move(outputs.at(0)),
+            std::move(outputs.at(1)),
+        };
+    }
+
+    auto combined = mlx::core::concatenate({state_values, source}, 1);
+    array output = bias_values.present
+        ? mlx::core::broadcast_to(
+              mlx::core::reshape(
+                  bias_values.values, Shape{1, 1, channels}),
+              Shape{batch, tokens, channels})
+        : mlx::core::zeros(
+              Shape{batch, tokens, channels}, mlx::core::float32);
+    auto weight_float = mlx::core::astype(
+        packed_weight.values, mlx::core::float32);
+    for (int tap = 0; tap < packed_weight.kernel; ++tap) {
+        auto tap_source = mlx::core::slice(
+            combined,
+            Shape{0, tap * dilation, 0},
+            Shape{batch, tap * dilation + tokens, channels});
+        auto coefficient = mlx::core::reshape(
+            mlx::core::slice(
+                weight_float,
+                Shape{0, tap},
+                Shape{channels, tap + 1}),
+            Shape{1, 1, channels});
+        output = output +
+            mlx::core::astype(tap_source, mlx::core::float32) * coefficient;
+    }
+    output = output * mlx::core::sigmoid(output);
+    auto next_state = state_length == 0
+        ? mlx::core::slice(
+              combined, Shape{0, 0, 0}, Shape{batch, 0, channels})
+        : mlx::core::slice(
+              combined,
+              Shape{0, combined.shape(1) - state_length, 0},
+              Shape{batch, combined.shape(1), channels});
+    return {
+        mlx::core::astype(output, source.dtype()),
+        mlx::core::contiguous(next_state),
+    };
 }
 
 MlxLinearConvQkvResult linear_conv_qkv(

@@ -18,6 +18,11 @@ struct MlxLinearConvQkvResult {
     mlx::core::array state;
 };
 
+struct MlxCachedDepthwiseConvResult {
+    mlx::core::array output;
+    mlx::core::array state;
+};
+
 MlxGatedDeltaNetResult gated_delta_net(
     const mlx::core::array& query,
     const mlx::core::array& key,
@@ -32,6 +37,13 @@ mlx::core::array ssm_conv_silu(
     const mlx::core::array& input,
     const mlx::core::array& weight,
     int tokens,
+    const std::optional<mlx::core::array>& bias = std::nullopt);
+
+MlxCachedDepthwiseConvResult cached_depthwise_conv_silu(
+    const mlx::core::array& input,
+    const mlx::core::array& weight,
+    const std::optional<mlx::core::array>& state = std::nullopt,
+    int dilation = 1,
     const std::optional<mlx::core::array>& bias = std::nullopt);
 
 MlxLinearConvQkvResult linear_conv_qkv(

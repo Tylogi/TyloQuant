@@ -21,7 +21,7 @@ from mfq.formats.assets import (
     is_asset_record,
 )
 from mfq.formats.header import FileHeader
-from mfq.formats.io import is_bfloat16_array, load_mmap, open_mmap, save
+from mfq.formats.io import is_bfloat16_array, load_mmap, open_mmap, save, unpack_dense
 from mfq.formats.moe import NintMoePool, NintMoeTensor
 from mfq.formats.nint import NintSpec
 from mfq.formats.shards import format_shard_path
@@ -40,6 +40,7 @@ from mfq.tools.quantize_hf_to_mfq import (
     _source_quantization,
     _transform_glm_kv_b,
     _validate_runtime_fused_pairs,
+    _write_dense_axis0_blob,
     convert,
 )
 from mfq.tools.quantize_hf_to_mfq import (
@@ -66,6 +67,20 @@ def _standard_plan(name: str, shape: tuple[int, ...] = (16, 48)) -> TensorPlan:
         source_dtype="BF16",
         target_dtype="NINT4" if len(shape) == 2 else "F16",
     )
+
+
+def test_streamed_dense_writer_preserves_three_dimensional_expert_geometry(tmp_path) -> None:
+    values = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(6, 4)
+
+    class Rows:
+        def read_rows(self, start, end, *, device="cpu"):
+            return values[start:end].to(device)
+
+    blob = tmp_path / "dense-experts.blob"
+    _write_dense_axis0_blob(Rows(), (2, 3, 4), blob, "F16", row_chunk=2)
+
+    restored = unpack_dense("F16", blob.read_bytes())
+    np.testing.assert_array_equal(restored, values.numpy().reshape(2, 3, 4))
 
 
 def test_standard_preset_aliases_match_llamacpp() -> None:
@@ -98,7 +113,7 @@ def test_q4_k_m_standard_preset_raises_sensitive_text_matrices() -> None:
     )
     by_name = {item.name: item for item in mapped}
 
-    assert by_name["model.language_model.embed_tokens.weight"].target_dtype == "NINT4"
+    assert by_name["model.language_model.embed_tokens.weight"].target_dtype == "NINT6"
     assert by_name["lm_head.weight"].target_dtype == "NINT6"
     assert by_name["model.language_model.layers.0.mlp.down_proj.weight"].target_dtype == "NINT6"
     assert by_name["model.language_model.layers.8.mlp.down_proj.weight"].target_dtype == "NINT4"
@@ -150,6 +165,7 @@ def test_standard_preset_keeps_all_vision_and_predictor_tensors_native_by_defaul
         _standard_plan("model.visual.merger.linear_fc2.weight"),
         _standard_plan("model.visual.patch_embed.proj.weight", (8, 3, 2, 2, 2)),
         _standard_plan("mtp.fc.weight"),
+        _standard_plan("predictor.block.0.attention.query.weight"),
     ]
     mapped = hf_to_mfq._apply_standard_preset(
         plans,
@@ -166,6 +182,89 @@ def test_standard_preset_keeps_all_vision_and_predictor_tensors_native_by_defaul
     assert by_name["model.visual.merger.linear_fc2.weight"].target_dtype == "BF16"
     assert by_name["model.visual.patch_embed.proj.weight"].target_dtype == "BF16"
     assert by_name["mtp.fc.weight"].target_dtype == "BF16"
+    assert by_name["predictor.block.0.attention.query.weight"].target_dtype == "BF16"
+
+
+def test_standard_preset_keeps_small_sensitive_control_paths_native() -> None:
+    plans = [
+        _standard_plan("model.block.0.attention.mhc.pre.down.weight", (320, 10240)),
+        _standard_plan("model.block.0.linear_attention.conv.weight", (10240, 1, 4)),
+        _standard_plan("model.block.0.attention.indexer.query_key.weight", (640, 2560)),
+        _standard_plan("model.block.0.position_embedding.key.weight", (10240, 2560)),
+        _standard_plan("model.block.0.position_embedding.value.weight", (2560, 2560)),
+        _standard_plan("model.block.0.position_embedding.conv.weight", (10240, 1, 4)),
+    ]
+    mapped = hf_to_mfq._apply_standard_preset(
+        plans,
+        "Q4_K_M",
+        {"num_hidden_layers": 1},
+    )
+
+    assert {item.target_dtype for item in mapped} == {"BF16"}
+
+
+@pytest.mark.parametrize(
+    ("preset", "expected"),
+    [
+        ("Q2_K_S", "NINT6"),
+        ("Q4_K_M", "NINT6"),
+        ("Q8_0", "NINT8"),
+    ],
+)
+def test_standard_preset_matches_embedding_to_output_precision(
+    preset: str,
+    expected: str,
+) -> None:
+    mapped = hf_to_mfq._apply_standard_preset(
+        [
+            _standard_plan("model.token_embedding.weight"),
+            _standard_plan("model.output.weight"),
+        ],
+        preset,
+        {"num_hidden_layers": 1},
+    )
+
+    assert [item.target_dtype for item in mapped] == [expected, expected]
+
+
+@pytest.mark.parametrize("preset", hf_to_mfq.STANDARD_PRESET_NAMES)
+def test_standard_preset_always_uses_nint8_for_shared_expert_weights(
+    preset: str,
+) -> None:
+    plans = [
+        _standard_plan("model.block.0.mlp.shared_expert.gate.weight"),
+        _standard_plan("model.block.0.mlp.shared_expert.up.weight"),
+        _standard_plan("model.block.0.mlp.shared_expert.down.weight"),
+        _standard_plan("model.block.0.mlp.shared_expert.router.weight"),
+    ]
+    mapped = hf_to_mfq._apply_standard_preset(
+        plans,
+        preset,
+        {"num_hidden_layers": 1},
+    )
+    by_name = {item.name: item for item in mapped}
+
+    for projection in ("gate", "up", "down"):
+        assert (
+            by_name[f"model.block.0.mlp.shared_expert.{projection}.weight"].target_dtype
+            == "NINT8"
+        )
+    assert by_name["model.block.0.mlp.shared_expert.router.weight"].target_dtype == "BF16"
+
+
+def test_standard_preset_only_treats_schema_expert_banks_as_nintm() -> None:
+    plans = [
+        _standard_plan("model.block.0.linear_attention.conv.weight", (16, 1, 4)),
+        _standard_plan("model.block.0.mlp.experts.down.weight", (8, 16, 48)),
+    ]
+    mapped = hf_to_mfq._apply_standard_preset(
+        plans,
+        "Q4_K_M",
+        {"num_hidden_layers": 1},
+    )
+
+    assert mapped[0].target_dtype == "BF16"
+    assert mapped[1].target_dtype == "NINTM"
 
 
 def test_standard_preset_quantizes_vision_and_predictor_only_with_opt_in() -> None:
@@ -212,6 +311,61 @@ def test_normalize_hf_expert_storage_preserves_mixed_nintm_plan() -> None:
 
     assert normalized == [item]
     assert normalized[0].expert_precisions == precisions
+
+
+def test_balanced_random_expert_mix_is_reproducible_and_fusion_safe() -> None:
+    plans = [
+        TensorPlan(
+            name=f"model.language_model.layers.0.mlp.experts.{suffix}.weight",
+            shard="model.safetensors",
+            shape=(8, rows, 48),
+            source_dtype="F8_E4M3",
+            target_dtype="NINTM",
+            expert_shape=(8, rows, 48),
+            expert_precisions=(ExpertPrecision("NINT4", NintSpec(4, 24, 6)),) * 8,
+        )
+        for suffix, rows in (("gate_proj", 32), ("up_proj", 32), ("down_proj", 16))
+    ]
+    profiles = hf_to_mfq._parse_expert_mix_profiles("NINT2,NINT4,NVQ2J")
+
+    mixed = hf_to_mfq._apply_balanced_random_expert_mix(plans, profiles, 17)
+    repeated = hf_to_mfq._apply_balanced_random_expert_mix(plans, profiles, 17)
+
+    assert mixed == repeated
+    assignments = [item.expert_precisions for item in mixed]
+    assert assignments[0] == assignments[1] == assignments[2]
+    counts = {
+        family: sum(value.family == family for value in assignments[0] or ())
+        for family in ("NINT2", "NINT4", "NVQ2J")
+    }
+    assert max(counts.values()) - min(counts.values()) <= 1
+    _validate_runtime_fused_pairs(mixed)
+
+
+def test_parse_expert_mix_profiles_uses_runtime_nint_specs() -> None:
+    profiles = hf_to_mfq._parse_expert_mix_profiles(
+        "NINT2,NINT3,NINT4,NINT5,NINT6,NINT8,NVQ2J,NVQ3J,MXFP4"
+    )
+
+    assert [value.family for value in profiles] == [
+        "NINT2",
+        "NINT3",
+        "NINT4",
+        "NINT5",
+        "NINT6",
+        "NINT8",
+        "NVQ2J",
+        "NVQ3J",
+        "MXFP4",
+    ]
+    assert [value.nint_spec for value in profiles[:6]] == [
+        NintSpec(2, 16, 5),
+        NintSpec(3, 24, 5),
+        NintSpec(4, 24, 6),
+        NintSpec(5, 28, 7),
+        NintSpec(6, 24, 7),
+        NintSpec(8, 48, 7),
+    ]
 
 
 def test_raw_safetensor_slice_streams_bfloat16_rows_and_expert_rows(tmp_path):

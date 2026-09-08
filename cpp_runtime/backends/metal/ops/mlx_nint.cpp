@@ -1,6 +1,13 @@
 #include "mlx_nint.h"
 
+#include "mfq_nintm_prefill_embedded.h"
 #include "mlx_staging_allocator.h"
+
+#include <mlx/allocator.h>
+#include <mlx/backend/metal/device.h>
+#include <mlx/primitives.h>
+
+#include <sys/sysctl.h>
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +30,180 @@ using mlx::core::Dtype;
 using mlx::core::MathMode;
 using mlx::core::Shape;
 using mlx::core::array;
+
+struct DenseNintMmqParameters {
+    int rows = 0;
+    int output_width = 0;
+    int input_width = 0;
+    int bits = 0;
+    int group_size = 0;
+    int groups = 0;
+    int q5_execution = 0;
+};
+
+static_assert(sizeof(DenseNintMmqParameters) == 28);
+
+struct DenseNintMmqConfig {
+    int rows = 0;
+    int output_width = 0;
+    int input_width = 0;
+    int bits = 0;
+    int group_size = 0;
+    int groups = 0;
+    int q5_execution = 0;
+    bool use_nax = false;
+};
+
+bool dense_nint_nax_enabled() noexcept {
+    const char* setting = std::getenv("MFQ_METAL_NINT_PREFILL_NAX");
+    if (setting != nullptr) {
+        return std::strcmp(setting, "0") != 0;
+    }
+    static const bool is_m5 = [] {
+        std::size_t size = 0;
+        if (::sysctlbyname(
+                "machdep.cpu.brand_string", nullptr, &size, nullptr, 0) != 0
+            || size <= 1) {
+            return false;
+        }
+        std::string name(size, '\0');
+        if (::sysctlbyname(
+                "machdep.cpu.brand_string", name.data(), &size, nullptr, 0)
+            != 0) {
+            return false;
+        }
+        return name.rfind("Apple M5", 0) == 0;
+    }();
+    return is_m5;
+}
+
+class DenseNintMmqPrimitive final : public mlx::core::UnaryPrimitive {
+public:
+    DenseNintMmqPrimitive(
+        mlx::core::Stream stream,
+        DenseNintMmqConfig config)
+        : UnaryPrimitive(stream), config_(std::move(config)) {}
+
+    void eval_cpu(const std::vector<array>&, array&) override {
+        throw std::runtime_error("dense NINT MMQ has no CPU path");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        if (inputs.size() != 6) {
+            throw std::logic_error("dense NINT MMQ input count mismatch");
+        }
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(selected_stream.device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            config_.use_nax
+                ? "mfq_dense_nint_nax_v1"
+                : "mfq_dense_nint_mmq_v6",
+            options,
+            [use_nax = config_.use_nax] {
+                std::string source;
+                source.reserve(
+                    (use_nax
+                        ? sizeof(detail::kSteelNaxSource)
+                        : sizeof(detail::kSteelMmaSource))
+                    + sizeof(detail::kNintmPrefillSource)
+                    + 256);
+                source += "#include <metal_stdlib>\n";
+                source += "#include <metal_simdgroup>\n";
+                source += "#include <metal_simdgroup_matrix>\n";
+                if (use_nax) {
+                    source += "#include <MetalPerformancePrimitives/"
+                        "MetalPerformancePrimitives.h>\n";
+                    source += "#define MFQ_ENABLE_NAX 1\n";
+                }
+                source += "using namespace metal;\n";
+                source += "using bfloat16_t = bfloat;\n";
+                source += use_nax
+                    ? detail::kSteelNaxSource
+                    : detail::kSteelMmaSource;
+                source += detail::kNintmPrefillSource;
+                return source;
+            });
+        auto& encoder = mlx::core::metal::get_command_encoder(selected_stream);
+        for (int index = 0; index < 6; ++index) {
+            encoder.set_input_array(inputs[static_cast<std::size_t>(index)], index);
+        }
+        encoder.set_output_array(output, 6);
+        const DenseNintMmqParameters parameters{
+            .rows = config_.rows,
+            .output_width = config_.output_width,
+            .input_width = config_.input_width,
+            .bits = config_.bits,
+            .group_size = config_.group_size,
+            .groups = config_.groups,
+            .q5_execution = config_.q5_execution,
+        };
+        encoder.set_bytes(parameters, 7);
+        auto* kernel = device.get_kernel(
+            config_.use_nax
+                ? "mfq_dense_nint_nax_f16_bm64_bn64_bk96"
+                : "mfq_dense_nint_mmq_f16_bm128_bn64_bk48",
+            library);
+        encoder.set_compute_pipeline_state(kernel);
+        encoder.dispatch_threadgroups(
+            MTL::Size(
+                (config_.output_width + 63) / 64,
+                config_.use_nax
+                    ? (config_.rows + 63) / 64
+                    : (config_.rows + 127) / 128,
+                1),
+            MTL::Size(config_.use_nax ? 128 : 256, 1, 1));
+    }
+
+    const char* name() const override {
+        return "DenseNintMmqPrimitive";
+    }
+
+    bool is_equivalent(const mlx::core::Primitive& other) const override {
+        const auto* primitive =
+            dynamic_cast<const DenseNintMmqPrimitive*>(&other);
+        return primitive != nullptr
+            && primitive->config_.rows == config_.rows
+            && primitive->config_.output_width == config_.output_width
+            && primitive->config_.input_width == config_.input_width
+            && primitive->config_.bits == config_.bits
+            && primitive->config_.group_size == config_.group_size
+            && primitive->config_.groups == config_.groups
+            && primitive->config_.q5_execution == config_.q5_execution
+            && primitive->config_.use_nax == config_.use_nax;
+    }
+
+    std::vector<Shape> output_shapes(const std::vector<array>&) override {
+        return {Shape{config_.rows, config_.output_width}};
+    }
+
+private:
+    DenseNintMmqConfig config_;
+};
+
+array dense_nint_mmq(
+    const array& q,
+    const array& sub_scale,
+    const array& sub_min,
+    const array& anchor_scale,
+    const array& anchor_min,
+    const array& x,
+    DenseNintMmqConfig config) {
+    auto stream = mlx::core::default_stream(mlx::core::default_device());
+    if (stream.device != mlx::core::Device::gpu) {
+        throw std::invalid_argument("dense NINT MMQ requires the Metal device");
+    }
+    const Shape shape{config.rows, config.output_width};
+    return array(
+        shape,
+        mlx::core::float16,
+        std::make_shared<DenseNintMmqPrimitive>(stream, std::move(config)),
+        {q, sub_scale, sub_min, anchor_scale, anchor_min, x});
+}
 
 constexpr const char* kNintHeader = R"METAL(
 #include <metal_simdgroup_matrix>
@@ -3194,8 +3375,14 @@ array MlxNintWeight::matmul_impl(
     }
 
     auto source = input;
-    if (source.dtype() != mlx::core::float16 &&
-        source.dtype() != mlx::core::float32) {
+    // Large packed matrix products accumulate in float while consuming
+    // half activations, matching the native FP16/BF16 linear path.  Keeping
+    // an incidental FP32 residual dtype here used to bypass the packed MMQ
+    // entirely and materialize the full weight for every prefill layer.
+    if (rows >= 64 && source.dtype() == mlx::core::float32) {
+        source = mlx::core::astype(source, mlx::core::float16);
+    } else if (source.dtype() != mlx::core::float16 &&
+               source.dtype() != mlx::core::float32) {
         source = mlx::core::astype(source, mlx::core::float16);
     }
     source = mlx::core::reshape(
@@ -3204,17 +3391,34 @@ array MlxNintWeight::matmul_impl(
             static_cast<std::int32_t>(rows),
             input_size_,
         });
-    if (rows >= 64 &&
-        source.dtype() == mlx::core::float16) {
-        const auto token_ids = mlx::core::arange(
-            output_size_,
-            mlx::core::int32);
-        const auto dense = embedding(
-            token_ids,
-            mlx::core::float16);
-        auto result = mlx::core::matmul(
-            source,
-            mlx::core::transpose(dense));
+    if (rows >= 64 && source.dtype() == mlx::core::float16) {
+        const auto* packed_setting =
+            std::getenv("MFQ_METAL_NINT_PREFILL_PACKED_MMQ");
+        const bool packed_enabled = packed_setting == nullptr
+            || std::strcmp(packed_setting, "0") != 0;
+        auto result = packed_enabled
+            ? dense_nint_mmq(
+                  q_packed_,
+                  sub_scale_,
+                  sub_min_,
+                  neuron_scale_,
+                  neuron_min_,
+                  source,
+                  DenseNintMmqConfig{
+                      .rows = static_cast<int>(rows),
+                      .output_width = output_size_,
+                      .input_width = input_size_,
+                      .bits = bits_,
+                      .group_size = group_size_,
+                      .groups = groups_,
+                      .q5_execution = static_cast<int>(q5_execution_layout_),
+                      .use_nax = dense_nint_nax_enabled(),
+                  })
+            : mlx::core::matmul(
+                  source,
+                  mlx::core::transpose(embedding(
+                      mlx::core::arange(output_size_, mlx::core::int32),
+                      mlx::core::float16)));
         result = mlx::core::reshape(
             std::move(result),
             std::move(output_shape));

@@ -51,14 +51,20 @@ _DEFAULT_TYPE = {
 class TensorRole(str, Enum):
     TOKEN_EMBEDDING = "token_embedding"
     PLE_EMBEDDING = "ple_embedding"
+    PLE_PROJECTION = "ple_projection"
     OUTPUT = "output"
     ATTENTION_Q = "attention_q"
     ATTENTION_K = "attention_k"
     ATTENTION_V = "attention_v"
     ATTENTION_OUTPUT = "attention_output"
+    ATTENTION_INDEXER = "attention_indexer"
     FFN_GATE = "ffn_gate"
     FFN_UP = "ffn_up"
     FFN_DOWN = "ffn_down"
+    SHARED_EXPERT = "shared_expert"
+    ROUTED_EXPERT = "routed_expert"
+    MHC = "mhc"
+    SHORT_CONVOLUTION = "short_convolution"
     OTHER = "other"
 
 
@@ -66,6 +72,7 @@ class TensorScope(str, Enum):
     TEXT = "text"
     VISION = "vision"
     PREDICTOR = "predictor"
+    PLE = "ple"
     OTHER = "other"
 
 
@@ -128,7 +135,9 @@ _VISION_COMPONENTS = frozenset(
         "vit",
     }
 )
-_PREDICTOR_COMPONENTS = frozenset({"mtp", "draft", "draft_model", "speculator", "medusa"})
+_PREDICTOR_COMPONENTS = frozenset(
+    {"mtp", "predictor", "draft", "draft_model", "speculator", "medusa"}
+)
 _DENSE_COMPONENTS = frozenset(
     {
         "merger",
@@ -155,12 +164,21 @@ def normalize_preset(value: str) -> str:
     return preset
 
 
+def _is_ple_path(name: str) -> bool:
+    components = set(name.split("."))
+    return "ple" in components or bool(
+        re.search(r"(?:^|\.)block\.\d+\.position_embedding\.", name)
+    )
+
+
 def _scope(name: str) -> TensorScope:
     components = set(name.split("."))
     if components & _VISION_COMPONENTS:
         return TensorScope.VISION
     if components & _PREDICTOR_COMPONENTS:
         return TensorScope.PREDICTOR
+    if _is_ple_path(name):
+        return TensorScope.PLE
     if components & {"language_model", "text_model", "llm"} or name.startswith(
         ("model.", "blk.")
     ):
@@ -170,6 +188,7 @@ def _scope(name: str) -> TensorScope:
 
 def _role(name: str, canonical_name: str | None) -> TensorRole:
     canonical = canonical_name or name
+    names = (name, canonical)
     if (
         ".position_embedding.ngram.shard." in canonical
         or ".ngram_embedding.shard_" in name
@@ -183,6 +202,40 @@ def _role(name: str, canonical_name: str | None) -> TensorRole:
         "model.token_embedding.weight",
     } or name.endswith(("embed_tokens.weight", "token_embedding.weight")):
         return TensorRole.TOKEN_EMBEDDING
+    if any(
+        any(
+            component in {"mhc", "hyper_connection", "hyper_connection_mixer"}
+            or component.endswith("_hyper_connection")
+            for component in value.split(".")
+        )
+        for value in names
+    ):
+        return TensorRole.MHC
+    if any("indexer" in value.split(".") for value in names):
+        return TensorRole.ATTENTION_INDEXER
+    if any(
+        value.endswith(".weight")
+        and any(
+            component in {"conv", "conv1d", "ssm_conv1d"}
+            or component.endswith("_conv")
+            for component in value.split(".")
+        )
+        for value in names
+    ):
+        return TensorRole.SHORT_CONVOLUTION
+    if any(
+        any(component in {"shared_expert", "shared_experts"} for component in value.split("."))
+        or "_shexp." in value
+        for value in names
+    ):
+        return TensorRole.SHARED_EXPERT
+    if any(
+        any(component in {"experts", "expert"} for component in value.split("."))
+        for value in names
+    ):
+        return TensorRole.ROUTED_EXPERT
+    if any(_is_ple_path(value) for value in names):
+        return TensorRole.PLE_PROJECTION
     if any(
         marker in canonical
         for marker in (
@@ -246,9 +299,9 @@ def describe_tensor(
     canonical_scope = _scope(canonical_name) if canonical_name else TensorScope.OTHER
     scope = (
         canonical_scope
-        if canonical_scope in {TensorScope.VISION, TensorScope.PREDICTOR}
+        if canonical_scope in {TensorScope.VISION, TensorScope.PREDICTOR, TensorScope.PLE}
         else source_scope
-        if source_scope in {TensorScope.VISION, TensorScope.PREDICTOR}
+        if source_scope in {TensorScope.VISION, TensorScope.PREDICTOR, TensorScope.PLE}
         else canonical_scope
         if canonical_scope is not TensorScope.OTHER
         else source_scope
@@ -257,11 +310,15 @@ def describe_tensor(
     source_layer_match = _LAYER_PATTERN.search(name)
     match = source_layer_match or _LAYER_PATTERN.search(canonical_name or "")
     layer_index = int(match.group(1)) if match is not None else None
-    components = set(name.split("."))
-    quantizable = len(shape) in (2, 3) and source_dtype not in {"I32", "I64"}
-    quantizable &= len(shape) == 3 or name.endswith(".weight")
+    names = (name, canonical_name or name)
+    components = {component for value in names for component in value.split(".")}
+    is_matrix = len(shape) == 2
+    is_expert_bank = len(shape) == 3 and role is TensorRole.ROUTED_EXPERT
+    quantizable = (is_matrix or is_expert_bank) and source_dtype not in {"I32", "I64"}
+    quantizable &= any(value.endswith(".weight") for value in names)
     quantizable &= not any(
-        marker in name
+        marker in value
+        for value in names
         for marker in (
             "_norm.weight",
             "layernorm.weight",
@@ -276,6 +333,11 @@ def describe_tensor(
         )
     )
     quantizable &= not bool(components & _DENSE_COMPONENTS)
+    quantizable &= role not in {
+        TensorRole.ATTENTION_INDEXER,
+        TensorRole.MHC,
+        TensorRole.SHORT_CONVOLUTION,
+    }
     # Root-level predictor fusion/projection matrices are small, shared, and
     # outside the repeated decoder stack.  Preserve them without naming a
     # particular speculative architecture.
@@ -304,8 +366,10 @@ def select_recipe_type(
 
     preset = normalize_preset(preset)
     target = _DEFAULT_TYPE[preset]
-    if role is TensorRole.OUTPUT:
+    if role in {TensorRole.OUTPUT, TensorRole.TOKEN_EMBEDDING}:
         return "Q8_0" if preset == "Q8_0" else "Q6_K"
+    if role is TensorRole.SHARED_EXPERT:
+        return "Q8_0"
     if role is TensorRole.ATTENTION_V:
         index = attention_index or 0
         if preset == "Q2_K":

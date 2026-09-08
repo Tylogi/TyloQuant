@@ -1876,6 +1876,60 @@ def _spec_for_target(target_dtype: str, default_spec: NintSpec) -> NintSpec:
     return default_spec
 
 
+def _parse_expert_mix_profiles(value: str) -> tuple[ExpertPrecision, ...]:
+    """Parse the compact families used by a deterministic expert-mix fixture."""
+
+    labels = tuple(part.strip().upper() for part in value.split(",") if part.strip())
+    if not labels:
+        return ()
+    if len(set(labels)) != len(labels):
+        raise ValueError("--random-expert-mix contains duplicate precision families")
+    precisions: list[ExpertPrecision] = []
+    for family in labels:
+        if family.startswith("NINT") and family != "NINT8-0":
+            spec = _spec_for_target(family, NintSpec())
+            if family != f"NINT{spec.bits}":
+                raise ValueError(f"unsupported random expert precision: {family}")
+            precisions.append(nint_expert_precision(spec))
+        else:
+            try:
+                precisions.append(ExpertPrecision(family=family))
+            except ValueError as exc:
+                raise ValueError(f"unsupported random expert precision: {family}") from exc
+    return tuple(precisions)
+
+
+def _apply_balanced_random_expert_mix(
+    plan: list[TensorPlan],
+    profiles: tuple[ExpertPrecision, ...],
+    seed: int,
+) -> list[TensorPlan]:
+    """Replace routed-expert policies with one balanced, reproducible mixture.
+
+    The assignment is cached by expert count, so mandatory fused projections
+    (notably gate/up) always receive identical expert-wise precision vectors.
+    """
+
+    if not profiles:
+        return plan
+    assignments: dict[int, tuple[ExpertPrecision, ...]] = {}
+    result: list[TensorPlan] = []
+    for item in plan:
+        if item.target_dtype != "NINTM" or item.expert_shape is None:
+            result.append(item)
+            continue
+        n_experts = int(item.expert_shape[0])
+        assigned = assignments.get(n_experts)
+        if assigned is None:
+            indices = np.arange(n_experts, dtype=np.int64) % len(profiles)
+            rng = np.random.default_rng(np.random.SeedSequence((int(seed), n_experts)))
+            rng.shuffle(indices)
+            assigned = tuple(profiles[int(index)] for index in indices)
+            assignments[n_experts] = assigned
+        result.append(replace(item, target_spec=None, expert_precisions=assigned))
+    return result
+
+
 def _apply_standard_preset(
     plan: list[TensorPlan],
     preset: str,
@@ -1893,21 +1947,24 @@ def _apply_standard_preset(
     text_attention: list[tuple[int, str]] = []
     vision_attention: list[tuple[int, str]] = []
     for item in plan:
+        source_name = item.source_name or item.name
         gguf_name = item.gguf_name or _hf_to_gguf_name(
-            item.name,
+            source_name,
             mtp_layer_index=topology.text_layers,
         )
         descriptor = describe_tensor(
-            item.name,
+            source_name,
             item.shape,
             item.source_dtype,
-            canonical_name=gguf_name,
+            canonical_name=item.name,
         )
         scope_enabled = not (
             descriptor.scope is TensorScope.VISION
             and not quantize_vision
             or descriptor.scope is TensorScope.PREDICTOR
             and not quantize_mtp
+            or descriptor.scope is TensorScope.PLE
+            and not quantize_ple
             or descriptor.role is TensorRole.PLE_EMBEDDING
             and not quantize_ple
         )
@@ -3077,6 +3134,44 @@ def _dense_blob_from_tensor(t: torch.Tensor, blob_path: Path, dtype: str) -> int
     return blob_path.stat().st_size
 
 
+def _write_dense_axis0_blob(
+    source,
+    shape: tuple[int, ...],
+    blob_path: Path,
+    dtype: str,
+    row_chunk: int,
+) -> int:
+    """Stream a row-readable source into one dense MFQ blob."""
+
+    if len(shape) < 2 or any(int(value) <= 0 for value in shape):
+        raise ValueError(f"streamed dense tensor must have a non-empty rank >= 2: {shape}")
+    rows = int(np.prod(shape[:-1]))
+    columns = int(shape[-1])
+    chunk_rows = max(1, int(row_chunk))
+    with blob_path.open("wb") as handle:
+        handle.write(struct.pack("<I", len(shape)))
+        handle.write(struct.pack(f"<{len(shape)}q", *shape))
+        for start in range(0, rows, chunk_rows):
+            end = min(rows, start + chunk_rows)
+            value = source.read_rows(start, end, device="cpu")
+            if tuple(map(int, value.shape)) != (end - start, columns):
+                raise ValueError(
+                    f"streamed dense row shape mismatch: {tuple(value.shape)} != "
+                    f"{(end - start, columns)}"
+                )
+            if dtype == "F32":
+                array = value.to(torch.float32).contiguous().numpy().astype(np.float32, copy=False)
+            elif dtype == "F16":
+                array = value.to(torch.float16).contiguous().numpy().astype(np.float16, copy=False)
+            elif dtype == "BF16":
+                array = value.to(torch.bfloat16).contiguous().view(torch.uint16).numpy()
+                array = array.astype("<u2", copy=False)
+            else:
+                raise ValueError(f"unsupported streamed dense target dtype: {dtype}")
+            handle.write(np.ascontiguousarray(array).tobytes())
+    return blob_path.stat().st_size
+
+
 def _write_float8_e4m3_axis0_blob(
     source,
     shape: tuple[int, ...],
@@ -3117,6 +3212,7 @@ def _write_nint_axis0_blob(
     quant_backend: str,
     device: str,
     importance_rows=None,
+    synthetic: bool = False,
 ) -> int:
     if len(shape) != 2:
         raise ValueError(f"NINT stream writer only supports 2D tensors, got {shape}")
@@ -3146,6 +3242,9 @@ def _write_nint_axis0_blob(
         sub_min_off = sub_scale_off + sub_nbytes
         q_off = sub_min_off + sub_nbytes
         f.truncate(q_off + q_nbytes)
+
+        if synthetic:
+            return int(q_off + q_nbytes)
 
         for start in range(0, out, row_chunk):
             end = min(start + row_chunk, out)
@@ -3375,12 +3474,14 @@ class _GlmExpertRowSource:
             cursor += take
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
 
-    def __getitem__(self, key: slice) -> torch.Tensor:
-        if not isinstance(key, slice) or key.step not in (None, 1):
-            raise TypeError("HF expert source accepts contiguous slices only")
+    def read_rows(
+        self,
+        start: int,
+        end: int,
+        *,
+        device: str | torch.device,
+    ) -> torch.Tensor:
         total_rows = self.n_experts * self.rows_per_expert
-        start = 0 if key.start is None else int(key.start)
-        end = total_rows if key.stop is None else int(key.stop)
         if start < 0 or end < start or end > total_rows:
             raise IndexError(f"invalid HF expert row slice {start}:{end}")
         pieces: list[torch.Tensor] = []
@@ -3392,8 +3493,17 @@ class _GlmExpertRowSource:
             pieces.append(self._read(expert, local_row, local_row + take))
             cursor += take
         if not pieces:
-            return torch.empty((0, self.columns), dtype=torch.float32)
-        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+            return torch.empty((0, self.columns), dtype=torch.float32, device=device)
+        value = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+        return value.to(device)
+
+    def __getitem__(self, key: slice) -> torch.Tensor:
+        if not isinstance(key, slice) or key.step not in (None, 1):
+            raise TypeError("HF expert source accepts contiguous slices only")
+        total_rows = self.n_experts * self.rows_per_expert
+        start = 0 if key.start is None else int(key.start)
+        end = total_rows if key.stop is None else int(key.stop)
+        return self.read_rows(start, end, device="cpu")
 
 
 class _MfqGlmExpertRowSource:
@@ -3510,6 +3620,7 @@ def _write_nint_moe_axis0_blob(
     quant_backend: str,
     device: str,
     importance: np.ndarray | torch.Tensor | None = None,
+    synthetic: bool = False,
 ) -> int:
     """Stream a mixed-profile expert tensor into the ``NINTM`` container."""
 
@@ -3573,6 +3684,7 @@ def _write_nint_moe_axis0_blob(
                     quant_backend,
                     device,
                     importance_rows=(importance_rows if profile.bits in {2, 3, 4, 5, 6} else None),
+                    synthetic=synthetic,
                 )
                 dtype = f"NINT{profile.bits}".encode("ascii")
                 output.write(
@@ -3718,6 +3830,7 @@ def _write_flat_family_axis0_blob(
     artifact_root: str | Path | None,
     importance: np.ndarray | torch.Tensor | None = None,
     importance_rows_per_entry: int | None = None,
+    synthetic: bool = False,
 ) -> int:
     family = precision.family
     if family.startswith("NINT") or family.startswith("NEPQ"):
@@ -3944,6 +4057,9 @@ def _write_flat_family_axis0_blob(
             offset += (out * bits + 7) // 8
         output.truncate(offset)
 
+        if synthetic:
+            return int(offset)
+
         for start in range(0, out, row_chunk):
             end = min(start + row_chunk, out)
             chunk = (
@@ -4169,6 +4285,26 @@ def _write_nepq_cohort_blob(
     return payload_nbytes, runtime_payload
 
 
+def _write_synthetic_mxfp4_axis0_blob(
+    shape: tuple[int, int],
+    blob_path: Path,
+) -> int:
+    """Write a structurally valid all-zero MXFP4 matrix for performance tests."""
+
+    rows, columns = (int(value) for value in shape)
+    header = mx_header_bytes(
+        "MXFP4",
+        (rows, columns),
+        (rows, columns // 2),
+        (rows, columns // 32),
+    )
+    size = len(header) + rows * (columns // 2 + columns // 32)
+    with blob_path.open("wb+") as output:
+        output.write(header)
+        output.truncate(size)
+    return int(size)
+
+
 def _write_mixed_moe_axis0_blob(
     source,
     source_shape: tuple[int, ...],
@@ -4180,6 +4316,7 @@ def _write_mixed_moe_axis0_blob(
     device: str,
     artifact_root: str | Path | None,
     importance: np.ndarray | torch.Tensor | None = None,
+    synthetic: bool = False,
 ) -> int:
     """Stream all supported precision families into one NIM2 container."""
 
@@ -4212,6 +4349,7 @@ def _write_mixed_moe_axis0_blob(
             quant_backend,
             device,
             importance=importance,
+            synthetic=synthetic,
         )
 
     cohorts: dict[ExpertPrecision, list[int]] = {}
@@ -4283,15 +4421,22 @@ def _write_mixed_moe_axis0_blob(
                         importance_rows=(
                             importance_rows if precision.nint_spec.bits in {2, 3, 4, 5, 6} else None
                         ),
+                        synthetic=synthetic,
                     )
                     runtime_payload = b""
                 elif precision.family == "MXFP4":
-                    exact_writer = getattr(source, "write_mxfp4_expert_pool", None)
-                    if exact_writer is None:
-                        raise TypeError(
-                            "MXFP4 expert preservation requires an exact native MXFP4 source"
+                    if synthetic:
+                        pool_nbytes = _write_synthetic_mxfp4_axis0_blob(
+                            (len(expert_ids) * rows_per_expert, columns),
+                            pool_path,
                         )
-                    pool_nbytes = exact_writer(expert_ids, pool_path)
+                    else:
+                        exact_writer = getattr(source, "write_mxfp4_expert_pool", None)
+                        if exact_writer is None:
+                            raise TypeError(
+                                "MXFP4 expert preservation requires an exact native MXFP4 source"
+                            )
+                        pool_nbytes = exact_writer(expert_ids, pool_path)
                     runtime_payload = b""
                 elif precision.family.startswith("NEPQ"):
                     pool_nbytes, runtime_payload = _write_nepq_cohort_blob(
@@ -4316,6 +4461,7 @@ def _write_mixed_moe_axis0_blob(
                         importance_rows_per_entry=(
                             rows_per_expert if importance_shape == (n_experts, columns) else None
                         ),
+                        synthetic=synthetic,
                     )
                     runtime_payload = b""
                 dtype = precision.family.encode("ascii")
@@ -4771,9 +4917,13 @@ def convert(args: argparse.Namespace) -> None:
     recipe_types = _load_gguf_recipe(Path(recipe_gguf).resolve()) if recipe_gguf else None
     standard_preset_arg = getattr(args, "standard_preset", "")
     standard_preset = _normalize_standard_preset(standard_preset_arg) if standard_preset_arg else ""
+    random_expert_mix_arg = getattr(args, "random_expert_mix", "")
+    random_expert_mix = _parse_expert_mix_profiles(random_expert_mix_arg)
+    random_expert_mix_seed = int(getattr(args, "random_expert_mix_seed", 20260908))
     quantize_vision = bool(getattr(args, "quantize_vision", False))
     quantize_mtp = bool(getattr(args, "quantize_mtp", False))
     quantize_ple = bool(getattr(args, "quantize_ple", False))
+    synthetic_expert_weights = bool(getattr(args, "synthetic_expert_weights", False))
     calibration_scheme_path = getattr(args, "calibration_scheme", "")
     calibration_scheme = (
         load_scheme(Path(calibration_scheme_path).resolve()) if calibration_scheme_path else None
@@ -4805,6 +4955,8 @@ def convert(args: argparse.Namespace) -> None:
         raise ValueError(
             "--quantize-vision, --quantize-mtp, and --quantize-ple do not apply to --bf16"
         )
+    if synthetic_expert_weights and not random_expert_mix:
+        raise ValueError("--synthetic-expert-weights requires --random-expert-mix")
     if base_store is not None and (
         mostly_bf16
         or recipe_types is not None
@@ -4812,6 +4964,7 @@ def convert(args: argparse.Namespace) -> None:
         or calibration_scheme is not None
         or getattr(args, "imatrix", "")
         or getattr(args, "tensor_precision_overrides", "")
+        or random_expert_mix
         or quantize_ple
     ):
         raise ValueError(
@@ -4867,6 +5020,11 @@ def convert(args: argparse.Namespace) -> None:
         tensor_precision_overrides,
     )
     plan = _normalize_hf_expert_storage(plan)
+    plan = _apply_balanced_random_expert_mix(
+        plan,
+        random_expert_mix,
+        random_expert_mix_seed,
+    )
     if base_store is not None:
         if source_inventory is None:
             source_inventory = _hf_source_inventory(root)
@@ -4955,6 +5113,11 @@ def convert(args: argparse.Namespace) -> None:
                 },
                 "recipe": _artifact_provenance_name(recipe_gguf),
                 "standard_preset": standard_preset or None,
+                "random_expert_mix": [value.family for value in random_expert_mix],
+                "random_expert_mix_seed": (
+                    random_expert_mix_seed if random_expert_mix else None
+                ),
+                "synthetic_expert_weights": synthetic_expert_weights,
                 "quantize_vision": quantize_vision,
                 "quantize_mtp": quantize_mtp,
                 "quantize_ple": quantize_ple,
@@ -5146,23 +5309,19 @@ def convert(args: argparse.Namespace) -> None:
                 # Keep only one safetensors mmap alive at a time.  Holding a
                 # multi-gigabyte shard open across all tensors lets touched
                 # pages accumulate in the process working set on Windows.
-                if item.target_dtype == "NINTM" and item.expert_source_names is not None:
-                    if (
-                        item.expert_shape is None
-                        or item.expert_precisions is None
-                        or item.expert_source_shards is None
-                    ):
-                        raise ValueError(f"NINTM plan lacks HF expert metadata: {item.name}")
+                if item.expert_source_names is not None:
+                    if item.expert_source_shards is None:
+                        raise ValueError(f"plan lacks HF expert source metadata: {item.name}")
                     source = (
                         _MfqGlmExpertRowSource(
                             mfq_checkpoint,
-                            item.expert_shape,
+                            item.shape,
                             item.expert_source_names,
                         )
                         if mfq_checkpoint is not None
                         else _GlmExpertRowSource(
                             root,
-                            item.expert_shape,
+                            item.shape,
                             item.expert_source_names,
                             item.expert_source_shards,
                             item.expert_source_quantizations,
@@ -5171,25 +5330,43 @@ def convert(args: argparse.Namespace) -> None:
                         )
                     )
                     try:
-                        expert_importance = _hf_expert_importance(
-                            item, imatrix_bindings.get(item.name)
-                        )
-                        flattened_shape = (
-                            item.expert_shape[0] * item.expert_shape[1],
-                            item.expert_shape[2],
-                        )
-                        nbytes = _write_mixed_moe_axis0_blob(
-                            source,
-                            flattened_shape,
-                            item.expert_shape,
-                            item.expert_precisions,
-                            blob_path,
-                            row_chunk,
-                            quant_backend,
-                            quant_device,
-                            artifact_root,
-                            importance=expert_importance,
-                        )
+                        if item.target_dtype == "NINTM":
+                            if item.expert_shape is None or item.expert_precisions is None:
+                                raise ValueError(
+                                    f"NINTM plan lacks HF expert precision metadata: {item.name}"
+                                )
+                            expert_importance = _hf_expert_importance(
+                                item, imatrix_bindings.get(item.name)
+                            )
+                            flattened_shape = (
+                                item.expert_shape[0] * item.expert_shape[1],
+                                item.expert_shape[2],
+                            )
+                            nbytes = _write_mixed_moe_axis0_blob(
+                                source,
+                                flattened_shape,
+                                item.expert_shape,
+                                item.expert_precisions,
+                                blob_path,
+                                row_chunk,
+                                quant_backend,
+                                quant_device,
+                                artifact_root,
+                                importance=expert_importance,
+                                synthetic=synthetic_expert_weights,
+                            )
+                        elif item.target_dtype in {"BF16", "F16", "F32"}:
+                            nbytes = _write_dense_axis0_blob(
+                                source,
+                                item.shape,
+                                blob_path,
+                                item.target_dtype,
+                                row_chunk,
+                            )
+                        else:
+                            raise ValueError(
+                                f"HF expert sources cannot produce {item.target_dtype}: {item.name}"
+                            )
                     finally:
                         source.close()
                     del source
@@ -5238,6 +5415,7 @@ def convert(args: argparse.Namespace) -> None:
                             quant_device,
                             artifact_root,
                             importance=expert_importance,
+                            synthetic=synthetic_expert_weights,
                         )
                     elif preserve_raw_e4m3:
                         if item.source_dtype != "F8_E4M3":
@@ -5760,6 +5938,11 @@ def convert(args: argparse.Namespace) -> None:
                     if standard_preset
                     else None
                 ),
+                "random_expert_mix": [value.family for value in random_expert_mix],
+                "random_expert_mix_seed": (
+                    random_expert_mix_seed if random_expert_mix else None
+                ),
+                "synthetic_expert_weights": synthetic_expert_weights,
                 "quantize_vision": quantize_vision,
                 "quantize_mtp": quantize_mtp,
                 "quantize_ple": quantize_ple,
@@ -5883,6 +6066,28 @@ def build_parser() -> argparse.ArgumentParser:
         dest="standard_preset",
         default="",
         help=("built-in llama.cpp-style tensor mixture: " + ", ".join(STANDARD_PRESET_NAMES)),
+    )
+    parser.add_argument(
+        "--random-expert-mix",
+        default="",
+        help=(
+            "comma-separated expert precision families; distributes them evenly "
+            "and reproducibly over every compact routed-expert tensor"
+        ),
+    )
+    parser.add_argument(
+        "--random-expert-mix-seed",
+        type=int,
+        default=20260908,
+        help="seed for --random-expert-mix expert placement",
+    )
+    parser.add_argument(
+        "--synthetic-expert-weights",
+        action="store_true",
+        help=(
+            "write structurally valid zero-valued packed routed-expert payloads; "
+            "performance fixtures only, never quality evaluation"
+        ),
     )
     parser.add_argument(
         "--quantize-vision",

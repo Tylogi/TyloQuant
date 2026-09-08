@@ -918,6 +918,119 @@ _GROUPED_SOURCE = r"""
     }
 """
 
+
+_GROUPED_NINT4_QMV_SOURCE = r"""
+    constexpr uint SIMD_GROUPS = 2u;
+    constexpr uint ROWS_PER_SIMD = 4u;
+    constexpr uint ROWS_PER_TG = SIMD_GROUPS * ROWS_PER_SIMD;
+    constexpr uint OUTPUT_TILES = (uint(OUT) + ROWS_PER_TG - 1u) / ROWS_PER_TG;
+    constexpr uint VALUES_PER_LANE = 16u;
+    constexpr uint BLOCK_K = 32u * VALUES_PER_LANE;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint workgroup = threadgroup_position_in_grid.x;
+    uint output_tile = workgroup % OUTPUT_TILES;
+    uint projection_index = workgroup / OUTPUT_TILES;
+    uint projection = projection_index % uint(PROJECTIONS);
+    uint route_index = projection_index / uint(PROJECTIONS);
+    if (route_index >= uint(ROUTE_COUNT)) {
+        return;
+    }
+    uint output_base =
+        output_tile * ROWS_PER_TG + simd_group * ROWS_PER_SIMD;
+
+    int expert = int(expert_ids[route_index]);
+    if (expert < 0 || expert >= int(EXPERTS)) {
+        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+            uint output = output_base + row;
+            if (lane == 0u && output < uint(OUT)) {
+                y[
+                    (route_index * uint(PROJECTIONS) + projection)
+                    * uint(OUT) + output
+                ] = T(0.0f);
+            }
+        }
+        return;
+    }
+
+    uint descriptor_base = (
+        uint(expert) * uint(PROJECTIONS) + projection
+    ) * uint(DESCRIPTOR_SIZE);
+    uint local_expert = uint(descriptors[descriptor_base + 1u]);
+    uint groupsize = uint(descriptors[descriptor_base + 5u]);
+    uint groups = uint(descriptors[descriptor_base + 6u]);
+    uint q_offset = uint(descriptors[descriptor_base + 7u]);
+    uint sub_offset = uint(descriptors[descriptor_base + 8u]);
+    uint anchor_offset = uint(descriptors[descriptor_base + 9u]);
+    uint x_offset = route_index * uint(K);
+    uint padded_columns = groups * groupsize;
+    uint packed_row_bytes = padded_columns >> 1u;
+    float accumulators[ROWS_PER_SIMD] = {0.0f};
+
+    for (uint block = 0u; block < uint(K); block += BLOCK_K) {
+        uint column_base = block + lane * VALUES_PER_LANE;
+        if (column_base >= uint(K)) {
+            continue;
+        }
+        float activations[VALUES_PER_LANE];
+        for (uint component = 0u; component < VALUES_PER_LANE; ++component) {
+            activations[component] = float(x[x_offset + column_base + component]);
+        }
+        uint first_group = column_base / groupsize;
+        uint next_group_column = (first_group + 1u) * groupsize;
+
+        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+            uint output = min(output_base + row, uint(OUT) - 1u);
+            uint pool_output = local_expert * uint(OUT) + output;
+            uint metadata_base = sub_offset + pool_output * groups;
+            float anchor_scale = nint_anchor_scale[anchor_offset + pool_output];
+            float anchor_minimum = nint_anchor_min[anchor_offset + pool_output];
+            float scale0 = anchor_scale * float(nint_sub_scale[
+                metadata_base + first_group
+            ]);
+            float minimum0 = anchor_minimum * float(nint_sub_min[
+                metadata_base + first_group
+            ]);
+            uint second_group = min(first_group + 1u, groups - 1u);
+            float scale1 = anchor_scale * float(nint_sub_scale[
+                metadata_base + second_group
+            ]);
+            float minimum1 = anchor_minimum * float(nint_sub_min[
+                metadata_base + second_group
+            ]);
+
+            uint packed_offset = q_offset + pool_output * packed_row_bytes
+                + (column_base >> 1u);
+            const device uint* packed_words =
+                reinterpret_cast<const device uint*>(nint_q + packed_offset);
+            ulong packed = ulong(packed_words[0])
+                | (ulong(packed_words[1]) << 32u);
+            for (uint component = 0u; component < VALUES_PER_LANE; ++component) {
+                uint column = column_base + component;
+                bool upper = column >= next_group_column;
+                float scale = upper ? scale1 : scale0;
+                float minimum = upper ? minimum1 : minimum0;
+                uint quantized = uint((packed >> (component * 4u)) & 15ul);
+                accumulators[row] += activations[component]
+                    * (scale * float(quantized) - minimum);
+            }
+        }
+    }
+
+    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+        float total = simd_sum(accumulators[row]);
+        uint output = output_base + row;
+        if (lane == 0u && output < uint(OUT)) {
+            y[
+                (route_index * uint(PROJECTIONS) + projection)
+                * uint(OUT) + output
+            ] = T(total);
+        }
+    }
+"""
+
+
 _GROUPED_COMPACT_SOURCE = r"""
     constexpr uint SIMD_GROUPS = 2u;
     constexpr uint K_LANES = 8u;
@@ -2022,6 +2135,23 @@ _GROUPED_KERNEL = mx.fast.metal_kernel(
     compile_options={"math_mode": "fast"},
 )
 
+_GROUPED_NINT4_QMV_KERNEL = mx.fast.metal_kernel(
+    name="mfq_nint4_grouped_qmv",
+    input_names=[
+        "descriptors",
+        "nint_q",
+        "nint_sub_scale",
+        "nint_sub_min",
+        "nint_anchor_scale",
+        "nint_anchor_min",
+        "x",
+        "expert_ids",
+    ],
+    output_names=["y"],
+    source=_GROUPED_NINT4_QMV_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
+
 _GROUPED_COMPACT_KERNEL = mx.fast.metal_kernel(
     name="mfq_heterogeneous_grouped_compact_mmq",
     input_names=[
@@ -2700,6 +2830,7 @@ def grouped_moe_matmul(
     compact_threshold: int | None = 0,
     matrix_threshold: int | None = 0,
     expert_matrix_threshold: int | None = 1,
+    nint4_qmv: bool = True,
 ) -> mx.array:
     """Execute routed experts with direct decode or route-compacted MMQ/MMA.
 
@@ -2780,6 +2911,7 @@ def grouped_moe_matmul(
                 compact_threshold=compact_threshold,
                 matrix_threshold=matrix_threshold,
                 expert_matrix_threshold=expert_matrix_threshold,
+                nint4_qmv=nint4_qmv,
             )
             for start in range(0, tokens, chunk_tokens)
         ]
@@ -2793,6 +2925,65 @@ def grouped_moe_matmul(
             for signs, block, _ in weight.rotation_specs
         )
         source = mx.contiguous(mx.concatenate(variants, axis=0))
+
+    descriptor_values = weight.descriptor_values
+    uniform_nint4 = bool(
+        nint4_qmv
+        and compact_threshold == 0
+        and matrix_threshold == 0
+        and route_count <= 64
+        and weight.neuron_len % 16 == 0
+        and np.all(descriptor_values[:, _FAMILY] == _FAMILY_NINT)
+        and np.all(descriptor_values[:, _NINT_BITS] == 4)
+        and np.all(descriptor_values[:, _NINT_GS] % 2 == 0)
+        and np.all(
+            (
+                descriptor_values[:, _NINT_NG]
+                * descriptor_values[:, _NINT_GS]
+                // 2
+            )
+            % 4
+            == 0
+        )
+        and np.all(descriptor_values[:, _NINT_Q_OFFSET] % 4 == 0)
+    )
+    if uniform_nint4:
+        return _GROUPED_NINT4_QMV_KERNEL(
+            inputs=[
+                weight.descriptors,
+                weight.nint_q,
+                weight.nint_sub_scale,
+                weight.nint_sub_min,
+                weight.nint_anchor_scale,
+                weight.nint_anchor_min,
+                source,
+                ids.reshape((route_count,)),
+            ],
+            template=[
+                ("T", source.dtype),
+                ("ROUTE_COUNT", route_count),
+                ("EXPERTS", weight.experts),
+                ("OUT", weight.out_per_expert),
+                ("PROJECTIONS", weight.projections),
+                ("K", weight.neuron_len),
+                ("DESCRIPTOR_SIZE", _DESCRIPTOR_SIZE),
+            ],
+            grid=(
+                route_count
+                * weight.projections
+                * ((weight.out_per_expert + 7) // 8)
+                * 64,
+                1,
+                1,
+            ),
+            threadgroup=(64, 1, 1),
+            output_shapes=[(
+                tokens,
+                routes,
+                weight.projections * weight.out_per_expert,
+            )],
+            output_dtypes=[source.dtype],
+        )[0]
 
     def add_sparse_residual(base: mx.array) -> mx.array:
         profiles = weight.descriptor_values[:, _VQ_PROFILE]
@@ -2854,7 +3045,7 @@ def grouped_moe_matmul(
         weight.mx_values,
         weight.mx_scales,
     ]
-    descriptor_families = weight.descriptor_values[:, _FAMILY]
+    descriptor_families = descriptor_values[:, _FAMILY]
     only_low_bit_nint = bool(
         np.all(descriptor_families == _FAMILY_NINT)
         and np.all(weight.descriptor_values[:, _NINT_BITS] <= 3)

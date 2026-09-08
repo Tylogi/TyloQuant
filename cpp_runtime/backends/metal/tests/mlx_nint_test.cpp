@@ -795,25 +795,27 @@ int main() {
             const array large_input(
                 large_input_values.begin(),
                 Shape{64, input_size});
-            auto large_output = astype(
-                weight.matmul(astype(large_input, float16)),
-                float32);
-            large_output.eval();
-            const auto* large_values = large_output.data<float>();
-            for (int input_row = 0; input_row < 64; ++input_row) {
-                for (int output_row = 0; output_row < 2; ++output_row) {
-                    float expected = 0.0f;
-                    for (int index = 0; index < input_size; ++index) {
-                        expected +=
-                            large_input_values[
-                                input_row * input_size + index] *
-                            fixture.quantized[
-                                output_row * packed_row_size + index];
+            for (const auto large_dtype : {float16, float32}) {
+                auto large_output = astype(
+                    weight.matmul(astype(large_input, large_dtype)),
+                    float32);
+                large_output.eval();
+                const auto* large_values = large_output.data<float>();
+                for (int input_row = 0; input_row < 64; ++input_row) {
+                    for (int output_row = 0; output_row < 2; ++output_row) {
+                        float expected = 0.0f;
+                        for (int index = 0; index < input_size; ++index) {
+                            expected +=
+                                large_input_values[
+                                    input_row * input_size + index] *
+                                fixture.quantized[
+                                    output_row * packed_row_size + index];
+                        }
+                        require_close(
+                            large_values[input_row * 2 + output_row],
+                            expected,
+                            0.02f);
                     }
-                    require_close(
-                        large_values[input_row * 2 + output_row],
-                        expected,
-                        0.02f);
                 }
             }
 

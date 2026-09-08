@@ -3,6 +3,7 @@
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_minicpmo45.h"
 #include "mlx_moe.h"
+#include "mlx_qwen4_causal_lm.h"
 #include "mlx_qwen35_causal_lm.h"
 #include "mlx_tensor.h"
 #include "qwen35_model.h"
@@ -61,6 +62,8 @@ struct Arguments {
     std::filesystem::path mfq;
     std::string tensor;
     int benchmark_reps = 1;
+    int benchmark_tokens = 1;
+    int benchmark_distributed_routes = 0;
     std::vector<std::int32_t> benchmark_experts;
     bool benchmark_swiglu = false;
     bool check_container = false;
@@ -110,6 +113,14 @@ Arguments parse_arguments(int argc, char** argv) {
                     "--benchmark-reps must be in [1, 10000]");
             }
             result.benchmark_reps = static_cast<int>(parsed);
+        } else if (value == "--benchmark-tokens") {
+            const auto parsed = std::stoll(
+                require_value("--benchmark-tokens"));
+            if (parsed <= 0 || parsed > 32768) {
+                usage_error(
+                    "--benchmark-tokens must be in [1, 32768]");
+            }
+            result.benchmark_tokens = static_cast<int>(parsed);
         } else if (value == "--benchmark-experts") {
             const auto text = require_value("--benchmark-experts");
             std::size_t begin = 0;
@@ -142,6 +153,14 @@ Arguments parse_arguments(int argc, char** argv) {
             if (result.benchmark_experts.empty()) {
                 usage_error("--benchmark-experts cannot be empty");
             }
+        } else if (value == "--benchmark-distributed-experts") {
+            const auto parsed = std::stoll(
+                require_value("--benchmark-distributed-experts"));
+            if (parsed <= 0 || parsed > 1024) {
+                usage_error(
+                    "--benchmark-distributed-experts must be in [1, 1024]");
+            }
+            result.benchmark_distributed_routes = static_cast<int>(parsed);
         } else if (value == "--check-mfq-container") {
             result.check_container = true;
         } else if (value == "--list-tensors") {
@@ -228,7 +247,10 @@ void print_help() {
         << "  --list-tensors         print record dtype, bytes, and name\n"
         << "  --tensor NAME          load and execute one supported linear weight\n"
         << "  --benchmark-reps N     timed executions for --tensor (default 1)\n"
+        << "  --benchmark-tokens N   routed input rows for --tensor (default 1)\n"
         << "  --benchmark-experts L  comma-separated NINTM expert IDs\n"
+        << "  --benchmark-distributed-experts N\n"
+        << "                          vary N routed experts across benchmark tokens\n"
         << "  --benchmark-swiglu     fuse an even-width NINTM gate/up record\n"
         << "  --self-test-metal      execute an MLX C++ graph on Metal\n"
         << "  --server               run the native C++ OpenAI-compatible server\n"
@@ -1218,6 +1240,34 @@ std::int32_t generate_with_prefill_metrics(
         token_constraint);
 }
 
+std::int32_t generate_with_prefill_metrics(
+    mfq::metal::MlxQwen4CausalLm& runtime,
+    const std::vector<std::int64_t>& prompt,
+    const mfq::metal::MlxSamplingParams& sampling,
+    std::int32_t max_tokens,
+    const MfqTokenCallback& callback,
+    const MfqPrefillCallback& on_prefill,
+    const MfqPromptCachePlan& cache_plan,
+    const MfqTokenConstraintPtr& token_constraint,
+    int) {
+    std::function<void(std::size_t, double)> report_prefill;
+    if (on_prefill) {
+        report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
+            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+        };
+    }
+    return runtime.generate(
+        prompt,
+        sampling,
+        max_tokens,
+        callback,
+        report_prefill,
+        token_constraint,
+        cache_plan.stable_prefix_tokens > 0
+            ? std::optional<std::size_t>(cache_plan.stable_prefix_tokens)
+            : std::nullopt);
+}
+
 template <typename Runtime, typename Loader>
 int serve_loaded_runtime(
     const Arguments& arguments,
@@ -1830,6 +1880,51 @@ int run_native_server(
             runtime_stream);
     }
 
+    if (backbone == "qwen4_exp") {
+        const auto config =
+            mfq::metal::Qwen4Config::from_mfq(container);
+        const int context = static_cast<int>(
+            std::min<std::int64_t>(
+                arguments.context_size,
+                config.max_position_embeddings));
+        std::cout
+            << "Loading native C++/MLX Qwen4-Exp model "
+               "on Apple GPU..."
+            << std::endl;
+        auto runtime =
+            mfq::metal::MlxQwen4CausalLm::load(container, context);
+        release_model_load_staging_memory();
+        const auto load_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        std::cout
+            << "Loaded " << runtime.layer_count()
+            << " Qwen4-Exp layers in "
+            << load_seconds << " s; runtime=native-cpp"
+            << std::endl;
+        const auto load_runtime =
+            [&container](std::int64_t requested_context) {
+                if (requested_context < 1 ||
+                    requested_context > std::numeric_limits<int>::max()) {
+                    throw std::invalid_argument(
+                        "Metal runtime context is out of range");
+                }
+                return mfq::metal::MlxQwen4CausalLm::load(
+                    container,
+                    static_cast<int>(requested_context));
+            };
+        return serve_loaded_runtime(
+            arguments,
+            &container,
+            std::move(runtime),
+            load_runtime,
+            config.text_model_type.empty()
+                ? config.model_type
+                : config.text_model_type,
+            config.max_position_embeddings,
+            config.vocab_size,
+            runtime_stream);
+    }
+
     if (backbone != "qwen3_5") {
         throw std::runtime_error(
             "unsupported native Metal backbone implementation: " + backbone);
@@ -1937,12 +2032,25 @@ int main(int argc, char** argv) {
                 const auto weight =
                     mfq::metal::MlxNintMoeWeight::from_blob(
                         model.read(arguments.tensor));
-                const int routes = arguments.benchmark_experts.empty()
+                if (arguments.benchmark_distributed_routes > 0
+                    && !arguments.benchmark_experts.empty()) {
+                    usage_error(
+                        "choose either --benchmark-experts or "
+                        "--benchmark-distributed-experts");
+                }
+                const int routes = arguments.benchmark_distributed_routes > 0
+                    ? arguments.benchmark_distributed_routes
+                    : arguments.benchmark_experts.empty()
                     ? std::min(6, weight.experts())
                     : static_cast<int>(
                           arguments.benchmark_experts.size());
+                if (routes > weight.experts()) {
+                    usage_error(
+                        "NINTM benchmark routes exceed expert count");
+                }
                 std::vector<float> input_values(
-                    static_cast<std::size_t>(weight.neuron_len()));
+                    static_cast<std::size_t>(arguments.benchmark_tokens)
+                        * static_cast<std::size_t>(weight.neuron_len()));
                 for (std::size_t index = 0;
                      index < input_values.size();
                      ++index) {
@@ -1952,11 +2060,15 @@ int main(int argc, char** argv) {
                 auto input = mlx::core::astype(
                     mlx::core::array(
                         input_values.begin(),
-                        mlx::core::Shape{1, weight.neuron_len()}),
+                        mlx::core::Shape{
+                            arguments.benchmark_tokens,
+                            weight.neuron_len(),
+                        }),
                     mlx::core::float16);
                 std::vector<std::int32_t> expert_values =
                     arguments.benchmark_experts;
-                if (expert_values.empty()) {
+                if (expert_values.empty()
+                    && arguments.benchmark_distributed_routes == 0) {
                     expert_values.resize(static_cast<std::size_t>(routes));
                     for (int route = 0; route < routes; ++route) {
                         expert_values[static_cast<std::size_t>(route)] =
@@ -1970,9 +2082,26 @@ int main(int argc, char** argv) {
                             "expert ID");
                     }
                 }
+                std::vector<std::int32_t> routed_experts(
+                    static_cast<std::size_t>(arguments.benchmark_tokens)
+                        * static_cast<std::size_t>(routes));
+                for (int token = 0;
+                     token < arguments.benchmark_tokens;
+                     ++token) {
+                    for (int route = 0; route < routes; ++route) {
+                        routed_experts[static_cast<std::size_t>(
+                            token * routes + route)] =
+                            arguments.benchmark_distributed_routes > 0
+                            ? (token * 131 + route * 97) % weight.experts()
+                            : expert_values[static_cast<std::size_t>(route)];
+                    }
+                }
                 auto expert_ids = mlx::core::array(
-                    expert_values.begin(),
-                    mlx::core::Shape{1, routes});
+                    routed_experts.begin(),
+                    mlx::core::Shape{
+                        arguments.benchmark_tokens,
+                        routes,
+                    });
 
                 auto execute = [&] {
                     return arguments.benchmark_swiglu
@@ -1998,6 +2127,9 @@ int main(int argc, char** argv) {
                 checked.eval();
                 const auto* values = checked.data<float>();
                 float maximum = 0.0f;
+                double checksum = 0.0;
+                double l1 = 0.0;
+                double l2 = 0.0;
                 for (std::size_t index = 0;
                      index < checked.size();
                      ++index) {
@@ -2007,6 +2139,11 @@ int main(int argc, char** argv) {
                     }
                     maximum = std::max(
                         maximum, std::fabs(values[index]));
+                    checksum += static_cast<double>(values[index])
+                        * static_cast<double>(index % 251u + 1u);
+                    l1 += std::fabs(static_cast<double>(values[index]));
+                    l2 += static_cast<double>(values[index])
+                        * static_cast<double>(values[index]);
                 }
                 if (maximum <= 1e-12f) {
                     throw std::runtime_error(
@@ -2015,7 +2152,11 @@ int main(int argc, char** argv) {
                 std::cout
                     << "Metal NINTM smoke test passed"
                     << " experts=" << weight.experts()
+                    << " tokens=" << arguments.benchmark_tokens
                     << " routes=" << routes
+                    << " distributed="
+                    << static_cast<int>(
+                           arguments.benchmark_distributed_routes > 0)
                     << " in=" << weight.neuron_len()
                     << " out=" << weight.out_per_expert()
                     << " projections=" << weight.projections()
@@ -2026,6 +2167,10 @@ int main(int argc, char** argv) {
                     << " reps=" << arguments.benchmark_reps
                     << " ms_per_dispatch="
                     << elapsed_ms / arguments.benchmark_reps
+                    << " checksum=" << checksum
+                    << " max=" << maximum
+                    << " l1=" << l1
+                    << " l2=" << l2
                     << "\n";
                 return EXIT_SUCCESS;
             }
@@ -2033,7 +2178,8 @@ int main(int argc, char** argv) {
                 model,
                 arguments.tensor);
             std::vector<float> input_values(
-                static_cast<std::size_t>(weight.input_size()));
+                static_cast<std::size_t>(arguments.benchmark_tokens)
+                    * static_cast<std::size_t>(weight.input_size()));
             for (std::size_t index = 0;
                  index < input_values.size();
                  ++index) {
@@ -2044,7 +2190,10 @@ int main(int argc, char** argv) {
             }
             auto input = mlx::core::array(
                 input_values.begin(),
-                mlx::core::Shape{1, weight.input_size()});
+                mlx::core::Shape{
+                    arguments.benchmark_tokens,
+                    weight.input_size(),
+                });
             input = mlx::core::astype(input, mlx::core::float16);
             auto execute = [&] {
                 return weight(input);
@@ -2083,6 +2232,7 @@ int main(int argc, char** argv) {
             std::cout
                 << "Metal linear smoke test passed"
                 << " dtype=" << record.dtype
+                << " tokens=" << arguments.benchmark_tokens
                 << " in=" << weight.input_size()
                 << " out=" << weight.output_size()
                 << " packed=" << (weight.packed() ? "true" : "false")

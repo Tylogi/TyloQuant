@@ -89,6 +89,13 @@ mlx::core::array moe_weighted_reduce_shared_gate(
     const mlx::core::array& shared,
     const mlx::core::array& gate_logits);
 
+mlx::core::array moe_weighted_reduce_shared_gate_sorted(
+    const mlx::core::array& sorted_pair_output,
+    const mlx::core::array& inverse_route_order,
+    const mlx::core::array& weights,
+    const mlx::core::array& shared,
+    const mlx::core::array& gate_logits);
+
 mlx::core::array moe_apply_expert_scale(
     const mlx::core::array& weights,
     const mlx::core::array& ids,

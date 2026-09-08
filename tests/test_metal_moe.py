@@ -35,7 +35,12 @@ from mfq.formats.nvq import (  # noqa: E402
 from mfq.kernels.metal import moe as metal_moe  # noqa: E402
 from mfq.kernels.metal.moe import grouped_moe_matmul  # noqa: E402
 from mfq.quantize.nint_quant import dequantize, quantize  # noqa: E402
-from mfq.runtime.mlx_moe import MlxRoutedLinear, MlxRoutedSwiGLUFFN  # noqa: E402
+from mfq.runtime.mlx_linear import MlxNintModel  # noqa: E402
+from mfq.runtime.mlx_moe import (  # noqa: E402
+    MlxDenseRoutedLinear,
+    MlxRoutedLinear,
+    MlxRoutedSwiGLUFFN,
+)
 from tests.test_formats.test_nepq import _tensor as _nepq_tensor  # noqa: E402
 from tests.test_formats.test_nepq_a import _a_tensor as _nepq_a_tensor  # noqa: E402
 from tests.test_metal_vq import (  # noqa: E402
@@ -90,6 +95,32 @@ def _decode_nint_moe(tensor: NintMoeTensor) -> np.ndarray:
         )
         result[np.asarray(pool.expert_ids)] = decoded
     return result
+
+
+@pytest.mark.parametrize("routed_input", [False, True])
+def test_dense_routed_linear_matches_selected_expert_matmul(routed_input: bool) -> None:
+    rng = np.random.default_rng(1200)
+    dense = rng.normal(scale=0.1, size=(4, 7, 16)).astype(np.float16)
+    shared = rng.normal(scale=0.1, size=(3, 16)).astype(np.float16)
+    ids = np.asarray([[0, 3], [2, 1], [1, 0]], dtype=np.int32)
+    source = (
+        np.stack((shared, shared * np.float16(0.5)), axis=1)
+        if routed_input
+        else shared
+    )
+    expected = np.empty((3, 2, 7), dtype=np.float32)
+    for token in range(3):
+        for route in range(2):
+            row = source[token, route] if routed_input else source[token]
+            expected[token, route] = row.astype(np.float32) @ dense[ids[token, route]].T.astype(
+                np.float32
+            )
+
+    layer = MlxNintModel({"experts": dense}).routed("experts")
+    assert isinstance(layer, MlxDenseRoutedLinear)
+    actual = _array(layer(source, ids))
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
 
 
 def test_grouped_moe_chunks_routes_before_metal_grid_overflow(monkeypatch) -> None:

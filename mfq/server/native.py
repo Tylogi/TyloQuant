@@ -14,10 +14,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mfq.compat.legacy_model_graph import legacy_model_graph
-from mfq.formats.assets import MODEL_CONFIG_ASSET, MODEL_GRAPH_ASSET
+from mfq.formats.assets import (
+    HF_TOKENIZER_CONFIG_ASSET,
+    HF_TOKENIZER_JSON_ASSET,
+    MODEL_CONFIG_ASSET,
+    MODEL_GRAPH_ASSET,
+    TOKENIZER_GGUF_ASSET,
+)
 from mfq.formats.io import open_mmap
 from mfq.server.hf_tokenizer import (
     ensure_hf_tokenizer_gguf,
+    ensure_mfq_tokenizer_gguf,
     native_hf_asset_environment,
 )
 
@@ -50,8 +57,6 @@ _RUNTIME_IMPLEMENTATION_REGISTRY = (
     ),
     _RuntimeImplementationRegistration(
         backbone="qwen4_exp",
-        python_mlx_worker=True,
-        python_mlx_requires_mfq=True,
     ),
     _RuntimeImplementationRegistration(
         backbone="glm5_next",
@@ -214,9 +219,27 @@ def reserve_loopback_port() -> int:
 
 def native_tokenizer_arguments(model: str | Path) -> list[str]:
     model_path = Path(model).expanduser().resolve()
-    if not model_path.is_dir():
+    if model_path.is_dir():
+        tokenizer = ensure_hf_tokenizer_gguf(model_path)
+    elif model_path.is_file():
+        with open_mmap(model_path) as store:
+            has_embedded_tokenizer = (
+                TOKENIZER_GGUF_ASSET in store.records
+                or all(
+                    name in store.records
+                    for name in (
+                        MODEL_CONFIG_ASSET,
+                        HF_TOKENIZER_JSON_ASSET,
+                        HF_TOKENIZER_CONFIG_ASSET,
+                    )
+                )
+            )
+        if not has_embedded_tokenizer:
+            return []
+        tokenizer = ensure_mfq_tokenizer_gguf(model_path)
+    else:
         return []
-    return ["--tokenizer-gguf", str(ensure_hf_tokenizer_gguf(model_path))]
+    return ["--tokenizer-gguf", str(tokenizer)]
 
 
 @dataclass

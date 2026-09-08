@@ -112,7 +112,7 @@ using MlxTpqExpertResidency = MlxNintMoeOffloadCache;
 // A sorted routed-MoE row block list.  The plan is built once on the GPU and
 // shared by gate/up and down projections so every populated row block can be
 // scheduled as an independent Metal threadgroup.
-struct MlxGroupedVqMmqPlan {
+struct MlxGroupedMmqPlan {
     mlx::core::array block_meta;
     mlx::core::array block_count;
     int max_blocks = 0;
@@ -121,12 +121,16 @@ struct MlxGroupedVqMmqPlan {
     int experts = 0;
 };
 
+// Temporary source-compatibility alias; new code uses the family-neutral
+// name because the same plan serves NINT, VQ, MX, and dense expert cohorts.
+using MlxGroupedVqMmqPlan = MlxGroupedMmqPlan;
+
 // Native packed NINTM routed-expert weight.
 //
-// NINT1-NINT8, NINT8-0, VQ-family, and native MXFP4 cohorts are decoded
-// directly by one heterogeneous Metal dispatch. Expert IDs retain the global
-// ordering from the NINTM container while each descriptor points at its
-// cohort-local packed rows.
+// NINT1-NINT8, NINT8-0, VQ-family, MXFP4/MXFP8, and BF16/F16 cohorts are
+// decoded directly by one heterogeneous Metal dispatch. Expert IDs retain
+// the global ordering from the NINTM container while each descriptor points
+// at its cohort-local rows.
 class MlxNintMoeWeight {
 public:
     static MlxNintMoeWeight from_blob(
@@ -172,12 +176,23 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& packed_expert_ids,
         float limit = 0.0f) const;
-    bool supports_grouped_vq_mmq() const noexcept;
+    bool supports_grouped_mmq() const noexcept;
+    bool supports_grouped_vq_mmq() const noexcept {
+        return supports_grouped_mmq();
+    }
     bool prefers_mxfp4_smallm_nax(
         const mlx::core::array& expert_ids) const noexcept;
-    MlxGroupedVqMmqPlan build_grouped_vq_mmq_plan(
+    int recommended_grouped_mmq_block_rows(
+        int route_count) const noexcept;
+    MlxGroupedMmqPlan build_grouped_mmq_plan(
         const mlx::core::array& expert_ids,
-        const mlx::core::array& route_order) const;
+        const mlx::core::array& route_order,
+        int block_rows = 32) const;
+    MlxGroupedMmqPlan build_grouped_vq_mmq_plan(
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& route_order) const {
+        return build_grouped_mmq_plan(expert_ids, route_order);
+    }
     mlx::core::array routed_matmul_sorted(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
@@ -185,7 +200,7 @@ public:
         bool input_is_sorted,
         bool fused_swiglu = false,
         float swiglu_limit = 0.0f,
-        const MlxGroupedVqMmqPlan* plan = nullptr,
+        const MlxGroupedMmqPlan* plan = nullptr,
         bool force_mxfp4_nax = false) const;
     mlx::core::array operator()(
         const mlx::core::array& input,
@@ -266,26 +281,34 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& packed_expert_ids,
         const mlx::core::array& route_weights) const;
+    bool supports_grouped_mmq() const noexcept {
+        return weight_.supports_grouped_mmq();
+    }
     bool supports_grouped_vq_mmq() const noexcept {
-        return weight_.supports_grouped_vq_mmq();
+        return supports_grouped_mmq();
     }
     bool prefers_mxfp4_smallm_nax(
         const mlx::core::array& expert_ids) const noexcept {
         return weight_.prefers_mxfp4_smallm_nax(expert_ids);
     }
-    MlxGroupedVqMmqPlan build_grouped_vq_mmq_plan(
+    MlxGroupedMmqPlan build_grouped_mmq_plan(
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_order) const {
-        return weight_.build_grouped_vq_mmq_plan(
+        return weight_.build_grouped_mmq_plan(
             expert_ids,
             route_order);
+    }
+    MlxGroupedMmqPlan build_grouped_vq_mmq_plan(
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& route_order) const {
+        return build_grouped_mmq_plan(expert_ids, route_order);
     }
     mlx::core::array forward_sorted(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_order,
         bool input_is_sorted,
-        const MlxGroupedVqMmqPlan* plan = nullptr,
+        const MlxGroupedMmqPlan* plan = nullptr,
         bool force_mxfp4_nax = false) const {
         return weight_.routed_matmul_sorted(
             input,
