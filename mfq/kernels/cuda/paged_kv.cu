@@ -658,23 +658,42 @@ __global__ void paged_attention_decode_reduce_kernel(
         static_cast<int>(seq_len[query / Hq]), parts, dynamic_parts);
     __shared__ float part_weight[64];
     __shared__ float denominator;
-    if (tid == 0) {
-        float maximum = -1e30f;
-        for (int part = 0; part < active_parts; ++part) {
+    if (tid < 32) {
+        const int first_part = tid;
+        const int second_part = tid + 32;
+        float maximum = first_part < active_parts
+            ? partial_m[static_cast<size_t>(query) * workspace_parts +
+                first_part] : -1e30f;
+        if (second_part < active_parts) {
             maximum = fmaxf(maximum, partial_m[
-                static_cast<size_t>(query) * workspace_parts + part]);
+                static_cast<size_t>(query) * workspace_parts + second_part]);
         }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            maximum = fmaxf(maximum, __shfl_down_sync(
+                0xffffffffu, maximum, offset));
+        }
+        maximum = __shfl_sync(0xffffffffu, maximum, 0);
         float sum = 0.0f;
-        for (int part = 0; part < active_parts; ++part) {
+        if (first_part < active_parts) {
             const size_t statistic =
-                static_cast<size_t>(query) * workspace_parts + part;
+                static_cast<size_t>(query) * workspace_parts + first_part;
             const float local_denominator = partial_l[statistic];
             const float weight = local_denominator > 0.0f
                 ? expf(partial_m[statistic] - maximum) : 0.0f;
-            part_weight[part] = weight;
+            part_weight[first_part] = weight;
             sum += weight * local_denominator;
         }
-        denominator = sum;
+        if (second_part < active_parts) {
+            const size_t statistic =
+                static_cast<size_t>(query) * workspace_parts + second_part;
+            const float local_denominator = partial_l[statistic];
+            const float weight = local_denominator > 0.0f
+                ? expf(partial_m[statistic] - maximum) : 0.0f;
+            part_weight[second_part] = weight;
+            sum += weight * local_denominator;
+        }
+        sum = paged_warp_sum(sum);
+        if (tid == 0) denominator = sum;
     }
     __syncthreads();
     float value_sum = 0.0f;
