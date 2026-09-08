@@ -221,6 +221,29 @@ inline half decode_mxfp8_value_at(
         values[value_offset + row * k_size + column]));
 }
 
+inline half4 decode_mxfp8_quad_at(
+    const device int* d,
+    const device uchar* values,
+    const device uchar* scales,
+    uint row,
+    uint column,
+    uint k_size) {
+    uint groups = uint(d[4]);
+    uint value_offset = uint(d[5]);
+    uint scale_offset = uint(d[6]);
+    uint group = column >> 7u;
+    float scale = decode_e8m0(
+        scales[scale_offset + (row >> 7u) * groups + group]);
+    uchar4 packed = *reinterpret_cast<device const uchar4*>(
+        values + value_offset + row * k_size + column);
+    float4 decoded = float4(
+        decode_mxfp8_value(packed.x),
+        decode_mxfp8_value(packed.y),
+        decode_mxfp8_value(packed.z),
+        decode_mxfp8_value(packed.w));
+    return half4(scale * decoded);
+}
+
 inline half decode_dense_value_at(
     const device int* d,
     const device int8_t* values,
@@ -235,6 +258,23 @@ inline half decode_dense_value_at(
     return family == 5u
         ? half(as_type<float>(uint(raw) << 16u))
         : as_type<half>(raw);
+}
+
+inline half4 decode_dense_quad_at(
+    const device int* d,
+    const device int8_t* values,
+    uint family,
+    uint row,
+    uint column,
+    uint k_size) {
+    ulong byte_offset = ulong(uint(d[4]))
+        + (ulong(row) * ulong(k_size) + ulong(column)) * 2u;
+    if (family == 5u) {
+        ushort4 raw = *reinterpret_cast<device const ushort4*>(
+            values + byte_offset);
+        return half4(as_type<float4>(uint4(raw) << 16u));
+    }
+    return *reinterpret_cast<device const half4*>(values + byte_offset);
 }
 
 inline void decode_nint4_group24(
@@ -616,9 +656,116 @@ inline void decode_nint8_zero_group32(
     uint scale_offset = uint(d[6]);
     float scale = float(scales[scale_offset + row * groups + group]);
     uint value_base = q_offset + (row * groups + group) * 32u;
-    for (uint column = 0u; column < 32u; ++column) {
-        target[column] = half(
-            scale * float(values[value_base + column]));
+#pragma clang loop unroll(full)
+    for (uint column = 0u; column < 32u; column += 4u) {
+        char4 packed = *reinterpret_cast<device const char4*>(
+            values + value_base + column);
+        *reinterpret_cast<threadgroup half4*>(target + column) =
+            half4(scale * float4(packed));
+    }
+}
+
+template <uint JSC_VECTOR, uint BYTES_PER_SIGN>
+inline void decode_jsc_group24(
+    const device int* d,
+    const device uchar* indices,
+    const device uchar* state_stream,
+    const device uchar* aux,
+    const device float* anchors,
+    const device int8_t* codebooks,
+    const device float* scales,
+    const device uchar* state_to_bank,
+    threadgroup half* target,
+    uint row,
+    uint group,
+    uint k_size) {
+    constexpr bool DUAL_INDEX = JSC_VECTOR == 4u;
+    uint groups = uint(d[5]);
+    uint vectors = uint(d[7]);
+    uint indices_offset = uint(d[18]);
+    uint state_offset = uint(d[19]);
+    uint aux_offset = uint(d[20]);
+    uint anchor_offset = uint(d[21]);
+    uint codebook_offset = uint(d[22]);
+    uint scale_offset = uint(d[23]);
+    uint state_bank_offset = uint(d[24]);
+    uint execution = uint(d[29]);
+    uint state_index = row * groups + group;
+    uint signs = (k_size + 7u) / 8u;
+    uint packed_state =
+        uint(state_stream[state_offset + (state_index >> 1u)]);
+    uint state =
+        (packed_state >> ((state_index & 1u) * 4u)) & 15u;
+    uint selected_bank =
+        uint(state_to_bank[state_bank_offset + state]);
+    float scale = anchors[anchor_offset + row]
+        * scales[scale_offset + state];
+    uint sign_base = row * signs + group * 3u;
+    uint vector_base = row * vectors + group * (24u / JSC_VECTOR);
+
+#pragma clang loop unroll(full)
+    for (uint chunk = 0u; chunk < 3u; ++chunk) {
+        uint sign_index = sign_base + chunk;
+        uint first_vector = vector_base + chunk * (8u / JSC_VECTOR);
+        uint index0 = 0u;
+        uint index1 = 0u;
+        uint sign_value = 0u;
+        if (execution != 0u) {
+            uint offset = indices_offset
+                + sign_index * BYTES_PER_SIGN;
+            if constexpr (DUAL_INDEX) {
+                index0 = uint(indices[offset]);
+                index1 = uint(indices[offset + 1u]);
+                sign_value = uint(indices[offset + 2u]);
+            } else {
+                uchar2 packed = *reinterpret_cast<device const uchar2*>(
+                    indices + offset);
+                index0 = uint(packed.x);
+                sign_value = uint(packed.y);
+            }
+        } else {
+            index0 = uint(indices[indices_offset + first_vector]);
+            if constexpr (DUAL_INDEX) {
+                index1 = uint(indices[indices_offset + first_vector + 1u]);
+            }
+            sign_value = read_bits(
+                aux + aux_offset,
+                sign_index,
+                7u);
+        }
+        uint sign_bits = sign_value;
+        if (execution == 0u) {
+            sign_bits |= (popcount(sign_value) & 1u) << 7u;
+        }
+        uint first_code_base = codebook_offset
+            + (selected_bank * 256u + index0) * JSC_VECTOR;
+        uint second_code_base = 0u;
+        if constexpr (DUAL_INDEX) {
+            second_code_base = codebook_offset
+                + (selected_bank * 256u + index1) * JSC_VECTOR;
+        } else {
+            second_code_base = first_code_base + 4u;
+        }
+        char4 first_code = *reinterpret_cast<device const char4*>(
+            codebooks + first_code_base);
+        char4 second_code = *reinterpret_cast<device const char4*>(
+            codebooks + second_code_base);
+        float4 first_value = float4(first_code);
+        float4 second_value = float4(second_code);
+        first_value = select(
+            first_value,
+            -first_value,
+            (uint4(sign_bits) & uint4(1u, 2u, 4u, 8u))
+                != uint4(0u));
+        second_value = select(
+            second_value,
+            -second_value,
+            (uint4(sign_bits) & uint4(16u, 32u, 64u, 128u))
+                != uint4(0u));
+        *reinterpret_cast<threadgroup half4*>(
+            target + chunk * 8u) = half4(scale * first_value);
+        *reinterpret_cast<threadgroup half4*>(
+            target + chunk * 8u + 4u) = half4(scale * second_value);
     }
 }
 
@@ -665,62 +812,16 @@ inline void decode_vq_group24(
     uint signs = (k_size + 7u) / 8u;
     float anchor = anchors[anchor_offset + row];
 
-    if (profile == 1u || profile == 4u) {
-        uint packed_state =
-            uint(state_stream[state_offset + (state_index >> 1u)]);
-        uint state =
-            (packed_state >> ((state_index & 1u) * 4u)) & 15u;
-        uint selected_bank =
-            uint(state_to_bank[state_bank_offset + state]);
-        float scale = anchor * scales[scale_offset + state];
-        uint jsc_vector = profile == 1u ? 4u : 8u;
-        uint bytes_per_sign = profile == 1u ? 3u : 2u;
-        for (uint chunk = 0u; chunk < 3u; ++chunk) {
-            uint column_base = group * 24u + chunk * 8u;
-            uint first_vector = column_base / jsc_vector;
-            uint index0 = 0u;
-            uint index1 = 0u;
-            uint sign_value = 0u;
-            if (execution != 0u) {
-                uint offset = indices_offset +
-                    (row * signs + column_base / 8u) * bytes_per_sign;
-                index0 = uint(indices[offset]);
-                if (profile == 1u) {
-                    index1 = uint(indices[offset + 1u]);
-                }
-                sign_value =
-                    uint(indices[offset + bytes_per_sign - 1u]);
-            } else {
-                index0 = uint(indices[
-                    indices_offset + row * vectors + first_vector]);
-                if (profile == 1u) {
-                    index1 = uint(indices[
-                        indices_offset + row * vectors
-                        + first_vector + 1u]);
-                }
-                sign_value = read_bits(
-                    aux + aux_offset,
-                    row * signs + column_base / 8u,
-                    7u);
-            }
-            for (uint inner = 0u; inner < 8u; ++inner) {
-                uint index =
-                    profile == 1u && inner >= 4u ? index1 : index0;
-                uint code_component =
-                    profile == 1u ? (inner & 3u) : inner;
-                float code = float(codebooks[
-                    codebook_offset +
-                    (selected_bank * 256u + index) * jsc_vector
-                    + code_component]);
-                uint negative = inner < 7u
-                    ? ((sign_value >> inner) & 1u)
-                    : (execution != 0u
-                        ? ((sign_value >> 7u) & 1u)
-                        : (popcount(sign_value) & 1u));
-                target[chunk * 8u + inner] = half(
-                    scale * (negative != 0u ? -code : code));
-            }
-        }
+    if (profile == 1u) {
+        decode_jsc_group24<4u, 3u>(
+            d, indices, state_stream, aux, anchors, codebooks, scales,
+            state_to_bank, target, row, group, k_size);
+        return;
+    }
+    if (profile == 4u) {
+        decode_jsc_group24<8u, 2u>(
+            d, indices, state_stream, aux, anchors, codebooks, scales,
+            state_to_bank, target, row, group, k_size);
         return;
     }
 
@@ -1046,8 +1147,7 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                     || (nint_bits == 8u && nint_group_size == 48u));
                 bool sliced_nint5 = family == 0u
                     && nint_bits == 5u && nint_group_size == 28u;
-                bool scalar_decode = (family == 0u && !aligned_nint)
-                    || family == 4u || family == 5u || family == 6u;
+                bool scalar_decode = family == 0u && !aligned_nint;
                 if (aligned_nint) {
                     uint groups_per_tile = uint(BK) / nint_group_size;
                     uint decode_units_per_tile = nint_bits == 2u
@@ -1148,6 +1248,69 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                                 + slice_start - uint(k_base),
                             pool_row, group, slice_start - group_start,
                             slice_end - slice_start);
+                    }
+                } else if (family == 4u) {
+                    constexpr uint VALUES_PER_ITEM = 4u;
+                    constexpr uint ITEMS_PER_ROW = uint(BK) / VALUES_PER_ITEM;
+                    for (uint item = thread_id;
+                         item < uint(BN) * ITEMS_PER_ROW;
+                         item += TGP_SIZE) {
+                        uint output_row = item / ITEMS_PER_ROW;
+                        uint local_item = item - output_row * ITEMS_PER_ROW;
+                        uint local_column = local_item * VALUES_PER_ITEM;
+                        uint input_column = uint(k_base) + local_column;
+                        if (output_row < uint(valid_n)
+                            && input_column < uint(input_width)) {
+                            uint pool_row =
+                                local_expert * uint(matrix_output_width)
+                                + uint(output_base) + output_row
+                                + uint(projection * output_width);
+                            *reinterpret_cast<threadgroup half4*>(
+                                Ws + output_row * uint(BK_padded)
+                                    + local_column) = decode_mxfp8_quad_at(
+                                descriptor, mx_values, mx_scales,
+                                pool_row, input_column, uint(input_width));
+                        }
+                    }
+                } else if (family == 5u || family == 6u) {
+                    constexpr uint VALUES_PER_ITEM = 4u;
+                    constexpr uint ITEMS_PER_ROW = uint(BK) / VALUES_PER_ITEM;
+                    for (uint item = thread_id;
+                         item < uint(BN) * ITEMS_PER_ROW;
+                         item += TGP_SIZE) {
+                        uint output_row = item / ITEMS_PER_ROW;
+                        uint local_item = item - output_row * ITEMS_PER_ROW;
+                        uint local_column = local_item * VALUES_PER_ITEM;
+                        uint input_column = uint(k_base) + local_column;
+                        if (output_row >= uint(valid_n)
+                            || input_column >= uint(input_width)) {
+                            continue;
+                        }
+                        uint pool_row =
+                            local_expert * uint(matrix_output_width)
+                            + uint(output_base) + output_row
+                            + uint(projection * output_width);
+                        threadgroup half* target =
+                            Ws + output_row * uint(BK_padded) + local_column;
+                        if (input_column + VALUES_PER_ITEM
+                            <= uint(input_width)) {
+                            *reinterpret_cast<threadgroup half4*>(target) =
+                                decode_dense_quad_at(
+                                    descriptor, q8_q, family, pool_row,
+                                    input_column, uint(input_width));
+                        } else {
+#pragma clang loop unroll(full)
+                            for (uint lane = 0u;
+                                 lane < VALUES_PER_ITEM;
+                                 ++lane) {
+                                if (input_column + lane < uint(input_width)) {
+                                    target[lane] = decode_dense_value_at(
+                                        descriptor, q8_q, family, pool_row,
+                                        input_column + lane,
+                                        uint(input_width));
+                                }
+                            }
+                        }
                     }
                 } else if (scalar_decode) {
                     for (uint item = thread_id;
@@ -1485,8 +1648,7 @@ template <
                     || (nint_bits == 8u && nint_group_size == 48u));
                 bool sliced_nint5 = family == 0u
                     && nint_bits == 5u && nint_group_size == 28u;
-                bool scalar_decode = (family == 0u && !aligned_nint)
-                    || family == 4u || family == 5u || family == 6u;
+                bool scalar_decode = family == 0u && !aligned_nint;
                 if (aligned_nint) {
                     uint groups_per_tile = uint(BK) / nint_group_size;
                     uint decode_units_per_tile = nint_bits == 2u
@@ -1587,6 +1749,71 @@ template <
                                 + slice_start - uint(k_base),
                             pool_row, group, slice_start - group_start,
                             slice_end - slice_start);
+                    }
+                } else if (family == 4u) {
+                    constexpr uint VALUES_PER_ITEM = 4u;
+                    constexpr uint ITEMS_PER_ROW = uint(BK) / VALUES_PER_ITEM;
+                    for (uint item = thread_id;
+                         item < uint(BN) * ITEMS_PER_ROW;
+                         item += TGP_SIZE) {
+                        uint output_row = item / ITEMS_PER_ROW;
+                        uint local_item = item - output_row * ITEMS_PER_ROW;
+                        uint local_column = local_item * VALUES_PER_ITEM;
+                        uint input_column = uint(k_base) + local_column;
+                        if (output_row < uint(valid_n)
+                            && input_column < uint(params.input_width)) {
+                            uint pool_row = local_expert
+                                    * uint(params.matrix_output_width)
+                                + uint(output_base) + output_row
+                                + uint(projection * params.output_width);
+                            *reinterpret_cast<threadgroup half4*>(
+                                Ws + output_row * uint(W_STRIDE)
+                                    + local_column) = decode_mxfp8_quad_at(
+                                descriptor, mx_values, mx_scales,
+                                pool_row, input_column,
+                                uint(params.input_width));
+                        }
+                    }
+                } else if (family == 5u || family == 6u) {
+                    constexpr uint VALUES_PER_ITEM = 4u;
+                    constexpr uint ITEMS_PER_ROW = uint(BK) / VALUES_PER_ITEM;
+                    for (uint item = thread_id;
+                         item < uint(BN) * ITEMS_PER_ROW;
+                         item += TGP_SIZE) {
+                        uint output_row = item / ITEMS_PER_ROW;
+                        uint local_item = item - output_row * ITEMS_PER_ROW;
+                        uint local_column = local_item * VALUES_PER_ITEM;
+                        uint input_column = uint(k_base) + local_column;
+                        if (output_row >= uint(valid_n)
+                            || input_column >= uint(params.input_width)) {
+                            continue;
+                        }
+                        uint pool_row = local_expert
+                                * uint(params.matrix_output_width)
+                            + uint(output_base) + output_row
+                            + uint(projection * params.output_width);
+                        threadgroup half* target =
+                            Ws + output_row * uint(W_STRIDE) + local_column;
+                        if (input_column + VALUES_PER_ITEM
+                            <= uint(params.input_width)) {
+                            *reinterpret_cast<threadgroup half4*>(target) =
+                                decode_dense_quad_at(
+                                    descriptor, q8_q, family, pool_row,
+                                    input_column, uint(params.input_width));
+                        } else {
+#pragma clang loop unroll(full)
+                            for (uint lane = 0u;
+                                 lane < VALUES_PER_ITEM;
+                                 ++lane) {
+                                if (input_column + lane
+                                    < uint(params.input_width)) {
+                                    target[lane] = decode_dense_value_at(
+                                        descriptor, q8_q, family, pool_row,
+                                        input_column + lane,
+                                        uint(params.input_width));
+                                }
+                            }
+                        }
                     }
                 } else if (scalar_decode) {
                     for (uint item = thread_id;

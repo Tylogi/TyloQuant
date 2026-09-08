@@ -4478,6 +4478,57 @@ void test_grouped_nint8_group48_tail_prefill() {
     }
 }
 
+void test_grouped_dense_quad_tail_prefill() {
+    constexpr int tokens = 1025;
+    constexpr int routes = 2;
+    constexpr int output = 24;
+    constexpr int input_width = 642;
+    constexpr int experts = 2;
+    const auto fixture = make_moe_fixture(
+        {"F16", "BF16"}, output, input_width, 37, 48);
+    const auto weight = mfq::metal::MlxMoeWeight::from_blob(
+        fixture.blob);
+    require(
+        weight.supports_grouped_mmq(),
+        "mixed F16/BF16 tail fixture must support grouped prefill");
+    std::vector<float> input(tokens * input_width);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<float>(
+            static_cast<int>((index * 7 + 3) % 23) - 11)
+            / 256.0f;
+    }
+    std::vector<std::int32_t> ids(tokens * routes);
+    for (int index = 0; index < tokens * routes; ++index) {
+        ids[index] = index % experts;
+    }
+    const auto input_array = mlx::core::astype(
+        mlx::core::array(
+            input.begin(),
+            mlx::core::Shape{tokens, input_width}),
+        mlx::core::float16);
+    const auto ids_array = mlx::core::array(
+        ids.begin(), mlx::core::Shape{tokens, routes});
+    const auto actual = evaluated_floats(
+        weight.routed_matmul(input_array, ids_array));
+    for (int token = 0; token < tokens; ++token) {
+        for (int route = 0; route < routes; ++route) {
+            const int expert = ids[token * routes + route];
+            for (int row = 0; row < output; ++row) {
+                float expected = 0.0f;
+                for (int column = 0; column < input_width; ++column) {
+                    expected += input[token * input_width + column]
+                        * fixture.dense[
+                            (expert * output + row) * input_width + column];
+                }
+                require_close(
+                    actual[(token * routes + route) * output + row],
+                    expected,
+                    1e-1f);
+            }
+        }
+    }
+}
+
 void test_mixed_nintm_native_and_grouped_dispatch() {
     constexpr int experts = 4;
     constexpr int routes = 2;
@@ -4967,6 +5018,7 @@ int main(int argc, char** argv) {
         test_grouped_nint_mmq_prefill();
         test_grouped_nint2_pair_prefill();
         test_grouped_nint8_group48_tail_prefill();
+        test_grouped_dense_quad_tail_prefill();
         test_mixed_nintm_native_and_grouped_dispatch();
         test_grouped_mxfp4_vq_mmq_prefill();
         test_container_validation();
