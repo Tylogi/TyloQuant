@@ -1356,6 +1356,22 @@ static bool tensor_parallel_fp16_reduce_enabled() {
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
+static bool tensor_parallel_peer_first_launch_enabled() {
+    static const bool enabled = [] {
+        const char * environment = std::getenv(
+            "MFQ_TP_PEER_FIRST_LAUNCH");
+        return environment == nullptr || std::atoi(environment) != 0;
+    }();
+    return enabled;
+}
+
+static size_t tensor_parallel_launch_index(
+        size_t launch_position, size_t shard_count) {
+    return tensor_parallel_peer_first_launch_enabled() && shard_count == 2
+        ? shard_count - 1 - launch_position
+        : launch_position;
+}
+
 struct LayerPlacementConfig {
     std::vector<int> devices;
     std::vector<double> split;
@@ -12384,9 +12400,14 @@ struct QuantLinear {
             tensor_parallel_axis == TensorParallelAxis::Output ||
             tensor_parallel_axis == TensorParallelAxis::Input,
             "tensor-parallel linear has an invalid axis");
-        std::vector<mfq_tensor_backend::Tensor> local_outputs;
-        local_outputs.reserve(tensor_parallel_shards.size());
-        for (const auto & shard : tensor_parallel_shards) {
+        std::vector<mfq_tensor_backend::Tensor> local_outputs(
+            tensor_parallel_shards.size());
+        for (size_t launch_position = 0;
+             launch_position < tensor_parallel_shards.size();
+             ++launch_position) {
+            const size_t index = tensor_parallel_launch_index(
+                launch_position, tensor_parallel_shards.size());
+            const auto & shard = tensor_parallel_shards[index];
             MfqCudaGuard guard(shard.device);
             mfq_tensor_backend::Tensor local_x = x;
             mfq_tensor_backend::Tensor local_gate;
@@ -12412,17 +12433,17 @@ struct QuantLinear {
                 MFQ_RUNTIME_CHECK(
                     !gate.has_value(),
                     "MXFP8 input-axis tensor parallelism does not support gating");
-                local_outputs.push_back(
-                    mxfp8_matmul_f32(shard.mxfp8, local_x));
+                local_outputs[index] =
+                    mxfp8_matmul_f32(shard.mxfp8, local_x);
             } else {
-                local_outputs.push_back(
+                local_outputs[index] =
                     run_quant_linear_shard(
                         shard, local_x,
                         gate.has_value()
                             ? MfqOptional<mfq_tensor_backend::Tensor>(
                                 local_gate)
                             : mfq_nullopt,
-                        gate_mode));
+                        gate_mode);
             }
         }
 
@@ -12687,27 +12708,31 @@ forward_tensor_parallel_output_projections(
     const size_t shard_count =
         projections.front()->tensor_parallel_shards.size();
     if (g_decode_graph_tp_projection_major) {
-        std::vector<mfq_tensor_backend::Tensor> local_inputs;
-        local_inputs.reserve(shard_count);
-        for (size_t shard = 0; shard < shard_count; ++shard) {
+        std::vector<mfq_tensor_backend::Tensor> local_inputs(shard_count);
+        for (size_t launch_position = 0;
+             launch_position < shard_count; ++launch_position) {
+            const size_t shard = tensor_parallel_launch_index(
+                launch_position, shard_count);
             const int device =
                 projections.front()->tensor_parallel_shards[shard].device;
             MfqCudaGuard guard(device);
-            local_inputs.push_back(tensor_to_cuda_device(flat, device));
+            local_inputs[shard] = tensor_to_cuda_device(flat, device);
         }
 
         const int primary = g_tensor_parallel.primary_device();
         std::vector<mfq_tensor_backend::Tensor> result;
         result.reserve(projections.size());
         for (const auto * projection : projections) {
-            std::vector<mfq_tensor_backend::Tensor> local_outputs;
-            local_outputs.reserve(shard_count);
-            for (size_t shard = 0; shard < shard_count; ++shard) {
+            std::vector<mfq_tensor_backend::Tensor> local_outputs(shard_count);
+            for (size_t launch_position = 0;
+                 launch_position < shard_count; ++launch_position) {
+                const size_t shard = tensor_parallel_launch_index(
+                    launch_position, shard_count);
                 const auto & weight =
                     projection->tensor_parallel_shards[shard];
                 MfqCudaGuard guard(weight.device);
-                local_outputs.push_back(run_quant_linear_shard(
-                    weight, local_inputs[shard]));
+                local_outputs[shard] = run_quant_linear_shard(
+                    weight, local_inputs[shard]);
             }
             MfqCudaGuard primary_guard(primary);
             std::vector<mfq_tensor_backend::Tensor> gathered;
@@ -12726,9 +12751,12 @@ forward_tensor_parallel_output_projections(
     std::vector<std::vector<mfq_tensor_backend::Tensor>>
         local_outputs(projections.size());
     for (auto & outputs : local_outputs) {
-        outputs.reserve(shard_count);
+        outputs.resize(shard_count);
     }
-    for (size_t shard = 0; shard < shard_count; ++shard) {
+    for (size_t launch_position = 0;
+         launch_position < shard_count; ++launch_position) {
+        const size_t shard = tensor_parallel_launch_index(
+            launch_position, shard_count);
         const int device =
             projections.front()->tensor_parallel_shards[shard].device;
         MfqCudaGuard guard(device);
@@ -12738,11 +12766,11 @@ forward_tensor_parallel_output_projections(
         auto local_x = tensor_to_cuda_device(flat, device);
         for (size_t projection = 0;
                 projection < projections.size(); ++projection) {
-            local_outputs[projection].push_back(
+            local_outputs[projection][shard] =
                 run_quant_linear_shard(
                     projections[projection]
                         ->tensor_parallel_shards[shard],
-                    local_x));
+                    local_x);
         }
     }
 
@@ -14612,13 +14640,13 @@ struct FFN {
         auto shape = xh.sizes().vec();
         auto flat = xh.reshape(
             {-1, xh.size(-1)});
-        std::vector<mfq_tensor_backend::Tensor> partials;
-        partials.reserve(
-            down.tensor_parallel_shards.size());
-        for (size_t index = 0;
-             index <
-                 down.tensor_parallel_shards.size();
-             ++index) {
+        const size_t shard_count = down.tensor_parallel_shards.size();
+        std::vector<mfq_tensor_backend::Tensor> partials(shard_count);
+        for (size_t launch_position = 0;
+             launch_position < shard_count;
+             ++launch_position) {
+            const size_t index = tensor_parallel_launch_index(
+                launch_position, shard_count);
             const auto & gate_shard =
                 gate_up.layers[0]
                     .tensor_parallel_shards[index];
@@ -14664,9 +14692,8 @@ struct FFN {
                     (mfq_tensor_backend::silu(gate_output) *
                      up_output).contiguous();
             }
-            partials.push_back(
-                run_quant_linear_shard(
-                    down_shard, activation));
+            partials[index] = run_quant_linear_shard(
+                down_shard, activation);
         }
         auto output =
             reduce_tensor_parallel_outputs(

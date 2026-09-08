@@ -98,7 +98,16 @@ def test_batched_decode_graph_orders_tp_groups_by_projection():
     assert "g_decode_graph_tp_projection_major" in SOURCE
     assert "DecodeGraphTpProjectionScope" in SOURCE
     assert "std::vector<mfq_tensor_backend::Tensor> local_inputs" in SOURCE
-    assert "local_inputs.push_back(tensor_to_cuda_device(flat, device))" in SOURCE
+    assert "local_inputs[shard] = tensor_to_cuda_device(flat, device)" in SOURCE
+
+
+def test_tensor_parallel_peer_first_launch_preserves_rank_indexing():
+    assert '"MFQ_TP_PEER_FIRST_LAUNCH"' in SOURCE
+    assert "tensor_parallel_launch_index(" in SOURCE
+    assert "environment == nullptr || std::atoi(environment) != 0" in SOURCE
+    assert "shard_count == 2" in SOURCE
+    assert "local_outputs[index] =" in SOURCE
+    assert "partials[index] = run_quant_linear_shard(" in SOURCE
 
 
 def test_qwen35_mtp_accepts_dense_tensor_parallel_placement():
