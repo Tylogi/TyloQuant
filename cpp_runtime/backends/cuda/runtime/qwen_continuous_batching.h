@@ -1275,14 +1275,14 @@ static int run_qwen_continuous_batching_check(Model & model) {
         "continuous batching check requires vocab>1024 and context>=208");
 
     MfqSamplingParams first_params;
-    first_params.max_tokens = 12;
+    first_params.max_tokens = 20;
     first_params.temperature = 0.0;
     first_params.top_k = 1;
     first_params.top_p = 1.0;
     first_params.enable_mtp = false;
     first_params.seed = 20260907;
     auto second_params = first_params;
-    second_params.max_tokens = 4;
+    second_params.max_tokens = 18;
     second_params.seed += 1;
     std::vector<int64_t> first_prompt(193);
     std::vector<int64_t> second_prompt(17);
@@ -1437,6 +1437,22 @@ static int run_qwen_continuous_batching_check(Model & model) {
               << metric("continuous_batching_cuda_graph_captures")
               << " cuda_graph_replays="
               << metric("continuous_batching_cuda_graph_replays")
+              << " paged_kv="
+              << metric("continuous_batching_paged_kv")
+              << " page_size="
+              << metric("paged_kv_page_size")
+              << " live_pages="
+              << metric("paged_kv_live_pages")
+              << " peak_pages="
+              << metric("paged_kv_peak_live_pages")
+              << " capacity_pages="
+              << metric("paged_kv_capacity_pages")
+              << " page_allocations="
+              << metric("paged_kv_page_allocations")
+              << " page_reuses="
+              << metric("paged_kv_page_reuses")
+              << " page_releases="
+              << metric("paged_kv_page_releases")
               << " active="
               << metric("continuous_batching_active")
               << " queued="
@@ -1448,8 +1464,19 @@ static int run_qwen_continuous_batching_check(Model & model) {
         (!qwen_continuous_batch_packed_metadata_enabled() ||
             metric("continuous_batching_packed_metadata_batches") >= 1.0) &&
         (!qwen_continuous_batch_cuda_graph_enabled(model) ||
-            (metric("continuous_batching_cuda_graph_captures") >= 1.0 &&
+             (metric("continuous_batching_cuda_graph_captures") >= 1.0 &&
              metric("continuous_batching_cuda_graph_replays") >= 2.0)) &&
+        (!qwen_continuous_paged_kv_enabled() ||
+            (metric("continuous_batching_paged_kv") == 1.0 &&
+             metric("paged_kv_page_size") ==
+                static_cast<double>(QwenPagedKvArena::kPageSize) &&
+             metric("paged_kv_live_pages") == 0.0 &&
+             metric("paged_kv_peak_live_pages") > 0.0 &&
+             metric("paged_kv_capacity_pages") >=
+                metric("paged_kv_peak_live_pages") &&
+             metric("paged_kv_page_allocations") ==
+                metric("paged_kv_page_releases") &&
+             metric("paged_kv_page_reuses") > 0.0)) &&
         metric("continuous_batching_active") == 0.0 &&
         metric("continuous_batching_queued") == 0.0,
         "continuous batching check did not exercise join and retire");
