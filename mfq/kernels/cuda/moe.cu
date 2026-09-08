@@ -819,7 +819,24 @@ __device__ __forceinline__ uint8_t unpack_one(const uint8_t * values, int index)
 
 template <int BITS>
 __device__ __forceinline__ int unpack_four(const uint8_t * values, int index) {
-    if constexpr (BITS == 4) {
+    if constexpr (BITS == 2) {
+        const uint32_t packed = values[index >> 2];
+        return static_cast<int>(packed & 0x03u) |
+            (static_cast<int>((packed & 0x0cu) << 6)) |
+            (static_cast<int>((packed & 0x30u) << 12)) |
+            (static_cast<int>((packed & 0xc0u) << 18));
+    } else if constexpr (BITS == 3) {
+        const int bit = index * 3;
+        const int byte = bit >> 3;
+        const int shift = bit & 7;
+        const uint32_t word = static_cast<uint32_t>(values[byte + 0]) |
+            (static_cast<uint32_t>(values[byte + 1]) << 8);
+        const uint32_t unpacked = word >> shift;
+        return static_cast<int>(unpacked & 7u) |
+            (static_cast<int>((unpacked >> 3) & 7u) << 8) |
+            (static_cast<int>((unpacked >> 6) & 7u) << 16) |
+            (static_cast<int>((unpacked >> 9) & 7u) << 24);
+    } else if constexpr (BITS == 4) {
         const uint16_t packed = *reinterpret_cast<const uint16_t *>(values + (index >> 1));
         const uint8_t first = static_cast<uint8_t>(packed);
         const uint8_t second = static_cast<uint8_t>(packed >> 8);
@@ -2641,10 +2658,16 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                 qg = q_packed + meta * QBYTES;
             }
 #pragma unroll
-            for (int i = 0; i < GS; ++i) {
-                const float qv = valid ? static_cast<float>(unpack_one<BITS>(qg, i)) : 0.0f;
-                W_s[nn][gl * GS + i] = valid ? __float2half_rn(d * qv - m)
-                                               : __float2half_rn(0.0f);
+            for (int i = 0; i < GS; i += 4) {
+                const int packed = valid ? unpack_four<BITS>(qg, i) : 0;
+                const float q0 = static_cast<float>(packed & 255);
+                const float q1 = static_cast<float>((packed >> 8) & 255);
+                const float q2 = static_cast<float>((packed >> 16) & 255);
+                const float q3 = static_cast<float>((packed >> 24) & 255);
+                *reinterpret_cast<__half2 *>(&W_s[nn][gl * GS + i + 0]) =
+                    __floats2half2_rn(d * q0 - m, d * q1 - m);
+                *reinterpret_cast<__half2 *>(&W_s[nn][gl * GS + i + 2]) =
+                    __floats2half2_rn(d * q2 - m, d * q3 - m);
             }
         }
 
