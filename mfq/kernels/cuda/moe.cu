@@ -2925,6 +2925,12 @@ __device__ __forceinline__ void nint_moe_mma_profile(
         __syncthreads();
     }
 
+    if constexpr (BM == 64) {
+        if (tid < BM) {
+            const int compact = first + tid;
+            source_rows_s[tid] = compact < last ? ids_dst[compact] : -1;
+        }
+    }
 #pragma unroll
     for (int a = 0; a < ACCS_PER_WARP; ++a) {
         const int mi = warp_m0 + a * 2;
@@ -2950,7 +2956,12 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                     const int compact = compact0 + r;
                     const int gn = gn0 + c;
                     if (compact < last && gn < out_per_expert) {
-                        const int pair = ids_dst[compact];
+                        int pair;
+                        if constexpr (BM == 64) {
+                            pair = source_rows_s[mi * 16 + r];
+                        } else {
+                            pair = ids_dst[compact];
+                        }
                         out[static_cast<size_t>(pair) * out_per_expert + gn] =
                             __float2half_rn(C_s[scratch_warp][r][c]);
                     }
