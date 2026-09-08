@@ -7749,7 +7749,18 @@ int MlxNintMoeWeight::recommended_grouped_mmq_block_rows(
     const int logical_output_width = fused_swiglu
         ? impl_->out_per_expert / 2
         : impl_->out_per_expert;
-    return logical_output_width <= impl_->neuron_len ? 32 : 64;
+    if (logical_output_width <= impl_->neuron_len) {
+        // At very high occupancy the fused gate/up projection no longer
+        // benefits from BM32 enough to justify a second block plan beside a
+        // wide BM64 down projection. BM64 is neutral-to-positive once there
+        // are at least eight 64-row blocks per expert; retain BM32 below that
+        // point because its BN128 geometry is materially faster there.
+        if (fused_swiglu && mean_routes >= 512) {
+            return 64;
+        }
+        return 32;
+    }
+    return 64;
 }
 
 MlxGroupedMmqPlan MlxNintMoeWeight::build_grouped_mmq_plan(

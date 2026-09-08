@@ -4604,6 +4604,60 @@ void test_grouped_nint_mmq_prefill() {
     }
 }
 
+void test_large_fused_grouped_tile_policy() {
+    const auto gate_fixture = make_moe_fixture(
+        {"NINT4"}, 48, 96, 31, 24);
+    const auto down_fixture = make_moe_fixture(
+        {"NINT4"}, 96, 24, 37, 24);
+    const auto gate = mfq::metal::MlxMoeWeight::from_blob(
+        gate_fixture.blob);
+    const auto down = mfq::metal::MlxMoeWeight::from_blob(
+        down_fixture.blob);
+
+    const char* prior_nax = std::getenv("MFQ_METAL_NINT_PREFILL_NAX");
+    const char* prior_direct =
+        std::getenv("MFQ_METAL_NINT_PREFILL_NAX_DIRECT");
+    const char* prior_rows =
+        std::getenv("MFQ_METAL_GROUPED_MMQ_BLOCK_ROWS");
+    const std::optional<std::string> saved_nax = prior_nax == nullptr
+        ? std::nullopt
+        : std::optional<std::string>(prior_nax);
+    const std::optional<std::string> saved_direct = prior_direct == nullptr
+        ? std::nullopt
+        : std::optional<std::string>(prior_direct);
+    const std::optional<std::string> saved_rows = prior_rows == nullptr
+        ? std::nullopt
+        : std::optional<std::string>(prior_rows);
+    setenv("MFQ_METAL_NINT_PREFILL_NAX", "1", 1);
+    setenv("MFQ_METAL_NINT_PREFILL_NAX_DIRECT", "0", 1);
+    unsetenv("MFQ_METAL_GROUPED_MMQ_BLOCK_ROWS");
+
+    require(
+        gate.recommended_grouped_mmq_block_rows(511, true) == 32,
+        "fused grouped gate/up must retain BM32 below high occupancy");
+    require(
+        gate.recommended_grouped_mmq_block_rows(512, true) == 64,
+        "fused grouped gate/up must use BM64 at high occupancy");
+    require(
+        gate.recommended_grouped_mmq_block_rows(512, false) == 32,
+        "ordinary narrow grouped projection unexpectedly selected BM64");
+    require(
+        down.recommended_grouped_mmq_block_rows(512, false) == 64,
+        "wide grouped down projection must use BM64 at high occupancy");
+
+    const auto restore = [](const char* name,
+                            const std::optional<std::string>& value) {
+        if (value.has_value()) {
+            setenv(name, value->c_str(), 1);
+        } else {
+            unsetenv(name);
+        }
+    };
+    restore("MFQ_METAL_NINT_PREFILL_NAX", saved_nax);
+    restore("MFQ_METAL_NINT_PREFILL_NAX_DIRECT", saved_direct);
+    restore("MFQ_METAL_GROUPED_MMQ_BLOCK_ROWS", saved_rows);
+}
+
 void test_grouped_nint2_pair_prefill() {
     constexpr int tokens = 1024;
     constexpr int output = 24;
@@ -5277,6 +5331,7 @@ int main(int argc, char** argv) {
         test_grouped_mmq_prefill();
         test_grouped_vq_decoder_tail_prefill();
         test_grouped_nint_mmq_prefill();
+        test_large_fused_grouped_tile_policy();
         test_grouped_nint2_pair_prefill();
         test_grouped_nint5_group28_tail_prefill();
         test_grouped_nint8_group48_tail_prefill();
