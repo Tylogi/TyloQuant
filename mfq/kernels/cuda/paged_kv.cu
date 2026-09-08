@@ -439,7 +439,7 @@ __global__ void paged_attention_decode_split_kernel(
 }
 
 template <int FixedPageSize, int FixedPagesPerChunk,
-          int ValuesPerThread, typename scalar_t>
+          int ValuesPerThread, int IndependentWarps, typename scalar_t>
 __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     const scalar_t * __restrict__ q,
     const int64_t * __restrict__ k_chunk_ptrs,
@@ -456,6 +456,8 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     constexpr int Rep = 4;
     constexpr int Threads = D / ValuesPerThread;
     constexpr int Warps = Threads / 32;
+    static_assert(IndependentWarps == 1 ||
+        (IndependentWarps == 2 && Warps == 1));
     static_assert(ValuesPerThread == 1 || ValuesPerThread == 2 ||
         ValuesPerThread == 4 || ValuesPerThread == 8);
     const int part = blockIdx.x % parts;
@@ -463,7 +465,8 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     const int kv_head = kv % Hk;
     const int batch = kv / Hk;
     const int first_query_head = kv_head * Rep;
-    const int tid = threadIdx.x;
+    const int worker = threadIdx.x / Threads;
+    const int tid = threadIdx.x - worker * Threads;
     const int first_dimension = tid * ValuesPerThread;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -474,10 +477,14 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     tokens = tokens < 0 ? 0 : (tokens > maximum_tokens ? maximum_tokens : tokens);
     const int active_parts = paged_active_parts(tokens, parts, dynamic_parts);
     if (part >= active_parts) return;
-    const int start = static_cast<int>(
+    const int part_start = static_cast<int>(
         static_cast<int64_t>(tokens) * part / active_parts);
-    const int end = static_cast<int>(
+    const int part_end = static_cast<int>(
         static_cast<int64_t>(tokens) * (part + 1) / active_parts);
+    const int start = part_start +
+        (part_end - part_start) * worker / IndependentWarps;
+    const int end = part_start +
+        (part_end - part_start) * (worker + 1) / IndependentWarps;
     float query[Rep][ValuesPerThread];
     float value_sum[Rep][ValuesPerThread];
     #pragma unroll
@@ -634,16 +641,83 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
             }
         }
     }
-    #pragma unroll
-    for (int index = 0; index < Rep; ++index) {
-        const int query_index = batch * Hq + first_query_head + index;
-        const size_t statistic =
-            static_cast<size_t>(query_index) * workspace_parts + part;
-        paged_store_floats(
-            partial_o + statistic * D + first_dimension, value_sum[index]);
-        if (tid == index) {
-            partial_m[statistic] = start < end ? maximum : -1e30f;
-            partial_l[statistic] = start < end ? denominator : 0.0f;
+    if constexpr (IndependentWarps == 1) {
+        #pragma unroll
+        for (int index = 0; index < Rep; ++index) {
+            const int query_index = batch * Hq + first_query_head + index;
+            const size_t statistic =
+                static_cast<size_t>(query_index) * workspace_parts + part;
+            paged_store_floats(
+                partial_o + statistic * D + first_dimension,
+                value_sum[index]);
+            if (tid == index) {
+                partial_m[statistic] = start < end ? maximum : -1e30f;
+                partial_l[statistic] = start < end ? denominator : 0.0f;
+            }
+        }
+    } else {
+        __shared__ float second_value[Rep][D];
+        __shared__ float second_maximum[Rep];
+        __shared__ float second_denominator[Rep];
+        if (worker == 1) {
+            #pragma unroll
+            for (int index = 0; index < Rep; ++index) {
+                paged_store_floats(
+                    second_value[index] + first_dimension,
+                    value_sum[index]);
+                if (tid == index) {
+                    second_maximum[index] =
+                        start < end ? maximum : -1e30f;
+                    second_denominator[index] =
+                        start < end ? denominator : 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+        if (worker == 0) {
+            float first_factor = 0.0f;
+            float second_factor = 0.0f;
+            if (lane < Rep) {
+                const float other_maximum = second_maximum[lane];
+                const float other_denominator = second_denominator[lane];
+                const float combined_maximum = fmaxf(
+                    maximum, other_maximum);
+                first_factor = denominator > 0.0f
+                    ? expf(maximum - combined_maximum) : 0.0f;
+                second_factor = other_denominator > 0.0f
+                    ? expf(other_maximum - combined_maximum) : 0.0f;
+                denominator = denominator * first_factor +
+                    other_denominator * second_factor;
+                maximum = combined_maximum;
+            }
+            #pragma unroll
+            for (int index = 0; index < Rep; ++index) {
+                const float active_first_factor = __shfl_sync(
+                    0xffffffffu, first_factor, index);
+                const float active_second_factor = __shfl_sync(
+                    0xffffffffu, second_factor, index);
+                #pragma unroll
+                for (int value_index = 0;
+                        value_index < ValuesPerThread; ++value_index) {
+                    value_sum[index][value_index] =
+                        value_sum[index][value_index] * active_first_factor +
+                        second_value[index][first_dimension + value_index] *
+                            active_second_factor;
+                }
+                const int query_index =
+                    batch * Hq + first_query_head + index;
+                const size_t statistic =
+                    static_cast<size_t>(query_index) * workspace_parts + part;
+                paged_store_floats(
+                    partial_o + statistic * D + first_dimension,
+                    value_sum[index]);
+                if (tid == index) {
+                    partial_m[statistic] =
+                        part_start < part_end ? maximum : -1e30f;
+                    partial_l[statistic] =
+                        part_start < part_end ? denominator : 0.0f;
+                }
+            }
         }
     }
 }
@@ -912,8 +986,8 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
             if (D == 256 && gqa_ratio == 4) {
                 if (page == 16 && chunk_pages == 64) {
                     paged_attention_decode_split_gqa4_d256_kernel<
-                        16, 64, 8, scalar_t><<<
-                        B * Hk * split_parts, 32, 0, stream>>>(
+                        16, 64, 8, 2, scalar_t><<<
+                        B * Hk * split_parts, 64, 0, stream>>>(
                         q.data_ptr<scalar_t>(), k_chunk_ptrs.data_ptr<int64_t>(),
                         v_chunk_ptrs.data_ptr<int64_t>(),
                         page_table.data_ptr<int32_t>(), seq_len.data_ptr<int64_t>(),
@@ -923,7 +997,7 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
                         static_cast<float>(scale), dynamic_parts ? 1 : 0);
                 } else {
                     paged_attention_decode_split_gqa4_d256_kernel<
-                        0, 0, 1, scalar_t><<<
+                        0, 0, 1, 1, scalar_t><<<
                         B * Hk * split_parts, 256, 0, stream>>>(
                         q.data_ptr<scalar_t>(), k_chunk_ptrs.data_ptr<int64_t>(),
                         v_chunk_ptrs.data_ptr<int64_t>(),
