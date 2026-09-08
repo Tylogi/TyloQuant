@@ -134,6 +134,16 @@ if(BUILD_TESTING)
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
         CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 
+    add_executable(mfq-paged-kv-attention-bench
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_paged_kv_attention_bench.cu)
+    target_compile_definitions(mfq-paged-kv-attention-bench PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1)
+    target_link_libraries(mfq-paged-kv-attention-bench PRIVATE
+        mfq-cuda-core mfq-cuda-native-kernels)
+    set_target_properties(mfq-paged-kv-attention-bench PROPERTIES
+        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
+        CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+
     mfq_add_cuda_test(mfq-cuda-context-test
         ${MFQ_CUDA_ROOT}/tests/mfq_cuda_context_test.cu)
     mfq_add_cuda_test(mfq-cuda-activation-test
