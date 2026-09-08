@@ -210,22 +210,26 @@ __global__ void paged_attention_decode_gqa4_d256_kernel(
     int tokens = static_cast<int>(seq_len[batch]);
     tokens = tokens < 0 ? 0 : (tokens > maximum_tokens ? maximum_tokens : tokens);
     float query[Rep];
-    float maximum[Rep];
-    float denominator[Rep];
     float value_sum[Rep];
     #pragma unroll
     for (int index = 0; index < Rep; ++index) {
         query[index] = static_cast<float>(q[
             (static_cast<size_t>(batch) * Hq + first_query_head + index) *
             D + tid]);
-        maximum[index] = -1e30f;
-        denominator[index] = 0.0f;
         value_sum[index] = 0.0f;
     }
     __shared__ float warp_dot[Rep][Warps];
-    __shared__ float score[Rep];
+    __shared__ float maximum[Rep];
+    __shared__ float denominator[Rep];
+    __shared__ float previous_factor[Rep];
+    __shared__ float probability[Rep];
     __shared__ uintptr_t key_page_address;
     __shared__ uintptr_t value_page_address;
+    if (tid < Rep) {
+        maximum[tid] = -1e30f;
+        denominator[tid] = 0.0f;
+    }
+    __syncthreads();
     const size_t page_elements =
         static_cast<size_t>(Hk) * page_size * D;
     for (int token = 0; token < tokens; ++token) {
@@ -271,20 +275,23 @@ __global__ void paged_attention_decode_gqa4_d256_kernel(
             for (int index = 0; index < Rep; ++index) {
                 float dot = lane < Warps ? warp_dot[index][lane] : 0.0f;
                 dot = paged_warp_sum(dot);
-                if (lane == 0) score[index] = dot * scale;
+                if (lane == 0) {
+                    const float score = dot * scale;
+                    const float new_maximum = fmaxf(maximum[index], score);
+                    previous_factor[index] = expf(
+                        maximum[index] - new_maximum);
+                    probability[index] = expf(score - new_maximum);
+                    denominator[index] = denominator[index] *
+                        previous_factor[index] + probability[index];
+                    maximum[index] = new_maximum;
+                }
             }
         }
         __syncthreads();
         #pragma unroll
         for (int index = 0; index < Rep; ++index) {
-            const float new_maximum = fmaxf(maximum[index], score[index]);
-            const float previous_factor = expf(maximum[index] - new_maximum);
-            const float probability = expf(score[index] - new_maximum);
-            value_sum[index] = value_sum[index] * previous_factor +
-                probability * value;
-            denominator[index] = denominator[index] * previous_factor +
-                probability;
-            maximum[index] = new_maximum;
+            value_sum[index] = value_sum[index] * previous_factor[index] +
+                probability[index] * value;
         }
     }
     #pragma unroll
@@ -438,22 +445,26 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     const int end = static_cast<int>(
         static_cast<int64_t>(tokens) * (part + 1) / active_parts);
     float query[Rep];
-    float maximum[Rep];
-    float denominator[Rep];
     float value_sum[Rep];
     #pragma unroll
     for (int index = 0; index < Rep; ++index) {
         query[index] = static_cast<float>(q[
             (static_cast<size_t>(batch) * Hq + first_query_head + index) *
             D + tid]);
-        maximum[index] = -1e30f;
-        denominator[index] = 0.0f;
         value_sum[index] = 0.0f;
     }
     __shared__ float warp_dot[Rep][Warps];
-    __shared__ float score[Rep];
+    __shared__ float maximum[Rep];
+    __shared__ float denominator[Rep];
+    __shared__ float previous_factor[Rep];
+    __shared__ float probability[Rep];
     __shared__ uintptr_t key_page_address;
     __shared__ uintptr_t value_page_address;
+    if (tid < Rep) {
+        maximum[tid] = -1e30f;
+        denominator[tid] = 0.0f;
+    }
+    __syncthreads();
     const size_t page_elements =
         static_cast<size_t>(Hk) * page_size * D;
     for (int token = start; token < end; ++token) {
@@ -499,20 +510,23 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
             for (int index = 0; index < Rep; ++index) {
                 float dot = lane < Warps ? warp_dot[index][lane] : 0.0f;
                 dot = paged_warp_sum(dot);
-                if (lane == 0) score[index] = dot * scale;
+                if (lane == 0) {
+                    const float score = dot * scale;
+                    const float new_maximum = fmaxf(maximum[index], score);
+                    previous_factor[index] = expf(
+                        maximum[index] - new_maximum);
+                    probability[index] = expf(score - new_maximum);
+                    denominator[index] = denominator[index] *
+                        previous_factor[index] + probability[index];
+                    maximum[index] = new_maximum;
+                }
             }
         }
         __syncthreads();
         #pragma unroll
         for (int index = 0; index < Rep; ++index) {
-            const float new_maximum = fmaxf(maximum[index], score[index]);
-            const float previous_factor = expf(maximum[index] - new_maximum);
-            const float probability = expf(score[index] - new_maximum);
-            value_sum[index] = value_sum[index] * previous_factor +
-                probability * value;
-            denominator[index] = denominator[index] * previous_factor +
-                probability;
-            maximum[index] = new_maximum;
+            value_sum[index] = value_sum[index] * previous_factor[index] +
+                probability[index] * value;
         }
     }
     #pragma unroll
