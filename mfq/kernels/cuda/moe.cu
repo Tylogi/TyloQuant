@@ -2940,7 +2940,7 @@ __global__ void __launch_bounds__(256, 1) nint8_zero_moe_mma_kernel(
 }
 
 template <int BM>
-__global__ void __launch_bounds__(256, 1) nint_moe_hetero_mma_kernel(
+__global__ void __launch_bounds__(256, BM == 32 ? 3 : 1) nint_moe_hetero_mma_kernel(
         const int64_t * __restrict__ weight_ptrs,
         const int32_t * __restrict__ pool_params,
         const int32_t * __restrict__ expert_pool,
