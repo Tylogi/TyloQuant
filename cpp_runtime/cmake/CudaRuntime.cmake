@@ -233,6 +233,7 @@ if(MSVC)
     target_compile_options(mfq-decode PRIVATE
         "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
         "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/bigobj>"
         "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
         "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
     )

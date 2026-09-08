@@ -29,6 +29,30 @@ For an A/B build, configure a separate tree with LibTorch discoverable and
 `-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=ON`. This adds `mfq-decode-torch`; it does
 not alter `mfq-decode`.
 
+## Tensor and expert parallel execution
+
+The native runtime accepts either a rank count or an ordered CUDA device list.
+Split weights stay attached to that device order:
+
+```shell
+mfq-decode --mfq model.mfq --tensor-parallel 4
+mfq-decode --mfq moe.mfq \
+  --expert-parallel 0,1,2,3 --expert-split 1,1,1,1
+mfq-decode --mfq moe.mfq \
+  --tensor-parallel 0,1,2,3 --tensor-split 1,1,1,1 \
+  --expert-parallel 0,1,2,3 --expert-split 1,1,2,4
+```
+
+Combined tensor and expert parallel execution currently uses one NCCL rank
+group, so both ordered device lists must match. Their split weights may differ.
+For compatibility with older launches, routed experts inherit the tensor
+parallel device group when `--expert-parallel` is omitted.
+
+Four- and eight-rank changes must pass `mfq-tensor-parallel-test` before a CUDA
+run. A real multi-GPU gate must then cover dense tensor shards, routed expert
+ownership, NCCL reduction, eager execution, and CUDA Graph replay. Eight-rank
+code is not considered device-validated until that physical gate runs.
+
 ## Required A/B matrix
 
 Run every row with fixed model files, prompts, seeds, cache limits, and sampling
@@ -41,7 +65,7 @@ parameters. Start each executable in a fresh process.
 | Shapes | single-token decode, short and long prefill, odd sizes, batched inputs, and GQA head broadcasting |
 | State | empty cache, reused prefix cache, context rollover, session reset, and interrupted generation |
 | Sampling | greedy, temperature, top-k, top-p, min-p, repetition/presence penalties, and fixed random seed |
-| Execution | eager, CUDA Graph capture/replay, one and multiple CUDA streams, one GPU, and tensor parallel when NCCL is present |
+| Execution | eager, CUDA Graph capture/replay, one and multiple CUDA streams, one GPU, and tensor/expert parallel when NCCL is present |
 | Media | text, image, video, audio, half duplex, and full duplex |
 
 Capture raw logits from both executables at prefill and every decode step. The

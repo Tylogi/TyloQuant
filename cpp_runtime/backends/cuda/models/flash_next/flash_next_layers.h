@@ -25,6 +25,8 @@ static Routed routed(const MfqFile& file, const std::string& name, int layer,
     int64_t experts, int64_t output, int64_t input) {
     const auto& dtype=file.record(name).dtype;
     if (dtype=="F32" || dtype=="F16" || dtype=="BF16") {
+        MFQ_RUNTIME_CHECK(!moe_parallel_config().enabled(),
+            "expert parallelism requires packed routed tensors: ",name);
         auto w=dense(file,name);
         MFQ_RUNTIME_CHECK(w.sizes().vec()==std::vector<int64_t>({experts,output,input}),
             "Flash-Next dense expert tensor shape mismatch: ",name);

@@ -90,7 +90,7 @@ static bool qwen_continuous_batch_cuda_graph_enabled(const Model & model) {
     return (environment == nullptr || std::atoi(environment) != 0) &&
         (server_environment == nullptr || server_environment[0] != '0') &&
         !model.c.is_flash_next() && mfq_cuda_graph_capture_supported() &&
-        tensor_parallel_cuda_graph_enabled();
+        model_parallel_cuda_graph_enabled();
 }
 
 static bool qwen_continuous_paged_kv_enabled() {

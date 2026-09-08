@@ -1176,7 +1176,7 @@ enum class TensorParallelAxis {
     Input,
 };
 
-struct TensorParallelConfig {
+struct ParallelConfig {
     std::vector<int> devices;
     std::vector<double> split;
     bool allow_duplicate_devices = false;
@@ -1190,9 +1190,37 @@ struct TensorParallelConfig {
     }
 };
 
-static TensorParallelConfig g_tensor_parallel;
+static ParallelConfig g_tensor_parallel;
+static ParallelConfig g_expert_parallel;
 
-struct TensorParallelCollectiveRuntime {
+static bool model_parallel_enabled() {
+    return g_tensor_parallel.enabled() ||
+        g_expert_parallel.enabled();
+}
+
+static const ParallelConfig & model_parallel_config() {
+    return g_tensor_parallel.enabled()
+        ? g_tensor_parallel
+        : g_expert_parallel;
+}
+
+static const ParallelConfig & moe_parallel_config() {
+    return g_expert_parallel.enabled()
+        ? g_expert_parallel
+        : g_tensor_parallel;
+}
+
+static int model_parallel_primary_device() {
+    if (!g_tensor_parallel.devices.empty()) {
+        return g_tensor_parallel.primary_device();
+    }
+    if (!g_expert_parallel.devices.empty()) {
+        return g_expert_parallel.primary_device();
+    }
+    return 0;
+}
+
+struct ModelParallelCollectiveRuntime {
     using Stream = decltype(mfq_get_stream_from_pool(false));
 
     std::vector<int> devices;
@@ -1205,14 +1233,15 @@ struct TensorParallelCollectiveRuntime {
 #endif
     bool collectives_enabled = false;
 
-    ~TensorParallelCollectiveRuntime() {
+    ~ModelParallelCollectiveRuntime() {
         reset();
     }
 
     void reset() noexcept {
         // Release CUDA-owned state while every device context is still alive.
         // Static destruction is too late: the CUDA allocator may already be
-        // shutting down when tensors on secondary TP devices are destroyed.
+        // shutting down when tensors on secondary model-parallel devices are
+        // destroyed.
         for (int device : devices) {
             (void)cudaSetDevice(device);
             (void)cudaDeviceSynchronize();
@@ -1310,14 +1339,21 @@ struct TensorParallelCollectiveRuntime {
     }
 };
 
-static TensorParallelCollectiveRuntime g_tensor_parallel_collectives;
+static ModelParallelCollectiveRuntime g_model_parallel_collectives;
 
-static bool tensor_parallel_cuda_graph_enabled() {
-    if (!g_tensor_parallel.enabled()) {
+static bool model_parallel_cuda_graph_enabled() {
+    if (!model_parallel_enabled()) {
         return true;
     }
-    const char * environment = std::getenv("MFQ_TP_CUDA_GRAPH");
-    return g_tensor_parallel_collectives.collectives_enabled &&
+    const char * environment = std::getenv(
+        "MFQ_MODEL_PARALLEL_CUDA_GRAPH");
+    if (environment == nullptr) {
+        environment = std::getenv(
+            g_expert_parallel.enabled() && !g_tensor_parallel.enabled()
+                ? "MFQ_EP_CUDA_GRAPH"
+                : "MFQ_TP_CUDA_GRAPH");
+    }
+    return g_model_parallel_collectives.collectives_enabled &&
            (environment == nullptr || environment[0] != '0');
 }
 
@@ -1345,31 +1381,42 @@ static bool tensor_parallel_mirror_qwen35_attention_kv_enabled() {
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
-static bool tensor_parallel_reduce_to_primary_enabled() {
+static bool model_parallel_reduce_to_primary_enabled() {
     const char * environment = std::getenv(
-        "MFQ_TP_REDUCE_TO_PRIMARY");
+        "MFQ_MODEL_PARALLEL_REDUCE_TO_PRIMARY");
+    if (environment == nullptr) {
+        environment = std::getenv("MFQ_TP_REDUCE_TO_PRIMARY");
+    }
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
-static bool tensor_parallel_fp16_reduce_enabled() {
+static bool model_parallel_fp16_reduce_enabled() {
     const char * environment = std::getenv(
-        "MFQ_TP_FP16_REDUCE");
+        "MFQ_MODEL_PARALLEL_FP16_REDUCE");
+    if (environment == nullptr) {
+        environment = std::getenv("MFQ_TP_FP16_REDUCE");
+    }
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
-static bool tensor_parallel_peer_first_launch_enabled() {
+static bool model_parallel_peer_first_launch_enabled() {
     static const bool enabled = [] {
         const char * environment = std::getenv(
-            "MFQ_TP_PEER_FIRST_LAUNCH");
+            "MFQ_MODEL_PARALLEL_PEER_FIRST_LAUNCH");
+        if (environment == nullptr) {
+            environment = std::getenv(
+                "MFQ_TP_PEER_FIRST_LAUNCH");
+        }
         return environment == nullptr || std::atoi(environment) != 0;
     }();
     return enabled;
 }
 
-static size_t tensor_parallel_launch_index(
+static size_t model_parallel_launch_index(
         size_t launch_position, size_t shard_count) {
-    return tensor_parallel_peer_first_launch_enabled() && shard_count == 2
-        ? shard_count - 1 - launch_position
+    return model_parallel_peer_first_launch_enabled()
+        ? mfq::peer_first_parallel_launch_index(
+            launch_position, shard_count)
         : launch_position;
 }
 
@@ -1385,7 +1432,7 @@ struct LayerPlacementConfig {
 
     int primary_device() const {
         return devices.empty()
-            ? g_tensor_parallel.primary_device()
+            ? model_parallel_primary_device()
             : devices.front();
     }
 
@@ -1415,7 +1462,7 @@ static LayerPlacementConfig g_layer_placement;
 static int active_weight_load_device() {
     return g_layer_placement.load_device >= 0
         ? g_layer_placement.load_device
-        : g_tensor_parallel.primary_device();
+        : model_parallel_primary_device();
 }
 
 static const char * kl_mmq_mode_name(KlMmqMode mode) {
@@ -3726,14 +3773,14 @@ static MoeRoutePlan build_moe_route_plan(mfq_tensor_backend::Tensor ids, int n_e
     return result;
 }
 
-static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
+static mfq_tensor_backend::Tensor reduce_model_parallel_outputs(
     std::vector<mfq_tensor_backend::Tensor> outputs);
 
 struct NintMoeWeight {
-    struct TensorParallelShard {
+    struct ExpertParallelShard {
         int device = 0;
-        int64_t output_begin = 0;
-        int64_t output_end = 0;
+        int64_t expert_begin = 0;
+        int64_t expert_end = 0;
         std::shared_ptr<NintMoeWeight> weight;
     };
 
@@ -3751,11 +3798,9 @@ struct NintMoeWeight {
     int gs28_quantize_index = -1;
     int profile_mask = 0;
     int64_t mixed_weight_bytes = 0;
-    bool tensor_parallel_paired_output = false;
-    bool tensor_parallel_experts = false;
     bool partial_experts = false;
-    std::vector<TensorParallelShard>
-        tensor_parallel_shards;
+    std::vector<ExpertParallelShard>
+        expert_parallel_shards;
     std::function<void(const MoeRoutePlan &)> cache_prefetch;
     std::function<void(const MoeRoutePlan &)> cache_prefetch_begin;
     std::function<mfq_tensor_backend::Tensor(mfq_tensor_backend::Tensor, const MoeRoutePlan &)> mixed_forward;
@@ -3823,67 +3868,39 @@ struct NintMoeWeight {
             gs24_quantize_index >= 0 && gs28_quantize_index >= 0;
     }
 
-    bool tensor_parallel() const {
-        return !tensor_parallel_shards.empty();
+    bool expert_parallel() const {
+        return !expert_parallel_shards.empty();
     }
 
     template <typename Forward>
-    mfq_tensor_backend::Tensor forward_tensor_parallel(
+    mfq_tensor_backend::Tensor forward_expert_parallel(
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
-            bool paired_output,
             Forward && forward) const {
-        std::vector<mfq_tensor_backend::Tensor> outputs;
-        outputs.reserve(tensor_parallel_shards.size());
-        for (const auto & shard : tensor_parallel_shards) {
+        std::vector<mfq_tensor_backend::Tensor> outputs(
+            expert_parallel_shards.size());
+        for (size_t launch_position = 0;
+             launch_position < expert_parallel_shards.size();
+             ++launch_position) {
+            const size_t index = model_parallel_launch_index(
+                launch_position, expert_parallel_shards.size());
+            const auto & shard = expert_parallel_shards[index];
             if (!shard.weight) {
                 throw std::runtime_error(
-                    "tensor-parallel MoE shard is missing");
+                    "expert-parallel MoE shard is missing");
             }
             MfqCudaGuard guard(shard.device);
             auto local_x =
                 moe_tensor_to_device(x, shard.device);
             auto local_route =
                 moe_route_to_device(route, shard.device);
-            outputs.push_back(
-                forward(
-                    *shard.weight,
-                    local_x,
-                    local_route));
+            outputs[index] = forward(
+                *shard.weight,
+                local_x,
+                local_route);
         }
-        const int primary =
-            g_tensor_parallel.primary_device();
-        MfqCudaGuard primary_guard(primary);
-        if (!paired_output) {
-            for (auto & output : outputs) {
-                output =
-                    moe_tensor_to_device(output, primary);
-            }
-            return mfq_tensor_backend::cat(outputs, -1).contiguous();
-        }
-        std::vector<mfq_tensor_backend::Tensor> first;
-        std::vector<mfq_tensor_backend::Tensor> second;
-        first.reserve(outputs.size());
-        second.reserve(outputs.size());
-        for (auto & output : outputs) {
-            output =
-                moe_tensor_to_device(output, primary);
-            if (output.size(-1) % 2 != 0) {
-                throw std::runtime_error(
-                    "paired tensor-parallel MoE shard "
-                    "has an odd output width");
-            }
-            const int64_t half =
-                output.size(-1) / 2;
-            first.push_back(
-                output.narrow(-1, 0, half));
-            second.push_back(
-                output.narrow(-1, half, half));
-        }
-        return mfq_tensor_backend::cat(
-            {mfq_tensor_backend::cat(first, -1),
-             mfq_tensor_backend::cat(second, -1)},
-            -1).contiguous();
+        return reduce_model_parallel_outputs(
+            std::move(outputs));
     }
 
     void prefetch(const MoeRoutePlan & route) const {
@@ -3895,7 +3912,7 @@ struct NintMoeWeight {
     }
 
     bool supports_prequantized_input() const {
-        return !tensor_parallel() &&
+        return !expert_parallel() &&
             (hetero_supported || static_cast<bool>(mixed_prequantized_forward));
     }
 
@@ -3940,27 +3957,13 @@ struct NintMoeWeight {
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool input_prequantized) const {
-        if (tensor_parallel()) {
+        if (expert_parallel()) {
             if (input_prequantized) {
                 throw std::runtime_error(
-                    "prequantized MoE activation reuse is unavailable with tensor parallelism");
+                    "prequantized MoE activation reuse is unavailable with expert parallelism");
             }
-            if (tensor_parallel_experts) {
-                std::vector<mfq_tensor_backend::Tensor> partials;
-                partials.reserve(tensor_parallel_shards.size());
-                for (const auto & shard : tensor_parallel_shards) {
-                    MfqCudaGuard guard(shard.device);
-                    auto local_x = moe_tensor_to_device(x, shard.device);
-                    auto local_route = moe_route_to_device(route, shard.device);
-                    partials.push_back(
-                        shard.weight->forward(local_x, local_route));
-                }
-                return reduce_tensor_parallel_outputs(
-                    std::move(partials));
-            }
-            return forward_tensor_parallel(
+            return forward_expert_parallel(
                 x, route,
-                tensor_parallel_paired_output,
                 [](const NintMoeWeight & shard,
                    mfq_tensor_backend::Tensor local_x,
                    const MoeRoutePlan & local_route) {
@@ -4091,9 +4094,9 @@ struct NintMoeWeight {
 
     mfq_tensor_backend::Tensor forward_glu_output(
             mfq_tensor_backend::Tensor x, const MoeRoutePlan & route, bool gelu) const {
-        if (tensor_parallel()) {
-            return forward_tensor_parallel(
-                x, route, false,
+        if (expert_parallel()) {
+            return forward_expert_parallel(
+                x, route,
                 [gelu](
                     const NintMoeWeight & shard,
                     mfq_tensor_backend::Tensor local_x,
@@ -4148,9 +4151,9 @@ struct NintMoeWeight {
 
     mfq_tensor_backend::Tensor forward_glu(
             mfq_tensor_backend::Tensor gate_up, const MoeRoutePlan & route, bool gelu) const {
-        if (tensor_parallel()) {
-            return forward_tensor_parallel(
-                gate_up, route, false,
+        if (expert_parallel()) {
+            return forward_expert_parallel(
+                gate_up, route,
                 [gelu](
                     const NintMoeWeight & shard,
                     mfq_tensor_backend::Tensor local_gate_up,
@@ -4224,11 +4227,11 @@ struct NintMoeWeight {
     }
 
     bool supports_clamped_swiglu() const {
-        if (tensor_parallel()) {
+        if (expert_parallel()) {
             return std::all_of(
-                tensor_parallel_shards.begin(),
-                tensor_parallel_shards.end(),
-                [](const TensorParallelShard & shard) {
+                expert_parallel_shards.begin(),
+                expert_parallel_shards.end(),
+                [](const ExpertParallelShard & shard) {
                     return shard.weight &&
                         shard.weight
                             ->supports_clamped_swiglu();
@@ -4241,9 +4244,9 @@ struct NintMoeWeight {
             mfq_tensor_backend::Tensor gate_up,
             const MoeRoutePlan & route,
             double limit) const {
-        if (tensor_parallel()) {
-            return forward_tensor_parallel(
-                gate_up, route, false,
+        if (expert_parallel()) {
+            return forward_expert_parallel(
+                gate_up, route,
                 [limit](
                     const NintMoeWeight & shard,
                     mfq_tensor_backend::Tensor local_gate_up,
@@ -4400,7 +4403,7 @@ static NintMoeWeight to_gpu_nint_moe(const NintMoeCpu & cpu) {
 }
 
 static std::vector<mfq::TensorParallelSlice>
-plan_moe_tensor_parallel_slices(
+plan_moe_expert_parallel_slices(
     int64_t extent,
     const std::string & name);
 
@@ -6089,51 +6092,6 @@ static NepqWeight to_cpu_nepq(const NepqCpu & cpu) {
     return to_device_nepq(cpu, false);
 }
 
-static std::vector<int64_t> moe_output_row_indices(
-        int local_experts,
-        int source_out_per_expert,
-        int64_t begin,
-        int64_t end,
-        bool paired) {
-    if (local_experts <= 0 || begin < 0 ||
-        begin >= end) {
-        throw std::runtime_error(
-            "invalid tensor-parallel MoE output slice");
-    }
-    const int64_t logical_extent = paired
-        ? source_out_per_expert / 2
-        : source_out_per_expert;
-    if ((paired && source_out_per_expert % 2 != 0) ||
-        end > logical_extent) {
-        throw std::runtime_error(
-            "tensor-parallel MoE output slice "
-            "exceeds its logical width");
-    }
-    std::vector<int64_t> rows;
-    rows.reserve(
-        static_cast<size_t>(local_experts) *
-        static_cast<size_t>(end - begin) *
-        (paired ? 2u : 1u));
-    for (int expert = 0;
-         expert < local_experts; ++expert) {
-        const int64_t base =
-            static_cast<int64_t>(expert) *
-            source_out_per_expert;
-        for (int64_t row = begin; row < end; ++row) {
-            rows.push_back(base + row);
-        }
-        if (paired) {
-            const int64_t second =
-                base + logical_extent;
-            for (int64_t row = begin;
-                 row < end; ++row) {
-                rows.push_back(second + row);
-            }
-        }
-    }
-    return rows;
-}
-
 static NintCpu select_nint_cpu_rows(
         const NintCpu & source,
         const std::vector<int64_t> & rows) {
@@ -7175,130 +7133,6 @@ static NintMoeWeight to_gpu_mixed_moe(const NintMoeCpu & cpu) {
     return wrap_mixed_moe_runtime(make_mixed_moe_runtime(cpu, true));
 }
 
-static NintMoeWeight to_cuda_device_moe_output_slice(
-        const NintMoeCpu & cpu,
-        int64_t begin,
-        int64_t end,
-        bool paired,
-        int device) {
-    const int output_per_expert =
-        static_cast<int>(
-            (end - begin) *
-            (paired ? 2 : 1));
-    const bool all_nint = std::all_of(
-        cpu.pools.begin(), cpu.pools.end(),
-        [](const NintMoeCpuPool & pool) {
-            return pool.dtype != "NINTM" &&
-                pool.dtype != "NINT8-0" &&
-                pool.dtype.rfind("NINT", 0) == 0;
-        });
-    MfqCudaGuard guard(device);
-    if (all_nint) {
-        NintMoeCpu sliced = cpu;
-        sliced.out_per_expert =
-            output_per_expert;
-        for (size_t pool_index = 0;
-             pool_index < cpu.pools.size();
-             ++pool_index) {
-            const auto & source =
-                cpu.pools[pool_index];
-            auto rows = moe_output_row_indices(
-                static_cast<int>(
-                    source.expert_ids.size()),
-                cpu.out_per_expert,
-                begin, end, paired);
-            sliced.pools[pool_index].weight =
-                select_nint_cpu_rows(
-                    source.weight, rows);
-        }
-        return to_gpu_nint_moe(sliced);
-    }
-
-    auto runtime =
-        std::make_shared<MixedMoeRuntime>();
-    runtime->n_experts = cpu.n_experts;
-    runtime->out_per_expert =
-        output_per_expert;
-    runtime->neuron_len = cpu.neuron_len;
-    runtime->pools.reserve(cpu.pools.size());
-    for (const auto & source : cpu.pools) {
-        MixedMoePool pool;
-        pool.local_experts =
-            static_cast<int>(
-                source.expert_ids.size());
-        std::vector<int32_t> local(
-            static_cast<size_t>(cpu.n_experts),
-            -1);
-        for (int index = 0;
-             index < pool.local_experts;
-             ++index) {
-            local[static_cast<size_t>(
-                source.expert_ids[
-                    static_cast<size_t>(index)])] =
-                index;
-        }
-        pool.expert_local = mfq_tensor_backend::from_blob(
-            local.data(),
-            {static_cast<int64_t>(local.size())},
-            mfq_tensor_backend::TensorOptions().dtype(
-                mfq_tensor_backend::kInt32))
-            .clone().to(mfq_tensor_backend::kCUDA).contiguous();
-        auto rows = moe_output_row_indices(
-            pool.local_experts,
-            cpu.out_per_expert,
-            begin, end, paired);
-        if (source.dtype == "NINT8-0") {
-            pool.family =
-                MixedMoeFamily::Nint8Zero;
-            pool.q8_zero =
-                to_gpu_nint8_zero(
-                    select_nint8_zero_cpu_rows(
-                        source.q8_zero, rows));
-        } else if (
-                source.dtype != "NINTM" &&
-                source.dtype.rfind("NINT", 0) == 0) {
-            pool.family =
-                MixedMoeFamily::Nint;
-            pool.nint =
-                to_gpu_nint(
-                    select_nint_cpu_rows(
-                        source.weight, rows));
-        } else if (source.dtype == "MXFP4") {
-            pool.family = MixedMoeFamily::Mxfp4;
-            pool.mxfp4 = to_device_mxfp4(
-                select_mxfp4_cpu_rows(source.mxfp4, rows), true);
-        } else if (is_tpq_pq_dtype(source.dtype)) {
-            pool.family = MixedMoeFamily::Tpq;
-            pool.tpq = to_device_tpq(
-                select_tpq_cpu_rows(source.tpq, rows), true);
-        } else if (
-                source.dtype.rfind("NEPQ", 0) == 0) {
-            pool.family =
-                MixedMoeFamily::Nepq;
-            auto parsed = unpack_nepq(
-                source.payload,
-                source.dtype,
-                source.runtime_payload);
-            pool.nepq = to_gpu_nepq(
-                select_nepq_cpu_rows(
-                    parsed, rows,
-                    output_per_expert));
-        } else {
-            pool.family =
-                MixedMoeFamily::Nvq;
-            auto parsed = unpack_nvq(
-                source.payload,
-                source.dtype);
-            pool.nvq = to_gpu_nvq(
-                select_nvq_cpu_rows(
-                    parsed, rows));
-        }
-        runtime->pools.push_back(
-            std::move(pool));
-    }
-    return wrap_mixed_moe_runtime(runtime);
-}
-
 static NintMoeWeight to_cuda_device_moe_expert_slice(
         const NintMoeCpu & cpu,
         int64_t expert_begin,
@@ -7307,7 +7141,7 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
     if (expert_begin < 0 || expert_begin >= expert_end ||
             expert_end > cpu.n_experts) {
         throw std::runtime_error(
-            "invalid tensor-parallel MoE expert shard");
+            "invalid expert-parallel MoE shard");
     }
     const bool all_nint = std::all_of(
         cpu.pools.begin(), cpu.pools.end(),
@@ -7411,7 +7245,7 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
     }
     if (runtime->pools.empty()) {
         throw std::runtime_error(
-            "tensor-parallel MoE expert shard has no owned experts");
+            "expert-parallel MoE shard has no owned experts");
     }
     return wrap_mixed_moe_runtime(runtime);
 }
@@ -9733,16 +9567,8 @@ static NintMoeWeight load_nint_moe_gpu(
         int layer_id,
         const std::string & projection_role) {
     auto cpu = load_nint_moe_cpu(mfq, name);
-    if (g_tensor_parallel.enabled()) {
-        const bool paired =
-            projection_role == "gate_up";
-        if (paired &&
-            cpu.out_per_expert % 2 != 0) {
-            throw std::runtime_error(
-                "tensor-parallel gate/up MoE "
-                "width must be even: " + name);
-        }
-        auto slices = plan_moe_tensor_parallel_slices(
+    if (moe_parallel_config().enabled()) {
+        auto slices = plan_moe_expert_parallel_slices(
             cpu.n_experts, name);
         NintMoeWeight result;
         result.n_experts = cpu.n_experts;
@@ -9750,9 +9576,6 @@ static NintMoeWeight load_nint_moe_gpu(
             cpu.out_per_expert;
         result.neuron_len =
             cpu.neuron_len;
-        result.tensor_parallel_paired_output =
-            paired;
-        result.tensor_parallel_experts = true;
         result.hetero_supported = true;
         for (const auto & slice : slices) {
             auto shard =
@@ -9764,7 +9587,7 @@ static NintMoeWeight load_nint_moe_gpu(
             result.hetero_supported =
                 result.hetero_supported &&
                 shard->hetero_supported;
-            result.tensor_parallel_shards.push_back({
+            result.expert_parallel_shards.push_back({
                 slice.device,
                 slice.begin,
                 slice.end,
@@ -12108,20 +11931,20 @@ static mfq_tensor_backend::Tensor tensor_to_cuda_device(
     }
 #if defined(MFQ_NATIVE_CUDA_RUNTIME) && defined(MFQ_HAVE_NCCL)
     if (value.is_cuda() &&
-            g_tensor_parallel_collectives.collectives_enabled) {
+            g_model_parallel_collectives.collectives_enabled) {
         const int source_device = value.get_device();
         const auto source_rank_it = std::find(
-            g_tensor_parallel_collectives.devices.begin(),
-            g_tensor_parallel_collectives.devices.end(),
+            g_model_parallel_collectives.devices.begin(),
+            g_model_parallel_collectives.devices.end(),
             source_device);
         const auto destination_rank_it = std::find(
-            g_tensor_parallel_collectives.devices.begin(),
-            g_tensor_parallel_collectives.devices.end(),
+            g_model_parallel_collectives.devices.begin(),
+            g_model_parallel_collectives.devices.end(),
             device);
         if (source_rank_it !=
-                g_tensor_parallel_collectives.devices.end() &&
+                g_model_parallel_collectives.devices.end() &&
                 destination_rank_it !=
-                g_tensor_parallel_collectives.devices.end()) {
+                g_model_parallel_collectives.devices.end()) {
             const auto source_stream =
                 mfq_get_current_cuda_stream(source_device);
             cudaStreamCaptureStatus capture_status =
@@ -12142,7 +11965,7 @@ static mfq_tensor_backend::Tensor tensor_to_cuda_device(
                             mfq_tensor_backend::Device(
                                 mfq_tensor_backend::kCUDA, device)));
                 }
-                auto& runtime = g_tensor_parallel_collectives;
+                auto& runtime = g_model_parallel_collectives;
                 const auto source_rank = static_cast<size_t>(
                     source_rank_it - runtime.devices.begin());
                 const auto destination_rank = static_cast<size_t>(
@@ -12207,33 +12030,35 @@ static mfq_tensor_backend::Tensor tensor_to_cuda_device(
         true, false).contiguous();
 }
 
-static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
+static mfq_tensor_backend::Tensor reduce_model_parallel_outputs(
         std::vector<mfq_tensor_backend::Tensor> outputs) {
     if (outputs.empty()) {
         throw std::runtime_error(
-            "cannot reduce an empty tensor-parallel output");
+            "cannot reduce an empty model-parallel output");
     }
 #ifdef MFQ_HAVE_NCCL
-    if (g_tensor_parallel_collectives.collectives_enabled &&
+    if (g_model_parallel_collectives.collectives_enabled &&
             outputs.size() ==
-                g_tensor_parallel_collectives.devices.size()) {
-        auto & runtime = g_tensor_parallel_collectives;
+                g_model_parallel_collectives.devices.size()) {
+        auto & runtime = g_model_parallel_collectives;
         const auto shape = outputs.front().sizes().vec();
         const auto output_dtype = outputs.front().scalar_type();
         const int64_t elements = outputs.front().numel();
+        const bool reduce_to_primary =
+            model_parallel_reduce_to_primary_enabled();
         // A two-input FP16 sum has the same final FP16 rounding as the former
         // FP32 reduction, while avoiding both conversion passes.
         const bool fp16_reduce =
-            tensor_parallel_fp16_reduce_enabled() &&
-            tensor_parallel_reduce_to_primary_enabled() &&
+            model_parallel_fp16_reduce_enabled() &&
+            reduce_to_primary &&
             outputs.size() == 2 &&
             output_dtype == mfq_tensor_backend::kFloat16;
-        const int primary = g_tensor_parallel.primary_device();
+        const int primary = model_parallel_primary_device();
         const auto primary_rank_it = std::find(
             runtime.devices.begin(), runtime.devices.end(), primary);
         if (primary_rank_it == runtime.devices.end()) {
             throw std::runtime_error(
-                "tensor-parallel primary device is absent from NCCL ranks");
+                "model-parallel primary device is absent from NCCL ranks");
         }
         const auto primary_rank = static_cast<size_t>(
             primary_rank_it - runtime.devices.begin());
@@ -12244,7 +12069,7 @@ static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
                     outputs[index].sizes().vec() != shape ||
                     outputs[index].scalar_type() != output_dtype) {
                 throw std::runtime_error(
-                    "NCCL tensor-parallel reduction received mismatched shards");
+                    "NCCL model-parallel reduction received mismatched shards");
             }
             MfqCudaGuard guard(device);
             if (fp16_reduce) {
@@ -12277,7 +12102,7 @@ static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
         MFQ_NCCL_CHECK(ncclGroupStart());
         for (size_t index = 0; index < outputs.size(); ++index) {
             auto & buffer = runtime.reduction_buffers[index];
-            if (tensor_parallel_reduce_to_primary_enabled()) {
+            if (reduce_to_primary) {
                 void * reduction_data = fp16_reduce
                     ? outputs[index].data_ptr()
                     : buffer.data_ptr<float>();
@@ -12328,7 +12153,7 @@ static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
     }
 #endif
     const int primary =
-        g_tensor_parallel.primary_device();
+        model_parallel_primary_device();
     MfqCudaGuard primary_guard(primary);
     const auto output_dtype =
         outputs.front().scalar_type();
@@ -12406,7 +12231,7 @@ struct QuantLinear {
         for (size_t launch_position = 0;
              launch_position < tensor_parallel_shards.size();
              ++launch_position) {
-            const size_t index = tensor_parallel_launch_index(
+            const size_t index = model_parallel_launch_index(
                 launch_position, tensor_parallel_shards.size());
             const auto & shard = tensor_parallel_shards[index];
             MfqCudaGuard guard(shard.device);
@@ -12448,7 +12273,7 @@ struct QuantLinear {
             }
         }
 
-        const int primary = g_tensor_parallel.primary_device();
+        const int primary = model_parallel_primary_device();
         MfqCudaGuard primary_guard(primary);
         if (tensor_parallel_axis == TensorParallelAxis::Output) {
             std::vector<mfq_tensor_backend::Tensor> gathered;
@@ -12460,7 +12285,7 @@ struct QuantLinear {
             return mfq_tensor_backend::cat(gathered, -1).contiguous();
         }
 
-        auto reduced = reduce_tensor_parallel_outputs(
+        auto reduced = reduce_model_parallel_outputs(
             std::move(local_outputs));
         return is_mxfp8()
             ? reduced.to(x.scalar_type()).contiguous()
@@ -12531,7 +12356,7 @@ struct QuantLinear {
             partials.push_back(mxfp8_groupwise_matmul_f32(
                 shard.mxfp8, local, groups));
         }
-        return reduce_tensor_parallel_outputs(
+        return reduce_model_parallel_outputs(
             std::move(partials))
             .to(grouped.scalar_type()).contiguous();
     }
@@ -12712,7 +12537,7 @@ forward_tensor_parallel_output_projections(
         std::vector<mfq_tensor_backend::Tensor> local_inputs(shard_count);
         for (size_t launch_position = 0;
              launch_position < shard_count; ++launch_position) {
-            const size_t shard = tensor_parallel_launch_index(
+            const size_t shard = model_parallel_launch_index(
                 launch_position, shard_count);
             const int device =
                 projections.front()->tensor_parallel_shards[shard].device;
@@ -12720,14 +12545,14 @@ forward_tensor_parallel_output_projections(
             local_inputs[shard] = tensor_to_cuda_device(flat, device);
         }
 
-        const int primary = g_tensor_parallel.primary_device();
+        const int primary = model_parallel_primary_device();
         std::vector<mfq_tensor_backend::Tensor> result;
         result.reserve(projections.size());
         for (const auto * projection : projections) {
             std::vector<mfq_tensor_backend::Tensor> local_outputs(shard_count);
             for (size_t launch_position = 0;
                  launch_position < shard_count; ++launch_position) {
-                const size_t shard = tensor_parallel_launch_index(
+                const size_t shard = model_parallel_launch_index(
                     launch_position, shard_count);
                 const auto & weight =
                     projection->tensor_parallel_shards[shard];
@@ -12756,7 +12581,7 @@ forward_tensor_parallel_output_projections(
     }
     for (size_t launch_position = 0;
          launch_position < shard_count; ++launch_position) {
-        const size_t shard = tensor_parallel_launch_index(
+        const size_t shard = model_parallel_launch_index(
             launch_position, shard_count);
         const int device =
             projections.front()->tensor_parallel_shards[shard].device;
@@ -12775,7 +12600,7 @@ forward_tensor_parallel_output_projections(
         }
     }
 
-    const int primary = g_tensor_parallel.primary_device();
+    const int primary = model_parallel_primary_device();
     MfqCudaGuard primary_guard(primary);
     std::vector<mfq_tensor_backend::Tensor> result;
     result.reserve(projections.size());
@@ -13068,22 +12893,31 @@ static TensorParallelAxis infer_tensor_parallel_axis(
     return TensorParallelAxis::Output;
 }
 
-static int64_t tensor_parallel_granularity(
-        int64_t extent, int64_t preferred) {
+static std::vector<mfq::TensorParallelSlice>
+plan_parallel_slices(
+        int64_t extent,
+        int64_t preferred_granularity,
+        const ParallelConfig & config,
+        const std::string & name) {
+    (void)name;
+    if (!config.enabled()) {
+        throw std::runtime_error(
+            "parallel slice planning requires at least two ranks");
+    }
     int64_t granularity = std::max<int64_t>(
         1, std::min<int64_t>(
-            preferred,
-            extent /
-                static_cast<int64_t>(
-                    g_tensor_parallel.devices.size())));
+            preferred_granularity,
+            extent / static_cast<int64_t>(config.devices.size())));
     while (granularity > 1 &&
-           extent <
-               static_cast<int64_t>(
-                   g_tensor_parallel.devices.size()) *
-                   granularity) {
+           extent < static_cast<int64_t>(config.devices.size()) *
+               granularity) {
         granularity /= 2;
     }
-    return std::max<int64_t>(1, granularity);
+    auto slices = mfq::plan_tensor_parallel_slices(
+        extent, granularity, config.devices, config.split);
+    mfq::validate_tensor_parallel_slices(
+        slices, extent, granularity);
+    return slices;
 }
 
 static std::vector<mfq::TensorParallelSlice>
@@ -13091,25 +12925,17 @@ plan_quant_tensor_parallel_slices(
         int64_t extent,
         int64_t preferred_granularity,
         const std::string & name) {
-    (void)name;
-    const int64_t granularity =
-        tensor_parallel_granularity(
-            extent, preferred_granularity);
-    auto slices = mfq::plan_tensor_parallel_slices(
-        extent, granularity,
-        g_tensor_parallel.devices,
-        g_tensor_parallel.split);
-    mfq::validate_tensor_parallel_slices(
-        slices, extent, granularity);
-    return slices;
+    return plan_parallel_slices(
+        extent, preferred_granularity,
+        g_tensor_parallel, name);
 }
 
 static std::vector<mfq::TensorParallelSlice>
-plan_moe_tensor_parallel_slices(
+plan_moe_expert_parallel_slices(
         int64_t extent,
         const std::string & name) {
-    return plan_quant_tensor_parallel_slices(
-        extent, 128, name);
+    return plan_parallel_slices(
+        extent, 1, moe_parallel_config(), name);
 }
 
 static QuantLinear load_quant_linear(
@@ -13767,7 +13593,7 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(const QuantLinear & l
         throw std::runtime_error(
             "cannot reconstruct a mirrored tensor-parallel linear");
     }
-    const int primary = g_tensor_parallel.primary_device();
+    const int primary = model_parallel_primary_device();
     std::vector<mfq_tensor_backend::Tensor> parts;
     parts.reserve(linear.tensor_parallel_shards.size());
     for (const auto & shard : linear.tensor_parallel_shards) {
@@ -14646,7 +14472,7 @@ struct FFN {
         for (size_t launch_position = 0;
              launch_position < shard_count;
              ++launch_position) {
-            const size_t index = tensor_parallel_launch_index(
+            const size_t index = model_parallel_launch_index(
                 launch_position, shard_count);
             const auto & gate_shard =
                 gate_up.layers[0]
@@ -14697,61 +14523,61 @@ struct FFN {
                 down_shard, activation);
         }
         auto output =
-            reduce_tensor_parallel_outputs(
+            reduce_model_parallel_outputs(
                 std::move(partials));
         shape.back() = output.size(-1);
         return output.reshape(shape);
     }
 
-    bool tensor_parallel_moe_compatible() const {
+    bool expert_parallel_moe_compatible() const {
         if (!is_moe || moe_split_gate_up ||
-                !moe_gate_up.tensor_parallel_experts ||
-                !moe_down.tensor_parallel_experts ||
-                moe_gate_up.tensor_parallel_shards.size() !=
-                    moe_down.tensor_parallel_shards.size() ||
-                moe_gate_up.tensor_parallel_shards.empty()) {
+                moe_gate_up.expert_parallel_shards.size() !=
+                    moe_down.expert_parallel_shards.size() ||
+                moe_gate_up.expert_parallel_shards.empty()) {
             return false;
         }
         for (size_t index = 0;
-             index < moe_gate_up.tensor_parallel_shards.size(); ++index) {
-            const auto & gate = moe_gate_up.tensor_parallel_shards[index];
-            const auto & down = moe_down.tensor_parallel_shards[index];
+             index < moe_gate_up.expert_parallel_shards.size(); ++index) {
+            const auto & gate = moe_gate_up.expert_parallel_shards[index];
+            const auto & down = moe_down.expert_parallel_shards[index];
             if (!gate.weight || !down.weight ||
                     gate.device != down.device ||
-                    gate.output_begin != down.output_begin ||
-                    gate.output_end != down.output_end) {
+                    gate.expert_begin != down.expert_begin ||
+                    gate.expert_end != down.expert_end) {
                 return false;
             }
         }
         return true;
     }
 
-    mfq_tensor_backend::Tensor forward_tensor_parallel_moe(
+    mfq_tensor_backend::Tensor forward_expert_parallel_moe(
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             mfq_tensor_backend::Tensor route_weights) const {
-        std::vector<mfq_tensor_backend::Tensor> routed_partials;
+        const size_t shard_count =
+            moe_gate_up.expert_parallel_shards.size();
+        std::vector<mfq_tensor_backend::Tensor> routed_partials(
+            shard_count);
         std::vector<mfq_tensor_backend::Tensor> down_partials;
-        routed_partials.reserve(
-            moe_gate_up.tensor_parallel_shards.size());
         const bool collect_output_energy =
             moe_route_stats_path() != nullptr &&
             moe_route_output_energy_enabled();
         if (collect_output_energy) {
-            down_partials.reserve(
-                moe_gate_up.tensor_parallel_shards.size());
+            down_partials.resize(shard_count);
         }
         static const bool disable_swiglu_quant_fusion = [] {
             const char * value = std::getenv(
                 "MFQ_DISABLE_MOE_SWIGLU_QUANT_FUSION");
             return value != nullptr && std::atoi(value) != 0;
         }();
-        for (size_t index = 0;
-             index < moe_gate_up.tensor_parallel_shards.size(); ++index) {
+        for (size_t launch_position = 0;
+             launch_position < shard_count; ++launch_position) {
+            const size_t index = model_parallel_launch_index(
+                launch_position, shard_count);
             const auto & gate_shard =
-                moe_gate_up.tensor_parallel_shards[index];
+                moe_gate_up.expert_parallel_shards[index];
             const auto & down_shard =
-                moe_down.tensor_parallel_shards[index];
+                moe_down.expert_parallel_shards[index];
             MfqCudaGuard guard(gate_shard.device);
             auto local_x = tensor_to_cuda_device(x, gate_shard.device);
             auto local_weights = tensor_to_cuda_device(
@@ -14795,23 +14621,22 @@ struct FFN {
                     hidden, local_route);
             }
             if (collect_output_energy) {
-                down_partials.push_back(down_pair);
+                down_partials[index] = down_pair;
             }
-            routed_partials.push_back(
-                moe_weighted_reduce_cuda(
-                    down_pair, local_weights));
+            routed_partials[index] = moe_weighted_reduce_cuda(
+                down_pair, local_weights);
         }
         if (moe_route_stats_path() != nullptr) {
             mfq_tensor_backend::Tensor complete_down;
             if (collect_output_energy) {
-                complete_down = reduce_tensor_parallel_outputs(
+                complete_down = reduce_model_parallel_outputs(
                     std::move(down_partials));
             }
             record_moe_route_stats(
                 moe_layer, route.ids, route_weights,
                 complete_down, moe_gate_up.n_experts);
         }
-        return reduce_tensor_parallel_outputs(
+        return reduce_model_parallel_outputs(
             std::move(routed_partials));
     }
 
@@ -14946,10 +14771,10 @@ struct FFN {
                     selected.at(0),
                     moe_split_gate_up ? moe_gate.n_experts : moe_gate_up.n_experts);
             });
-            if (tensor_parallel_moe_compatible()) {
+            if (expert_parallel_moe_compatible()) {
                 auto routed = g_profiler.measure(
-                    "moe.tensor_parallel", [&]() {
-                        return forward_tensor_parallel_moe(
+                    "moe.expert_parallel", [&]() {
+                        return forward_expert_parallel_moe(
                             xf, route, selected.at(1));
                     });
                 auto shared_output = shared->forward(xf);
@@ -20292,7 +20117,13 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     m.c = load_config(mfq, config_path);
     if (m.c.is_flash_next() && (g_tensor_parallel.enabled() || g_layer_placement.enabled() ||
             g_n_gpu_layers >= 0 || g_moe_expert_cache)) {
-        throw std::runtime_error("Flash-Next native adapter currently requires single-device resident weights");
+        throw std::runtime_error(
+            "Flash-Next native adapter supports expert parallelism, but "
+            "tensor/layer parallelism and offload still require a different placement path");
+    }
+    if (g_expert_parallel.enabled() && m.c.num_experts <= 0) {
+        throw std::runtime_error(
+            "--expert-parallel requires a model with routed experts");
     }
     g_layer_placement.prepare(m.c.num_hidden_layers);
     g_dense_cpu_layer_count = 0;
@@ -20300,9 +20131,9 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         g_dense_cpu_layer_count = static_cast<int>(std::max<int64_t>(
             m.c.num_hidden_layers - g_n_gpu_layers, 0));
         if (g_dense_cpu_layer_count > 0) {
-            if (g_tensor_parallel.enabled() || g_layer_placement.enabled()) {
+            if (model_parallel_enabled() || g_layer_placement.enabled()) {
                 throw std::runtime_error(
-                    "--n-gpu-layers cannot be combined with tensor/layer parallelism");
+                    "--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
             }
             const bool supported_architecture =
                 !m.c.is_dsv4() && !m.c.is_glm_dsa() && !m.c.is_gemma4() &&
@@ -20508,95 +20339,151 @@ static std::vector<std::string> split_csv_values(
     return result;
 }
 
-static void configure_tensor_parallel(
+static ParallelConfig parse_parallel_config(
         const std::string & devices_arg,
         const std::string & split_arg,
-        bool allow_duplicate_devices = false) {
-    g_tensor_parallel_collectives.reset();
-    g_tensor_parallel = {};
+        const char * devices_option,
+        const char * split_option,
+        int available_devices,
+        bool allow_duplicate_devices) {
+    ParallelConfig config;
     if (devices_arg.empty()) {
         if (!split_arg.empty()) {
             throw std::runtime_error(
-                "--tensor-split requires --tensor-parallel");
+                std::string(split_option) + " requires " + devices_option);
         }
-        MFQ_CUDA_CHECK(cudaSetDevice(0));
-        return;
+        return config;
     }
 
-    const auto device_values =
-        split_csv_values(
-            devices_arg, "--tensor-parallel");
-    if (device_values.size() == 1 &&
-        devices_arg.find(',') == std::string::npos) {
-        const int count = std::stoi(device_values.front());
+    const auto values = split_csv_values(
+        devices_arg, devices_option);
+    if (values.size() == 1 &&
+            devices_arg.find(',') == std::string::npos) {
+        const int count = std::stoi(values.front());
         if (count < 2) {
             throw std::runtime_error(
-                "--tensor-parallel device count must be at least 2");
+                std::string(devices_option) +
+                " device count must be at least two");
         }
-        g_tensor_parallel.devices.resize(
-            static_cast<size_t>(count));
-        std::iota(
-            g_tensor_parallel.devices.begin(),
-            g_tensor_parallel.devices.end(), 0);
+        config.devices.resize(static_cast<size_t>(count));
+        std::iota(config.devices.begin(), config.devices.end(), 0);
     } else {
-        for (const auto & item : device_values) {
-            g_tensor_parallel.devices.push_back(
-                std::stoi(item));
+        for (const auto & item : values) {
+            config.devices.push_back(std::stoi(item));
         }
-        if (g_tensor_parallel.devices.size() < 2) {
+        if (config.devices.size() < 2) {
             throw std::runtime_error(
-                "--tensor-parallel requires at least two devices");
+                std::string(devices_option) +
+                " requires at least two devices");
         }
     }
-    g_tensor_parallel.allow_duplicate_devices =
-        allow_duplicate_devices;
+    config.allow_duplicate_devices = allow_duplicate_devices;
 
-    int available = 0;
-    MFQ_CUDA_CHECK(cudaGetDeviceCount(&available));
     std::unordered_set<int> unique_devices;
-    for (int device : g_tensor_parallel.devices) {
-        if (device < 0 || device >= available) {
+    for (const int device : config.devices) {
+        if (device < 0 || device >= available_devices) {
             throw std::runtime_error(
-                "tensor-parallel CUDA device is unavailable: " +
+                std::string(devices_option) +
+                " CUDA device is unavailable: " +
                 std::to_string(device));
         }
-        if (!allow_duplicate_devices &&
-            !unique_devices.insert(device).second) {
+        const bool inserted = unique_devices.insert(device).second;
+        if (!allow_duplicate_devices && !inserted) {
             throw std::runtime_error(
-                "tensor-parallel CUDA devices must be unique");
+                std::string(devices_option) +
+                " CUDA devices must be unique");
         }
     }
 
     if (!split_arg.empty()) {
         for (const auto & item :
-             split_csv_values(
-                 split_arg, "--tensor-split")) {
-            g_tensor_parallel.split.push_back(
-                std::stod(item));
+             split_csv_values(split_arg, split_option)) {
+            const double weight = std::stod(item);
+            if (!std::isfinite(weight) || weight <= 0.0) {
+                throw std::runtime_error(
+                    std::string(split_option) +
+                    " values must be finite and positive");
+            }
+            config.split.push_back(weight);
         }
-        if (g_tensor_parallel.split.size() !=
-            g_tensor_parallel.devices.size()) {
+        if (config.split.size() != config.devices.size()) {
             throw std::runtime_error(
-                "--tensor-split count must match "
-                "--tensor-parallel devices");
+                std::string(split_option) + " count must match " +
+                devices_option + " devices");
         }
     }
+    return config;
+}
 
-    for (int source : unique_devices) {
-        for (int destination : unique_devices) {
+static void print_parallel_config(
+        const char * label,
+        const ParallelConfig & config) {
+    if (!config.enabled()) return;
+    std::cerr << label << " devices=";
+    for (size_t index = 0; index < config.devices.size(); ++index) {
+        if (index) std::cerr << ',';
+        std::cerr << config.devices[index];
+    }
+    if (!config.split.empty()) {
+        std::cerr << " split=";
+        for (size_t index = 0; index < config.split.size(); ++index) {
+            if (index) std::cerr << ',';
+            std::cerr << config.split[index];
+        }
+    }
+    std::cerr << '\n';
+}
+
+static void configure_model_parallel(
+        const std::string & tensor_devices_arg,
+        const std::string & tensor_split_arg,
+        const std::string & expert_devices_arg,
+        const std::string & expert_split_arg,
+        bool allow_duplicate_devices = false) {
+    g_model_parallel_collectives.reset();
+    g_tensor_parallel = {};
+    g_expert_parallel = {};
+
+    int available = 0;
+    MFQ_CUDA_CHECK(cudaGetDeviceCount(&available));
+    g_tensor_parallel = parse_parallel_config(
+        tensor_devices_arg, tensor_split_arg,
+        "--tensor-parallel", "--tensor-split",
+        available, allow_duplicate_devices);
+    g_expert_parallel = parse_parallel_config(
+        expert_devices_arg, expert_split_arg,
+        "--expert-parallel", "--expert-split",
+        available, allow_duplicate_devices);
+
+    if (g_tensor_parallel.enabled() &&
+            g_expert_parallel.enabled() &&
+            g_tensor_parallel.devices != g_expert_parallel.devices) {
+        throw std::runtime_error(
+            "combined tensor and expert parallelism requires the same "
+            "ordered CUDA device group");
+    }
+    if (!model_parallel_enabled()) {
+        MFQ_CUDA_CHECK(cudaSetDevice(0));
+        return;
+    }
+
+    const auto & config = model_parallel_config();
+    std::unordered_set<int> unique_devices(
+        config.devices.begin(), config.devices.end());
+    for (const int source : unique_devices) {
+        for (const int destination : unique_devices) {
             if (source == destination) continue;
             int can_access = 0;
             MFQ_CUDA_CHECK(cudaDeviceCanAccessPeer(
                 &can_access, source, destination));
             if (!can_access) continue;
             MFQ_CUDA_CHECK(cudaSetDevice(source));
-            const cudaError_t status =
-                cudaDeviceEnablePeerAccess(
-                    destination, 0);
+            const cudaError_t status = cudaDeviceEnablePeerAccess(
+                destination, 0);
             if (status != cudaSuccess &&
-                status != cudaErrorPeerAccessAlreadyEnabled) {
+                    status != cudaErrorPeerAccessAlreadyEnabled) {
                 throw std::runtime_error(
-                    "failed to enable tensor-parallel peer access from CUDA " +
+                    "failed to enable model-parallel peer access from CUDA " +
                     std::to_string(source) + " to CUDA " +
                     std::to_string(destination) + ": " +
                     cudaGetErrorString(status));
@@ -20606,30 +20493,14 @@ static void configure_tensor_parallel(
             }
         }
     }
-    g_tensor_parallel_collectives.configure(
-        g_tensor_parallel.devices,
-        allow_duplicate_devices);
-    MFQ_CUDA_CHECK(
-        cudaSetDevice(
-            g_tensor_parallel.primary_device()));
-    std::cerr << "tensor_parallel devices=";
-    for (size_t index = 0;
-         index < g_tensor_parallel.devices.size();
-         ++index) {
-        if (index) std::cerr << ',';
-        std::cerr << g_tensor_parallel.devices[index];
-    }
-    if (!g_tensor_parallel.split.empty()) {
-        std::cerr << " split=";
-        for (size_t index = 0;
-             index < g_tensor_parallel.split.size();
-             ++index) {
-            if (index) std::cerr << ',';
-            std::cerr << g_tensor_parallel.split[index];
-        }
-    }
-    std::cerr << " collective_backend="
-              << (g_tensor_parallel_collectives.collectives_enabled
+    g_model_parallel_collectives.configure(
+        config.devices, allow_duplicate_devices);
+    MFQ_CUDA_CHECK(cudaSetDevice(model_parallel_primary_device()));
+    print_parallel_config("tensor_parallel", g_tensor_parallel);
+    print_parallel_config("expert_parallel", g_expert_parallel);
+    std::cerr << "model_parallel ranks=" << config.devices.size()
+              << " collective_backend="
+              << (g_model_parallel_collectives.collectives_enabled
                   ? "nccl" : "serial")
               << '\n';
 }
@@ -20645,9 +20516,9 @@ static void configure_layer_placement(
         }
         return;
     }
-    if (g_tensor_parallel.enabled()) {
+    if (model_parallel_enabled()) {
         throw std::runtime_error(
-            "--layer-parallel cannot be combined with --tensor-parallel");
+            "--layer-parallel cannot be combined with tensor/expert parallelism");
     }
 
     const auto device_values =
@@ -21138,12 +21009,13 @@ static bool sampling_has_penalties(const MfqSamplingParams & sampling) {
 
 static std::vector<MfqCudaStream> make_cuda_graph_compute_streams(
         const MfqCudaStream& primary_stream) {
-    if (!g_tensor_parallel.enabled()) {
+    if (!model_parallel_enabled()) {
         return {primary_stream};
     }
+    const auto & config = model_parallel_config();
     std::vector<MfqCudaStream> streams;
-    streams.reserve(g_tensor_parallel.devices.size());
-    for (const int device : g_tensor_parallel.devices) {
+    streams.reserve(config.devices.size());
+    for (const int device : config.devices) {
         streams.push_back(
             device == primary_stream.device_index()
                 ? primary_stream
@@ -21157,8 +21029,8 @@ static std::vector<MfqCudaStream> cuda_graph_participant_streams(
     auto participants = compute_streams;
     participants.insert(
         participants.end(),
-        g_tensor_parallel_collectives.streams.begin(),
-        g_tensor_parallel_collectives.streams.end());
+        g_model_parallel_collectives.streams.begin(),
+        g_model_parallel_collectives.streams.end());
     return participants;
 }
 
@@ -22545,7 +22417,7 @@ static int32_t generate_server_tokens(
         g_dsv4_cpu_offload_layers.empty() &&
         g_dense_cpu_layer_count == 0 &&
         !g_moe_expert_cache &&
-        tensor_parallel_cuda_graph_enabled();
+        model_parallel_cuda_graph_enabled();
     const char * graph_min_env = std::getenv("MFQ_SERVER_CUDA_GRAPH_MIN_TOKENS");
     const int32_t graph_min_tokens = graph_min_env != nullptr
         ? std::max<int32_t>(2, std::atoi(graph_min_env))
@@ -24588,7 +24460,7 @@ static int run_tensor_parallel_linear_check(
         M >= 1 && M <= 4096,
         "--check-tp-m must be in [1, 4096]");
     MfqFile mfq(mfq_path);
-    const TensorParallelConfig saved =
+    const ParallelConfig saved =
         g_tensor_parallel;
     g_tensor_parallel = {};
     g_tensor_parallel.devices = {
@@ -25323,7 +25195,7 @@ static int run_gemma_geglu_check(
 static double nint_moe_weight_bytes(const NintMoeWeight & weight) {
     double bytes = static_cast<double>(weight.mixed_weight_bytes);
     for (const auto & shard :
-         weight.tensor_parallel_shards) {
+         weight.expert_parallel_shards) {
         if (shard.weight) {
             bytes += nint_moe_weight_bytes(
                 *shard.weight);
@@ -25339,45 +25211,47 @@ static double nint_moe_weight_bytes(const NintMoeWeight & weight) {
     return bytes;
 }
 
-static int run_tensor_parallel_moe_check(
+static int run_expert_parallel_moe_check(
         const std::string & mfq_path,
         const std::string & tensor_name,
         int tokens,
         int routes) {
     MFQ_RUNTIME_CHECK(
-        g_tensor_parallel.enabled(),
-        "--check-tp-moe requires --tensor-parallel");
+        moe_parallel_config().enabled(),
+        "--check-ep-moe requires --expert-parallel or --tensor-parallel");
     MFQ_RUNTIME_CHECK(
         tokens >= 1 && tokens <= 4096,
-        "--check-tp-moe-tokens must be in [1, 4096]");
+        "--check-ep-moe-tokens must be in [1, 4096]");
     MFQ_RUNTIME_CHECK(
         routes >= 1,
-        "--check-tp-moe-routes must be positive");
+        "--check-ep-moe-routes must be positive");
     MfqFile mfq(mfq_path);
     const std::string role =
         tensor_name.find("gate_up") != std::string::npos
         ? "gate_up" : "diagnostic";
-    const TensorParallelConfig saved =
-        g_tensor_parallel;
+    const ParallelConfig saved_tensor = g_tensor_parallel;
+    const ParallelConfig saved_expert = g_expert_parallel;
+    const ParallelConfig saved = moe_parallel_config();
     g_tensor_parallel = {};
-    g_tensor_parallel.devices = {
-        saved.primary_device()};
+    g_expert_parallel = {};
+    g_expert_parallel.devices = {saved.primary_device()};
     auto full = load_nint_moe_gpu(
         mfq, tensor_name, false, 0, role);
-    g_tensor_parallel = saved;
+    g_tensor_parallel = saved_tensor;
+    g_expert_parallel = saved_expert;
     auto sharded = load_nint_moe_gpu(
         mfq, tensor_name, false, 0, role);
     MFQ_RUNTIME_CHECK(
-        sharded.tensor_parallel(),
-        "tensor-parallel MoE diagnostic did not create shards");
+        sharded.expert_parallel(),
+        "expert-parallel MoE diagnostic did not create shards");
     MFQ_RUNTIME_CHECK(
         full.n_experts == sharded.n_experts &&
         full.out_per_expert == sharded.out_per_expert &&
         full.neuron_len == sharded.neuron_len,
-        "tensor-parallel MoE metadata differs");
+        "expert-parallel MoE metadata differs");
     MFQ_RUNTIME_CHECK(
         routes <= full.n_experts,
-        "--check-tp-moe-routes exceeds the expert count");
+        "--check-ep-moe-routes exceeds the expert count");
 
     MfqCudaGuard primary_guard(
         saved.primary_device());
@@ -25442,7 +25316,7 @@ static int run_tensor_parallel_moe_check(
     const int64_t differing =
         test.ne(reference).sum().item<int64_t>();
     std::cout
-        << "tensor_parallel_moe_check=1"
+        << "expert_parallel_moe_check=1"
         << " tensor=" << tensor_name
         << " tokens=" << tokens
         << " routes=" << routes
@@ -25451,7 +25325,7 @@ static int run_tensor_parallel_moe_check(
         << full.out_per_expert << ','
         << full.neuron_len << ']'
         << " shards="
-        << sharded.tensor_parallel_shards.size()
+        << sharded.expert_parallel_shards.size()
         << " differing=" << differing
         << " relative=" << relative
         << " mean_abs=" << mean_abs
@@ -25460,7 +25334,7 @@ static int run_tensor_parallel_moe_check(
     if (!mfq_tensor_backend::isfinite(test).all().item<bool>() ||
         relative > 1.0e-6) {
         throw std::runtime_error(
-            "tensor-parallel MoE numerical check failed");
+            "expert-parallel MoE numerical check failed");
     }
     return 0;
 }
@@ -27889,11 +27763,11 @@ static int run_flash_next_check(Model& model) {
 }
 
 int main(int argc, char ** argv) {
-    struct TensorParallelCollectiveCleanup {
-        ~TensorParallelCollectiveCleanup() {
-            g_tensor_parallel_collectives.reset();
+    struct ModelParallelCollectiveCleanup {
+        ~ModelParallelCollectiveCleanup() {
+            g_model_parallel_collectives.reset();
         }
-    } tensor_parallel_collective_cleanup;
+    } model_parallel_collective_cleanup;
     try {
         std::string mfq_path, config_path, ids_arg, ids_file;
         std::string minicpmo_input_prefix, minicpmo_output_prefix;
@@ -27902,7 +27776,7 @@ int main(int argc, char ** argv) {
         std::string check_linear, check_linear_cpu, check_linear_gate, kl_base;
         std::string kl_save_logits_f16;
         std::string check_tp_linear;
-        std::string check_tp_moe;
+        std::string check_ep_moe;
         std::string check_tp_axis_arg = "output";
         std::string check_linear_group, check_q8_embedding;
         std::string check_gdn_input, check_gdn_output, check_gdn_state;
@@ -27923,6 +27797,8 @@ int main(int argc, char ** argv) {
         std::string moe_cache_profile_path;
         std::string tensor_parallel_arg;
         std::string tensor_split_arg;
+        std::string expert_parallel_arg;
+        std::string expert_split_arg;
         std::string layer_parallel_arg;
         std::string layer_split_arg;
         double moe_gpu_cache_gb = 0.0;
@@ -27951,8 +27827,8 @@ int main(int argc, char ** argv) {
         int check_linear_m = 1;
         int check_linear_reps = 200;
         int check_tp_m = 1;
-        int check_tp_moe_tokens = 1;
-        int check_tp_moe_routes = 2;
+        int check_ep_moe_tokens = 1;
+        int check_ep_moe_routes = 2;
         int check_gdn_tokens = 512;
         int check_gdn_q_heads = 16;
         int check_gdn_v_heads = 32;
@@ -27999,7 +27875,7 @@ int main(int argc, char ** argv) {
         bool compare_dsv4_hc_model = false;
         bool check_attention_swa_decode = false;
         bool check_nintm_routed_input = false;
-        bool tensor_parallel_test_duplicates = false;
+        bool parallel_test_duplicates = false;
         bool server_mode = false;
         bool check_runtime_assets = false;
         bool check_mfq_container = false;
@@ -28010,6 +27886,7 @@ int main(int argc, char ** argv) {
         bool cpu_threads_set = false;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
+            bool parsed_option = true;
             if (a == "--mfq" && i + 1 < argc) mfq_path = argv[++i];
             else if (a == "--config" && i + 1 < argc) config_path = argv[++i];
             else if (a == "--ids" && i + 1 < argc) ids_arg = argv[++i];
@@ -28061,14 +27938,17 @@ int main(int argc, char ** argv) {
             else if (a == "--check-tp-m" && i + 1 < argc) {
                 check_tp_m = std::stoi(argv[++i]);
             }
-            else if (a == "--check-tp-moe" && i + 1 < argc) {
-                check_tp_moe = argv[++i];
+            else if ((a == "--check-ep-moe" ||
+                    a == "--check-tp-moe") && i + 1 < argc) {
+                check_ep_moe = argv[++i];
             }
-            else if (a == "--check-tp-moe-tokens" && i + 1 < argc) {
-                check_tp_moe_tokens = std::stoi(argv[++i]);
+            else if ((a == "--check-ep-moe-tokens" ||
+                    a == "--check-tp-moe-tokens") && i + 1 < argc) {
+                check_ep_moe_tokens = std::stoi(argv[++i]);
             }
-            else if (a == "--check-tp-moe-routes" && i + 1 < argc) {
-                check_tp_moe_routes = std::stoi(argv[++i]);
+            else if ((a == "--check-ep-moe-routes" ||
+                    a == "--check-tp-moe-routes") && i + 1 < argc) {
+                check_ep_moe_routes = std::stoi(argv[++i]);
             }
             else if (a == "--check-linear-group" && i + 1 < argc) {
                 check_linear_group = argv[++i];
@@ -28129,7 +28009,10 @@ int main(int argc, char ** argv) {
             else if (a == "--bench-qwen35-mtp-reps" && i + 1 < argc) bench_qwen35_mtp_reps = std::stoi(argv[++i]);
             else if (a == "--compare-dsv4-hc-ops") compare_dsv4_hc_ops = true;
             else if (a == "--compare-dsv4-hc-model") compare_dsv4_hc_model = true;
-            else if (a == "--kl-base" && i + 1 < argc) kl_base = argv[++i];
+            else parsed_option = false;
+            if (parsed_option) continue;
+
+            if (a == "--kl-base" && i + 1 < argc) kl_base = argv[++i];
             else if (a == "--kl-save-logits-f16" && i + 1 < argc) {
                 kl_save_logits_f16 = argv[++i];
             }
@@ -28209,11 +28092,16 @@ int main(int argc, char ** argv) {
             else if (a == "--moe-cache-profile" && i + 1 < argc) {
                 moe_cache_profile_path = argv[++i];
             }
-            else if (a == "--tensor-parallel" && i + 1 < argc) {
-                tensor_parallel_arg = argv[++i];
-            }
-            else if (a == "--tensor-split" && i + 1 < argc) {
-                tensor_split_arg = argv[++i];
+            else if ((a == "--tensor-parallel" ||
+                    a == "--tensor-split" ||
+                    a == "--expert-parallel" ||
+                    a == "--expert-split") && i + 1 < argc) {
+                std::string * destination =
+                    a == "--tensor-parallel" ? &tensor_parallel_arg :
+                    a == "--tensor-split" ? &tensor_split_arg :
+                    a == "--expert-parallel" ? &expert_parallel_arg :
+                    &expert_split_arg;
+                *destination = argv[++i];
             }
             else if (a == "--layer-parallel" && i + 1 < argc) {
                 layer_parallel_arg = argv[++i];
@@ -28221,8 +28109,9 @@ int main(int argc, char ** argv) {
             else if (a == "--layer-split" && i + 1 < argc) {
                 layer_split_arg = argv[++i];
             }
-            else if (a == "--tensor-parallel-test-duplicates") {
-                tensor_parallel_test_duplicates = true;
+            else if (a == "--parallel-test-duplicates" ||
+                    a == "--tensor-parallel-test-duplicates") {
+                parallel_test_duplicates = true;
             }
             else if (a == "--tokenizer-model" && i + 1 < argc) tokenizer_model = argv[++i];
             else if (a == "--check-runtime-assets") check_runtime_assets = true;
@@ -28257,6 +28146,7 @@ int main(int argc, char ** argv) {
                              "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
                              "--continuous-batching 8 "
                              "--tensor-parallel 0,1 --tensor-split 1,1 "
+                             "--expert-parallel 0,1 --expert-split 1,1 "
                              "--layer-parallel 0,1 --layer-split 1,1 "
                              "--n-gpu-layers 60 --threads 32 --cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
                              "--moe-cache-profile profile.json "
@@ -28292,10 +28182,10 @@ int main(int argc, char ** argv) {
         if (check_backend_argmax) {
             return run_backend_argmax_check(151748, 2000);
         }
-        configure_tensor_parallel(
-            tensor_parallel_arg,
-            tensor_split_arg,
-            tensor_parallel_test_duplicates);
+        configure_model_parallel(
+            tensor_parallel_arg, tensor_split_arg,
+            expert_parallel_arg, expert_split_arg,
+            parallel_test_duplicates);
         configure_layer_placement(
             layer_parallel_arg, layer_split_arg);
         if (n_gpu_layers_set && g_n_gpu_layers < 0) {
@@ -28317,10 +28207,10 @@ int main(int argc, char ** argv) {
                 "--cpu-offload-layers");
         }
         if (moe_gpu_cache_gb > 0.0 &&
-                g_tensor_parallel.enabled()) {
+                model_parallel_enabled()) {
             throw std::runtime_error(
                 "--moe-gpu-cache-gb cannot be combined with "
-                "--tensor-parallel");
+                "tensor/expert parallelism");
         }
         if (!moe_cache_profile_path.empty() &&
                 moe_gpu_cache_gb <= 0.0) {
@@ -28390,15 +28280,15 @@ int main(int argc, char ** argv) {
                 mfq_path, check_tp_linear,
                 axis, check_tp_m);
         }
-        if (!check_tp_moe.empty()) {
+        if (!check_ep_moe.empty()) {
             if (mfq_path.empty()) {
                 throw std::runtime_error(
-                    "--check-tp-moe requires --mfq");
+                    "--check-ep-moe requires --mfq");
             }
-            return run_tensor_parallel_moe_check(
-                mfq_path, check_tp_moe,
-                check_tp_moe_tokens,
-                check_tp_moe_routes);
+            return run_expert_parallel_moe_check(
+                mfq_path, check_ep_moe,
+                check_ep_moe_tokens,
+                check_ep_moe_routes);
         }
         if (!check_linear_group.empty()) {
             if (mfq_path.empty()) {
@@ -29424,7 +29314,7 @@ int main(int argc, char ** argv) {
             g_dsv4_cpu_offload_layers.empty() &&
             g_dense_cpu_layer_count == 0 &&
             !g_moe_expert_cache &&
-            tensor_parallel_cuda_graph_enabled() &&
+            model_parallel_cuda_graph_enabled() &&
             (!profile || profile_cuda_graph) && gen > 1;
         const char * cuda_profiler_env = std::getenv("MFQ_CUDA_PROFILER_RANGE");
         const bool cuda_profiler_range = cuda_profiler_env != nullptr &&
