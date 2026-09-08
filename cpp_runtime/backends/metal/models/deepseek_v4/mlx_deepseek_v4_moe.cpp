@@ -1532,14 +1532,25 @@ MlxDeepseekV4Moe::forward_branches(
                             route_ids,
                             Shape{rows * routes})),
                     mlx::core::int32));
-            auto block_plan =
-                split_resident
-                ? gate->build_grouped_mmq_plan(
-                      route_ids,
-                      route_order)
-                : gate_up->build_grouped_mmq_plan(
-                      route_ids,
-                      route_order);
+            const auto* gate_source = split_resident ? gate : gate_up;
+            const int route_count = rows * routes;
+            const int gate_block_rows =
+                gate_source->recommended_grouped_mmq_block_rows(
+                    route_count);
+            const int down_block_rows =
+                down->recommended_grouped_mmq_block_rows(route_count);
+            auto gate_plan = gate_source->build_grouped_mmq_plan(
+                route_ids,
+                route_order,
+                gate_block_rows);
+            std::optional<MlxGroupedMmqPlan> down_plan;
+            if (down_block_rows != gate_block_rows) {
+                down_plan.emplace(
+                    down->build_grouped_mmq_plan(
+                        route_ids,
+                        route_order,
+                        down_block_rows));
+            }
             array routed_hidden = [&]() {
                 if (split_resident) {
                     auto gate_output = gate->forward_sorted(
@@ -1547,13 +1558,13 @@ MlxDeepseekV4Moe::forward_branches(
                         route_ids,
                         route_order,
                         false,
-                        &block_plan);
+                        &gate_plan);
                     auto up_output = up->forward_sorted(
                         source,
                         route_ids,
                         route_order,
                         false,
-                        &block_plan);
+                        &gate_plan);
                     return limited_swiglu_pair(
                         std::move(gate_output),
                         std::move(up_output),
@@ -1566,7 +1577,7 @@ MlxDeepseekV4Moe::forward_branches(
                         route_ids,
                         route_order,
                         false,
-                        &block_plan),
+                        &gate_plan),
                     static_cast<float>(
                         config_.swiglu_limit));
             }();
@@ -1581,7 +1592,7 @@ MlxDeepseekV4Moe::forward_branches(
                     route_ids,
                     route_order,
                     true,
-                    &block_plan);
+                    down_plan.has_value() ? &*down_plan : &gate_plan);
             if (detail::component_profile_active()) {
                 detail::profile_eval(
                     "moe.routed_down",

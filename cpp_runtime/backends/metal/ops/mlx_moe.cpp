@@ -156,24 +156,31 @@ bool mixed_grouped_nax_enabled(int route_count) noexcept {
 int grouped_mmq_tile_columns(
     int block_rows,
     int output_width) noexcept {
-    if (block_rows != 64) {
-        return 64;
-    }
     const char* value = std::getenv(
         "MFQ_METAL_GROUPED_MMQ_TILE_COLUMNS");
     if (value != nullptr) {
+        if (block_rows == 32 && std::string_view(value) == "128") {
+            return 128;
+        }
         if (std::string_view(value) == "96") {
-            return 96;
+            if (block_rows == 48 || block_rows == 64) {
+                return 96;
+            }
         }
         if (std::string_view(value) == "64") {
             return 64;
         }
     }
-    // BN96 amortizes activation staging and dispatch overhead for wide
-    // projections.  Narrow outputs do not expose enough column work to pay
-    // for its third column SIMD group, so retain the higher-occupancy BN64
-    // shape there.
-    return output_width >= 1024 ? 96 : 64;
+    // Use the largest column tile that remains within the 32-KiB
+    // threadgroup-memory budget for this row tile. Wider column tiles reduce
+    // repeated activation staging; retain BN64 for genuinely narrow outputs.
+    if (block_rows == 32 && output_width >= 512) {
+        return 128;
+    }
+    if (block_rows == 48 && output_width >= 512) {
+        return 96;
+    }
+    return block_rows == 64 && output_width >= 1024 ? 96 : 64;
 }
 
 bool mxfp4_nax_prefill_enabled(int route_count) noexcept {
@@ -2963,9 +2970,10 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
     const array& route_order_value,
     int experts,
     int block_rows = 32) {
-    if (block_rows != 32 && block_rows != 64) {
+    if (block_rows != 32 && block_rows != 48 && block_rows != 64
+        && block_rows != 80 && block_rows != 96) {
         throw std::invalid_argument(
-            "grouped MMQ block rows must be 32 or 64");
+            "grouped MMQ block rows must be 32, 48, 64, 80, or 96");
     }
     if (experts <= 0 || experts > 1024) {
         throw std::invalid_argument(
@@ -3362,8 +3370,12 @@ public:
         }
         encoder.set_input_array(inputs[6], 27);
         encoder.set_input_array(inputs[7], 28);
+        const bool block48 = config_.block_rows == 48;
         const bool block64 = config_.block_rows == 64;
+        const bool block80 = config_.block_rows == 80;
+        const bool block96 = config_.block_rows == 96;
         const bool columns96 = config_.tile_columns == 96;
+        const bool columns128 = config_.tile_columns == 128;
         const char* kernel_name = config_.use_nax
             ? (config_.direct_nax
                 ? (config_.fused_swiglu != 0
@@ -3371,12 +3383,32 @@ public:
                     : "mfq_grouped_nint4_nax_direct_f16_bm32_bn64_bk96")
                 : (config_.fused_swiglu != 0
                     ? (columns96
-                        ? "mfq_grouped_nint4_nax_swiglu_f16_bm64_bn96_bk96"
+                        ? (block48
+                            ? "mfq_grouped_nint4_nax_swiglu_f16_bm48_bn96_bk96"
+                            : "mfq_grouped_nint4_nax_swiglu_f16_bm64_bn96_bk96")
+                        : columns128
+                        ? "mfq_grouped_nint4_nax_swiglu_f16_bm32_bn128_bk96"
+                        : block96
+                        ? "mfq_grouped_nint4_nax_swiglu_f16_bm96_bn64_bk96"
+                        : block80
+                        ? "mfq_grouped_nint4_nax_swiglu_f16_bm80_bn64_bk96"
+                        : block48
+                        ? "mfq_grouped_nint4_nax_swiglu_f16_bm48_bn64_bk96"
                         : block64
                         ? "mfq_grouped_nint4_nax_swiglu_f16_bm64_bn64_bk96"
                         : "mfq_grouped_nint4_nax_swiglu_f16_bm32_bn64_bk96")
                     : (columns96
-                        ? "mfq_grouped_nint4_nax_f16_bm64_bn96_bk96"
+                        ? (block48
+                            ? "mfq_grouped_nint4_nax_f16_bm48_bn96_bk96"
+                            : "mfq_grouped_nint4_nax_f16_bm64_bn96_bk96")
+                        : columns128
+                        ? "mfq_grouped_nint4_nax_f16_bm32_bn128_bk96"
+                        : block96
+                        ? "mfq_grouped_nint4_nax_f16_bm96_bn64_bk96"
+                        : block80
+                        ? "mfq_grouped_nint4_nax_f16_bm80_bn64_bk96"
+                        : block48
+                        ? "mfq_grouped_nint4_nax_f16_bm48_bn64_bk96"
                         : block64
                         ? "mfq_grouped_nint4_nax_f16_bm64_bn64_bk96"
                         : "mfq_grouped_nint4_nax_f16_bm32_bn64_bk96")))
@@ -3398,11 +3430,9 @@ public:
                 config_.max_blocks,
                 1),
             MTL::Size(
-                config_.use_nax && columns96
-                    ? 384
-                    : (config_.use_nax && config_.block_rows == 32
-                        ? 128
-                        : 256),
+                config_.use_nax
+                    ? config_.block_rows * config_.tile_columns / 16
+                    : 256,
                 1,
                 1));
     }
@@ -7617,7 +7647,8 @@ bool MlxNintMoeWeight::prefers_mxfp4_smallm_nax(
 }
 
 int MlxNintMoeWeight::recommended_grouped_mmq_block_rows(
-    int route_count) const noexcept {
+    int route_count,
+    bool fused_swiglu) const noexcept {
     const bool use_nax = nint_grouped_nax_enabled()
         && (impl_->grouped_nint4_group24
             || (!impl_->has_nepq_residual
@@ -7638,15 +7669,44 @@ int MlxNintMoeWeight::recommended_grouped_mmq_block_rows(
         if (std::string_view(value) == "64") {
             return 64;
         }
+        if (std::string_view(value) == "48") {
+            return 48;
+        }
+        if (std::string_view(value) == "96") {
+            return 96;
+        }
+        if (std::string_view(value) == "80") {
+            return 80;
+        }
         if (std::string_view(value) == "32") {
             return 32;
         }
     }
-    // With four row SIMD groups BM64 preserves the BM32 per-group accumulator
-    // shape while sharing each decoded weight tile across twice as many
-    // routes.  Select it only once the mean expert population reaches one
-    // full BM32 block; below that point row underfill still dominates.
-    return route_count >= impl_->experts * 32 ? 64 : 32;
+    const int mean_routes = (route_count + impl_->experts - 1)
+        / impl_->experts;
+    // Up to 96 mean routes, use one 16-row-aligned block per expert to avoid
+    // wasting SIMD rows. Once multiple blocks are inevitable, choose from the
+    // projection aspect ratio: narrow outputs benefit from BM32/BN128's
+    // activation reuse, while wide outputs benefit from BM64's weight reuse.
+    if (mean_routes <= 32) {
+        return 32;
+    }
+    if (mean_routes <= 48) {
+        return 48;
+    }
+    if (mean_routes <= 64) {
+        return 64;
+    }
+    if (mean_routes <= 80) {
+        return 80;
+    }
+    if (mean_routes <= 96) {
+        return 96;
+    }
+    const int logical_output_width = fused_swiglu
+        ? impl_->out_per_expert / 2
+        : impl_->out_per_expert;
+    return logical_output_width <= impl_->neuron_len ? 32 : 64;
 }
 
 MlxGroupedMmqPlan MlxNintMoeWeight::build_grouped_mmq_plan(
@@ -7932,7 +7992,9 @@ array MlxNintMoeWeight::routed_matmul_sorted(
                 ids,
                 route_order,
                 impl_->experts,
-                recommended_grouped_mmq_block_rows(route_count)))
+                recommended_grouped_mmq_block_rows(
+                    route_count,
+                    fused_swiglu)))
         : std::nullopt;
     const auto& selected_plan = plan != nullptr
         ? *plan
@@ -7941,8 +8003,11 @@ array MlxNintMoeWeight::routed_matmul_sorted(
         selected_plan.route_count != route_count
         || selected_plan.experts != impl_->experts
         || (selected_plan.block_rows != 32
-            && selected_plan.block_rows != 64)
-        || (selected_plan.block_rows == 64
+            && selected_plan.block_rows != 48
+            && selected_plan.block_rows != 64
+            && selected_plan.block_rows != 80
+            && selected_plan.block_rows != 96)
+        || (selected_plan.block_rows != 32
             && (!use_grouped_nax || use_direct_nax))
         || selected_plan.max_blocks <= 0
     ) {
@@ -7961,9 +8026,11 @@ array MlxNintMoeWeight::routed_matmul_sorted(
             .route_count = route_count,
             .max_blocks = selected_plan.max_blocks,
             .block_rows = selected_plan.block_rows,
-            .tile_columns = grouped_mmq_tile_columns(
-                selected_plan.block_rows,
-                output_width),
+            .tile_columns = use_grouped_nax && !use_direct_nax
+                ? grouped_mmq_tile_columns(
+                    selected_plan.block_rows,
+                    output_width)
+                : 64,
             .tokens = tokens,
             .routes = routes,
             .experts = impl_->experts,
@@ -8186,19 +8253,6 @@ array MlxNintMoeWeight::routed_matmul_impl(
         workgroups,
         output_tiles,
         "routed workgroup count");
-    const auto grid = checked_product(
-        workgroups,
-        64,
-        "Metal grid");
-    if (
-        grid
-        > static_cast<std::size_t>(
-            std::numeric_limits<int>::max())
-    ) {
-        throw std::runtime_error(
-            "NINTM Metal grid exceeds MLX limits");
-    }
-
     const array params(
         {swiglu_limit},
         mlx::core::float32);
@@ -8253,7 +8307,9 @@ array MlxNintMoeWeight::routed_matmul_impl(
             ids,
             route_order,
             impl_->experts,
-            recommended_grouped_mmq_block_rows(variant_stride));
+            recommended_grouped_mmq_block_rows(
+                variant_stride,
+                fused_swiglu));
         kernel_inputs.push_back(plan.block_meta);
         kernel_inputs.push_back(plan.block_count);
         auto sorted_outputs = grouped_mmq_dispatch(
@@ -8266,9 +8322,11 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .route_count = variant_stride,
                 .max_blocks = plan.max_blocks,
                 .block_rows = plan.block_rows,
-                .tile_columns = grouped_mmq_tile_columns(
-                    plan.block_rows,
-                    logical_output_width),
+                .tile_columns = use_grouped_nax && !use_direct_nax
+                    ? grouped_mmq_tile_columns(
+                        plan.block_rows,
+                        logical_output_width)
+                    : 64,
                 .tokens = tokens,
                 .routes = routes,
                 .experts = impl_->experts,
@@ -8340,6 +8398,18 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .packed_expert_ids = static_cast<int>(packed_expert_ids),
                 .workgroups = static_cast<int>(workgroups),
             });
+    }
+    const auto grid = checked_product(
+        workgroups,
+        64,
+        "Metal grid");
+    if (
+        grid
+        > static_cast<std::size_t>(
+            std::numeric_limits<int>::max())
+    ) {
+        throw std::runtime_error(
+            "NINTM compatibility grid exceeds MLX limits");
     }
     kernel_inputs.push_back(map);
     auto outputs = moe_kernel()(

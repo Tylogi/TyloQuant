@@ -116,9 +116,9 @@ Arguments parse_arguments(int argc, char** argv) {
         } else if (value == "--benchmark-tokens") {
             const auto parsed = std::stoll(
                 require_value("--benchmark-tokens"));
-            if (parsed <= 0 || parsed > 32768) {
+            if (parsed <= 0 || parsed > 131072) {
                 usage_error(
-                    "--benchmark-tokens must be in [1, 32768]");
+                    "--benchmark-tokens must be in [1, 131072]");
             }
             result.benchmark_tokens = static_cast<int>(parsed);
         } else if (value == "--benchmark-experts") {

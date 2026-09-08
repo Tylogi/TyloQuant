@@ -183,7 +183,8 @@ public:
     bool prefers_mxfp4_smallm_nax(
         const mlx::core::array& expert_ids) const noexcept;
     int recommended_grouped_mmq_block_rows(
-        int route_count) const noexcept;
+        int route_count,
+        bool fused_swiglu = false) const noexcept;
     MlxGroupedMmqPlan build_grouped_mmq_plan(
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_order,
@@ -291,12 +292,21 @@ public:
         const mlx::core::array& expert_ids) const noexcept {
         return weight_.prefers_mxfp4_smallm_nax(expert_ids);
     }
+    int recommended_grouped_mmq_block_rows(
+        int route_count,
+        bool fused_swiglu = false) const noexcept {
+        return weight_.recommended_grouped_mmq_block_rows(
+            route_count,
+            fused_swiglu);
+    }
     MlxGroupedMmqPlan build_grouped_mmq_plan(
         const mlx::core::array& expert_ids,
-        const mlx::core::array& route_order) const {
+        const mlx::core::array& route_order,
+        int block_rows = 32) const {
         return weight_.build_grouped_mmq_plan(
             expert_ids,
-            route_order);
+            route_order,
+            block_rows);
     }
     MlxGroupedMmqPlan build_grouped_vq_mmq_plan(
         const mlx::core::array& expert_ids,

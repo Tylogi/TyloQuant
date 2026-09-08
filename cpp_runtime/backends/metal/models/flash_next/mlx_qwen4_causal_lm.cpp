@@ -365,9 +365,10 @@ public:
             if (tokens >= 32
                 && gate_up_.supports_grouped_mmq()
                 && down_.supports_grouped_mmq()) {
-                // Gate/up and down use the same routing.  Keep rows in expert
-                // order between both packed MMQs so sorting, block planning,
-                // and the large intermediate permutation happen only once.
+                // Gate/up and down use the same routing. Keep rows in expert
+                // order between both packed MMQs so sorting and the large
+                // intermediate permutation happen only once; each projection
+                // may still use the block plan best suited to its shape.
                 auto route_order = mlx::core::contiguous(
                     mlx::core::astype(
                         mlx::core::argsort(
@@ -375,15 +376,26 @@ public:
                                 routes.ids,
                                 Shape{route_count})),
                         mlx::core::int32));
-                const int block_rows = std::min(
+                const int gate_block_rows =
                     gate_up_.recommended_grouped_mmq_block_rows(
-                        route_count),
+                        route_count,
+                        true);
+                const int down_block_rows =
                     down_.recommended_grouped_mmq_block_rows(
-                        route_count));
-                auto plan = gate_up_.build_grouped_mmq_plan(
+                        route_count,
+                        false);
+                auto gate_plan = gate_up_.build_grouped_mmq_plan(
                     routes.ids,
                     route_order,
-                    block_rows);
+                    gate_block_rows);
+                std::optional<mfq::metal::MlxGroupedMmqPlan> down_plan;
+                if (down_block_rows != gate_block_rows) {
+                    down_plan.emplace(
+                        down_.build_grouped_mmq_plan(
+                            routes.ids,
+                            route_order,
+                            down_block_rows));
+                }
                 auto intermediate = gate_up_.routed_matmul_sorted(
                     source,
                     routes.ids,
@@ -391,7 +403,7 @@ public:
                     false,
                     true,
                     0.0f,
-                    &plan);
+                    &gate_plan);
                 if (detail::component_profile_active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_gate_up",
@@ -404,7 +416,7 @@ public:
                     true,
                     false,
                     0.0f,
-                    &plan);
+                    down_plan.has_value() ? &*down_plan : &gate_plan);
                 if (detail::component_profile_active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_down",

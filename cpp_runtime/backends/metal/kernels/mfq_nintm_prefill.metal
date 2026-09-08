@@ -1210,7 +1210,8 @@ template <
     // BM64 uses twice as many SIMD groups in the row dimension.  This keeps
     // every SIMD group's accumulator geometry identical to BM32 (16x32)
     // instead of doubling TM and spilling the fused gate/up accumulator.
-    constexpr int WM = BM == 64 ? 4 : 2;
+    static_assert(BM % 16 == 0);
+    constexpr int WM = BM / 16;
     constexpr int WN = BN / 32;
     constexpr uint TGP_SIZE = uint(WM * WN * 32);
     constexpr short SM = BM / WM;
@@ -1679,6 +1680,22 @@ instantiate_mfq_grouped_nint4_nax(
     true,
     false)
 instantiate_mfq_grouped_nint4_nax(
+    "mfq_grouped_nint4_nax_f16_bm32_bn128_bk96",
+    32,
+    128,
+    100,
+    100,
+    false,
+    false)
+instantiate_mfq_grouped_nint4_nax(
+    "mfq_grouped_nint4_nax_swiglu_f16_bm32_bn128_bk96",
+    32,
+    128,
+    100,
+    100,
+    true,
+    false)
+instantiate_mfq_grouped_nint4_nax(
     "mfq_grouped_nint4_nax_direct_f16_bm32_bn64_bk96",
     32,
     64,
@@ -1723,6 +1740,70 @@ instantiate_mfq_grouped_nint4_nax(
     64,
     96,
     104,
+    100,
+    true,
+    false)
+instantiate_mfq_grouped_nint4_nax(
+    "mfq_grouped_nint4_nax_f16_bm48_bn64_bk96",
+    48,
+    64,
+    100,
+    100,
+    false,
+    false)
+instantiate_mfq_grouped_nint4_nax(
+    "mfq_grouped_nint4_nax_swiglu_f16_bm48_bn64_bk96",
+    48,
+    64,
+    100,
+    100,
+    true,
+    false)
+instantiate_mfq_grouped_nint4_nax(
+    "mfq_grouped_nint4_nax_f16_bm48_bn96_bk96",
+    48,
+    96,
+    100,
+    100,
+    false,
+    false)
+instantiate_mfq_grouped_nint4_nax(
+    "mfq_grouped_nint4_nax_swiglu_f16_bm48_bn96_bk96",
+    48,
+    96,
+    100,
+    100,
+    true,
+    false)
+instantiate_mfq_grouped_nint4_nax(
+    "mfq_grouped_nint4_nax_f16_bm96_bn64_bk96",
+    96,
+    64,
+    100,
+    100,
+    false,
+    false)
+instantiate_mfq_grouped_nint4_nax(
+    "mfq_grouped_nint4_nax_swiglu_f16_bm96_bn64_bk96",
+    96,
+    64,
+    100,
+    100,
+    true,
+    false)
+instantiate_mfq_grouped_nint4_nax(
+    "mfq_grouped_nint4_nax_f16_bm80_bn64_bk96",
+    80,
+    64,
+    100,
+    100,
+    false,
+    false)
+instantiate_mfq_grouped_nint4_nax(
+    "mfq_grouped_nint4_nax_swiglu_f16_bm80_bn64_bk96",
+    80,
+    64,
+    100,
     100,
     true,
     false)
