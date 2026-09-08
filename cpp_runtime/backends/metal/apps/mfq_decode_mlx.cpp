@@ -48,6 +48,10 @@ namespace {
 
 constexpr std::size_t kMinicpmoDuplexCacheLimitBytes =
     std::size_t{8} << 30;
+constexpr std::size_t kMinimumServerCacheLimitBytes =
+    std::size_t{1} << 30;
+constexpr std::size_t kMaximumServerCacheLimitBytes =
+    std::size_t{8} << 30;
 
 void release_model_load_staging_memory() {
     // Model conversion and NINTM repacking leave large, now-unused buffers in
@@ -290,6 +294,18 @@ std::size_t physical_memory_bytes() {
         throw std::runtime_error("cannot determine physical memory size");
     }
     return static_cast<std::size_t>(bytes);
+}
+
+std::size_t server_cache_limit_bytes() {
+    // MLX otherwise defaults its reusable-buffer cache to the much larger
+    // process memory limit. Distinct Prefill shapes can then retain tens of
+    // GiB of dead activation buffers and push a fully resident model into
+    // compression or swap. Keep enough scratch for reuse while scaling the
+    // allowance to the host instead of assuming a 128-GiB development Mac.
+    return std::clamp(
+        physical_memory_bytes() / 16,
+        kMinimumServerCacheLimitBytes,
+        kMaximumServerCacheLimitBytes);
 }
 
 std::size_t requested_cache_bytes(
@@ -1280,6 +1296,8 @@ int serve_loaded_runtime(
     mlx::core::Stream runtime_stream) {
     constexpr const char* tokenizer_asset =
         "__mfq_asset__/tokenizer.gguf";
+    const auto allocator_cache_limit = server_cache_limit_bytes();
+    mlx::core::set_cache_limit(allocator_cache_limit);
     MfqServerConfig server;
     server.host = arguments.host;
     server.port = arguments.port;
@@ -1541,17 +1559,32 @@ int serve_loaded_runtime(
     session_control.metrics = [session_cache] {
         return session_cache->metrics();
     };
-    session_control.clear = [runtime_mutex, session_cache] {
+    session_control.clear = [runtime_mutex, runtime_holder, session_cache,
+                             runtime_stream] {
         std::lock_guard<std::mutex> lock(*runtime_mutex);
-        return session_cache->clear();
+        const auto released = session_cache->clear();
+        mlx::core::set_default_device(mlx::core::Device::gpu);
+        mlx::core::set_default_stream(runtime_stream);
+        if (runtime_holder->has_value()) {
+            auto& loaded_runtime = runtime_holder->value();
+            if constexpr (requires { loaded_runtime.reset_cache(1); }) {
+                loaded_runtime.reset_cache(1);
+            } else if constexpr (requires { loaded_runtime.reset(); }) {
+                loaded_runtime.reset();
+            }
+        }
+        mlx::core::synchronize(runtime_stream);
+        release_model_load_staging_memory();
+        return released;
     };
     return run_mfq_server(
         server, generate, reload, duplex, session_control,
         multimodal_generate,
-        [runtime_mutex, runtime_holder] {
+        [runtime_mutex, runtime_holder, allocator_cache_limit] {
             std::vector<std::pair<std::string, double>> metrics{
                 {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
                 {"mlx_cache_bytes", static_cast<double>(mlx::core::get_cache_memory())},
+                {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
                 {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
             };
             std::unique_lock lock(*runtime_mutex, std::try_to_lock);

@@ -98,6 +98,16 @@ def test_metal_runtime_matches_native_session_lifecycle_and_limits() -> None:
     assert "backend=metal" in METAL_DECODE
 
 
+def test_metal_server_bounds_and_explicitly_reclaims_allocator_cache() -> None:
+    assert "server_cache_limit_bytes()" in METAL_DECODE
+    assert "physical_memory_bytes() / 16" in METAL_DECODE
+    assert "mlx::core::set_cache_limit(allocator_cache_limit)" in METAL_DECODE
+    assert '"mlx_cache_limit_bytes"' in METAL_DECODE
+    assert "loaded_runtime.reset_cache(1)" in METAL_DECODE
+    assert "mlx::core::synchronize(runtime_stream)" in METAL_DECODE
+    assert "release_model_load_staging_memory();" in METAL_DECODE
+
+
 def test_all_metal_text_graphs_capture_and_restore_prefix_state() -> None:
     for source in (METAL_QWEN, METAL_DSV4, METAL_MINICPM):
         assert "capture_text_session_state" in source
