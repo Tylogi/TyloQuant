@@ -473,6 +473,51 @@ inline void decode_nint_aligned_group(
     }
 }
 
+inline void decode_nint8_group48(
+    const device int* d,
+    const device uchar* values,
+    const device uchar* sub_scales,
+    const device uchar* sub_mins,
+    const device float* anchor_scales,
+    const device float* anchor_mins,
+    threadgroup half* target,
+    uint row,
+    uint group,
+    uint neuron_len) {
+    constexpr uint GROUP_SIZE = 48u;
+    uint groups = uint(d[6]);
+    uint q_offset = uint(d[7]);
+    uint sub_offset = uint(d[8]);
+    uint anchor_offset = uint(d[9]);
+    uint metadata = row * groups + group;
+    float scale = anchor_scales[anchor_offset + row]
+        * float(sub_scales[sub_offset + metadata]);
+    float minimum = anchor_mins[anchor_offset + row]
+        * float(sub_mins[sub_offset + metadata]);
+    uint first_column = group * GROUP_SIZE;
+    uint valid = first_column < neuron_len
+        ? min(GROUP_SIZE, neuron_len - first_column)
+        : 0u;
+    uint packed_base = q_offset + metadata * GROUP_SIZE;
+#pragma clang loop unroll(full)
+    for (uint column = 0u; column < GROUP_SIZE; column += 4u) {
+        uchar4 packed = *reinterpret_cast<device const uchar4*>(
+            values + packed_base + column);
+        half4 decoded = half4(
+            scale * float4(packed) - float4(minimum));
+        if (column + 4u <= valid) {
+            *reinterpret_cast<threadgroup half4*>(target + column) = decoded;
+        } else {
+#pragma clang loop unroll(full)
+            for (uint lane = 0u; lane < 4u; ++lane) {
+                if (column + lane < valid) {
+                    target[column + lane] = decoded[lane];
+                }
+            }
+        }
+    }
+}
+
 template <uint BITS, uint GROUP_SIZE>
 inline void decode_nint_group_slice(
     const device int* d,
@@ -1061,7 +1106,7 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                                 nint_sub_min, nint_anchor_scale,
                                 nint_anchor_min, target, pool_row, group);
                         } else {
-                            decode_nint_aligned_group<8u, 48u>(
+                            decode_nint8_group48(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
                                 nint_anchor_min, target, pool_row, group,
@@ -1500,7 +1545,7 @@ template <
                                 nint_sub_min, nint_anchor_scale,
                                 nint_anchor_min, target, pool_row, group);
                         } else {
-                            decode_nint_aligned_group<8u, 48u>(
+                            decode_nint8_group48(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
                                 nint_anchor_min, target, pool_row, group,

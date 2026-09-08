@@ -1052,11 +1052,10 @@ TensorFixture make_nint_tensor(
     int columns,
     int salt,
     int group_size = kGroupSize) {
-    if (group_size <= 0 || columns % group_size != 0) {
-        throw std::runtime_error(
-            "test NINT width must be a multiple of its group size");
+    if (group_size <= 0 || columns <= 0) {
+        throw std::runtime_error("test NINT geometry is invalid");
     }
-    const int groups = columns / group_size;
+    const int groups = (columns + group_size - 1) / group_size;
     const auto metadata_count =
         static_cast<std::size_t>(rows) * groups;
     const auto value_count =
@@ -1326,18 +1325,21 @@ MoeFixture make_moe_fixture(
         --expert
     ) {
         const auto& profile = profiles[expert];
-        TensorFixture tensor =
-            profile == "NINT8-0"
-            ? make_q8_tensor(
-                  output,
-                  input,
-                  salt + expert)
-            : make_nint_tensor(
-                  std::stoi(profile.substr(4)),
-                  output,
-                  input,
-                  salt + expert,
-                  nint_group_size);
+        TensorFixture tensor = [&] {
+            if (profile == "NINT8-0") {
+                return make_q8_tensor(output, input, salt + expert);
+            }
+            if (profile == "F16" || profile == "BF16") {
+                return make_dense_tensor(
+                    profile, output, input, salt + expert);
+            }
+            return make_nint_tensor(
+                std::stoi(profile.substr(4)),
+                output,
+                input,
+                salt + expert,
+                nint_group_size);
+        }();
         pools.push_back({
             {expert},
             profile,
@@ -4436,6 +4438,46 @@ void test_grouped_nint2_pair_prefill() {
     }
 }
 
+void test_grouped_nint8_group48_tail_prefill() {
+    constexpr int tokens = 1025;
+    constexpr int output = 24;
+    constexpr int input_width = 640;
+    const auto fixture = make_moe_fixture(
+        {"NINT8", "F16"}, output, input_width, 31, 48);
+    const auto weight = mfq::metal::MlxMoeWeight::from_blob(
+        fixture.blob);
+    require(
+        weight.supports_grouped_mmq(),
+        "mixed NINT8-48 tail fixture must support grouped prefill");
+    std::vector<float> input(tokens * input_width);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<float>(
+            static_cast<int>((index * 13 + 5) % 31) - 15)
+            / 256.0f;
+    }
+    const std::vector<std::int32_t> ids(tokens, 0);
+    const auto input_array = mlx::core::astype(
+        mlx::core::array(
+            input.begin(),
+            mlx::core::Shape{tokens, input_width}),
+        mlx::core::float16);
+    const auto ids_array = mlx::core::array(
+        ids.begin(), mlx::core::Shape{tokens, 1});
+    const auto actual = evaluated_floats(
+        weight.routed_matmul(input_array, ids_array));
+    for (int token = 0; token < tokens; ++token) {
+        for (int row = 0; row < output; ++row) {
+            float expected = 0.0f;
+            for (int column = 0; column < input_width; ++column) {
+                expected += input[token * input_width + column]
+                    * fixture.dense[row * input_width + column];
+            }
+            require_close(
+                actual[token * output + row], expected, 8e-2f);
+        }
+    }
+}
+
 void test_mixed_nintm_native_and_grouped_dispatch() {
     constexpr int experts = 4;
     constexpr int routes = 2;
@@ -4924,6 +4966,7 @@ int main(int argc, char** argv) {
         test_grouped_mmq_prefill();
         test_grouped_nint_mmq_prefill();
         test_grouped_nint2_pair_prefill();
+        test_grouped_nint8_group48_tail_prefill();
         test_mixed_nintm_native_and_grouped_dispatch();
         test_grouped_mxfp4_vq_mmq_prefill();
         test_container_validation();
