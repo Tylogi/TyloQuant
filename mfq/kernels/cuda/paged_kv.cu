@@ -327,16 +327,9 @@ __global__ void paged_attention_decode_split_kernel(
     tokens = tokens < 0 ? 0 : (tokens > maximum_tokens ? maximum_tokens : tokens);
     const int active_parts = paged_active_parts(
         tokens, parts, dynamic_parts);
+    if (part >= active_parts) return;
     const size_t statistic =
         static_cast<size_t>(query) * workspace_parts + part;
-    if (part >= active_parts) {
-        if (tid < D) partial_o[statistic * D + tid] = 0.0f;
-        if (tid == 0) {
-            partial_m[statistic] = -1e30f;
-            partial_l[statistic] = 0.0f;
-        }
-        return;
-    }
     const int start = static_cast<int>(
         static_cast<int64_t>(tokens) * part / active_parts);
     const int end = static_cast<int>(
@@ -428,20 +421,7 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     int tokens = static_cast<int>(seq_len[batch]);
     tokens = tokens < 0 ? 0 : (tokens > maximum_tokens ? maximum_tokens : tokens);
     const int active_parts = paged_active_parts(tokens, parts, dynamic_parts);
-    if (part >= active_parts) {
-        #pragma unroll
-        for (int index = 0; index < Rep; ++index) {
-            const int query = batch * Hq + first_query_head + index;
-            const size_t statistic =
-                static_cast<size_t>(query) * workspace_parts + part;
-            partial_o[statistic * D + tid] = 0.0f;
-            if (tid == 0) {
-                partial_m[statistic] = -1e30f;
-                partial_l[statistic] = 0.0f;
-            }
-        }
-        return;
-    }
+    if (part >= active_parts) return;
     const int start = static_cast<int>(
         static_cast<int64_t>(tokens) * part / active_parts);
     const int end = static_cast<int>(
