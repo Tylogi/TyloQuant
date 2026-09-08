@@ -391,7 +391,8 @@ __global__ void paged_attention_decode_split_kernel(
     }
 }
 
-template <int FixedPageSize, int FixedPagesPerChunk, typename scalar_t>
+template <int FixedPageSize, int FixedPagesPerChunk,
+          int ValuesPerThread, typename scalar_t>
 __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     const scalar_t * __restrict__ q,
     const int64_t * __restrict__ k_chunk_ptrs,
@@ -406,13 +407,16 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     float scale, int dynamic_parts) {
     constexpr int D = 256;
     constexpr int Rep = 4;
-    constexpr int Warps = D / 32;
+    constexpr int Threads = D / ValuesPerThread;
+    constexpr int Warps = Threads / 32;
+    static_assert(ValuesPerThread == 1 || ValuesPerThread == 2);
     const int part = blockIdx.x % parts;
     const int kv = blockIdx.x / parts;
     const int kv_head = kv % Hk;
     const int batch = kv / Hk;
     const int first_query_head = kv_head * Rep;
     const int tid = threadIdx.x;
+    const int first_dimension = tid * ValuesPerThread;
     const int lane = tid & 31;
     const int warp = tid >> 5;
     constexpr bool FixedGeometry = FixedPageSize > 0;
@@ -426,14 +430,18 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
         static_cast<int64_t>(tokens) * part / active_parts);
     const int end = static_cast<int>(
         static_cast<int64_t>(tokens) * (part + 1) / active_parts);
-    float query[Rep];
-    float value_sum[Rep];
+    float query[Rep][ValuesPerThread];
+    float value_sum[Rep][ValuesPerThread];
     #pragma unroll
     for (int index = 0; index < Rep; ++index) {
-        query[index] = static_cast<float>(q[
-            (static_cast<size_t>(batch) * Hq + first_query_head + index) *
-            D + tid]);
-        value_sum[index] = 0.0f;
+        #pragma unroll
+        for (int value_index = 0;
+                value_index < ValuesPerThread; ++value_index) {
+            query[index][value_index] = static_cast<float>(q[
+                (static_cast<size_t>(batch) * Hq + first_query_head + index) *
+                D + first_dimension + value_index]);
+            value_sum[index][value_index] = 0.0f;
+        }
     }
     __shared__ float warp_dot[Rep][Warps];
     __shared__ float maximum[Rep];
@@ -494,15 +502,30 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
             key_page_address);
         const auto * value_page = reinterpret_cast<const scalar_t *>(
             value_page_address);
-        const size_t element =
-            (static_cast<size_t>(kv_head) * page_size + offset) * D + tid;
-        const float key = key_page != nullptr
-            ? static_cast<float>(key_page[element]) : 0.0f;
-        const float value = value_page != nullptr
-            ? static_cast<float>(value_page[element]) : 0.0f;
+        const size_t first_element =
+            (static_cast<size_t>(kv_head) * active_page_size + offset) * D +
+            first_dimension;
+        float key[ValuesPerThread];
+        float value[ValuesPerThread];
+        #pragma unroll
+        for (int value_index = 0;
+                value_index < ValuesPerThread; ++value_index) {
+            key[value_index] = key_page != nullptr
+                ? static_cast<float>(key_page[first_element + value_index])
+                : 0.0f;
+            value[value_index] = value_page != nullptr
+                ? static_cast<float>(value_page[first_element + value_index])
+                : 0.0f;
+        }
         #pragma unroll
         for (int index = 0; index < Rep; ++index) {
-            const float dot = paged_warp_sum(query[index] * key);
+            float dot = 0.0f;
+            #pragma unroll
+            for (int value_index = 0;
+                    value_index < ValuesPerThread; ++value_index) {
+                dot += query[index][value_index] * key[value_index];
+            }
+            dot = paged_warp_sum(dot);
             if (lane == 0) warp_dot[index][warp] = dot;
         }
         __syncthreads();
@@ -526,8 +549,13 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
         __syncthreads();
         #pragma unroll
         for (int index = 0; index < Rep; ++index) {
-            value_sum[index] = value_sum[index] * previous_factor[index] +
-                probability[index] * value;
+            #pragma unroll
+            for (int value_index = 0;
+                    value_index < ValuesPerThread; ++value_index) {
+                value_sum[index][value_index] =
+                    value_sum[index][value_index] * previous_factor[index] +
+                    probability[index] * value[value_index];
+            }
         }
     }
     #pragma unroll
@@ -535,7 +563,12 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
         const int query_index = batch * Hq + first_query_head + index;
         const size_t statistic =
             static_cast<size_t>(query_index) * workspace_parts + part;
-        partial_o[statistic * D + tid] = value_sum[index];
+        #pragma unroll
+        for (int value_index = 0;
+                value_index < ValuesPerThread; ++value_index) {
+            partial_o[statistic * D + first_dimension + value_index] =
+                value_sum[index][value_index];
+        }
         if (tid == 0) {
             partial_m[statistic] = start < end ? maximum[index] : -1e30f;
             partial_l[statistic] = start < end ? denominator[index] : 0.0f;
@@ -778,8 +811,8 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
             if (D == 256 && gqa_ratio == 4) {
                 if (page == 16 && chunk_pages == 64) {
                     paged_attention_decode_split_gqa4_d256_kernel<
-                        16, 64, scalar_t><<<
-                        B * Hk * split_parts, 256, 0, stream>>>(
+                        16, 64, 2, scalar_t><<<
+                        B * Hk * split_parts, 128, 0, stream>>>(
                         q.data_ptr<scalar_t>(), k_chunk_ptrs.data_ptr<int64_t>(),
                         v_chunk_ptrs.data_ptr<int64_t>(),
                         page_table.data_ptr<int32_t>(), seq_len.data_ptr<int64_t>(),
@@ -789,7 +822,7 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
                         static_cast<float>(scale), dynamic_parts ? 1 : 0);
                 } else {
                     paged_attention_decode_split_gqa4_d256_kernel<
-                        0, 0, scalar_t><<<
+                        0, 0, 1, scalar_t><<<
                         B * Hk * split_parts, 256, 0, stream>>>(
                         q.data_ptr<scalar_t>(), k_chunk_ptrs.data_ptr<int64_t>(),
                         v_chunk_ptrs.data_ptr<int64_t>(),
