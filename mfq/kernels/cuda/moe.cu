@@ -2853,10 +2853,11 @@ __device__ __forceinline__ void nint_moe_mma_profile(
             }
             int packed = valid ? unpack_four<BITS>(qg, 0) : 0;
             int next = GS > 4 && valid ? unpack_four<BITS>(qg, 4) : 0;
+            int ahead = GS > 8 && valid ? unpack_four<BITS>(qg, 8) : 0;
 #pragma unroll
             for (int i = 0; i < GS; i += 4) {
-                const int ahead = i + 8 < GS && valid
-                    ? unpack_four<BITS>(qg, i + 8) : 0;
+                const int future = i + 12 < GS && valid
+                    ? unpack_four<BITS>(qg, i + 12) : 0;
                 const float q0 = static_cast<float>(packed & 255);
                 const float q1 = static_cast<float>((packed >> 8) & 255);
                 const float q2 = static_cast<float>((packed >> 16) & 255);
@@ -2867,6 +2868,7 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                     __floats2half2_rn(d * q2 - m, d * q3 - m);
                 packed = next;
                 next = ahead;
+                ahead = future;
             }
         }
 
