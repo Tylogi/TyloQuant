@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -40,9 +41,8 @@ constexpr int D = 256;
 constexpr int Page = 16;
 constexpr int PagesPerChunk = 64;
 constexpr int MaxParts = 64;
-constexpr int MaxSeq = 8750;
 constexpr double Scale = 0.0625;
-constexpr int Lengths[B] = {2222, 4398, 6574, 8750};
+constexpr int DefaultLengths[B] = {2222, 4398, 6574, 8750};
 
 void check_cuda(cudaError_t status, const char * operation) {
     if (status != cudaSuccess) {
@@ -114,8 +114,21 @@ void print_values(const std::vector<float> & values) {
 int main(int argc, char ** argv) {
     int iterations = 200;
     int samples = 7;
+    int lengths[B] = {
+        DefaultLengths[0], DefaultLengths[1],
+        DefaultLengths[2], DefaultLengths[3]};
     if (argc > 1) iterations = std::max(1, std::atoi(argv[1]));
     if (argc > 2) samples = std::max(1, std::atoi(argv[2]));
+    if (argc > 3) {
+        const int requested_length = std::atoi(argv[3]);
+        if (requested_length < 1 || requested_length > 1048576) {
+            throw std::invalid_argument(
+                "sequence length must be in [1, 1048576]");
+        }
+        std::fill(std::begin(lengths), std::end(lengths), requested_length);
+    }
+    const int max_seq = *std::max_element(
+        std::begin(lengths), std::end(lengths));
 
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
@@ -126,23 +139,24 @@ int main(int argc, char ** argv) {
     const auto fp16 = TensorOptions().device(gpu).dtype(mfq::cuda::kFloat16);
     const auto fp32 = TensorOptions().device(gpu).dtype(mfq::cuda::kFloat32);
 
+    mfq::cuda::manual_seed(20260908);
     auto q = mfq::cuda::randn({B, Hq, 1, D}, fp32)
         .to(mfq::cuda::kFloat16).contiguous();
-    auto k = mfq::cuda::randn({B, Hk, MaxSeq, D}, fp32)
+    auto k = mfq::cuda::randn({B, Hk, max_seq, D}, fp32)
         .to(mfq::cuda::kFloat16).contiguous();
-    auto v = mfq::cuda::randn({B, Hk, MaxSeq, D}, fp32)
+    auto v = mfq::cuda::randn({B, Hk, max_seq, D}, fp32)
         .to(mfq::cuda::kFloat16).contiguous();
     auto seq_len = mfq::cuda::tensor<std::int64_t>({
-        Lengths[0], Lengths[1], Lengths[2], Lengths[3]}).to(gpu);
+        lengths[0], lengths[1], lengths[2], lengths[3]}).to(gpu);
 
-    constexpr int LogicalPages = (MaxSeq + Page - 1) / Page;
+    const int logical_pages = (max_seq + Page - 1) / Page;
     std::vector<std::int32_t> host_page_table(
-        static_cast<size_t>(B) * LogicalPages, -1);
+        static_cast<size_t>(B) * logical_pages, -1);
     int physical_pages = 0;
     for (int batch = 0; batch < B; ++batch) {
-        const int pages = (Lengths[batch] + Page - 1) / Page;
+        const int pages = (lengths[batch] + Page - 1) / Page;
         for (int logical = 0; logical < pages; ++logical) {
-            host_page_table[static_cast<size_t>(batch) * LogicalPages + logical] =
+            host_page_table[static_cast<size_t>(batch) * logical_pages + logical] =
                 physical_pages++;
         }
     }
@@ -168,16 +182,16 @@ int main(int argc, char ** argv) {
     auto k_chunk_ptrs = mfq::cuda::tensor<std::int64_t>(k_pointers).to(gpu);
     auto v_chunk_ptrs = mfq::cuda::tensor<std::int64_t>(v_pointers).to(gpu);
     auto page_table = mfq::cuda::tensor<std::int32_t>(host_page_table)
-        .reshape({B, LogicalPages}).to(gpu).contiguous();
+        .reshape({B, logical_pages}).to(gpu).contiguous();
     std::vector<std::int64_t> host_positions(
-        static_cast<size_t>(B) * MaxSeq, -1);
+        static_cast<size_t>(B) * max_seq, -1);
     for (int batch = 0; batch < B; ++batch) {
-        for (int token = 0; token < Lengths[batch]; ++token) {
-            host_positions[static_cast<size_t>(batch) * MaxSeq + token] = token;
+        for (int token = 0; token < lengths[batch]; ++token) {
+            host_positions[static_cast<size_t>(batch) * max_seq + token] = token;
         }
     }
     auto positions = mfq::cuda::tensor<std::int64_t>(host_positions)
-        .reshape({B, MaxSeq}).to(gpu).contiguous();
+        .reshape({B, max_seq}).to(gpu).contiguous();
     paged_kv_cache_write_cuda(
         k_chunk_ptrs, v_chunk_ptrs, page_table,
         k, v, positions, Page, PagesPerChunk);
@@ -231,8 +245,8 @@ int main(int argc, char ** argv) {
               << ",\"page_size\":" << Page
               << ",\"pages_per_chunk\":" << PagesPerChunk
               << ",\"parts\":" << MaxParts
-              << ",\"lengths\":[" << Lengths[0] << ',' << Lengths[1]
-              << ',' << Lengths[2] << ',' << Lengths[3] << "]}"
+              << ",\"lengths\":[" << lengths[0] << ',' << lengths[1]
+              << ',' << lengths[2] << ',' << lengths[3] << "]}"
               << ",\"iterations\":" << iterations
               << ",\"samples\":" << samples
               << ",\"maximum_absolute_error\":" << maximum_error
