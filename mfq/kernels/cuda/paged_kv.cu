@@ -133,13 +133,11 @@ __device__ __forceinline__ float paged_warp_sum(float value) {
 }
 
 __device__ __forceinline__ int paged_active_parts(
-        int token_count, int launch_parts, int dynamic_parts,
-        int tokens_per_part = 128) {
+        int token_count, int launch_parts, int dynamic_parts) {
     if (!dynamic_parts) return launch_parts;
     const int cache_position = token_count > 0 ? token_count - 1 : 0;
     if (cache_position < 192) return 1;
-    const int active =
-        (cache_position + tokens_per_part - 1) / tokens_per_part;
+    const int active = (cache_position + 127) / 128;
     return active < launch_parts ? active : launch_parts;
 }
 
@@ -436,7 +434,7 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     float * __restrict__ partial_l,
     int Hq, int Hk, int logical_pages, int page_size,
     int pages_per_chunk, int chunks, int parts, int workspace_parts,
-    float scale, int dynamic_parts, int tokens_per_part) {
+    float scale, int dynamic_parts) {
     constexpr int D = 256;
     constexpr int Rep = 4;
     constexpr int Threads = D / ValuesPerThread;
@@ -457,8 +455,7 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     const int maximum_tokens = logical_pages * active_page_size;
     int tokens = static_cast<int>(seq_len[batch]);
     tokens = tokens < 0 ? 0 : (tokens > maximum_tokens ? maximum_tokens : tokens);
-    const int active_parts = paged_active_parts(
-        tokens, parts, dynamic_parts, tokens_per_part);
+    const int active_parts = paged_active_parts(tokens, parts, dynamic_parts);
     if (part >= active_parts) return;
     const int start = static_cast<int>(
         static_cast<int64_t>(tokens) * part / active_parts);
@@ -653,13 +650,12 @@ __global__ void paged_attention_decode_reduce_kernel(
     const int64_t * __restrict__ seq_len,
     scalar_t * __restrict__ output,
     int total, int Hq, int D, int parts, int workspace_parts,
-    int dynamic_parts, int tokens_per_part) {
+    int dynamic_parts) {
     const int query = blockIdx.x;
     const int tid = threadIdx.x;
     if (query >= total) return;
     const int active_parts = paged_active_parts(
-        static_cast<int>(seq_len[query / Hq]), parts, dynamic_parts,
-        tokens_per_part);
+        static_cast<int>(seq_len[query / Hq]), parts, dynamic_parts);
     __shared__ float part_weight[64];
     __shared__ float denominator;
     if (tid == 0) {
@@ -840,9 +836,6 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
     const int page = static_cast<int>(page_size);
     const int chunk_pages = static_cast<int>(pages_per_chunk);
     const int split_parts = static_cast<int>(parts);
-    const int split_tokens_per_part =
-        D == 256 && gqa_ratio == 4 && page == 16 && chunk_pages == 64
-        ? 64 : 128;
     auto stream = mfq_current_cuda_stream();
     MFQ_DISPATCH_FLOATING_TYPES_AND2(
         mfq_dispatch_half, mfq_dispatch_bfloat16,
@@ -902,8 +895,7 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
                         partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),
                         partial_l.data_ptr<float>(), Hq, Hk, logical_pages, page,
                         chunk_pages, chunks, split_parts, workspace_parts,
-                        static_cast<float>(scale), dynamic_parts ? 1 : 0,
-                        split_tokens_per_part);
+                        static_cast<float>(scale), dynamic_parts ? 1 : 0);
                 } else {
                     paged_attention_decode_split_gqa4_d256_kernel<
                         0, 0, 1, scalar_t><<<
@@ -914,8 +906,7 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
                         partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),
                         partial_l.data_ptr<float>(), Hq, Hk, logical_pages, page,
                         chunk_pages, chunks, split_parts, workspace_parts,
-                        static_cast<float>(scale), dynamic_parts ? 1 : 0,
-                        split_tokens_per_part);
+                        static_cast<float>(scale), dynamic_parts ? 1 : 0);
                 }
             } else if (D <= 64) {
                 paged_attention_decode_split_kernel<64, scalar_t><<<
@@ -961,29 +952,25 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
                     total, 64, 0, stream>>>(partial_o.data_ptr<float>(),
                     partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),
                     seq_len.data_ptr<int64_t>(), output.data_ptr<scalar_t>(), total,
-                    Hq, D, split_parts, workspace_parts, dynamic_parts ? 1 : 0,
-                    split_tokens_per_part);
+                    Hq, D, split_parts, workspace_parts, dynamic_parts ? 1 : 0);
             } else if (D <= 128) {
                 paged_attention_decode_reduce_kernel<128, scalar_t><<<
                     total, 128, 0, stream>>>(partial_o.data_ptr<float>(),
                     partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),
                     seq_len.data_ptr<int64_t>(), output.data_ptr<scalar_t>(), total,
-                    Hq, D, split_parts, workspace_parts, dynamic_parts ? 1 : 0,
-                    split_tokens_per_part);
+                    Hq, D, split_parts, workspace_parts, dynamic_parts ? 1 : 0);
             } else if (D <= 256) {
                 paged_attention_decode_reduce_kernel<256, scalar_t><<<
                     total, 256, 0, stream>>>(partial_o.data_ptr<float>(),
                     partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),
                     seq_len.data_ptr<int64_t>(), output.data_ptr<scalar_t>(), total,
-                    Hq, D, split_parts, workspace_parts, dynamic_parts ? 1 : 0,
-                    split_tokens_per_part);
+                    Hq, D, split_parts, workspace_parts, dynamic_parts ? 1 : 0);
             } else {
                 paged_attention_decode_reduce_kernel<512, scalar_t><<<
                     total, 512, 0, stream>>>(partial_o.data_ptr<float>(),
                     partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),
                     seq_len.data_ptr<int64_t>(), output.data_ptr<scalar_t>(), total,
-                    Hq, D, split_parts, workspace_parts, dynamic_parts ? 1 : 0,
-                    split_tokens_per_part);
+                    Hq, D, split_parts, workspace_parts, dynamic_parts ? 1 : 0);
             }
         }
     });
