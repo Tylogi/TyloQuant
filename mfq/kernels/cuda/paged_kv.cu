@@ -617,25 +617,35 @@ __global__ void paged_attention_decode_reduce_kernel(
     if (query >= total) return;
     const int active_parts = paged_active_parts(
         static_cast<int>(seq_len[query / Hq]), parts, dynamic_parts);
-    float maximum = -1e30f;
-    for (int part = 0; part < active_parts; ++part) {
-        maximum = fmaxf(maximum, partial_m[
-            static_cast<size_t>(query) * workspace_parts + part]);
-    }
-    float denominator = 0.0f;
-    float value_sum = 0.0f;
-    for (int part = 0; part < active_parts; ++part) {
-        const size_t statistic =
-            static_cast<size_t>(query) * workspace_parts + part;
-        const float local_denominator = partial_l[statistic];
-        const float weight = local_denominator > 0.0f
-            ? expf(partial_m[statistic] - maximum) : 0.0f;
-        denominator += weight * local_denominator;
-        if (tid < D) {
-            value_sum += weight * partial_o[statistic * D + tid];
+    __shared__ float part_weight[64];
+    __shared__ float denominator;
+    if (tid == 0) {
+        float maximum = -1e30f;
+        for (int part = 0; part < active_parts; ++part) {
+            maximum = fmaxf(maximum, partial_m[
+                static_cast<size_t>(query) * workspace_parts + part]);
         }
+        float sum = 0.0f;
+        for (int part = 0; part < active_parts; ++part) {
+            const size_t statistic =
+                static_cast<size_t>(query) * workspace_parts + part;
+            const float local_denominator = partial_l[statistic];
+            const float weight = local_denominator > 0.0f
+                ? expf(partial_m[statistic] - maximum) : 0.0f;
+            part_weight[part] = weight;
+            sum += weight * local_denominator;
+        }
+        denominator = sum;
     }
+    __syncthreads();
+    float value_sum = 0.0f;
     if (tid < D) {
+        for (int part = 0; part < active_parts; ++part) {
+            const size_t statistic =
+                static_cast<size_t>(query) * workspace_parts + part;
+            value_sum += part_weight[part] *
+                partial_o[statistic * D + tid];
+        }
         output[static_cast<size_t>(query) * D + tid] =
             static_cast<scalar_t>(value_sum /
                 (denominator > 0.0f ? denominator : 1.0f));
