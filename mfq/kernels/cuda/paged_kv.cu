@@ -29,7 +29,7 @@ template <int Count, typename scalar_t>
 __device__ __forceinline__ void paged_load_values(
         const scalar_t * source, float (&values)[Count]) {
     if constexpr (Count == 8 && std::is_same_v<scalar_t, mfq_half>) {
-        const uint4 packed = *reinterpret_cast<const uint4 *>(source);
+        const uint4 packed = __ldg(reinterpret_cast<const uint4 *>(source));
         values[0] = __half2float(__ushort_as_half(
             static_cast<unsigned short>(packed.x)));
         values[1] = __half2float(__ushort_as_half(
