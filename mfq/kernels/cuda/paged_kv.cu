@@ -480,8 +480,15 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     __shared__ float probability[Rep];
     __shared__ uintptr_t key_page_address;
     __shared__ uintptr_t value_page_address;
-    float maximum = -1e30f;
-    float denominator = 0.0f;
+    float maximum[Rep];
+    float denominator[Rep];
+    if (tid == 0) {
+        #pragma unroll
+        for (int index = 0; index < Rep; ++index) {
+            maximum[index] = -1e30f;
+            denominator[index] = 0.0f;
+        }
+    }
     const size_t page_elements =
         static_cast<size_t>(Hk) * active_page_size * D;
     int token = start;
@@ -568,17 +575,16 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                 }
                 dot = paged_warp_sum(dot);
                 if constexpr (Warps == 1) {
-                    dot = __shfl_sync(0xffffffffu, dot, 0);
-                    if (lane == index) {
+                    if (lane == 0) {
                         const float score = dot * scale;
                         const float new_maximum = fmaxf(
-                            maximum, score);
+                            maximum[index], score);
                         previous_factor[index] = expf(
-                            maximum - new_maximum);
+                            maximum[index] - new_maximum);
                         probability[index] = expf(score - new_maximum);
-                        denominator = denominator *
+                        denominator[index] = denominator[index] *
                             previous_factor[index] + probability[index];
-                        maximum = new_maximum;
+                        maximum[index] = new_maximum;
                     }
                 } else if (lane == 0) {
                     warp_dot[index][warp] = dot;
@@ -594,17 +600,16 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                         float dot = lane < Warps
                             ? warp_dot[index][lane] : 0.0f;
                         dot = paged_warp_sum(dot);
-                        dot = __shfl_sync(0xffffffffu, dot, 0);
-                        if (lane == index) {
+                        if (lane == 0) {
                             const float score = dot * scale;
                             const float new_maximum = fmaxf(
-                                maximum, score);
+                                maximum[index], score);
                             previous_factor[index] = expf(
-                                maximum - new_maximum);
+                                maximum[index] - new_maximum);
                             probability[index] = expf(score - new_maximum);
-                            denominator = denominator *
+                            denominator[index] = denominator[index] *
                                 previous_factor[index] + probability[index];
-                            maximum = new_maximum;
+                            maximum[index] = new_maximum;
                         }
                     }
                 }
@@ -633,9 +638,9 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
             partial_o[statistic * D + first_dimension + value_index] =
                 value_sum[index][value_index];
         }
-        if (tid == index) {
-            partial_m[statistic] = start < end ? maximum : -1e30f;
-            partial_l[statistic] = start < end ? denominator : 0.0f;
+        if (tid == 0) {
+            partial_m[statistic] = start < end ? maximum[index] : -1e30f;
+            partial_l[statistic] = start < end ? denominator[index] : 0.0f;
         }
     }
 }
