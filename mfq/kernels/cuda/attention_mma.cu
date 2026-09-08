@@ -370,11 +370,18 @@ mfq_tensor_backend::Tensor mfq_attention_mma256_cuda(
     const int D = (int)q.size(3);
     const int Hk = (int)k.size(1);
     MFQ_RUNTIME_CHECK(D == 256 && k.size(3) == D && v.size(3) == D, "mfq_attention_mma256: head_dim must be 256");
-    MFQ_RUNTIME_CHECK(Hq == 4 * Hk && k.size(0) == B && v.size(0) == B &&
+    const int gqa_ratio = Hk > 0 ? Hq / Hk : 0;
+    MFQ_RUNTIME_CHECK(Hk > 0 && Hq % Hk == 0 &&
+                (gqa_ratio == 4 || gqa_ratio == 8) &&
+                k.size(0) == B && v.size(0) == B &&
                 k.size(2) == T && v.size(2) == T && v.size(1) == Hk,
-                "mfq_attention_mma256: requires self-attention with GQA ratio 4");
+                "mfq_attention_mma256: requires self-attention with GQA ratio 4 or 8");
     if (T % FATTN_KQ_STRIDE == 0) {
-        return mfq_attention_mma_launch<256, 256, 16, 4>(q, k, v, scale, false, 0);
+        return gqa_ratio == 8
+            ? mfq_attention_mma_launch<256, 256, 8, 8>(
+                  q, k, v, scale, false, 0)
+            : mfq_attention_mma_launch<256, 256, 16, 4>(
+                  q, k, v, scale, false, 0);
     }
     if (T <= 8) return mfq_attention_mma_launch<256, 256, 8, 1>(q, k, v, scale, false, 0);
     if (T <= 16) return mfq_attention_mma_launch<256, 256, 16, 1>(q, k, v, scale, false, 0);
@@ -411,13 +418,19 @@ mfq_tensor_backend::Tensor mfq_attention_mma128_cuda(
     MFQ_RUNTIME_CHECK(
         D == 128 && k.size(3) == D && v.size(3) == D,
         "mfq_attention_mma128: head_dim must be 128");
+    const int gqa_ratio = Hk > 0 ? Hq / Hk : 0;
     MFQ_RUNTIME_CHECK(
-        Hq == 4 * Hk && k.size(0) == B && v.size(0) == B &&
+        Hk > 0 && Hq % Hk == 0 &&
+            (gqa_ratio == 4 || gqa_ratio == 8) &&
+            k.size(0) == B && v.size(0) == B &&
             k.size(2) == T && v.size(2) == T && v.size(1) == Hk,
-        "mfq_attention_mma128: requires self-attention with GQA ratio 4");
+        "mfq_attention_mma128: requires self-attention with GQA ratio 4 or 8");
     if (T % FATTN_KQ_STRIDE == 0) {
-        return mfq_attention_mma_launch<128, 128, 16, 4>(
-            q, k, v, scale, false, 0);
+        return gqa_ratio == 8
+            ? mfq_attention_mma_launch<128, 128, 8, 8>(
+                  q, k, v, scale, false, 0)
+            : mfq_attention_mma_launch<128, 128, 16, 4>(
+                  q, k, v, scale, false, 0);
     }
     if (T <= 8) {
         return mfq_attention_mma_launch<128, 128, 8, 1>(

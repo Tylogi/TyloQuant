@@ -181,8 +181,9 @@ def test_minicpmo_bf16_prefill_flash128_is_strictly_bounded() -> None:
         "mfq_attention_mma128_cuda", 1
     )[1].split("mfq_attention_mma512_cuda", 1)[0]
     assert "D == 128" in implementation
-    assert "Hq == 4 * Hk" in implementation
+    assert "(gqa_ratio == 4 || gqa_ratio == 8)" in implementation
     assert "mfq_attention_mma_launch<128, 128, 16, 4>" in implementation
+    assert "mfq_attention_mma_launch<128, 128, 8, 8>" in implementation
     casts = SOURCE.split(
         '"MFQ_DISABLE_MINICPM_FLASH128_SPECIALIZED_CASTS"', 1
     )[1].split("attention_token_major = true", 1)[0]
@@ -196,6 +197,19 @@ def test_minicpmo_bf16_prefill_flash128_is_strictly_bounded() -> None:
     assert "__float2half_rn" in ATTENTION_MMA_SOURCE
     assert "__float2bfloat16_rn" in ATTENTION_MMA_SOURCE
     assert ATTENTION_MMA_SOURCE.count("numel() > 0") >= 3
+
+
+def test_full_flash_attention_accepts_gqa8_with_matching_tiles() -> None:
+    implementation = ATTENTION_MMA_SOURCE.split(
+        "mfq_attention_mma256_cuda", 1
+    )[1].split("mfq_attention_mma128_cuda", 1)[0]
+    assert "(gqa_ratio == 4 || gqa_ratio == 8)" in implementation
+    assert "mfq_attention_mma_launch<256, 256, 16, 4>" in implementation
+    assert "mfq_attention_mma_launch<256, 256, 8, 8>" in implementation
+    selection = SOURCE.split(
+        'const char * mma_attention_env = std::getenv("MFQ_MMA_ATTENTION")', 1
+    )[1].split("else if (sliding)", 1)[0]
+    assert "nh == 4 * nkh || nh == 8 * nkh" in selection
 
 
 def test_minicpmo_bf16_residual_uses_contiguous_specialized_add() -> None:

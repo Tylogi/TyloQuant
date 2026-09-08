@@ -16831,7 +16831,8 @@ struct FullBlock : Block {
                         q.to(mfq_tensor_backend::kFloat32).contiguous(), kh, vh,
                         attn_scale, attention_window);
                     attention_token_major = true;
-                } else if (!sliding && T >= 32 && hd == 256 && nh == 4 * nkh &&
+                } else if (!sliding && T >= 32 && hd == 256 &&
+                           (nh == 4 * nkh || nh == 8 * nkh) &&
                            mma_attention_enabled) {
                     a = mfq_attention_mma256_cuda(
                         q.to(mfq_tensor_backend::kFloat32).contiguous(), kh, vh, attn_scale);
@@ -26445,9 +26446,16 @@ static int run_gemma4_swa_check(int reps) {
         }
     }
 
-    for (const int tokens : {33, 256}) {
+    struct FullAttentionShape {
+        int tokens;
+        int kv_heads;
+    };
+    for (const auto shape : {
+            FullAttentionShape{33, 4}, FullAttentionShape{256, 4},
+            FullAttentionShape{65, 2}, FullAttentionShape{256, 2}}) {
         constexpr int full_hq = 16;
-        constexpr int full_hk = 4;
+        const int tokens = shape.tokens;
+        const int full_hk = shape.kv_heads;
         auto q = mfq_tensor_backend::randn({B, full_hq, tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat32));
         auto k = mfq_tensor_backend::randn({B, full_hk, tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
         auto v = mfq_tensor_backend::randn({B, full_hk, tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
@@ -26460,12 +26468,48 @@ static int run_gemma4_swa_check(int reps) {
         const double rel = ((test - ref).norm() / ref.norm()).item<double>();
         const bool finite = mfq_tensor_backend::isfinite(test).all().item<bool>();
         std::cout << "flash256_full_check tokens=" << tokens
+                  << " gqa=" << full_hq / full_hk
                   << " rel=" << rel
                   << " mean_abs=" << diff.mean().item<double>()
                   << " max_abs=" << diff.max().item<double>()
                   << " finite=" << (finite ? 1 : 0) << "\n";
         if (!finite || rel > 0.02) {
             throw std::runtime_error("full FlashAttention numerical regression failed");
+        }
+    }
+
+    for (const int tokens : {65, 256}) {
+        constexpr int full_hq = 16;
+        constexpr int full_hk = 2;
+        constexpr int full_d = 128;
+        const double full_scale = 1.0 / std::sqrt((double)full_d);
+        auto q = mfq_tensor_backend::randn(
+            {B, full_hq, tokens, full_d},
+            cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto k = mfq_tensor_backend::randn(
+            {B, full_hk, tokens, full_d},
+            cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto v = mfq_tensor_backend::randn(
+            {B, full_hk, tokens, full_d},
+            cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto ref = attention_cuda(
+            q, k.to(mfq_tensor_backend::kFloat32),
+            v.to(mfq_tensor_backend::kFloat32), full_scale, true);
+        auto test = mfq_attention_mma128_cuda(q, k, v, full_scale)
+            .permute({0, 2, 1, 3}).contiguous();
+        mfq_cuda_synchronize();
+        auto diff = (test - ref).abs();
+        const double rel = ((test - ref).norm() / ref.norm()).item<double>();
+        const bool finite = mfq_tensor_backend::isfinite(test).all().item<bool>();
+        std::cout << "flash128_full_check tokens=" << tokens
+                  << " gqa=" << full_hq / full_hk
+                  << " rel=" << rel
+                  << " mean_abs=" << diff.mean().item<double>()
+                  << " max_abs=" << diff.max().item<double>()
+                  << " finite=" << (finite ? 1 : 0) << "\n";
+        if (!finite || rel > 0.02) {
+            throw std::runtime_error(
+                "D128 full FlashAttention numerical regression failed");
         }
     }
 
