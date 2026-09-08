@@ -132,6 +132,13 @@ __device__ __forceinline__ float paged_warp_sum(float value) {
     return value;
 }
 
+__device__ __forceinline__ float paged_warp_sum_all(float value) {
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        value += __shfl_xor_sync(0xffffffffu, value, mask);
+    }
+    return value;
+}
+
 __device__ __forceinline__ int paged_active_parts(
         int token_count, int launch_parts, int dynamic_parts) {
     if (!dynamic_parts) return launch_parts;
@@ -569,12 +576,12 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                         value_index < ValuesPerThread; ++value_index) {
                     dot += query[index][value_index] * key[value_index];
                 }
-                dot = paged_warp_sum(dot);
                 if constexpr (Warps == 1) {
-                    dot = __shfl_sync(0xffffffffu, dot, 0);
+                    dot = paged_warp_sum_all(dot);
                     if (lane == index) head_dot = dot;
-                } else if (lane == 0) {
-                    warp_dot[index][warp] = dot;
+                } else {
+                    dot = paged_warp_sum(dot);
+                    if (lane == 0) warp_dot[index][warp] = dot;
                 }
             }
             if constexpr (Warps == 1) {
