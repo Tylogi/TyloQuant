@@ -68,6 +68,12 @@ mlx::core::array moe_weighted_reduce(
     const mlx::core::array& pair_output,
     const mlx::core::array& weights);
 
+// Invert a valid one-dimensional int32 permutation in one linear Metal pass.
+// This is substantially cheaper than argsort(order), especially for the
+// token*top_k route permutations used by grouped MoE prefill.
+mlx::core::array moe_inverse_permutation(
+    const mlx::core::array& order);
+
 mlx::core::array moe_swiglu_split(
     const mlx::core::array& gate_up);
 

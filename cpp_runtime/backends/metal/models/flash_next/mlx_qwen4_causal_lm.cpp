@@ -422,10 +422,8 @@ public:
                         "qwen4.moe.routed_down",
                         sorted);
                 }
-                inverse_route_order = mlx::core::contiguous(
-                    mlx::core::astype(
-                        mlx::core::argsort(route_order),
-                        mlx::core::int32));
+                inverse_route_order =
+                    moe_inverse_permutation(route_order);
                 pairs_are_sorted = true;
                 return sorted;
             }

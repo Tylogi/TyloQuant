@@ -1511,7 +1511,7 @@ MlxDeepseekV4Moe::forward_branches(
             auto routed_pairs = mlx::core::reshape(
                 mlx::core::take(
                     std::move(down_sorted),
-                    mlx::core::argsort(route_order),
+                    moe_inverse_permutation(route_order),
                     0),
                 Shape{rows, routes, hidden});
             auto output = moe_weighted_reduce(
@@ -1601,7 +1601,7 @@ MlxDeepseekV4Moe::forward_branches(
             auto routed_pairs = mlx::core::reshape(
                 mlx::core::take(
                     std::move(down_sorted),
-                    mlx::core::argsort(route_order),
+                    moe_inverse_permutation(route_order),
                     0),
                 Shape{rows, routes, hidden});
             auto output = moe_weighted_reduce(

@@ -8343,7 +8343,7 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .direct_nax = use_direct_nax,
                 .swiglu_limit = swiglu_limit,
             });
-        auto inverse_order = mlx::core::argsort(route_order);
+        auto inverse_order = moe_inverse_permutation(route_order);
         auto restored = mlx::core::take(
             std::move(sorted_outputs),
             inverse_order,

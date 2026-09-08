@@ -360,6 +360,17 @@ constexpr const char* kWeightedReduceSource = R"METAL(
     output[index] = T(value);
 )METAL";
 
+constexpr const char* kInversePermutationSource = R"METAL(
+    uint sorted_row = thread_position_in_grid.x;
+    if (sorted_row >= uint(SIZE)) {
+        return;
+    }
+    int original_row = order[sorted_row];
+    if (original_row >= 0 && original_row < SIZE) {
+        inverse[uint(original_row)] = int(sorted_row);
+    }
+)METAL";
+
 constexpr const char* kGluSplitSource = R"METAL(
     uint index = thread_position_in_grid.x;
     if (index >= uint(ROWS * WIDTH)) {
@@ -545,6 +556,16 @@ weighted_reduce_kernel() {
         {"pair_output", "weights"},
         {"output"},
         kWeightedReduceSource);
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+inverse_permutation_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_moe_inverse_permutation",
+        {"order"},
+        {"inverse"},
+        kInversePermutationSource);
     return kernel;
 }
 
@@ -1119,6 +1140,28 @@ array moe_weighted_reduce(
             {"ROUTES", routes},
             {"WIDTH", width},
         },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
+array moe_inverse_permutation(const array& order) {
+    auto permutation = int32_contiguous(order);
+    if (permutation.ndim() != 1 || permutation.size() == 0) {
+        throw std::invalid_argument(
+            "MoE route order must be a non-empty one-dimensional permutation");
+    }
+    const int size = checked_int(
+        permutation.size(),
+        "route permutation size");
+    auto outputs = inverse_permutation_kernel()(
+        {std::move(permutation)},
+        {Shape{size}},
+        {mlx::core::int32},
+        {size, 1, 1},
+        {std::min(kThreads, size), 1, 1},
+        {{"SIZE", size}},
         std::nullopt,
         false,
         {});
