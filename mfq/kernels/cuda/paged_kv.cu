@@ -132,6 +132,20 @@ __device__ __forceinline__ float paged_warp_sum(float value) {
     return value;
 }
 
+__device__ __forceinline__ void paged_softmax_step(
+        float score, float & maximum, float & denominator,
+        float & previous_factor, float & probability) {
+    previous_factor = 1.0f;
+    probability = 1.0f;
+    if (score > maximum) {
+        previous_factor = expf(maximum - score);
+        maximum = score;
+    } else {
+        probability = expf(score - maximum);
+    }
+    denominator = denominator * previous_factor + probability;
+}
+
 __device__ __forceinline__ int paged_active_parts(
         int token_count, int launch_parts, int dynamic_parts) {
     if (!dynamic_parts) return launch_parts;
@@ -201,14 +215,13 @@ __global__ void paged_attention_decode_kernel(
             ? static_cast<float>(key_page[element]) : 0.0f;
         const float dot = paged_block_sum<Warps>(query * key);
         const float score = dot * scale;
-        const float new_maximum = fmaxf(maximum, score);
-        const float previous_factor = expf(maximum - new_maximum);
-        const float probability = expf(score - new_maximum);
+        float previous_factor = 1.0f;
+        float probability = 1.0f;
+        paged_softmax_step(
+            score, maximum, denominator, previous_factor, probability);
         const float value = tid < D && value_page != nullptr
             ? static_cast<float>(value_page[element]) : 0.0f;
         value_sum = value_sum * previous_factor + probability * value;
-        denominator = denominator * previous_factor + probability;
-        maximum = new_maximum;
     }
     if (tid < D) {
         output[(static_cast<size_t>(batch) * Hq + query_head) * D + tid] =
@@ -307,13 +320,9 @@ __global__ void paged_attention_decode_gqa4_d256_kernel(
                 dot = paged_warp_sum(dot);
                 if (lane == 0) {
                     const float score = dot * scale;
-                    const float new_maximum = fmaxf(maximum[index], score);
-                    previous_factor[index] = expf(
-                        maximum[index] - new_maximum);
-                    probability[index] = expf(score - new_maximum);
-                    denominator[index] = denominator[index] *
-                        previous_factor[index] + probability[index];
-                    maximum[index] = new_maximum;
+                    paged_softmax_step(
+                        score, maximum[index], denominator[index],
+                        previous_factor[index], probability[index]);
                 }
             }
         }
@@ -405,14 +414,13 @@ __global__ void paged_attention_decode_split_kernel(
             ? static_cast<float>(key_page[element]) : 0.0f;
         const float dot = paged_block_sum<Warps>(query_value * key);
         const float score = dot * scale;
-        const float new_maximum = fmaxf(maximum, score);
-        const float previous_factor = expf(maximum - new_maximum);
-        const float probability = expf(score - new_maximum);
+        float previous_factor = 1.0f;
+        float probability = 1.0f;
+        paged_softmax_step(
+            score, maximum, denominator, previous_factor, probability);
         const float value = tid < D && value_page != nullptr
             ? static_cast<float>(value_page[element]) : 0.0f;
         value_sum = value_sum * previous_factor + probability * value;
-        denominator = denominator * previous_factor + probability;
-        maximum = new_maximum;
     }
     if (tid < D) partial_o[statistic * D + tid] = value_sum;
     if (tid == 0) {
@@ -577,13 +585,9 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
             if constexpr (Warps == 1) {
                 if (lane == 0) {
                     const float score = dot * scale;
-                    const float new_maximum = fmaxf(maximum[index], score);
-                    previous_factor[index] = expf(
-                        maximum[index] - new_maximum);
-                    probability[index] = expf(score - new_maximum);
-                    denominator[index] = denominator[index] *
-                        previous_factor[index] + probability[index];
-                    maximum[index] = new_maximum;
+                    paged_softmax_step(
+                        score, maximum[index], denominator[index],
+                        previous_factor[index], probability[index]);
                 }
             } else if (lane == 0) {
                 warp_dot[index][warp] = dot;
@@ -600,14 +604,9 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                     dot = paged_warp_sum(dot);
                     if (lane == 0) {
                         const float score = dot * scale;
-                        const float new_maximum = fmaxf(
-                            maximum[index], score);
-                        previous_factor[index] = expf(
-                            maximum[index] - new_maximum);
-                        probability[index] = expf(score - new_maximum);
-                        denominator[index] = denominator[index] *
-                            previous_factor[index] + probability[index];
-                        maximum[index] = new_maximum;
+                        paged_softmax_step(
+                            score, maximum[index], denominator[index],
+                            previous_factor[index], probability[index]);
                     }
                 }
             }
