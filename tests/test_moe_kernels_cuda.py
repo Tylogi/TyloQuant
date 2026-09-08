@@ -313,6 +313,51 @@ def test_moe_dual_group_quantization_is_bit_exact():
     torch.testing.assert_close(actual_scale28, expected_scale28, rtol=0, atol=0)
 
 
+def _multi_quant_metadata(outputs, geometries):
+    pointers = torch.tensor(
+        [[qx.data_ptr(), xscale.data_ptr()] for qx, xscale in outputs],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    params = torch.tensor(
+        [[groups, gs] for groups, gs in geometries],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    plan = torch.tensor(
+        [
+            [geometry, group]
+            for geometry, (groups, _) in enumerate(geometries)
+            for group in range(groups)
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    return pointers, params, plan
+
+
+def test_moe_multi_group_quantization_is_bit_exact():
+    torch.manual_seed(771)
+    rows, width = 7, 2051
+    x = torch.randn(rows, width, device="cuda", dtype=torch.float16)
+    geometries = tuple(((width + gs - 1) // gs, gs) for gs in (16, 24, 28, 48))
+    expected = []
+    actual = []
+    for groups, gs in geometries:
+        expected_qx = torch.empty((rows, groups * gs), device="cuda", dtype=torch.int8)
+        expected_scale = torch.empty((rows, groups), device="cuda", dtype=torch.float32)
+        ext().nint_moe_quantize_input_ws_cuda(
+            x, gs, expected_qx, expected_scale
+        )
+        expected.append((expected_qx, expected_scale))
+        actual.append((torch.empty_like(expected_qx), torch.empty_like(expected_scale)))
+    pointers, params, plan = _multi_quant_metadata(actual, geometries)
+    ext().nint_moe_quantize_multi_ws_cuda(x, pointers, params, plan)
+    for actual_pair, expected_pair in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_pair[0], expected_pair[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual_pair[1], expected_pair[1], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("activation", ["swiglu", "geglu"])
 def test_moe_gs16_glu_quantization_is_bit_exact(activation):
     torch.manual_seed(2161 if activation == "swiglu" else 2162)
@@ -333,6 +378,32 @@ def test_moe_gs16_glu_quantization_is_bit_exact(activation):
     fn(gate_up, 16, actual_qx, actual_scale)
     torch.testing.assert_close(actual_qx, expected_qx, rtol=0, atol=0)
     torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "geglu"])
+def test_moe_multi_group_glu_quantization_is_bit_exact(activation):
+    torch.manual_seed(772 if activation == "swiglu" else 773)
+    rows, width = 7, 513
+    gate_up = torch.randn(1, rows, 2 * width, device="cuda", dtype=torch.float16)
+    hidden = swiglu_split(gate_up) if activation == "swiglu" else geglu_split(gate_up)
+    geometries = tuple(((width + gs - 1) // gs, gs) for gs in (16, 24, 28, 48))
+    expected = []
+    actual = []
+    for groups, gs in geometries:
+        expected_qx = torch.empty((rows, groups * gs), device="cuda", dtype=torch.int8)
+        expected_scale = torch.empty((rows, groups), device="cuda", dtype=torch.float32)
+        ext().nint_moe_quantize_input_ws_cuda(
+            hidden, gs, expected_qx, expected_scale
+        )
+        expected.append((expected_qx, expected_scale))
+        actual.append((torch.empty_like(expected_qx), torch.empty_like(expected_scale)))
+    pointers, params, plan = _multi_quant_metadata(actual, geometries)
+    ext().nint_moe_quantize_glu_multi_ws_cuda(
+        gate_up, pointers, params, plan, activation == "geglu"
+    )
+    for actual_pair, expected_pair in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_pair[0], expected_pair[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual_pair[1], expected_pair[1], rtol=0, atol=0)
 
 
 def test_moe_swiglu_dual_group_quantization_is_bit_exact():

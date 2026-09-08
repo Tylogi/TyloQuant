@@ -85,10 +85,16 @@ void nint_moe_quantize_input_ws_cuda(
 void nint_moe_quantize_24_28_ws_cuda(
     torch::Tensor x, torch::Tensor qx24, torch::Tensor xscale24,
     torch::Tensor qx28, torch::Tensor xscale28);
+void nint_moe_quantize_multi_ws_cuda(
+    torch::Tensor x, torch::Tensor output_ptrs,
+    torch::Tensor output_params, torch::Tensor group_plan);
 void nint_moe_quantize_swiglu_input_ws_cuda(
     torch::Tensor gate_up, int64_t gs, torch::Tensor qx, torch::Tensor xscale);
 void nint_moe_quantize_geglu_input_ws_cuda(
     torch::Tensor gate_up, int64_t gs, torch::Tensor qx, torch::Tensor xscale);
+void nint_moe_quantize_glu_multi_ws_cuda(
+    torch::Tensor gate_up, torch::Tensor output_ptrs,
+    torch::Tensor output_params, torch::Tensor group_plan, bool gelu);
 void nint_moe_quantize_swiglu_24_28_ws_cuda(
     torch::Tensor gate_up, torch::Tensor qx24, torch::Tensor xscale24,
     torch::Tensor qx28, torch::Tensor xscale28);
@@ -633,10 +639,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Quantize one activation layout for heterogeneous expert NINT (CUDA)");
     m.def("nint_moe_quantize_24_28_ws_cuda", &nint_moe_quantize_24_28_ws_cuda,
           "Simultaneous gs24/gs28 activation quantization (CUDA)");
+    m.def("nint_moe_quantize_multi_ws_cuda", &nint_moe_quantize_multi_ws_cuda,
+          "Single-launch multi-geometry activation quantization (CUDA)");
     m.def("nint_moe_quantize_swiglu_input_ws_cuda", &nint_moe_quantize_swiglu_input_ws_cuda,
           "Fused SwiGLU + quantize for heterogeneous expert NINT (CUDA)");
     m.def("nint_moe_quantize_geglu_input_ws_cuda", &nint_moe_quantize_geglu_input_ws_cuda,
           "Fused GeGLU + quantize for heterogeneous expert NINT (CUDA)");
+    m.def("nint_moe_quantize_glu_multi_ws_cuda", &nint_moe_quantize_glu_multi_ws_cuda,
+          "Fused GLU + single-launch multi-geometry quantization (CUDA)");
     m.def("nint_moe_quantize_swiglu_24_28_ws_cuda", &nint_moe_quantize_swiglu_24_28_ws_cuda,
           "Fused SwiGLU + simultaneous gs24/gs28 quantization (CUDA)");
     m.def("nint_moe_grouped_matmul_hetero_qx_cuda", &nint_moe_grouped_matmul_hetero_qx_cuda,

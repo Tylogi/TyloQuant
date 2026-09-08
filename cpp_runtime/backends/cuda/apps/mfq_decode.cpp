@@ -280,6 +280,9 @@ void nint_moe_quantize_input_ws_cuda(
 void nint_moe_quantize_24_28_ws_cuda(
     mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor qx24, mfq_tensor_backend::Tensor xscale24,
     mfq_tensor_backend::Tensor qx28, mfq_tensor_backend::Tensor xscale28);
+void nint_moe_quantize_multi_ws_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor output_ptrs,
+    mfq_tensor_backend::Tensor output_params, mfq_tensor_backend::Tensor group_plan);
 void nint_moe_quantize_swiglu_input_ws_cuda(
     mfq_tensor_backend::Tensor gate_up, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 void nint_moe_quantize_swiglu_clamped_input_ws_cuda(
@@ -293,6 +296,10 @@ void nint_moe_quantize_geglu_input_ws_cuda(
 void nint_moe_quantize_geglu_24_28_ws_cuda(
     mfq_tensor_backend::Tensor gate_up, mfq_tensor_backend::Tensor qx24, mfq_tensor_backend::Tensor xscale24,
     mfq_tensor_backend::Tensor qx28, mfq_tensor_backend::Tensor xscale28);
+void nint_moe_quantize_glu_multi_ws_cuda(
+    mfq_tensor_backend::Tensor gate_up, mfq_tensor_backend::Tensor output_ptrs,
+    mfq_tensor_backend::Tensor output_params, mfq_tensor_backend::Tensor group_plan,
+    bool gelu);
 mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_qx_cuda(
     mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor activation_ptrs,
     mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local, mfq_tensor_backend::Tensor ids,
@@ -3640,6 +3647,9 @@ struct MoeHeteroWorkspace {
     std::vector<mfq_tensor_backend::Tensor> qx;
     std::vector<mfq_tensor_backend::Tensor> xscale;
     mfq_tensor_backend::Tensor activation_ptrs;
+    mfq_tensor_backend::Tensor quantize_ptrs;
+    mfq_tensor_backend::Tensor quantize_params;
+    mfq_tensor_backend::Tensor quantize_group_plan;
 };
 
 struct MoeRoutePlan {
@@ -3851,6 +3861,47 @@ struct NintMoeWeight {
         workspace.activation_ptrs = mfq_tensor_backend::from_blob(
             pointers.data(), {static_cast<int64_t>(pools.size()), 2},
             mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)).clone().to(x.device()).contiguous();
+        std::vector<int64_t> quantize_ptrs;
+        std::vector<int32_t> quantize_params;
+        std::vector<int32_t> quantize_group_plan;
+        quantize_ptrs.reserve(quantize_pool_indices.size() * 2);
+        quantize_params.reserve(quantize_pool_indices.size() * 2);
+        for (int geometry = 0;
+                geometry < static_cast<int>(quantize_pool_indices.size());
+                ++geometry) {
+            const int pool_index = quantize_pool_indices.at(
+                static_cast<size_t>(geometry));
+            const auto & pool = pools.at(static_cast<size_t>(pool_index));
+            const int groups = static_cast<int>(pool.weight.ng);
+            const int gs = static_cast<int>(pool.weight.gs);
+            quantize_ptrs.push_back(static_cast<int64_t>(
+                reinterpret_cast<uintptr_t>(workspace.qx.at(
+                    static_cast<size_t>(pool_index)).data_ptr<int8_t>())));
+            quantize_ptrs.push_back(static_cast<int64_t>(
+                reinterpret_cast<uintptr_t>(workspace.xscale.at(
+                    static_cast<size_t>(pool_index)).data_ptr<float>())));
+            quantize_params.push_back(groups);
+            quantize_params.push_back(gs);
+            for (int group = 0; group < groups; ++group) {
+                quantize_group_plan.push_back(geometry);
+                quantize_group_plan.push_back(group);
+            }
+        }
+        workspace.quantize_ptrs = mfq_tensor_backend::from_blob(
+            quantize_ptrs.data(),
+            {static_cast<int64_t>(quantize_pool_indices.size()), 2},
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+            .clone().to(x.device()).contiguous();
+        workspace.quantize_params = mfq_tensor_backend::from_blob(
+            quantize_params.data(),
+            {static_cast<int64_t>(quantize_pool_indices.size()), 2},
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+            .clone().to(x.device()).contiguous();
+        workspace.quantize_group_plan = mfq_tensor_backend::from_blob(
+            quantize_group_plan.data(),
+            {static_cast<int64_t>(quantize_group_plan.size() / 2), 2},
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+            .clone().to(x.device()).contiguous();
         return hetero_workspaces.emplace(input_rows, std::move(workspace)).first->second;
     }
 
@@ -4048,6 +4099,11 @@ struct NintMoeWeight {
                         workspace.xscale.at(static_cast<size_t>(gs24_quantize_index)),
                         workspace.qx.at(static_cast<size_t>(gs28_quantize_index)),
                         workspace.xscale.at(static_cast<size_t>(gs28_quantize_index)));
+                } else if (quantize_pool_indices.size() > 1 &&
+                        !supports_dual_quant()) {
+                    nint_moe_quantize_multi_ws_cuda(
+                        x, workspace.quantize_ptrs, workspace.quantize_params,
+                        workspace.quantize_group_plan);
                 } else {
                     for (int pool_index : quantize_pool_indices) {
                         const auto & pool = pools.at(static_cast<size_t>(pool_index));
@@ -4125,6 +4181,10 @@ struct NintMoeWeight {
                 workspace.xscale.at(static_cast<size_t>(gs24_quantize_index)),
                 workspace.qx.at(static_cast<size_t>(gs28_quantize_index)),
                 workspace.xscale.at(static_cast<size_t>(gs28_quantize_index)));
+        } else if (quantize_pool_indices.size() > 1) {
+            nint_moe_quantize_multi_ws_cuda(
+                x, workspace.quantize_ptrs, workspace.quantize_params,
+                workspace.quantize_group_plan);
         } else {
             for (int pool_index : quantize_pool_indices) {
                 const auto & pool = pools.at(static_cast<size_t>(pool_index));
@@ -4193,6 +4253,10 @@ struct NintMoeWeight {
                     workspace.qx.at(static_cast<size_t>(gs28_quantize_index)),
                     workspace.xscale.at(static_cast<size_t>(gs28_quantize_index)));
             }
+        } else if (quantize_pool_indices.size() > 1) {
+            nint_moe_quantize_glu_multi_ws_cuda(
+                gate_up, workspace.quantize_ptrs, workspace.quantize_params,
+                workspace.quantize_group_plan, gelu);
         } else {
             for (int pool_index : quantize_pool_indices) {
                 const auto & pool = pools.at(static_cast<size_t>(pool_index));

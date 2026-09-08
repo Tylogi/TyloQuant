@@ -670,6 +670,105 @@ __global__ void quantize_moe_input_24_28_kernel(
     }
 }
 
+__device__ __forceinline__ void quantize_moe_multi_store(
+        float value0,
+        float value1,
+        bool real0,
+        bool real1,
+        int8_t * __restrict__ qx,
+        float * __restrict__ xscale,
+        int row,
+        int group,
+        int groups,
+        int gs,
+        int lane) {
+    float max_value = fmaxf(
+        real0 ? fabsf(value0) : 0.0f,
+        real1 ? fabsf(value1) : 0.0f);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_value = fmaxf(
+            max_value,
+            __shfl_down_sync(0xffffffffu, max_value, offset));
+    }
+    float group_scale = 1.0f;
+    if (lane == 0) {
+        group_scale = max_value > 0.0f ? max_value / 127.0f : 1.0f;
+        xscale[static_cast<size_t>(row) * groups + group] = group_scale;
+    }
+    group_scale = __shfl_sync(0xffffffffu, group_scale, 0);
+    const size_t output_base =
+        static_cast<size_t>(row) * groups * gs + group * gs;
+    if (lane < gs) {
+        int quant = 0;
+        if (real0) {
+            quant = static_cast<int>(roundf(value0 / group_scale));
+            quant = max(-127, min(127, quant));
+        }
+        qx[output_base + lane] = static_cast<int8_t>(quant);
+    }
+    const int lane1 = lane + kWarpSize;
+    if (lane1 < gs) {
+        int quant = 0;
+        if (real1) {
+            quant = static_cast<int>(roundf(value1 / group_scale));
+            quant = max(-127, min(127, quant));
+        }
+        qx[output_base + lane1] = static_cast<int8_t>(quant);
+    }
+}
+
+__device__ __forceinline__ void load_moe_multi_geometry(
+        const int64_t * __restrict__ output_ptrs,
+        const int32_t * __restrict__ output_params,
+        const int32_t * __restrict__ group_plan,
+        int combined_group,
+        int8_t *& qx,
+        float *& xscale,
+        int & group,
+        int & groups,
+        int & gs) {
+    const int geometry = group_plan[2 * combined_group + 0];
+    group = group_plan[2 * combined_group + 1];
+    groups = output_params[2 * geometry + 0];
+    gs = output_params[2 * geometry + 1];
+    qx = reinterpret_cast<int8_t *>(
+        static_cast<uintptr_t>(output_ptrs[2 * geometry + 0]));
+    xscale = reinterpret_cast<float *>(
+        static_cast<uintptr_t>(output_ptrs[2 * geometry + 1]));
+}
+
+__global__ void quantize_moe_input_multi_kernel(
+        const __half * __restrict__ x,
+        const int64_t * __restrict__ output_ptrs,
+        const int32_t * __restrict__ output_params,
+        const int32_t * __restrict__ group_plan,
+        int combined_groups,
+        int k_real) {
+    const int linear_block = blockIdx.x;
+    const int row = linear_block / combined_groups;
+    const int combined_group = linear_block - row * combined_groups;
+    const int lane = threadIdx.x;
+    int8_t * qx = nullptr;
+    float * xscale = nullptr;
+    int group = 0;
+    int groups = 0;
+    int gs = 0;
+    load_moe_multi_geometry(
+        output_ptrs, output_params, group_plan, combined_group,
+        qx, xscale, group, groups, gs);
+    const int k0 = group * gs + lane;
+    const int k1 = k0 + kWarpSize;
+    const bool real0 = lane < gs && k0 < k_real;
+    const bool real1 = lane + kWarpSize < gs && k1 < k_real;
+    const __half * row_input = x + static_cast<size_t>(row) * k_real;
+    const float value0 = real0 ? __half2float(row_input[k0]) : 0.0f;
+    const float value1 = real1 ? __half2float(row_input[k1]) : 0.0f;
+    quantize_moe_multi_store(
+        value0, value1, real0, real1, qx, xscale,
+        row, group, groups, gs, lane);
+}
+
 template <int GS, int BD, bool GELU, bool CLAMPED = false>
 __global__ void quantize_moe_glu_input_kernel(
         const __half * __restrict__ gate_up,
@@ -798,6 +897,98 @@ __global__ void quantize_moe_glu_24_28_kernel(
         quantize_moe_shared_group<28>(
             hidden, qx28, xscale28, row, group, groups28, k_real, groups28 * 28, lane);
     }
+}
+
+template <bool GELU>
+__device__ __forceinline__ float load_moe_glu_value(
+        const __half * __restrict__ gate_up,
+        size_t row_base,
+        int k_real,
+        int k) {
+    const float gate = __half2float(gate_up[row_base + k]);
+    const float up = __half2float(gate_up[row_base + k_real + k]);
+    return __half2float(__float2half_rn(mfq_glu<GELU>(gate, up)));
+}
+
+template <bool GELU>
+__global__ void quantize_moe_glu_multi_shared_kernel(
+        const __half * __restrict__ gate_up,
+        const int64_t * __restrict__ output_ptrs,
+        const int32_t * __restrict__ output_params,
+        const int32_t * __restrict__ group_plan,
+        int combined_groups,
+        int k_real) {
+    extern __shared__ __half hidden[];
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const size_t row_base = static_cast<size_t>(row) * (2 * k_real);
+    for (int k = tid; k < k_real; k += blockDim.x) {
+        const float gate = __half2float(gate_up[row_base + k]);
+        const float up = __half2float(gate_up[row_base + k_real + k]);
+        hidden[k] = __float2half_rn(mfq_glu<GELU>(gate, up));
+    }
+    __syncthreads();
+
+    const int lane = tid & (kWarpSize - 1);
+    const int warp = tid / kWarpSize;
+    const int warps = blockDim.x / kWarpSize;
+    for (int combined_group = warp;
+            combined_group < combined_groups;
+            combined_group += warps) {
+        int8_t * qx = nullptr;
+        float * xscale = nullptr;
+        int group = 0;
+        int groups = 0;
+        int gs = 0;
+        load_moe_multi_geometry(
+            output_ptrs, output_params, group_plan, combined_group,
+            qx, xscale, group, groups, gs);
+        const int k0 = group * gs + lane;
+        const int k1 = k0 + kWarpSize;
+        const bool real0 = lane < gs && k0 < k_real;
+        const bool real1 = lane + kWarpSize < gs && k1 < k_real;
+        const float value0 = real0 ? __half2float(hidden[k0]) : 0.0f;
+        const float value1 = real1 ? __half2float(hidden[k1]) : 0.0f;
+        quantize_moe_multi_store(
+            value0, value1, real0, real1, qx, xscale,
+            row, group, groups, gs, lane);
+    }
+}
+
+template <bool GELU>
+__global__ void quantize_moe_glu_multi_group_kernel(
+        const __half * __restrict__ gate_up,
+        const int64_t * __restrict__ output_ptrs,
+        const int32_t * __restrict__ output_params,
+        const int32_t * __restrict__ group_plan,
+        int combined_groups,
+        int k_real) {
+    const int linear_block = blockIdx.x;
+    const int row = linear_block / combined_groups;
+    const int combined_group = linear_block - row * combined_groups;
+    const int lane = threadIdx.x;
+    int8_t * qx = nullptr;
+    float * xscale = nullptr;
+    int group = 0;
+    int groups = 0;
+    int gs = 0;
+    load_moe_multi_geometry(
+        output_ptrs, output_params, group_plan, combined_group,
+        qx, xscale, group, groups, gs);
+    const int k0 = group * gs + lane;
+    const int k1 = k0 + kWarpSize;
+    const bool real0 = lane < gs && k0 < k_real;
+    const bool real1 = lane + kWarpSize < gs && k1 < k_real;
+    const size_t row_base = static_cast<size_t>(row) * (2 * k_real);
+    const float value0 = real0
+        ? load_moe_glu_value<GELU>(gate_up, row_base, k_real, k0)
+        : 0.0f;
+    const float value1 = real1
+        ? load_moe_glu_value<GELU>(gate_up, row_base, k_real, k1)
+        : 0.0f;
+    quantize_moe_multi_store(
+        value0, value1, real0, real1, qx, xscale,
+        row, group, groups, gs, lane);
 }
 
 template <int BITS>
@@ -3860,6 +4051,56 @@ void nint_moe_quantize_24_28_ws_cuda(
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+static int validate_moe_multi_quant_metadata(
+        const mfq_tensor_backend::Tensor & source,
+        const mfq_tensor_backend::Tensor & output_ptrs,
+        const mfq_tensor_backend::Tensor & output_params,
+        const mfq_tensor_backend::Tensor & group_plan) {
+    MFQ_RUNTIME_CHECK(output_ptrs.is_cuda() && output_ptrs.is_contiguous() &&
+        output_ptrs.scalar_type() == mfq_tensor_backend::kInt64 && output_ptrs.dim() == 2 &&
+        output_ptrs.size(0) > 0 && output_ptrs.size(1) == 2,
+        "output_ptrs must be contiguous CUDA int64 [geometries,2]");
+    const int geometries = static_cast<int>(output_ptrs.size(0));
+    MFQ_RUNTIME_CHECK(output_params.is_cuda() && output_params.is_contiguous() &&
+        output_params.scalar_type() == mfq_tensor_backend::kInt32 && output_params.dim() == 2 &&
+        output_params.size(0) == geometries && output_params.size(1) == 2,
+        "output_params must be contiguous CUDA int32 [geometries,2]");
+    MFQ_RUNTIME_CHECK(group_plan.is_cuda() && group_plan.is_contiguous() &&
+        group_plan.scalar_type() == mfq_tensor_backend::kInt32 && group_plan.dim() == 2 &&
+        group_plan.size(0) > 0 && group_plan.size(1) == 2 &&
+        group_plan.size(0) <= INT_MAX,
+        "group_plan must be contiguous CUDA int32 [combined_groups,2]");
+    check_same_device(source, output_ptrs, "output_ptrs");
+    check_same_device(source, output_params, "output_params");
+    check_same_device(source, group_plan, "group_plan");
+    return static_cast<int>(group_plan.size(0));
+}
+
+void nint_moe_quantize_multi_ws_cuda(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor output_ptrs,
+        mfq_tensor_backend::Tensor output_params,
+        mfq_tensor_backend::Tensor group_plan) {
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() &&
+        x.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        (x.dim() == 2 || x.dim() == 3),
+        "x must be contiguous CUDA float16 [T,K] or [T,R,K]");
+    const int k_real = static_cast<int>(x.size(-1));
+    const int rows = static_cast<int>(x.numel() / k_real);
+    const int combined_groups = validate_moe_multi_quant_metadata(
+        x, output_ptrs, output_params, group_plan);
+    const int64_t blocks =
+        static_cast<int64_t>(rows) * combined_groups;
+    MFQ_RUNTIME_CHECK(blocks > 0 && blocks <= INT_MAX,
+        "multi-geometry NINT MoE quantization grid is too large");
+    quantize_moe_input_multi_kernel<<<
+        static_cast<int>(blocks), 32, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
+        output_ptrs.data_ptr<int64_t>(), output_params.data_ptr<int32_t>(),
+        group_plan.data_ptr<int32_t>(), combined_groups, k_real);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void nint_moe_quantize_swiglu_input_ws_cuda(
         mfq_tensor_backend::Tensor gate_up,
         int64_t gs,
@@ -3981,6 +4222,59 @@ void nint_moe_quantize_geglu_input_ws_cuda(
         case 48: launch_quantize_glu<48, true>(gate_up, qx, xscale, rows, k_real, k_pad, groups, stream); break;
     }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <bool GELU>
+static void nint_moe_quantize_glu_multi_ws_cuda_impl(
+        mfq_tensor_backend::Tensor gate_up,
+        mfq_tensor_backend::Tensor output_ptrs,
+        mfq_tensor_backend::Tensor output_params,
+        mfq_tensor_backend::Tensor group_plan) {
+    MFQ_RUNTIME_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
+        gate_up.scalar_type() == mfq_tensor_backend::kFloat16 && gate_up.dim() == 3 &&
+        gate_up.size(2) > 0 && gate_up.size(2) % 2 == 0,
+        "gate_up must be contiguous CUDA float16 [T,R,2*K]");
+    const int k_real = static_cast<int>(gate_up.size(2) / 2);
+    const int rows = static_cast<int>(gate_up.size(0) * gate_up.size(1));
+    const int combined_groups = validate_moe_multi_quant_metadata(
+        gate_up, output_ptrs, output_params, group_plan);
+    constexpr int kSharedActivationElements = 16384;
+    if (k_real <= kSharedActivationElements) {
+        constexpr int block = 256;
+        const size_t shared_bytes =
+            static_cast<size_t>(k_real) * sizeof(__half);
+        quantize_moe_glu_multi_shared_kernel<GELU><<<
+            rows, block, shared_bytes, mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const __half *>(gate_up.data_ptr<mfq_half>()),
+            output_ptrs.data_ptr<int64_t>(), output_params.data_ptr<int32_t>(),
+            group_plan.data_ptr<int32_t>(), combined_groups, k_real);
+    } else {
+        const int64_t blocks =
+            static_cast<int64_t>(rows) * combined_groups;
+        MFQ_RUNTIME_CHECK(blocks > 0 && blocks <= INT_MAX,
+            "multi-geometry NINT MoE GLU quantization grid is too large");
+        quantize_moe_glu_multi_group_kernel<GELU><<<
+            static_cast<int>(blocks), 32, 0, mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const __half *>(gate_up.data_ptr<mfq_half>()),
+            output_ptrs.data_ptr<int64_t>(), output_params.data_ptr<int32_t>(),
+            group_plan.data_ptr<int32_t>(), combined_groups, k_real);
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void nint_moe_quantize_glu_multi_ws_cuda(
+        mfq_tensor_backend::Tensor gate_up,
+        mfq_tensor_backend::Tensor output_ptrs,
+        mfq_tensor_backend::Tensor output_params,
+        mfq_tensor_backend::Tensor group_plan,
+        bool gelu) {
+    if (gelu) {
+        nint_moe_quantize_glu_multi_ws_cuda_impl<true>(
+            gate_up, output_ptrs, output_params, group_plan);
+    } else {
+        nint_moe_quantize_glu_multi_ws_cuda_impl<false>(
+            gate_up, output_ptrs, output_params, group_plan);
+    }
 }
 
 template <bool GELU>

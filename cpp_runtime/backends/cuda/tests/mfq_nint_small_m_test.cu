@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <tuple>
 #include <vector>
 
 using mfq_tensor_backend::Tensor;
@@ -37,6 +39,11 @@ Tensor nint_gemv_packed_gate_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Ten
     int64_t, int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_bits_gate_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, int64_t, int64_t, Tensor, Tensor, Tensor);
+void nint_moe_quantize_input_ws_cuda(Tensor, int64_t, Tensor, Tensor);
+void nint_moe_quantize_multi_ws_cuda(Tensor, Tensor, Tensor, Tensor);
+void nint_moe_quantize_swiglu_input_ws_cuda(Tensor, int64_t, Tensor, Tensor);
+void nint_moe_quantize_geglu_input_ws_cuda(Tensor, int64_t, Tensor, Tensor);
+void nint_moe_quantize_glu_multi_ws_cuda(Tensor, Tensor, Tensor, Tensor, bool);
 
 namespace {
 using namespace mfq::cuda;
@@ -51,6 +58,151 @@ void exact(const Tensor& actual, const Tensor& expected) {
     require(a.sizes() == e.sizes() && a.scalar_type() == e.scalar_type(), "small-M shape or dtype mismatch");
     require(std::memcmp(a.data_ptr(), e.data_ptr(), a.nbytes()) == 0,
         "small-M output differs from serial M=1 bits");
+}
+
+struct MultiQuantGeometry {
+    int gs = 0;
+    int groups = 0;
+    Tensor expected_qx;
+    Tensor expected_scale;
+    Tensor actual_qx;
+    Tensor actual_scale;
+};
+
+std::tuple<Tensor, Tensor, Tensor> multi_quant_metadata(
+        const std::vector<MultiQuantGeometry>& geometries,
+        const Device& gpu) {
+    std::vector<int64_t> pointers;
+    std::vector<int32_t> params;
+    std::vector<int32_t> plan;
+    for (int geometry = 0; geometry < static_cast<int>(geometries.size()); ++geometry) {
+        const auto& item = geometries[geometry];
+        pointers.push_back(static_cast<int64_t>(reinterpret_cast<uintptr_t>(
+            item.actual_qx.data_ptr<int8_t>())));
+        pointers.push_back(static_cast<int64_t>(reinterpret_cast<uintptr_t>(
+            item.actual_scale.data_ptr<float>())));
+        params.push_back(item.groups);
+        params.push_back(item.gs);
+        for (int group = 0; group < item.groups; ++group) {
+            plan.push_back(geometry);
+            plan.push_back(group);
+        }
+    }
+    const auto cpu = TensorOptions{}.device(kCPU);
+    auto pointer_tensor = from_blob(
+        pointers.data(), {static_cast<int64_t>(geometries.size()), 2},
+        cpu.dtype(kInt64)).clone().to(gpu).contiguous();
+    auto param_tensor = from_blob(
+        params.data(), {static_cast<int64_t>(geometries.size()), 2},
+        cpu.dtype(kInt32)).clone().to(gpu).contiguous();
+    auto plan_tensor = from_blob(
+        plan.data(), {static_cast<int64_t>(plan.size() / 2), 2},
+        cpu.dtype(kInt32)).clone().to(gpu).contiguous();
+    return {pointer_tensor, param_tensor, plan_tensor};
+}
+
+void check_multi_quant(int& cases, int& graphs) {
+    constexpr int rows = 7;
+    constexpr int input_width = 2051;
+    const Device gpu{DeviceType::cuda, 0};
+    const auto cpu = TensorOptions{}.device(kCPU);
+    const auto cuda = TensorOptions{}.device(gpu);
+    auto xh = empty({rows, input_width}, cpu.dtype(kFloat16));
+    for (int index = 0; index < rows * input_width; ++index) {
+        xh.data_ptr<__half>()[index] = __float2half_rn(
+            float((index * 37 + 19) % 509 - 254) / 97.0f);
+    }
+    auto x = xh.to(gpu);
+    std::vector<MultiQuantGeometry> input_geometries;
+    for (int gs : {16, 24, 28, 48}) {
+        const int groups = (input_width + gs - 1) / gs;
+        input_geometries.push_back({
+            gs,
+            groups,
+            empty({rows, groups * gs}, cuda.dtype(kInt8)),
+            empty({rows, groups}, cuda.dtype(kFloat32)),
+            empty({rows, groups * gs}, cuda.dtype(kInt8)),
+            empty({rows, groups}, cuda.dtype(kFloat32)),
+        });
+        auto& item = input_geometries.back();
+        nint_moe_quantize_input_ws_cuda(
+            x, gs, item.expected_qx, item.expected_scale);
+    }
+    auto [input_ptrs, input_params, input_plan] =
+        multi_quant_metadata(input_geometries, gpu);
+    nint_moe_quantize_multi_ws_cuda(x, input_ptrs, input_params, input_plan);
+    for (const auto& item : input_geometries) {
+        exact(item.actual_qx, item.expected_qx);
+        exact(item.actual_scale, item.expected_scale);
+    }
+    ++cases;
+    {
+        Graph graph;
+        graph.prepare_memory();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
+        graph.capture_begin();
+        nint_moe_quantize_multi_ws_cuda(x, input_ptrs, input_params, input_plan);
+        graph.capture_end();
+        graph.replay();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
+        for (const auto& item : input_geometries) {
+            exact(item.actual_qx, item.expected_qx);
+            exact(item.actual_scale, item.expected_scale);
+        }
+        ++graphs;
+    }
+
+    constexpr int glu_width = 513;
+    auto gate_up_h = empty({1, rows, 2 * glu_width}, cpu.dtype(kFloat16));
+    for (int index = 0; index < rows * 2 * glu_width; ++index) {
+        gate_up_h.data_ptr<__half>()[index] = __float2half_rn(
+            float((index * 29 + 11) % 383 - 191) / 83.0f);
+    }
+    auto gate_up = gate_up_h.to(gpu);
+    for (bool gelu : {false, true}) {
+        std::vector<MultiQuantGeometry> geometries;
+        for (int gs : {16, 24, 28, 48}) {
+            const int groups = (glu_width + gs - 1) / gs;
+            geometries.push_back({
+                gs,
+                groups,
+                empty({rows, groups * gs}, cuda.dtype(kInt8)),
+                empty({rows, groups}, cuda.dtype(kFloat32)),
+                empty({rows, groups * gs}, cuda.dtype(kInt8)),
+                empty({rows, groups}, cuda.dtype(kFloat32)),
+            });
+            auto& item = geometries.back();
+            if (gelu) {
+                nint_moe_quantize_geglu_input_ws_cuda(
+                    gate_up, gs, item.expected_qx, item.expected_scale);
+            } else {
+                nint_moe_quantize_swiglu_input_ws_cuda(
+                    gate_up, gs, item.expected_qx, item.expected_scale);
+            }
+        }
+        auto [pointers, params, plan] = multi_quant_metadata(geometries, gpu);
+        nint_moe_quantize_glu_multi_ws_cuda(
+            gate_up, pointers, params, plan, gelu);
+        for (const auto& item : geometries) {
+            exact(item.actual_qx, item.expected_qx);
+            exact(item.actual_scale, item.expected_scale);
+        }
+        ++cases;
+        Graph graph;
+        graph.prepare_memory();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
+        graph.capture_begin();
+        nint_moe_quantize_glu_multi_ws_cuda(
+            gate_up, pointers, params, plan, gelu);
+        graph.capture_end();
+        graph.replay();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
+        for (const auto& item : geometries) {
+            exact(item.actual_qx, item.expected_qx);
+            exact(item.actual_scale, item.expected_scale);
+        }
+        ++graphs;
+    }
 }
 
 void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs, int& f32_cases, int rows = 17) {
@@ -279,7 +431,10 @@ int main() {
         for (const auto profile : std::vector<std::vector<int>>{{2,16,5},{3,24,5},{4,24,6},{5,28,7},{6,24,7},{8,48,7}})
             for (int width : {47, 257, 4096}) check(profile[0], profile[1], profile[2], width, cases, graphs, f32_cases);
         for (int width : {47, 257, 4096}) check(8, 48, 7, width, cases, graphs, f32_cases, 33);
-        require(cases == 450 && graphs == 32 && f32_cases == 105, "incomplete small-M coverage");
+        const int legacy_graphs = graphs;
+        check_multi_quant(cases, graphs);
+        require(cases == 453 && legacy_graphs == 32 && graphs == 35 && f32_cases == 105,
+            "incomplete small-M coverage");
         std::cout << "PASS small_m_cases=" << cases << " f32_boundary_cases=" << f32_cases
             << " graphs=" << graphs << '\n';
     } catch (const std::exception& error) {
