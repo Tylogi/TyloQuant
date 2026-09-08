@@ -300,6 +300,8 @@ constexpr std::uint32_t kGroupedVqVectorProfileMask =
     | (std::uint32_t{1} << kVqProfileNvq1L)
     | (std::uint32_t{1} << kVqProfileNpqL)
     | (std::uint32_t{1} << kVqProfileNvq1S);
+constexpr std::uint32_t kGroupedJscExtendedProfileMask =
+    std::uint32_t{1} << kVqProfileJscExtended8;
 
 constexpr const char* kMoeHeader = R"METAL(
 template <typename Stream>
@@ -3307,16 +3309,35 @@ public:
         const bool vector_vq =
             (static_cast<std::uint32_t>(config_.vq_profile_mask)
                 & kGroupedVqVectorProfileMask) != 0;
+        const bool vector_jsc_extended =
+            (static_cast<std::uint32_t>(config_.vq_profile_mask)
+                & kGroupedJscExtendedProfileMask) != 0;
+        const char* library_name;
+        if (config_.use_nax) {
+            library_name = vector_vq
+                ? (vector_jsc_extended
+                    ? "mfq_grouped_nint4_nax_v2_legacy_vq_jsc_extended"
+                    : "mfq_grouped_nint4_nax_v2_legacy_vq_vector")
+                : (vector_jsc_extended
+                    ? "mfq_grouped_nint4_nax_v2_jsc_extended"
+                    : "mfq_grouped_nint4_nax_v2");
+        } else {
+            library_name = vector_vq
+                ? (vector_jsc_extended
+                    ? "mfq_grouped_mmq_v13_legacy_vq_jsc_extended"
+                    : "mfq_grouped_mmq_v13_legacy_vq_vector")
+                : (vector_jsc_extended
+                    ? "mfq_grouped_mmq_v13_jsc_extended"
+                    : "mfq_grouped_mmq_v13");
+        }
         auto* library = device.get_library(
-            config_.use_nax
-                ? (vector_vq
-                    ? "mfq_grouped_nint4_nax_v2_legacy_vq_vector"
-                    : "mfq_grouped_nint4_nax_v2")
-                : (vector_vq
-                    ? "mfq_grouped_mmq_v13_legacy_vq_vector"
-                    : "mfq_grouped_mmq_v13"),
+            library_name,
             compile_options,
-            [use_nax = config_.use_nax, vector_vq] {
+            [
+                use_nax = config_.use_nax,
+                vector_vq,
+                vector_jsc_extended
+            ] {
                 std::string source;
                 source.reserve(
                     (use_nax
@@ -3335,6 +3356,10 @@ public:
                 if (vector_vq) {
                     source +=
                         "#define MFQ_ENABLE_LEGACY_VQ_VECTOR 1\n";
+                }
+                if (vector_jsc_extended) {
+                    source +=
+                        "#define MFQ_ENABLE_JSC_EXTENDED_VECTOR 1\n";
                 }
                 source += "using namespace metal;\n";
                 source += "using bfloat16_t = bfloat;\n";

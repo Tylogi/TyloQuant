@@ -539,6 +539,15 @@ VqFixture make_jsc_nvq(
     }
     append<std::uint8_t>(blob, group64 ? 1 : 0);
     blob.insert(blob.end(), 11, 0);
+    const auto code_value = [group64](
+        int bank,
+        int entry,
+        int component) {
+        return group64
+            ? static_cast<std::int8_t>(
+                (entry * 3 + component * 5 + bank * 7) % 15 - 7)
+            : static_cast<std::int8_t>(bank + 1);
+    };
     for (int bank = 0; bank < 2; ++bank) {
         for (
             int entry = 0;
@@ -550,17 +559,56 @@ VqFixture make_jsc_nvq(
                  ++component) {
                 append<std::int8_t>(
                     blob,
-                    static_cast<std::int8_t>(
-                        bank + 1));
+                    code_value(bank, entry, component));
             }
         }
     }
+    std::vector<float> dense;
     if (group64) {
         const int groups = (input + 23) / 24;
         append_vq_anchors(blob, output);
+        dense.resize(
+            static_cast<std::size_t>(output) * input);
         for (int row = 0; row < output; ++row) {
             for (int group = 0; group < groups; ++group) {
-                append<std::uint64_t>(blob, std::uint64_t{1} << 60);
+                const auto state = static_cast<std::uint64_t>(
+                    (row + group) & 15);
+                std::uint64_t record = state << 60;
+                for (int chunk = 0; chunk < 3; ++chunk) {
+                    if (group * 3 + chunk >= (input + 7) / 8) {
+                        continue;
+                    }
+                    const auto index = static_cast<std::uint32_t>(
+                        (row * 17 + group * 11 + chunk * 3)
+                        & ((1 << index_bits) - 1));
+                    const auto mask7 = static_cast<std::uint32_t>(
+                        (row * 13 + group * 7 + chunk * 5) & 0x7f);
+                    const auto sign_bits = mask7
+                        | ((std::popcount(mask7) & 1u) << 7u);
+                    const auto segment = static_cast<std::uint64_t>(
+                        index | (sign_bits << 12u));
+                    record |= segment << (chunk * 20);
+                    for (int component = 0; component < 8; ++component) {
+                        const int column = group * 24
+                            + chunk * 8 + component;
+                        if (column >= input) {
+                            continue;
+                        }
+                        float value = static_cast<float>(
+                            code_value(
+                                static_cast<int>(state & 1u),
+                                static_cast<int>(index),
+                                component));
+                        if ((sign_bits & (1u << component)) != 0u) {
+                            value = -value;
+                        }
+                        dense[
+                            static_cast<std::size_t>(row) * input
+                                + column
+                        ] = value;
+                    }
+                }
+                append<std::uint64_t>(blob, record);
             }
         }
     } else {
@@ -579,13 +627,15 @@ VqFixture make_jsc_nvq(
         std::move(dtype),
         std::move(blob),
         {},
-        repeated_vq_dense(
-            output,
-            input,
-            std::vector<float>(
-                static_cast<std::size_t>(
-                    vector_size),
-                2.0f)),
+        group64
+            ? std::move(dense)
+            : repeated_vq_dense(
+                output,
+                input,
+                std::vector<float>(
+                    static_cast<std::size_t>(
+                        vector_size),
+                    2.0f)),
         {},
         0,
         0,
@@ -4423,6 +4473,28 @@ void test_grouped_vq_decoder_tail_prefill() {
             3,
             4,
             9),
+        make_jsc_nvq(
+            output,
+            input_width,
+            "NVQ2J-L",
+            4,
+            8,
+            10),
+        make_jsc_nvq(
+            output,
+            input_width,
+            "NVQ2J-XL",
+            5,
+            8,
+            12),
+        make_jsc_nvq(
+            output,
+            input_width,
+            "NVQ2J-XL",
+            5,
+            8,
+            12,
+            true),
     });
     const auto weight = mfq::metal::MlxMoeWeight::from_blob(
         fixture.blob);
