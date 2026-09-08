@@ -135,14 +135,12 @@ __device__ __forceinline__ float paged_warp_sum(float value) {
 __device__ __forceinline__ void paged_softmax_step(
         float score, float & maximum, float & denominator,
         float & previous_factor, float & probability) {
-    previous_factor = 1.0f;
-    probability = 1.0f;
-    if (score > maximum) {
-        previous_factor = expf(maximum - score);
-        maximum = score;
-    } else {
-        probability = expf(score - maximum);
-    }
+    const float difference = score - maximum;
+    const float factor = expf(-fabsf(difference));
+    const bool score_is_new_maximum = difference > 0.0f;
+    previous_factor = score_is_new_maximum ? factor : 1.0f;
+    probability = score_is_new_maximum ? 1.0f : factor;
+    maximum = fmaxf(maximum, score);
     denominator = denominator * previous_factor + probability;
 }
 
