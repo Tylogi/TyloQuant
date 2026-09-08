@@ -460,8 +460,8 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     __shared__ float denominator[Rep];
     __shared__ float previous_factor[Rep];
     __shared__ float probability[Rep];
-    __shared__ uintptr_t key_page_address;
-    __shared__ uintptr_t value_page_address;
+    __shared__ uintptr_t shared_key_page_address;
+    __shared__ uintptr_t shared_value_page_address;
     if (tid < Rep) {
         maximum[tid] = -1e30f;
         denominator[tid] = 0.0f;
@@ -469,6 +469,8 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     __syncthreads();
     const size_t page_elements =
         static_cast<size_t>(Hk) * active_page_size * D;
+    unsigned long long key_page_address = 0;
+    unsigned long long value_page_address = 0;
     for (int token = start; token < end; ++token) {
         int offset = 0;
         int logical_page = 0;
@@ -481,41 +483,77 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
             logical_page = token / page_size;
         }
         if (token == start || offset == 0) {
-            if (tid == 0) {
-                const int physical = page_table[
-                    static_cast<size_t>(batch) * logical_pages +
-                    logical_page];
-                int chunk = -1;
-                int local_page = 0;
-                if constexpr (FixedGeometry) {
-                    chunk = physical >= 0 ? physical >> 6 : -1;
-                    local_page = physical & (FixedPagesPerChunk - 1);
-                } else {
-                    chunk = physical >= 0
-                        ? physical / pages_per_chunk : -1;
-                    local_page = physical - chunk * pages_per_chunk;
+            if constexpr (FixedGeometry) {
+                unsigned long long next_key_page_address = 0;
+                unsigned long long next_value_page_address = 0;
+                if (lane == 0) {
+                    const int physical = page_table[
+                        static_cast<size_t>(batch) * logical_pages +
+                        logical_page];
+                    const int chunk = physical >= 0 ? physical >> 6 : -1;
+                    const int local_page =
+                        physical & (FixedPagesPerChunk - 1);
+                    if (chunk >= 0 && chunk < chunks &&
+                            k_chunk_ptrs[chunk] != 0) {
+                        next_key_page_address = static_cast<unsigned long long>(
+                            reinterpret_cast<uintptr_t>(
+                                reinterpret_cast<const scalar_t *>(
+                                    static_cast<uintptr_t>(
+                                        k_chunk_ptrs[chunk])) +
+                                static_cast<size_t>(local_page) *
+                                    page_elements));
+                    }
+                    if (chunk >= 0 && chunk < chunks &&
+                            v_chunk_ptrs[chunk] != 0) {
+                        next_value_page_address =
+                            static_cast<unsigned long long>(
+                                reinterpret_cast<uintptr_t>(
+                                    reinterpret_cast<const scalar_t *>(
+                                        static_cast<uintptr_t>(
+                                            v_chunk_ptrs[chunk])) +
+                                    static_cast<size_t>(local_page) *
+                                        page_elements));
+                    }
                 }
-                key_page_address = chunk >= 0 && chunk < chunks &&
-                        k_chunk_ptrs[chunk] != 0
-                    ? reinterpret_cast<uintptr_t>(
-                        reinterpret_cast<const scalar_t *>(
-                            static_cast<uintptr_t>(k_chunk_ptrs[chunk])) +
-                        static_cast<size_t>(local_page) * page_elements) : 0;
-                value_page_address = chunk >= 0 && chunk < chunks &&
-                        v_chunk_ptrs[chunk] != 0
-                    ? reinterpret_cast<uintptr_t>(
-                        reinterpret_cast<const scalar_t *>(
-                            static_cast<uintptr_t>(v_chunk_ptrs[chunk])) +
-                        static_cast<size_t>(local_page) * page_elements) : 0;
+                key_page_address = __shfl_sync(
+                    0xffffffffu, next_key_page_address, 0);
+                value_page_address = __shfl_sync(
+                    0xffffffffu, next_value_page_address, 0);
+            } else {
+                if (tid == 0) {
+                    const int physical = page_table[
+                        static_cast<size_t>(batch) * logical_pages +
+                        logical_page];
+                    const int chunk = physical >= 0
+                        ? physical / pages_per_chunk : -1;
+                    const int local_page =
+                        physical - chunk * pages_per_chunk;
+                    shared_key_page_address = chunk >= 0 && chunk < chunks &&
+                            k_chunk_ptrs[chunk] != 0
+                        ? reinterpret_cast<uintptr_t>(
+                            reinterpret_cast<const scalar_t *>(
+                                static_cast<uintptr_t>(k_chunk_ptrs[chunk])) +
+                            static_cast<size_t>(local_page) * page_elements) : 0;
+                    shared_value_page_address = chunk >= 0 && chunk < chunks &&
+                            v_chunk_ptrs[chunk] != 0
+                        ? reinterpret_cast<uintptr_t>(
+                            reinterpret_cast<const scalar_t *>(
+                                static_cast<uintptr_t>(v_chunk_ptrs[chunk])) +
+                            static_cast<size_t>(local_page) * page_elements) : 0;
+                }
+                __syncthreads();
+                key_page_address = static_cast<unsigned long long>(
+                    shared_key_page_address);
+                value_page_address = static_cast<unsigned long long>(
+                    shared_value_page_address);
             }
-            __syncthreads();
         }
         const auto * key_page = reinterpret_cast<const scalar_t *>(
-            key_page_address);
+            static_cast<uintptr_t>(key_page_address));
         const auto * value_page = reinterpret_cast<const scalar_t *>(
-            value_page_address);
+            static_cast<uintptr_t>(value_page_address));
         const size_t element =
-            (static_cast<size_t>(kv_head) * page_size + offset) * D + tid;
+            (static_cast<size_t>(kv_head) * active_page_size + offset) * D + tid;
         const float key = key_page != nullptr
             ? static_cast<float>(key_page[element]) : 0.0f;
         const float value = value_page != nullptr
