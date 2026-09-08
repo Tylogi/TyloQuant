@@ -539,7 +539,6 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                 (static_cast<size_t>(kv_head) * active_page_size + offset) * D +
                 first_dimension;
             float key[ValuesPerThread];
-            float value[ValuesPerThread];
             if (key_page != nullptr) {
                 paged_load_values(key_page + first_element, key);
             } else {
@@ -547,15 +546,6 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                 for (int value_index = 0;
                         value_index < ValuesPerThread; ++value_index) {
                     key[value_index] = 0.0f;
-                }
-            }
-            if (value_page != nullptr) {
-                paged_load_values(value_page + first_element, value);
-            } else {
-                #pragma unroll
-                for (int value_index = 0;
-                        value_index < ValuesPerThread; ++value_index) {
-                    value[value_index] = 0.0f;
                 }
             }
             float head_dot = 0.0f;
@@ -608,6 +598,16 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                     }
                 }
                 __syncthreads();
+            }
+            float value[ValuesPerThread];
+            if (value_page != nullptr) {
+                paged_load_values(value_page + first_element, value);
+            } else {
+                #pragma unroll
+                for (int value_index = 0;
+                        value_index < ValuesPerThread; ++value_index) {
+                    value[value_index] = 0.0f;
+                }
             }
             #pragma unroll
             for (int index = 0; index < Rep; ++index) {
