@@ -559,6 +559,8 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                 }
             }
             float head_dot = 0.0f;
+            float lane_previous_factor = 0.0f;
+            float lane_probability = 0.0f;
             #pragma unroll
             for (int index = 0; index < Rep; ++index) {
                 float dot = 0.0f;
@@ -579,13 +581,12 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                 if (lane < Rep) {
                     const float score = head_dot * scale;
                     const float new_maximum = fmaxf(maximum, score);
-                    previous_factor[lane] = expf(maximum - new_maximum);
-                    probability[lane] = expf(score - new_maximum);
-                    denominator = denominator * previous_factor[lane] +
-                        probability[lane];
+                    lane_previous_factor = expf(maximum - new_maximum);
+                    lane_probability = expf(score - new_maximum);
+                    denominator = denominator * lane_previous_factor +
+                        lane_probability;
                     maximum = new_maximum;
                 }
-                __syncwarp();
             } else {
                 __syncthreads();
                 if (warp == 0) {
@@ -611,12 +612,23 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
             }
             #pragma unroll
             for (int index = 0; index < Rep; ++index) {
+                float active_previous_factor;
+                float active_probability;
+                if constexpr (Warps == 1) {
+                    active_previous_factor = __shfl_sync(
+                        0xffffffffu, lane_previous_factor, index);
+                    active_probability = __shfl_sync(
+                        0xffffffffu, lane_probability, index);
+                } else {
+                    active_previous_factor = previous_factor[index];
+                    active_probability = probability[index];
+                }
                 #pragma unroll
                 for (int value_index = 0;
                         value_index < ValuesPerThread; ++value_index) {
                     value_sum[index][value_index] =
-                        value_sum[index][value_index] * previous_factor[index] +
-                        probability[index] * value[value_index];
+                        value_sum[index][value_index] * active_previous_factor +
+                        active_probability * value[value_index];
                 }
             }
         }
