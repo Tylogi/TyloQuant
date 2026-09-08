@@ -455,7 +455,11 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
         maximum[tid] = -1e30f;
         denominator[tid] = 0.0f;
     }
-    __syncthreads();
+    if constexpr (Warps == 1) {
+        __syncwarp();
+    } else {
+        __syncthreads();
+    }
     const size_t page_elements =
         static_cast<size_t>(Hk) * active_page_size * D;
     for (int token = start; token < end; ++token) {
@@ -497,7 +501,11 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                             static_cast<uintptr_t>(v_chunk_ptrs[chunk])) +
                         static_cast<size_t>(local_page) * page_elements) : 0;
             }
-            __syncthreads();
+            if constexpr (Warps == 1) {
+                __syncwarp();
+            } else {
+                __syncthreads();
+            }
         }
         const auto * key_page = reinterpret_cast<const scalar_t *>(
             key_page_address);
@@ -527,14 +535,7 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                 dot += query[index][value_index] * key[value_index];
             }
             dot = paged_warp_sum(dot);
-            if (lane == 0) warp_dot[index][warp] = dot;
-        }
-        __syncthreads();
-        if (warp == 0) {
-            #pragma unroll
-            for (int index = 0; index < Rep; ++index) {
-                float dot = lane < Warps ? warp_dot[index][lane] : 0.0f;
-                dot = paged_warp_sum(dot);
+            if constexpr (Warps == 1) {
                 if (lane == 0) {
                     const float score = dot * scale;
                     const float new_maximum = fmaxf(maximum[index], score);
@@ -545,9 +546,34 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                         previous_factor[index] + probability[index];
                     maximum[index] = new_maximum;
                 }
+            } else if (lane == 0) {
+                warp_dot[index][warp] = dot;
             }
         }
-        __syncthreads();
+        if constexpr (Warps == 1) {
+            __syncwarp();
+        } else {
+            __syncthreads();
+            if (warp == 0) {
+                #pragma unroll
+                for (int index = 0; index < Rep; ++index) {
+                    float dot = lane < Warps ? warp_dot[index][lane] : 0.0f;
+                    dot = paged_warp_sum(dot);
+                    if (lane == 0) {
+                        const float score = dot * scale;
+                        const float new_maximum = fmaxf(
+                            maximum[index], score);
+                        previous_factor[index] = expf(
+                            maximum[index] - new_maximum);
+                        probability[index] = expf(score - new_maximum);
+                        denominator[index] = denominator[index] *
+                            previous_factor[index] + probability[index];
+                        maximum[index] = new_maximum;
+                    }
+                }
+            }
+            __syncthreads();
+        }
         #pragma unroll
         for (int index = 0; index < Rep; ++index) {
             #pragma unroll
@@ -812,8 +838,8 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
             if (D == 256 && gqa_ratio == 4) {
                 if (page == 16 && chunk_pages == 64) {
                     paged_attention_decode_split_gqa4_d256_kernel<
-                        16, 64, 4, scalar_t><<<
-                        B * Hk * split_parts, 64, 0, stream>>>(
+                        16, 64, 8, scalar_t><<<
+                        B * Hk * split_parts, 32, 0, stream>>>(
                         q.data_ptr<scalar_t>(), k_chunk_ptrs.data_ptr<int64_t>(),
                         v_chunk_ptrs.data_ptr<int64_t>(),
                         page_table.data_ptr<int32_t>(), seq_len.data_ptr<int64_t>(),
