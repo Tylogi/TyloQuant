@@ -2793,6 +2793,7 @@ __device__ __forceinline__ void nint_moe_mma_profile(
         __half (*W_s)[kMoeMmaBkStride<BM>],
         __half (*X_s)[kMoeMmaBkStride<BM>],
         float (*C_s)[16][16],
+        int32_t * source_rows_s,
         int first,
         int last,
         int n0,
@@ -2817,6 +2818,17 @@ __device__ __forceinline__ void nint_moe_mma_profile(
     const int tid = warp * 32 + lane;
     const int warp_m0 = warp / NFRAGS;
     const int warp_n = warp % NFRAGS;
+
+    if (tid < BM) {
+        const int compact = first + tid;
+        int source_row = -1;
+        if (compact < last) {
+            const int pair = ids_dst[compact];
+            source_row = routed_input ? pair : pair / routes;
+        }
+        source_rows_s[tid] = source_row;
+    }
+    __syncthreads();
 
     using FragA = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
                                          __half, nvcuda::wmma::row_major>;
@@ -2876,12 +2888,10 @@ __device__ __forceinline__ void nint_moe_mma_profile(
         for (int index = tid; index < XPAIRS; index += 256) {
             const int mm = index / (BK / 2);
             const int pair_k = index - mm * (BK / 2);
-            const int compact = first + mm;
             const int k = kb + pair_k * 2;
             __half2 value = __float2half2_rn(0.0f);
-            if (compact < last) {
-                const int pair = ids_dst[compact];
-                const int source_row = routed_input ? pair : pair / routes;
+            const int source_row = source_rows_s[mm];
+            if (source_row >= 0) {
                 const __half * row = x + static_cast<size_t>(source_row) * k_real;
                 if (k + 1 < k_real) {
                     value = *reinterpret_cast<const __half2 *>(row + k);
@@ -3170,6 +3180,7 @@ __global__ void __launch_bounds__(256, BM >= 32 ? 3 : 1) nint_moe_hetero_mma_ker
     __shared__ __half W_s[kMoeMmaBn][kMoeMmaBkStride<BM>];
     __shared__ __half X_s[BM][kMoeMmaBkStride<BM>];
     __shared__ float C_s[BM == 64 ? 4 : 8][16][16];
+    __shared__ int32_t source_rows_s[BM];
 
     const int ntiles_n = (out_per_expert + kMoeMmaBn - 1) / kMoeMmaBn;
     const int total_fine_tiles = tile_bounds[experts];
@@ -3203,7 +3214,7 @@ __global__ void __launch_bounds__(256, BM >= 32 ? 3 : 1) nint_moe_hetero_mma_ker
 #define MFQ_MOE_MMA_PROFILE(BITS_VALUE, GS_VALUE, GROUPS_VALUE) \
         nint_moe_mma_profile<BITS_VALUE, GS_VALUE, GROUPS_VALUE, BM>( \
             q_packed, sub_scale, sub_min, neuron_scale, neuron_min, x, ids_dst, out, \
-            W_s, X_s, C_s, first, last, n0, local_expert, routes, out_per_expert, \
+            W_s, X_s, C_s, source_rows_s, first, last, n0, local_expert, routes, out_per_expert, \
             weight_out_stride, weight_row_offset, groups, k_real, routed_input)
         switch (profile) {
             case kMoeProfileNint2Gs16: MFQ_MOE_MMA_PROFILE(2, 16, 7); break;
