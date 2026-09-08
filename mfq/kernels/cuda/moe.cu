@@ -2852,10 +2852,11 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                 qg = q_packed + meta * QBYTES;
             }
             int packed = valid ? unpack_four<BITS>(qg, 0) : 0;
+            int next = GS > 4 && valid ? unpack_four<BITS>(qg, 4) : 0;
 #pragma unroll
             for (int i = 0; i < GS; i += 4) {
-                const int next = i + 4 < GS && valid
-                    ? unpack_four<BITS>(qg, i + 4) : 0;
+                const int ahead = i + 8 < GS && valid
+                    ? unpack_four<BITS>(qg, i + 8) : 0;
                 const float q0 = static_cast<float>(packed & 255);
                 const float q1 = static_cast<float>((packed >> 8) & 255);
                 const float q2 = static_cast<float>((packed >> 16) & 255);
@@ -2865,6 +2866,7 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                 *reinterpret_cast<__half2 *>(&W_s[nn][gl * GS + i + 2]) =
                     __floats2half2_rn(d * q2 - m, d * q3 - m);
                 packed = next;
+                next = ahead;
             }
         }
 
@@ -3202,7 +3204,7 @@ __global__ void __launch_bounds__(256, BM >= 32 ? 3 : 1) nint_moe_hetero_mma_ker
             W_s, X_s, C_s, first, last, n0, local_expert, routes, out_per_expert, \
             weight_out_stride, weight_row_offset, groups, k_real, routed_input)
         switch (profile) {
-            case kMoeProfileNint2Gs16: MFQ_MOE_MMA_PROFILE(2, 16, 4); break;
+            case kMoeProfileNint2Gs16: MFQ_MOE_MMA_PROFILE(2, 16, 7); break;
             case kMoeProfileNint3Gs24: MFQ_MOE_MMA_PROFILE(3, 24, 4); break;
             case kMoeProfileNint4Gs24: MFQ_MOE_MMA_PROFILE(4, 24, 4); break;
             case kMoeProfileNint5Gs28: MFQ_MOE_MMA_PROFILE(5, 28, 4); break;
