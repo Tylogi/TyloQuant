@@ -54,6 +54,23 @@ __device__ __forceinline__ void paged_load_values(
     }
 }
 
+template <int Count>
+__device__ __forceinline__ void paged_store_floats(
+        float * destination, const float (&values)[Count]) {
+    if constexpr (Count == 8) {
+        auto * packed = reinterpret_cast<float4 *>(destination);
+        packed[0] = make_float4(
+            values[0], values[1], values[2], values[3]);
+        packed[1] = make_float4(
+            values[4], values[5], values[6], values[7]);
+    } else {
+        #pragma unroll
+        for (int index = 0; index < Count; ++index) {
+            destination[index] = values[index];
+        }
+    }
+}
+
 template <typename scalar_t>
 __global__ void paged_kv_cache_write_kernel(
     const int64_t * __restrict__ k_chunk_ptrs,
@@ -622,12 +639,8 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
         const int query_index = batch * Hq + first_query_head + index;
         const size_t statistic =
             static_cast<size_t>(query_index) * workspace_parts + part;
-        #pragma unroll
-        for (int value_index = 0;
-                value_index < ValuesPerThread; ++value_index) {
-            partial_o[statistic * D + first_dimension + value_index] =
-                value_sum[index][value_index];
-        }
+        paged_store_floats(
+            partial_o + statistic * D + first_dimension, value_sum[index]);
         if (tid == index) {
             partial_m[statistic] = start < end ? maximum : -1e30f;
             partial_l[statistic] = start < end ? denominator : 0.0f;
