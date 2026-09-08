@@ -277,6 +277,103 @@ inline void decode_nint4_group24(
     }
 }
 
+inline void decode_nint3_group24(
+    const device int* d,
+    const device uchar* values,
+    const device uchar* sub_scales,
+    const device uchar* sub_mins,
+    const device float* anchor_scales,
+    const device float* anchor_mins,
+    threadgroup half* target,
+    uint row,
+    uint group) {
+    uint groups = uint(d[6]);
+    uint q_offset = uint(d[7]);
+    uint sub_offset = uint(d[8]);
+    uint anchor_offset = uint(d[9]);
+    uint metadata = row * groups + group;
+    float scale = anchor_scales[anchor_offset + row]
+        * float(sub_scales[sub_offset + metadata]);
+    float minimum = anchor_mins[anchor_offset + row]
+        * float(sub_mins[sub_offset + metadata]);
+    uint packed_base = q_offset + metadata * 9u;
+#pragma clang loop unroll(full)
+    for (uint chunk = 0u; chunk < 3u; ++chunk) {
+        uint chunk_base = packed_base + chunk * 3u;
+        uint packed = uint(values[chunk_base])
+            | (uint(values[chunk_base + 1u]) << 8u)
+            | (uint(values[chunk_base + 2u]) << 16u);
+        half4 first = half4(
+            scale * float(packed & 7u) - minimum,
+            scale * float((packed >> 3u) & 7u) - minimum,
+            scale * float((packed >> 6u) & 7u) - minimum,
+            scale * float((packed >> 9u) & 7u) - minimum);
+        half4 second = half4(
+            scale * float((packed >> 12u) & 7u) - minimum,
+            scale * float((packed >> 15u) & 7u) - minimum,
+            scale * float((packed >> 18u) & 7u) - minimum,
+            scale * float((packed >> 21u) & 7u) - minimum);
+        *reinterpret_cast<threadgroup half4*>(
+            target + chunk * 8u) = first;
+        *reinterpret_cast<threadgroup half4*>(
+            target + chunk * 8u + 4u) = second;
+    }
+}
+
+inline void decode_nint6_group24(
+    const device int* d,
+    const device uchar* values,
+    const device uchar* sub_scales,
+    const device uchar* sub_mins,
+    const device float* anchor_scales,
+    const device float* anchor_mins,
+    threadgroup half* target,
+    uint row,
+    uint group) {
+    uint groups = uint(d[6]);
+    uint q_offset = uint(d[7]);
+    uint sub_offset = uint(d[8]);
+    uint anchor_offset = uint(d[9]);
+    uint metadata = row * groups + group;
+    float scale = anchor_scales[anchor_offset + row]
+        * float(sub_scales[sub_offset + metadata]);
+    float minimum = anchor_mins[anchor_offset + row]
+        * float(sub_mins[sub_offset + metadata]);
+    uint packed_base = q_offset + metadata * 18u;
+#pragma clang loop unroll(full)
+    for (uint chunk = 0u; chunk < 6u; ++chunk) {
+        uint chunk_base = packed_base + chunk * 3u;
+        uint packed = uint(values[chunk_base])
+            | (uint(values[chunk_base + 1u]) << 8u)
+            | (uint(values[chunk_base + 2u]) << 16u);
+        half4 decoded = half4(
+            scale * float(packed & 63u) - minimum,
+            scale * float((packed >> 6u) & 63u) - minimum,
+            scale * float((packed >> 12u) & 63u) - minimum,
+            scale * float((packed >> 18u) & 63u) - minimum);
+        *reinterpret_cast<threadgroup half4*>(
+            target + chunk * 4u) = decoded;
+    }
+}
+
+inline void decode_nint2_packed16(
+    uchar4 packed,
+    float scale,
+    float minimum,
+    threadgroup half* target) {
+#pragma clang loop unroll(full)
+    for (uint chunk = 0u; chunk < 4u; ++chunk) {
+        uint value = uint(packed[chunk]);
+        half4 decoded = half4(
+            scale * float(value & 3u) - minimum,
+            scale * float((value >> 2u) & 3u) - minimum,
+            scale * float((value >> 4u) & 3u) - minimum,
+            scale * float((value >> 6u) & 3u) - minimum);
+        *reinterpret_cast<threadgroup half4*>(
+            target + chunk * 4u) = decoded;
+    }
+}
+
 inline void decode_nint2_group16(
     const device int* d,
     const device uchar* values,
@@ -298,17 +395,42 @@ inline void decode_nint2_group16(
         * float(sub_mins[sub_offset + metadata]);
     uchar4 packed = *reinterpret_cast<device const uchar4*>(
         values + q_offset + metadata * 4u);
-#pragma clang loop unroll(full)
-    for (uint chunk = 0u; chunk < 4u; ++chunk) {
-        uint value = uint(packed[chunk]);
-        half4 decoded = half4(
-            scale * float(value & 3u) - minimum,
-            scale * float((value >> 2u) & 3u) - minimum,
-            scale * float((value >> 4u) & 3u) - minimum,
-            scale * float((value >> 6u) & 3u) - minimum);
-        *reinterpret_cast<threadgroup half4*>(
-            target + chunk * 4u) = decoded;
-    }
+    decode_nint2_packed16(packed, scale, minimum, target);
+}
+
+inline void decode_nint2_pair32(
+    const device int* d,
+    const device uchar* values,
+    const device uchar* sub_scales,
+    const device uchar* sub_mins,
+    const device float* anchor_scales,
+    const device float* anchor_mins,
+    threadgroup half* target,
+    uint row,
+    uint first_group) {
+    uint groups = uint(d[6]);
+    uint q_offset = uint(d[7]);
+    uint sub_offset = uint(d[8]);
+    uint anchor_offset = uint(d[9]);
+    uint first_metadata = row * groups + first_group;
+    float anchor_scale = anchor_scales[anchor_offset + row];
+    float anchor_minimum = anchor_mins[anchor_offset + row];
+    float first_scale = anchor_scale
+        * float(sub_scales[sub_offset + first_metadata]);
+    float first_minimum = anchor_minimum
+        * float(sub_mins[sub_offset + first_metadata]);
+    float second_scale = anchor_scale
+        * float(sub_scales[sub_offset + first_metadata + 1u]);
+    float second_minimum = anchor_minimum
+        * float(sub_mins[sub_offset + first_metadata + 1u]);
+    uchar4 first_packed = *reinterpret_cast<device const uchar4*>(
+        values + q_offset + first_metadata * 4u);
+    uchar4 second_packed = *reinterpret_cast<device const uchar4*>(
+        values + q_offset + (first_metadata + 1u) * 4u);
+    decode_nint2_packed16(
+        first_packed, first_scale, first_minimum, target);
+    decode_nint2_packed16(
+        second_packed, second_scale, second_minimum, target + 16u);
 }
 
 template <uint BITS, uint GROUP_SIZE>
@@ -883,11 +1005,18 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                     || family == 4u || family == 5u || family == 6u;
                 if (aligned_nint) {
                     uint groups_per_tile = uint(BK) / nint_group_size;
+                    uint decode_units_per_tile = nint_bits == 2u
+                        ? (groups_per_tile + 1u) / 2u
+                        : groups_per_tile;
                     for (uint item = thread_id;
-                         item < uint(BN) * groups_per_tile;
+                         item < uint(BN) * decode_units_per_tile;
                          item += TGP_SIZE) {
-                        uint output_row = item / groups_per_tile;
-                        uint local_group = item - output_row * groups_per_tile;
+                        uint output_row = item / decode_units_per_tile;
+                        uint decode_unit =
+                            item - output_row * decode_units_per_tile;
+                        uint local_group = nint_bits == 2u
+                            ? decode_unit * 2u
+                            : decode_unit;
                         uint input_column =
                             uint(k_base) + local_group * nint_group_size;
                         if (output_row >= uint(valid_n)
@@ -903,28 +1032,34 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                             Ws + output_row * uint(BK_padded)
                             + local_group * nint_group_size;
                         if (nint_bits == 2u) {
-                            decode_nint_aligned_group<2u, 16u>(
-                                descriptor, nint_q, nint_sub_scale,
-                                nint_sub_min, nint_anchor_scale,
-                                nint_anchor_min, target, pool_row, group,
-                                uint(input_width));
+                            if (local_group + 1u < groups_per_tile
+                                && input_column + nint_group_size
+                                    < uint(input_width)) {
+                                decode_nint2_pair32(
+                                    descriptor, nint_q, nint_sub_scale,
+                                    nint_sub_min, nint_anchor_scale,
+                                    nint_anchor_min, target, pool_row, group);
+                            } else {
+                                decode_nint2_group16(
+                                    descriptor, nint_q, nint_sub_scale,
+                                    nint_sub_min, nint_anchor_scale,
+                                    nint_anchor_min, target, pool_row, group);
+                            }
                         } else if (nint_bits == 3u) {
-                            decode_nint_aligned_group<3u, 24u>(
+                            decode_nint3_group24(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
-                                nint_anchor_min, target, pool_row, group,
-                                uint(input_width));
+                                nint_anchor_min, target, pool_row, group);
                         } else if (nint_bits == 4u) {
                             decode_nint4_group24(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
                                 nint_anchor_min, target, pool_row, group);
                         } else if (nint_bits == 6u) {
-                            decode_nint_aligned_group<6u, 24u>(
+                            decode_nint6_group24(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
-                                nint_anchor_min, target, pool_row, group,
-                                uint(input_width));
+                                nint_anchor_min, target, pool_row, group);
                         } else {
                             decode_nint_aligned_group<8u, 48u>(
                                 descriptor, nint_q, nint_sub_scale,
@@ -1309,11 +1444,18 @@ template <
                     || family == 4u || family == 5u || family == 6u;
                 if (aligned_nint) {
                     uint groups_per_tile = uint(BK) / nint_group_size;
+                    uint decode_units_per_tile = nint_bits == 2u
+                        ? (groups_per_tile + 1u) / 2u
+                        : groups_per_tile;
                     for (uint item = thread_id;
-                         item < uint(BN) * groups_per_tile;
+                         item < uint(BN) * decode_units_per_tile;
                          item += TGP_SIZE) {
-                        uint output_row = item / groups_per_tile;
-                        uint local_group = item - output_row * groups_per_tile;
+                        uint output_row = item / decode_units_per_tile;
+                        uint decode_unit =
+                            item - output_row * decode_units_per_tile;
+                        uint local_group = nint_bits == 2u
+                            ? decode_unit * 2u
+                            : decode_unit;
                         uint input_column =
                             uint(k_base) + local_group * nint_group_size;
                         if (output_row >= uint(valid_n)
@@ -1329,27 +1471,34 @@ template <
                             Ws + output_row * uint(W_STRIDE)
                             + local_group * nint_group_size;
                         if (nint_bits == 2u) {
-                            decode_nint2_group16(
+                            if (local_group + 1u < groups_per_tile
+                                && input_column + nint_group_size
+                                    < uint(params.input_width)) {
+                                decode_nint2_pair32(
+                                    descriptor, nint_q, nint_sub_scale,
+                                    nint_sub_min, nint_anchor_scale,
+                                    nint_anchor_min, target, pool_row, group);
+                            } else {
+                                decode_nint2_group16(
+                                    descriptor, nint_q, nint_sub_scale,
+                                    nint_sub_min, nint_anchor_scale,
+                                    nint_anchor_min, target, pool_row, group);
+                            }
+                        } else if (nint_bits == 3u) {
+                            decode_nint3_group24(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
                                 nint_anchor_min, target, pool_row, group);
-                        } else if (nint_bits == 3u) {
-                            decode_nint_aligned_group<3u, 24u>(
-                                descriptor, nint_q, nint_sub_scale,
-                                nint_sub_min, nint_anchor_scale,
-                                nint_anchor_min, target, pool_row, group,
-                                uint(params.input_width));
                         } else if (nint_bits == 4u) {
                             decode_nint4_group24(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
                                 nint_anchor_min, target, pool_row, group);
                         } else if (nint_bits == 6u) {
-                            decode_nint_aligned_group<6u, 24u>(
+                            decode_nint6_group24(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
-                                nint_anchor_min, target, pool_row, group,
-                                uint(params.input_width));
+                                nint_anchor_min, target, pool_row, group);
                         } else {
                             decode_nint_aligned_group<8u, 48u>(
                                 descriptor, nint_q, nint_sub_scale,

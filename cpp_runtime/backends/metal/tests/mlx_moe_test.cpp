@@ -4319,7 +4319,9 @@ void test_grouped_mmq_prefill() {
 }
 
 void test_grouped_nint_mmq_prefill() {
-    constexpr int tokens = 49;
+    // Cross the heterogeneous NAX threshold on supported Apple GPUs while
+    // retaining the same reference coverage on compatibility-only devices.
+    constexpr int tokens = 513;
     constexpr int routes = 2;
     constexpr int output = 48;
     constexpr int input_width = 96;
@@ -4379,6 +4381,57 @@ void test_grouped_nint_mmq_prefill() {
                     gate / (1.0f + std::exp(-gate)) * up,
                     2e-2f);
             }
+        }
+    }
+}
+
+void test_grouped_nint2_pair_prefill() {
+    constexpr int tokens = 1024;
+    constexpr int output = 24;
+    constexpr int input_width = 96;
+    const auto fixture = make_moe_fixture(
+        {"NINT2"}, output, input_width, 23);
+    const auto weight = mfq::metal::MlxMoeWeight::from_blob(
+        fixture.blob);
+    require(
+        weight.supports_grouped_mmq(),
+        "NINT2-16 must support grouped prefill");
+    std::vector<float> input(tokens * input_width);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<float>(
+            static_cast<int>((index * 17 + 7) % 31) - 15)
+            / 128.0f;
+    }
+    const std::vector<std::int32_t> ids(tokens, 0);
+    const auto input_array = mlx::core::astype(
+        mlx::core::array(
+            input.begin(),
+            mlx::core::Shape{tokens, input_width}),
+        mlx::core::float16);
+    const auto ids_array = mlx::core::array(
+        ids.begin(), mlx::core::Shape{tokens, 1});
+    const auto plain = evaluated_floats(
+        weight.routed_matmul(input_array, ids_array));
+    const auto fused = evaluated_floats(
+        weight.routed_swiglu(input_array, ids_array));
+    for (int token = 0; token < tokens; ++token) {
+        for (int row = 0; row < output; ++row) {
+            float expected = 0.0f;
+            for (int column = 0; column < input_width; ++column) {
+                expected += input[token * input_width + column]
+                    * fixture.dense[row * input_width + column];
+            }
+            require_close(
+                plain[token * output + row], expected, 2e-2f);
+        }
+        for (int row = 0; row < output / 2; ++row) {
+            const float gate = plain[token * output + row];
+            const float up = plain[
+                token * output + output / 2 + row];
+            require_close(
+                fused[token * (output / 2) + row],
+                gate / (1.0f + std::exp(-gate)) * up,
+                2e-2f);
         }
     }
 }
@@ -4870,6 +4923,7 @@ int main(int argc, char** argv) {
         test_nepq_a_routed_and_fused_swiglu();
         test_grouped_mmq_prefill();
         test_grouped_nint_mmq_prefill();
+        test_grouped_nint2_pair_prefill();
         test_mixed_nintm_native_and_grouped_dispatch();
         test_grouped_mxfp4_vq_mmq_prefill();
         test_container_validation();
