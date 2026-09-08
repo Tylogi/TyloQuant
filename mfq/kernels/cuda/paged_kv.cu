@@ -491,7 +491,8 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     }
     const size_t page_elements =
         static_cast<size_t>(Hk) * active_page_size * D;
-    for (int token = start; token < end; ++token) {
+    int token = start;
+    while (token < end) {
         int offset = 0;
         int logical_page = 0;
         if constexpr (FixedGeometry) {
@@ -502,100 +503,77 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
             offset = token % page_size;
             logical_page = token / page_size;
         }
-        if (token == start || offset == 0) {
-            if (tid == 0) {
-                const int physical = page_table[
-                    static_cast<size_t>(batch) * logical_pages +
-                    logical_page];
-                int chunk = -1;
-                int local_page = 0;
-                if constexpr (FixedGeometry) {
-                    chunk = physical >= 0 ? physical >> 6 : -1;
-                    local_page = physical & (FixedPagesPerChunk - 1);
-                } else {
-                    chunk = physical >= 0
-                        ? physical / pages_per_chunk : -1;
-                    local_page = physical - chunk * pages_per_chunk;
-                }
-                key_page_address = chunk >= 0 && chunk < chunks &&
-                        k_chunk_ptrs[chunk] != 0
-                    ? reinterpret_cast<uintptr_t>(
-                        reinterpret_cast<const scalar_t *>(
-                            static_cast<uintptr_t>(k_chunk_ptrs[chunk])) +
-                        static_cast<size_t>(local_page) * page_elements) : 0;
-                value_page_address = chunk >= 0 && chunk < chunks &&
-                        v_chunk_ptrs[chunk] != 0
-                    ? reinterpret_cast<uintptr_t>(
-                        reinterpret_cast<const scalar_t *>(
-                            static_cast<uintptr_t>(v_chunk_ptrs[chunk])) +
-                        static_cast<size_t>(local_page) * page_elements) : 0;
-            }
-            if constexpr (Warps == 1) {
-                __syncwarp();
+        if (tid == 0) {
+            const int physical = page_table[
+                static_cast<size_t>(batch) * logical_pages + logical_page];
+            int chunk = -1;
+            int local_page = 0;
+            if constexpr (FixedGeometry) {
+                chunk = physical >= 0 ? physical >> 6 : -1;
+                local_page = physical & (FixedPagesPerChunk - 1);
             } else {
-                __syncthreads();
+                chunk = physical >= 0
+                    ? physical / pages_per_chunk : -1;
+                local_page = physical - chunk * pages_per_chunk;
             }
-        }
-        const auto * key_page = reinterpret_cast<const scalar_t *>(
-            key_page_address);
-        const auto * value_page = reinterpret_cast<const scalar_t *>(
-            value_page_address);
-        const size_t first_element =
-            (static_cast<size_t>(kv_head) * active_page_size + offset) * D +
-            first_dimension;
-        float key[ValuesPerThread];
-        float value[ValuesPerThread];
-        if (key_page != nullptr) {
-            paged_load_values(key_page + first_element, key);
-        } else {
-            #pragma unroll
-            for (int value_index = 0;
-                    value_index < ValuesPerThread; ++value_index) {
-                key[value_index] = 0.0f;
-            }
-        }
-        if (value_page != nullptr) {
-            paged_load_values(value_page + first_element, value);
-        } else {
-            #pragma unroll
-            for (int value_index = 0;
-                    value_index < ValuesPerThread; ++value_index) {
-                value[value_index] = 0.0f;
-            }
-        }
-        #pragma unroll
-        for (int index = 0; index < Rep; ++index) {
-            float dot = 0.0f;
-            #pragma unroll
-            for (int value_index = 0;
-                    value_index < ValuesPerThread; ++value_index) {
-                dot += query[index][value_index] * key[value_index];
-            }
-            dot = paged_warp_sum(dot);
-            if constexpr (Warps == 1) {
-                if (lane == 0) {
-                    const float score = dot * scale;
-                    const float new_maximum = fmaxf(maximum[index], score);
-                    previous_factor[index] = expf(
-                        maximum[index] - new_maximum);
-                    probability[index] = expf(score - new_maximum);
-                    denominator[index] = denominator[index] *
-                        previous_factor[index] + probability[index];
-                    maximum[index] = new_maximum;
-                }
-            } else if (lane == 0) {
-                warp_dot[index][warp] = dot;
-            }
+            key_page_address = chunk >= 0 && chunk < chunks &&
+                    k_chunk_ptrs[chunk] != 0
+                ? reinterpret_cast<uintptr_t>(
+                    reinterpret_cast<const scalar_t *>(
+                        static_cast<uintptr_t>(k_chunk_ptrs[chunk])) +
+                    static_cast<size_t>(local_page) * page_elements) : 0;
+            value_page_address = chunk >= 0 && chunk < chunks &&
+                    v_chunk_ptrs[chunk] != 0
+                ? reinterpret_cast<uintptr_t>(
+                    reinterpret_cast<const scalar_t *>(
+                        static_cast<uintptr_t>(v_chunk_ptrs[chunk])) +
+                    static_cast<size_t>(local_page) * page_elements) : 0;
         }
         if constexpr (Warps == 1) {
             __syncwarp();
         } else {
             __syncthreads();
-            if (warp == 0) {
+        }
+        const auto * key_page = reinterpret_cast<const scalar_t *>(
+            key_page_address);
+        const auto * value_page = reinterpret_cast<const scalar_t *>(
+            value_page_address);
+        const int page_end = min(
+            end, token + active_page_size - offset);
+        for (; token < page_end; ++token, ++offset) {
+            const size_t first_element =
+                (static_cast<size_t>(kv_head) * active_page_size + offset) * D +
+                first_dimension;
+            float key[ValuesPerThread];
+            float value[ValuesPerThread];
+            if (key_page != nullptr) {
+                paged_load_values(key_page + first_element, key);
+            } else {
                 #pragma unroll
-                for (int index = 0; index < Rep; ++index) {
-                    float dot = lane < Warps ? warp_dot[index][lane] : 0.0f;
-                    dot = paged_warp_sum(dot);
+                for (int value_index = 0;
+                        value_index < ValuesPerThread; ++value_index) {
+                    key[value_index] = 0.0f;
+                }
+            }
+            if (value_page != nullptr) {
+                paged_load_values(value_page + first_element, value);
+            } else {
+                #pragma unroll
+                for (int value_index = 0;
+                        value_index < ValuesPerThread; ++value_index) {
+                    value[value_index] = 0.0f;
+                }
+            }
+            #pragma unroll
+            for (int index = 0; index < Rep; ++index) {
+                float dot = 0.0f;
+                #pragma unroll
+                for (int value_index = 0;
+                        value_index < ValuesPerThread; ++value_index) {
+                    dot += query[index][value_index] * key[value_index];
+                }
+                dot = paged_warp_sum(dot);
+                if constexpr (Warps == 1) {
                     if (lane == 0) {
                         const float score = dot * scale;
                         const float new_maximum = fmaxf(
@@ -607,18 +585,44 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                             previous_factor[index] + probability[index];
                         maximum[index] = new_maximum;
                     }
+                } else if (lane == 0) {
+                    warp_dot[index][warp] = dot;
                 }
             }
-            __syncthreads();
-        }
-        #pragma unroll
-        for (int index = 0; index < Rep; ++index) {
+            if constexpr (Warps == 1) {
+                __syncwarp();
+            } else {
+                __syncthreads();
+                if (warp == 0) {
+                    #pragma unroll
+                    for (int index = 0; index < Rep; ++index) {
+                        float dot = lane < Warps
+                            ? warp_dot[index][lane] : 0.0f;
+                        dot = paged_warp_sum(dot);
+                        if (lane == 0) {
+                            const float score = dot * scale;
+                            const float new_maximum = fmaxf(
+                                maximum[index], score);
+                            previous_factor[index] = expf(
+                                maximum[index] - new_maximum);
+                            probability[index] = expf(score - new_maximum);
+                            denominator[index] = denominator[index] *
+                                previous_factor[index] + probability[index];
+                            maximum[index] = new_maximum;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
             #pragma unroll
-            for (int value_index = 0;
-                    value_index < ValuesPerThread; ++value_index) {
-                value_sum[index][value_index] =
-                    value_sum[index][value_index] * previous_factor[index] +
-                    probability[index] * value[value_index];
+            for (int index = 0; index < Rep; ++index) {
+                #pragma unroll
+                for (int value_index = 0;
+                        value_index < ValuesPerThread; ++value_index) {
+                    value_sum[index][value_index] =
+                        value_sum[index][value_index] * previous_factor[index] +
+                        probability[index] * value[value_index];
+                }
             }
         }
     }
