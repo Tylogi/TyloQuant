@@ -91,6 +91,17 @@ def test_tensor_parallel_graph_primes_and_captures_nccl_peer_transfers():
     assert "for (int pass = 0; pass < 2; ++pass)" in SOURCE
 
 
+def test_expert_parallel_graph_uses_capture_safe_peer_transfers():
+    assert "tensor_to_cuda_device(std::move(value), device)" in SOURCE
+    assert (
+        "destination = tensor_to_cuda_device(\n"
+        "            source, device, std::move(destination));"
+        in SOURCE
+    )
+    assert "auto destination = destination_tensor();" in SOURCE
+    assert ".clone().to(pool.weight.q_packed.device()).contiguous()" in SOURCE
+
+
 def test_two_rank_fp16_reduce_avoids_round_trip_casts():
     assert '"MFQ_MODEL_PARALLEL_FP16_REDUCE"' in SOURCE
     assert '"MFQ_TP_FP16_REDUCE"' in SOURCE

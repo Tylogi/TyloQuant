@@ -3659,17 +3659,17 @@ struct MoeRoutePlan {
 
 static std::atomic<uint64_t> g_moe_route_generation{1};
 
+static mfq_tensor_backend::Tensor tensor_to_cuda_device(
+    mfq_tensor_backend::Tensor value,
+    int device,
+    mfq_tensor_backend::Tensor reusable =
+        mfq_tensor_backend::Tensor());
+
 static mfq_tensor_backend::Tensor moe_tensor_to_device(
         mfq_tensor_backend::Tensor value, int device) {
-    if (!value.defined()) return value;
-    if (value.is_cuda() && value.get_device() == device) {
-        return value.contiguous();
-    }
-    MfqCudaGuard guard(device);
-    return value.to(
-        value.options().device(
-            mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, device)),
-        true, false).contiguous();
+    return value.defined()
+        ? tensor_to_cuda_device(std::move(value), device)
+        : value;
 }
 
 struct MoeRouteReplicaEntry {
@@ -3704,17 +3704,8 @@ private:
             destination = source.contiguous();
             return;
         }
-        MfqCudaGuard guard(device);
-        auto options = source.options().device(
-            mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, device));
-        if (!destination.defined() ||
-                destination.sizes() != source.sizes() ||
-                destination.scalar_type() != source.scalar_type() ||
-                !destination.is_cuda() ||
-                destination.get_device() != device) {
-            destination = mfq_tensor_backend::empty(source.sizes(), options);
-        }
-        destination.copy_(source, true);
+        destination = tensor_to_cuda_device(
+            source, device, std::move(destination));
     }
 
     static void copy_plan(
@@ -3859,7 +3850,7 @@ struct NintMoeWeight {
         }
         workspace.activation_ptrs = mfq_tensor_backend::from_blob(
             pointers.data(), {static_cast<int64_t>(pools.size()), 2},
-            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)).clone().to(mfq_tensor_backend::kCUDA).contiguous();
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)).clone().to(x.device()).contiguous();
         return hetero_workspaces.emplace(input_rows, std::move(workspace)).first->second;
     }
 
@@ -4317,6 +4308,17 @@ static void initialize_nint_moe_dispatch(
         !(disable_hetero != nullptr &&
           std::atoi(disable_hetero) != 0);
     if (!result.hetero_supported) return;
+    MFQ_RUNTIME_CHECK(
+        !result.pools.empty() &&
+        result.pools.front().weight.q_packed.is_cuda(),
+        "NINT MoE dispatch requires CUDA pools");
+    const auto target =
+        result.pools.front().weight.q_packed.device();
+    for (const auto & pool : result.pools) {
+        MFQ_RUNTIME_CHECK(
+            pool.weight.q_packed.device() == target,
+            "NINT MoE pools must share one CUDA device");
+    }
 
     std::vector<int64_t> weight_ptrs;
     std::vector<int32_t> pool_params;
@@ -4346,22 +4348,22 @@ static void initialize_nint_moe_dispatch(
         weight_ptrs.data(),
         {static_cast<int64_t>(result.pools.size()), 5},
         mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
-        .clone().to(mfq_tensor_backend::kCUDA).contiguous();
+        .clone().to(target).contiguous();
     result.pool_params = mfq_tensor_backend::from_blob(
         pool_params.data(),
         {static_cast<int64_t>(result.pools.size()), 2},
         mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-        .clone().to(mfq_tensor_backend::kCUDA).contiguous();
+        .clone().to(target).contiguous();
     result.expert_pool = mfq_tensor_backend::from_blob(
         const_cast<int32_t *>(expert_pool.data()),
         {static_cast<int64_t>(expert_pool.size())},
         mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-        .clone().to(mfq_tensor_backend::kCUDA).contiguous();
+        .clone().to(target).contiguous();
     result.expert_local = mfq_tensor_backend::from_blob(
         const_cast<int32_t *>(expert_local.data()),
         {static_cast<int64_t>(expert_local.size())},
         mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-        .clone().to(mfq_tensor_backend::kCUDA).contiguous();
+        .clone().to(target).contiguous();
 }
 
 static NintMoeWeight to_gpu_nint_moe(const NintMoeCpu & cpu) {
@@ -4394,7 +4396,7 @@ static NintMoeWeight to_gpu_nint_moe(const NintMoeCpu & cpu) {
         }
         pool.expert_local = mfq_tensor_backend::from_blob(
             local.data(), {(int64_t)local.size()}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-            .clone().to(mfq_tensor_backend::kCUDA).contiguous();
+            .clone().to(pool.weight.q_packed.device()).contiguous();
         result.pools.push_back(std::move(pool));
     }
     initialize_nint_moe_dispatch(
@@ -6056,29 +6058,32 @@ static NepqWeight to_device_nepq(const NepqCpu & cpu, bool cuda) {
             mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt16)).clone();
     }
     if (cuda) {
+        const auto target = mfq_tensor_backend::Device(
+            mfq_tensor_backend::kCUDA,
+            mfq_current_cuda_device());
         value.indices_packed =
-            value.indices_packed.to(mfq_tensor_backend::kCUDA).contiguous();
+            value.indices_packed.to(target).contiguous();
         value.aux_packed =
-            value.aux_packed.to(mfq_tensor_backend::kCUDA).contiguous();
+            value.aux_packed.to(target).contiguous();
         value.state_packed =
-            value.state_packed.to(mfq_tensor_backend::kCUDA).contiguous();
+            value.state_packed.to(target).contiguous();
         value.neuron_scale =
-            value.neuron_scale.to(mfq_tensor_backend::kCUDA).contiguous();
+            value.neuron_scale.to(target).contiguous();
         value.table_pool =
-            value.table_pool.to(mfq_tensor_backend::kCUDA).contiguous();
+            value.table_pool.to(target).contiguous();
         value.grouped_table_pool =
-            value.grouped_table_pool.to(mfq_tensor_backend::kCUDA).contiguous();
+            value.grouped_table_pool.to(target).contiguous();
         value.bank_ids =
-            value.bank_ids.to(mfq_tensor_backend::kCUDA).contiguous();
+            value.bank_ids.to(target).contiguous();
         value.rotation_signs =
-            value.rotation_signs.to(mfq_tensor_backend::kCUDA).contiguous();
+            value.rotation_signs.to(target).contiguous();
         if (cpu.residual) {
             value.residual_codebook =
-                value.residual_codebook.to(mfq_tensor_backend::kCUDA).contiguous();
+                value.residual_codebook.to(target).contiguous();
             value.residual_first =
-                value.residual_first.to(mfq_tensor_backend::kCUDA).contiguous();
+                value.residual_first.to(target).contiguous();
             value.residual_second =
-                value.residual_second.to(mfq_tensor_backend::kCUDA).contiguous();
+                value.residual_second.to(target).contiguous();
         }
     }
     return value;
@@ -7032,8 +7037,11 @@ static std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
             mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
             .clone();
         if (cuda) {
+            const auto target = mfq_tensor_backend::Device(
+                mfq_tensor_backend::kCUDA,
+                mfq_current_cuda_device());
             pool.expert_local =
-                pool.expert_local.to(mfq_tensor_backend::kCUDA).contiguous();
+                pool.expert_local.to(target).contiguous();
         }
         const int expected_rows = pool.local_experts * cpu.out_per_expert;
         if (source.dtype == "NINT8-0") {
@@ -7210,7 +7218,9 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
             local_map.data(),
             {static_cast<int64_t>(local_map.size())},
             mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-            .clone().to(mfq_tensor_backend::kCUDA).contiguous();
+            .clone().to(mfq_tensor_backend::Device(
+                mfq_tensor_backend::kCUDA,
+                mfq_current_cuda_device())).contiguous();
         if (source.dtype == "NINT8-0") {
             pool.family = MixedMoeFamily::Nint8Zero;
             pool.q8_zero = to_gpu_nint8_zero(
@@ -7253,7 +7263,9 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
 static mfq_tensor_backend::Tensor copy_cpu_weight_to_cuda(
         const mfq_tensor_backend::Tensor & source) {
     return source.defined()
-        ? source.to(mfq_tensor_backend::kCUDA).contiguous()
+        ? source.to(mfq_tensor_backend::Device(
+            mfq_tensor_backend::kCUDA,
+            mfq_current_cuda_device())).contiguous()
         : mfq_tensor_backend::Tensor();
 }
 
@@ -11925,9 +11937,30 @@ static mfq_tensor_backend::Tensor run_quant_linear_shard(
 }
 
 static mfq_tensor_backend::Tensor tensor_to_cuda_device(
-        mfq_tensor_backend::Tensor value, int device) {
+        mfq_tensor_backend::Tensor value,
+        int device,
+        mfq_tensor_backend::Tensor reusable) {
     if (value.is_cuda() && value.get_device() == device) {
         return value.contiguous();
+    }
+    const auto reusable_matches = [&]() {
+        return reusable.defined() && reusable.is_cuda() &&
+            reusable.get_device() == device &&
+            reusable.sizes() == value.sizes() &&
+            reusable.scalar_type() == value.scalar_type() &&
+            reusable.is_contiguous();
+    };
+    const auto destination_tensor = [&]() {
+        if (reusable_matches()) return reusable;
+        MfqCudaGuard destination_guard(device);
+        return mfq_tensor_backend::empty(
+            value.sizes(),
+            value.options().device(
+                mfq_tensor_backend::Device(
+                    mfq_tensor_backend::kCUDA, device)));
+    };
+    if (value.numel() == 0) {
+        return destination_tensor();
     }
 #if defined(MFQ_NATIVE_CUDA_RUNTIME) && defined(MFQ_HAVE_NCCL)
     if (value.is_cuda() &&
@@ -11956,15 +11989,7 @@ static mfq_tensor_backend::Tensor tensor_to_cuda_device(
             }
             if (capture_status != cudaStreamCaptureStatusNone) {
                 auto source = value.contiguous();
-                mfq_tensor_backend::Tensor destination;
-                {
-                    MfqCudaGuard destination_guard(device);
-                    destination = mfq_tensor_backend::empty(
-                        source.sizes(),
-                        source.options().device(
-                            mfq_tensor_backend::Device(
-                                mfq_tensor_backend::kCUDA, device)));
-                }
+                auto destination = destination_tensor();
                 auto& runtime = g_model_parallel_collectives;
                 const auto source_rank = static_cast<size_t>(
                     source_rank_it - runtime.devices.begin());
@@ -12025,6 +12050,10 @@ static mfq_tensor_backend::Tensor tensor_to_cuda_device(
     }
 #endif
     MfqCudaGuard guard(device);
+    if (reusable_matches()) {
+        reusable.copy_(value, true);
+        return reusable;
+    }
     return value.to(
         value.options().device(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, device)),
         true, false).contiguous();
