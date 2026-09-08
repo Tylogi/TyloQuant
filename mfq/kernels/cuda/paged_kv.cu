@@ -154,7 +154,7 @@ __device__ __forceinline__ int paged_active_parts(
     if (!dynamic_parts) return launch_parts;
     const int cache_position = token_count > 0 ? token_count - 1 : 0;
     if (cache_position < 192) return 1;
-    const int active = (cache_position + 191) / 192;
+    const int active = (cache_position + 127) / 128;
     return active < launch_parts ? active : launch_parts;
 }
 
