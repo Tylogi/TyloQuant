@@ -2586,6 +2586,9 @@ __global__ void __launch_bounds__(256) nint_moe_group32_mmq_kernel(
 constexpr int kMoeMmaBn = 64;
 constexpr int kMoeMmaMaxBkStride = 120;
 
+template <int BM>
+constexpr int kMoeMmaBkStride = BM == 64 ? 112 : kMoeMmaMaxBkStride;
+
 template <int BITS, int GS, int GROUPS_PER_CHUNK, int BM>
 __device__ __forceinline__ void nint_moe_mma_profile(
         const uint8_t * __restrict__ q_packed,
@@ -2596,8 +2599,8 @@ __device__ __forceinline__ void nint_moe_mma_profile(
         const __half * __restrict__ x,
         const int32_t * __restrict__ ids_dst,
         __half * __restrict__ out,
-        __half (*W_s)[kMoeMmaMaxBkStride],
-        __half (*X_s)[kMoeMmaMaxBkStride],
+        __half (*W_s)[kMoeMmaBkStride<BM>],
+        __half (*X_s)[kMoeMmaBkStride<BM>],
         float (*C_s)[16][16],
         int first,
         int last,
@@ -2615,7 +2618,7 @@ __device__ __forceinline__ void nint_moe_mma_profile(
     constexpr int NFRAGS = kMoeMmaBn / 16;
     constexpr int ACCS_PER_WARP = (MTILES + 1) / 2;
     constexpr int QBYTES = (GS * BITS + 7) / 8;
-    static_assert(BK % 16 == 0 && BK <= kMoeMmaMaxBkStride);
+    static_assert(BK % 16 == 0 && BK <= kMoeMmaBkStride<BM>);
     static_assert(BM == 16 || BM == 32 || BM == 64);
 
     const int lane = threadIdx.x;
@@ -2698,14 +2701,14 @@ __device__ __forceinline__ void nint_moe_mma_profile(
             if (warp_active) {
                 FragB bfrag;
                 nvcuda::wmma::load_matrix_sync(
-                    bfrag, &W_s[warp_n * 16][ks], kMoeMmaMaxBkStride);
+                    bfrag, &W_s[warp_n * 16][ks], kMoeMmaBkStride<BM>);
 #pragma unroll
                 for (int a = 0; a < ACCS_PER_WARP; ++a) {
                     const int mi = warp_m0 + a * 2;
                     if (mi < MTILES) {
                         FragA afrag;
                         nvcuda::wmma::load_matrix_sync(
-                            afrag, &X_s[mi * 16][ks], kMoeMmaMaxBkStride);
+                            afrag, &X_s[mi * 16][ks], kMoeMmaBkStride<BM>);
                         nvcuda::wmma::mma_sync(acc[a], afrag, bfrag, acc[a]);
                     }
                 }
@@ -2718,28 +2721,35 @@ __device__ __forceinline__ void nint_moe_mma_profile(
     for (int a = 0; a < ACCS_PER_WARP; ++a) {
         const int mi = warp_m0 + a * 2;
         const bool owns = mi < MTILES;
-        if (owns) {
-            nvcuda::wmma::store_matrix_sync(
-                &C_s[warp][0][0], acc[a], 16, nvcuda::wmma::mem_row_major);
-        }
-        __syncthreads();
-        if (owns) {
-            const int compact0 = first + mi * 16;
-            const int gn0 = n0 + warp_n * 16;
+        constexpr int output_phases = BM == 64 ? 2 : 1;
 #pragma unroll
-            for (int element = lane; element < 16 * 16; element += 32) {
-                const int r = element / 16;
-                const int c = element - r * 16;
-                const int compact = compact0 + r;
-                const int gn = gn0 + c;
-                if (compact < last && gn < out_per_expert) {
-                    const int pair = ids_dst[compact];
-                    out[static_cast<size_t>(pair) * out_per_expert + gn] =
-                        __float2half_rn(C_s[warp][r][c]);
+        for (int phase = 0; phase < output_phases; ++phase) {
+            const bool phase_owns = owns && (BM != 64 || warp / 4 == phase);
+            const int scratch_warp = BM == 64 ? warp % 4 : warp;
+            if (phase_owns) {
+                nvcuda::wmma::store_matrix_sync(
+                    &C_s[scratch_warp][0][0], acc[a], 16,
+                    nvcuda::wmma::mem_row_major);
+            }
+            __syncthreads();
+            if (phase_owns) {
+                const int compact0 = first + mi * 16;
+                const int gn0 = n0 + warp_n * 16;
+#pragma unroll
+                for (int element = lane; element < 16 * 16; element += 32) {
+                    const int r = element / 16;
+                    const int c = element - r * 16;
+                    const int compact = compact0 + r;
+                    const int gn = gn0 + c;
+                    if (compact < last && gn < out_per_expert) {
+                        const int pair = ids_dst[compact];
+                        out[static_cast<size_t>(pair) * out_per_expert + gn] =
+                            __float2half_rn(C_s[scratch_warp][r][c]);
+                    }
                 }
             }
+            __syncthreads();
         }
-        __syncthreads();
     }
 }
 
@@ -2940,7 +2950,7 @@ __global__ void __launch_bounds__(256, 1) nint8_zero_moe_mma_kernel(
 }
 
 template <int BM>
-__global__ void __launch_bounds__(256, BM == 32 ? 3 : 1) nint_moe_hetero_mma_kernel(
+__global__ void __launch_bounds__(256, BM >= 32 ? 3 : 1) nint_moe_hetero_mma_kernel(
         const int64_t * __restrict__ weight_ptrs,
         const int32_t * __restrict__ pool_params,
         const int32_t * __restrict__ expert_pool,
@@ -2959,9 +2969,9 @@ __global__ void __launch_bounds__(256, BM == 32 ? 3 : 1) nint_moe_hetero_mma_ker
         int k_real,
         bool routed_input) {
     constexpr int fine_tiles_per_mma = BM / kRouteTile;
-    __shared__ __half W_s[kMoeMmaBn][kMoeMmaMaxBkStride];
-    __shared__ __half X_s[BM][kMoeMmaMaxBkStride];
-    __shared__ float C_s[8][16][16];
+    __shared__ __half W_s[kMoeMmaBn][kMoeMmaBkStride<BM>];
+    __shared__ __half X_s[BM][kMoeMmaBkStride<BM>];
+    __shared__ float C_s[BM == 64 ? 4 : 8][16][16];
 
     const int ntiles_n = (out_per_expert + kMoeMmaBn - 1) / kMoeMmaBn;
     const int total_fine_tiles = tile_bounds[experts];
