@@ -398,7 +398,7 @@ __global__ void paged_attention_decode_split_kernel(
     }
 }
 
-template <typename scalar_t>
+template <int FixedPageSize, int FixedPagesPerChunk, typename scalar_t>
 __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     const scalar_t * __restrict__ q,
     const int64_t * __restrict__ k_chunk_ptrs,
@@ -422,7 +422,9 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    const int maximum_tokens = logical_pages * page_size;
+    constexpr bool FixedGeometry = FixedPageSize > 0;
+    const int active_page_size = FixedGeometry ? FixedPageSize : page_size;
+    const int maximum_tokens = logical_pages * active_page_size;
     int tokens = static_cast<int>(seq_len[batch]);
     tokens = tokens < 0 ? 0 : (tokens > maximum_tokens ? maximum_tokens : tokens);
     const int active_parts = paged_active_parts(tokens, parts, dynamic_parts);
@@ -466,26 +468,45 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     }
     __syncthreads();
     const size_t page_elements =
-        static_cast<size_t>(Hk) * page_size * D;
+        static_cast<size_t>(Hk) * active_page_size * D;
     for (int token = start; token < end; ++token) {
-        const int offset = token % page_size;
+        int offset = 0;
+        int logical_page = 0;
+        if constexpr (FixedGeometry) {
+            static_assert(FixedPageSize == 16 && FixedPagesPerChunk == 64);
+            offset = token & (FixedPageSize - 1);
+            logical_page = token >> 4;
+        } else {
+            offset = token % page_size;
+            logical_page = token / page_size;
+        }
         if (token == start || offset == 0) {
             if (tid == 0) {
                 const int physical = page_table[
                     static_cast<size_t>(batch) * logical_pages +
-                    token / page_size];
-                const int chunk = physical >= 0
-                    ? physical / pages_per_chunk : -1;
+                    logical_page];
+                int chunk = -1;
+                int local_page = 0;
+                if constexpr (FixedGeometry) {
+                    chunk = physical >= 0 ? physical >> 6 : -1;
+                    local_page = physical & (FixedPagesPerChunk - 1);
+                } else {
+                    chunk = physical >= 0
+                        ? physical / pages_per_chunk : -1;
+                    local_page = physical - chunk * pages_per_chunk;
+                }
                 key_page_address = chunk >= 0 && chunk < chunks &&
                         k_chunk_ptrs[chunk] != 0
-                    ? reinterpret_cast<uintptr_t>(page_address<scalar_t>(
-                        k_chunk_ptrs, physical, pages_per_chunk,
-                        page_elements)) : 0;
+                    ? reinterpret_cast<uintptr_t>(
+                        reinterpret_cast<const scalar_t *>(
+                            static_cast<uintptr_t>(k_chunk_ptrs[chunk])) +
+                        static_cast<size_t>(local_page) * page_elements) : 0;
                 value_page_address = chunk >= 0 && chunk < chunks &&
                         v_chunk_ptrs[chunk] != 0
-                    ? reinterpret_cast<uintptr_t>(page_address<scalar_t>(
-                        v_chunk_ptrs, physical, pages_per_chunk,
-                        page_elements)) : 0;
+                    ? reinterpret_cast<uintptr_t>(
+                        reinterpret_cast<const scalar_t *>(
+                            static_cast<uintptr_t>(v_chunk_ptrs[chunk])) +
+                        static_cast<size_t>(local_page) * page_elements) : 0;
             }
             __syncthreads();
         }
@@ -775,15 +796,29 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
         } else {
             const int shmem = D * static_cast<int>(sizeof(float));
             if (D == 256 && gqa_ratio == 4) {
-                paged_attention_decode_split_gqa4_d256_kernel<scalar_t><<<
-                    B * Hk * split_parts, 256, 0, stream>>>(
-                    q.data_ptr<scalar_t>(), k_chunk_ptrs.data_ptr<int64_t>(),
-                    v_chunk_ptrs.data_ptr<int64_t>(), page_table.data_ptr<int32_t>(),
-                    seq_len.data_ptr<int64_t>(), partial_o.data_ptr<float>(),
-                    partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),
-                    Hq, Hk, logical_pages, page, chunk_pages, chunks,
-                    split_parts, workspace_parts, static_cast<float>(scale),
-                    dynamic_parts ? 1 : 0);
+                if (page == 16 && chunk_pages == 64) {
+                    paged_attention_decode_split_gqa4_d256_kernel<
+                        16, 64, scalar_t><<<
+                        B * Hk * split_parts, 256, 0, stream>>>(
+                        q.data_ptr<scalar_t>(), k_chunk_ptrs.data_ptr<int64_t>(),
+                        v_chunk_ptrs.data_ptr<int64_t>(),
+                        page_table.data_ptr<int32_t>(), seq_len.data_ptr<int64_t>(),
+                        partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),
+                        partial_l.data_ptr<float>(), Hq, Hk, logical_pages, page,
+                        chunk_pages, chunks, split_parts, workspace_parts,
+                        static_cast<float>(scale), dynamic_parts ? 1 : 0);
+                } else {
+                    paged_attention_decode_split_gqa4_d256_kernel<
+                        0, 0, scalar_t><<<
+                        B * Hk * split_parts, 256, 0, stream>>>(
+                        q.data_ptr<scalar_t>(), k_chunk_ptrs.data_ptr<int64_t>(),
+                        v_chunk_ptrs.data_ptr<int64_t>(),
+                        page_table.data_ptr<int32_t>(), seq_len.data_ptr<int64_t>(),
+                        partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),
+                        partial_l.data_ptr<float>(), Hq, Hk, logical_pages, page,
+                        chunk_pages, chunks, split_parts, workspace_parts,
+                        static_cast<float>(scale), dynamic_parts ? 1 : 0);
+                }
             } else if (D <= 64) {
                 paged_attention_decode_split_kernel<64, scalar_t><<<
                     total * split_parts, 64, shmem, stream>>>(q.data_ptr<scalar_t>(),
