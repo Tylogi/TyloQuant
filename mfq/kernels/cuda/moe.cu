@@ -1074,6 +1074,43 @@ __device__ __forceinline__ int unpack_four(const uint8_t * values, int index) {
     }
 }
 
+template <int BITS, int GS>
+__device__ __forceinline__ int unpack_four_moe_mma(
+        const uint8_t * values,
+        int index) {
+    if constexpr ((BITS == 5 && GS == 28) || (BITS == 6 && GS == 24)) {
+        const int byte = BITS == 5 ? (index * 5) >> 3 : (index >> 2) * 3;
+        uint32_t word;
+        if ((byte & 1) == 0) {
+            word = static_cast<uint32_t>(
+                       *reinterpret_cast<const uint16_t *>(values + byte)) |
+                (static_cast<uint32_t>(values[byte + 2]) << 16);
+        } else {
+            word = static_cast<uint32_t>(values[byte]) |
+                (static_cast<uint32_t>(
+                     *reinterpret_cast<const uint16_t *>(values + byte + 1)) << 8);
+        }
+        if constexpr (BITS == 5) {
+            const uint32_t unpacked = word >> ((index * 5) & 7);
+            return static_cast<int>(unpacked & 31u) |
+                (static_cast<int>((unpacked >> 5) & 31u) << 8) |
+                (static_cast<int>((unpacked >> 10) & 31u) << 16) |
+                (static_cast<int>((unpacked >> 15) & 31u) << 24);
+        } else {
+            const uint8_t q0 = word & 63u;
+            const uint8_t q1 = (word >> 6) & 63u;
+            const uint8_t q2 = (word >> 12) & 63u;
+            const uint8_t q3 = (word >> 18) & 63u;
+            return static_cast<int>(q0) |
+                (static_cast<int>(q1) << 8) |
+                (static_cast<int>(q2) << 16) |
+                (static_cast<int>(q3) << 24);
+        }
+    } else {
+        return unpack_four<BITS>(values, index);
+    }
+}
+
 __device__ __forceinline__ int load_i8x4(const int8_t * values) {
     return *reinterpret_cast<const int *>(values);
 }
@@ -2863,13 +2900,13 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                 m = neuron_min[weight_row] * static_cast<float>(sub_min[meta]);
                 qg = q_packed + meta * QBYTES;
             }
-            int packed = valid ? unpack_four<BITS>(qg, 0) : 0;
-            int next = GS > 4 && valid ? unpack_four<BITS>(qg, 4) : 0;
-            int ahead = GS > 8 && valid ? unpack_four<BITS>(qg, 8) : 0;
+            int packed = valid ? unpack_four_moe_mma<BITS, GS>(qg, 0) : 0;
+            int next = GS > 4 && valid ? unpack_four_moe_mma<BITS, GS>(qg, 4) : 0;
+            int ahead = GS > 8 && valid ? unpack_four_moe_mma<BITS, GS>(qg, 8) : 0;
 #pragma unroll
             for (int i = 0; i < GS; i += 4) {
                 const int future = i + 12 < GS && valid
-                    ? unpack_four<BITS>(qg, i + 12) : 0;
+                    ? unpack_four_moe_mma<BITS, GS>(qg, i + 12) : 0;
                 const float q0 = static_cast<float>(packed & 255);
                 const float q1 = static_cast<float>((packed >> 8) & 255);
                 const float q2 = static_cast<float>((packed >> 16) & 255);
