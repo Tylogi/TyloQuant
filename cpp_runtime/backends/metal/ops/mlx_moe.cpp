@@ -2911,16 +2911,17 @@ grouped_mmq_block_builder() {
                 const uint expert = thread_index_in_threadgroup;
 
                 threadgroup atomic_int local_count;
-                if (expert == 0) {
-                    atomic_store_explicit(
-                        &local_count,
-                        0,
-                        memory_order_relaxed);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                if (expert >= NUM_EXPERTS) {
-                    return;
+                threadgroup int expert_starts[NUM_EXPERTS];
+                threadgroup int expert_rows[NUM_EXPERTS];
+                threadgroup int use_block_chunks;
+                if constexpr (BLOCK_CHUNK == 0) {
+                    if (expert == 0) {
+                        atomic_store_explicit(
+                            &local_count,
+                            0,
+                            memory_order_relaxed);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
 
                 int lo = 0;
@@ -2946,24 +2947,102 @@ grouped_mmq_block_builder() {
                 }
                 const int end = lo;
 
-                for (int row = start; row < end; row += BM) {
-                    const int rows = min(BM, end - row);
-                    const int slot = atomic_fetch_add_explicit(
-                        &local_count,
-                        1,
-                        memory_order_relaxed);
-                    if (slot < MAX_BLOCKS) {
-                        block_meta[slot * 3 + 0] = row;
-                        block_meta[slot * 3 + 1] = int(expert);
-                        block_meta[slot * 3 + 2] = rows;
+                if constexpr (BLOCK_CHUNK == 0) {
+                    for (int row = start; row < end; row += BM) {
+                        const int rows = min(BM, end - row);
+                        const int slot = atomic_fetch_add_explicit(
+                            &local_count,
+                            1,
+                            memory_order_relaxed);
+                        if (slot < MAX_BLOCKS) {
+                            block_meta[slot * 3 + 0] = row;
+                            block_meta[slot * 3 + 1] = int(expert);
+                            block_meta[slot * 3 + 2] = rows;
+                        }
                     }
-                }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (expert == 0) {
+                        block_count[0] = atomic_load_explicit(
+                            &local_count,
+                            memory_order_relaxed);
+                    }
+                } else {
+                    expert_starts[expert] = start;
+                    expert_rows[expert] = end - start;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (expert == 0) {
-                    block_count[0] = atomic_load_explicit(
-                        &local_count,
-                        memory_order_relaxed);
+                    if (expert == 0) {
+                        int active_experts = 0;
+                        for (uint item = 0; item < NUM_EXPERTS; ++item) {
+                            active_experts += expert_rows[item] > 0 ? 1 : 0;
+                        }
+                        // A heavily skewed route set already reuses a small
+                        // working set and benefits from maximum interleave.
+                        // Chunk only when at least half the pool is active.
+                        use_block_chunks =
+                            active_experts * 2 >= int(NUM_EXPERTS) ? 1 : 0;
+                        if (use_block_chunks == 0) {
+                            atomic_store_explicit(
+                                &local_count,
+                                0,
+                                memory_order_relaxed);
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    if (use_block_chunks == 0) {
+                        for (int row = start; row < end; row += BM) {
+                            const int rows = min(BM, end - row);
+                            const int slot = atomic_fetch_add_explicit(
+                                &local_count,
+                                1,
+                                memory_order_relaxed);
+                            if (slot < MAX_BLOCKS) {
+                                block_meta[slot * 3 + 0] = row;
+                                block_meta[slot * 3 + 1] = int(expert);
+                                block_meta[slot * 3 + 2] = rows;
+                            }
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (expert == 0) {
+                            block_count[0] = atomic_load_explicit(
+                                &local_count,
+                                memory_order_relaxed);
+                        }
+                    } else if (expert == 0) {
+                        int maximum_blocks = 0;
+                        for (uint item = 0; item < NUM_EXPERTS; ++item) {
+                            maximum_blocks = max(
+                                maximum_blocks,
+                                (expert_rows[item] + BM - 1) / BM);
+                        }
+                        int slot = 0;
+                        for (int first = 0;
+                             first < maximum_blocks;
+                             first += BLOCK_CHUNK) {
+                            for (uint item = 0; item < NUM_EXPERTS; ++item) {
+                                int count =
+                                    (expert_rows[item] + BM - 1) / BM;
+                                for (int local = 0;
+                                     local < BLOCK_CHUNK
+                                         && first + local < count;
+                                     ++local) {
+                                    int row = expert_starts[item]
+                                        + (first + local) * BM;
+                                    if (slot < MAX_BLOCKS) {
+                                        block_meta[slot * 3 + 0] = row;
+                                        block_meta[slot * 3 + 1] = int(item);
+                                        block_meta[slot * 3 + 2] = min(
+                                            BM,
+                                            expert_starts[item]
+                                                + expert_rows[item] - row);
+                                    }
+                                    ++slot;
+                                }
+                            }
+                        }
+                        block_count[0] = slot;
+                    }
                 }
             )METAL",
             "",
@@ -3037,6 +3116,14 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
             {"BM", block_rows},
             {"M", route_count},
             {"MAX_BLOCKS", max_blocks},
+            {
+                "BLOCK_CHUNK",
+                // Two adjacent blocks retain useful packed-weight locality
+                // without serializing the entire expert. Below 96 mean rows
+                // there is too little reuse to repay deterministic planning;
+                // small expert pools remain on the lower-overhead builder.
+                experts >= 128 && route_count > experts * 96 ? 2 : 0,
+            },
         },
         std::nullopt,
         false,

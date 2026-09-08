@@ -4658,6 +4658,94 @@ void test_large_fused_grouped_tile_policy() {
     restore("MFQ_METAL_GROUPED_MMQ_BLOCK_ROWS", saved_rows);
 }
 
+void test_large_grouped_block_chunk_order() {
+    constexpr int experts = 128;
+    constexpr int tokens = 12300;
+    const std::vector<std::string> profiles(experts, "NINT4");
+    const auto fixture = make_moe_fixture(
+        profiles, 24, 96, 41, 24);
+    const auto weight = mfq::metal::MlxMoeWeight::from_blob(
+        fixture.blob);
+    std::vector<std::int32_t> ids;
+    ids.reserve(tokens);
+    for (int expert = 0; expert < experts; ++expert) {
+        ids.insert(ids.end(), expert < 12 ? 97 : 96, expert);
+    }
+    std::vector<std::int32_t> order(tokens);
+    std::iota(order.begin(), order.end(), 0);
+    auto plan = weight.build_grouped_mmq_plan(
+        mlx::core::array(
+            ids.begin(), mlx::core::Shape{tokens, 1}),
+        mlx::core::array(
+            order.begin(), mlx::core::Shape{tokens}),
+        32);
+    plan.block_count.eval();
+    plan.block_meta.eval();
+    const int count = plan.block_count.data<std::int32_t>()[0];
+    require(count == 396, "large grouped block count mismatch");
+    const std::array<std::array<std::int32_t, 3>, 12> expected{{
+        {{0, 0, 32}}, {{32, 0, 32}},
+        {{97, 1, 32}}, {{129, 1, 32}},
+        {{194, 2, 32}}, {{226, 2, 32}},
+        {{291, 3, 32}}, {{323, 3, 32}},
+        {{388, 4, 32}}, {{420, 4, 32}},
+        {{485, 5, 32}}, {{517, 5, 32}},
+    }};
+    const auto* actual = plan.block_meta.data<std::int32_t>();
+    for (int block = 0;
+         block < static_cast<int>(expected.size());
+         ++block) {
+        for (int field = 0; field < 3; ++field) {
+            require(
+                actual[block * 3 + field]
+                    == expected[static_cast<std::size_t>(block)]
+                               [static_cast<std::size_t>(field)],
+                "large grouped block chunk order mismatch");
+        }
+    }
+
+    std::vector<std::int32_t> skewed_ids;
+    skewed_ids.reserve(tokens);
+    for (int expert = 0; expert < 10; ++expert) {
+        skewed_ids.insert(skewed_ids.end(), 1230, expert);
+    }
+    auto skewed_plan = weight.build_grouped_mmq_plan(
+        mlx::core::array(
+            skewed_ids.begin(), mlx::core::Shape{tokens, 1}),
+        mlx::core::array(
+            order.begin(), mlx::core::Shape{tokens}),
+        32);
+    skewed_plan.block_count.eval();
+    skewed_plan.block_meta.eval();
+    const int skewed_count =
+        skewed_plan.block_count.data<std::int32_t>()[0];
+    require(skewed_count == 390, "skewed grouped block count mismatch");
+    std::vector<std::uint8_t> covered(tokens, 0);
+    const auto* skewed = skewed_plan.block_meta.data<std::int32_t>();
+    for (int block = 0; block < skewed_count; ++block) {
+        const int row = skewed[block * 3];
+        const int expert = skewed[block * 3 + 1];
+        const int rows = skewed[block * 3 + 2];
+        require(
+            row >= 0 && rows > 0 && rows <= 32 && row + rows <= tokens,
+            "skewed grouped block bounds mismatch");
+        for (int item = row; item < row + rows; ++item) {
+            require(
+                skewed_ids[static_cast<std::size_t>(item)] == expert,
+                "skewed grouped block expert mismatch");
+            require(
+                covered[static_cast<std::size_t>(item)]++ == 0,
+                "skewed grouped block overlap");
+        }
+    }
+    require(
+        std::all_of(
+            covered.begin(), covered.end(), [](std::uint8_t value) {
+                return value == 1;
+            }),
+        "skewed grouped block coverage mismatch");
+}
+
 void test_grouped_nint2_pair_prefill() {
     constexpr int tokens = 1024;
     constexpr int output = 24;
@@ -5332,6 +5420,7 @@ int main(int argc, char** argv) {
         test_grouped_vq_decoder_tail_prefill();
         test_grouped_nint_mmq_prefill();
         test_large_fused_grouped_tile_policy();
+        test_large_grouped_block_chunk_order();
         test_grouped_nint2_pair_prefill();
         test_grouped_nint5_group28_tail_prefill();
         test_grouped_nint8_group48_tail_prefill();
