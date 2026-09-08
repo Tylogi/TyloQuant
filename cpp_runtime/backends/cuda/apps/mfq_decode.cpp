@@ -1350,6 +1350,12 @@ static bool tensor_parallel_reduce_to_primary_enabled() {
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
+static bool tensor_parallel_fp16_reduce_enabled() {
+    const char * environment = std::getenv(
+        "MFQ_TP_FP16_REDUCE");
+    return environment == nullptr || std::atoi(environment) != 0;
+}
+
 struct LayerPlacementConfig {
     std::vector<int> devices;
     std::vector<double> split;
@@ -12198,6 +12204,13 @@ static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
         const auto shape = outputs.front().sizes().vec();
         const auto output_dtype = outputs.front().scalar_type();
         const int64_t elements = outputs.front().numel();
+        // A two-input FP16 sum has the same final FP16 rounding as the former
+        // FP32 reduction, while avoiding both conversion passes.
+        const bool fp16_reduce =
+            tensor_parallel_fp16_reduce_enabled() &&
+            tensor_parallel_reduce_to_primary_enabled() &&
+            outputs.size() == 2 &&
+            output_dtype == mfq_tensor_backend::kFloat16;
         const int primary = g_tensor_parallel.primary_device();
         const auto primary_rank_it = std::find(
             runtime.devices.begin(), runtime.devices.end(), primary);
@@ -12211,11 +12224,15 @@ static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
             const int device = runtime.devices[index];
             if (!outputs[index].defined() || !outputs[index].is_cuda() ||
                     outputs[index].get_device() != device ||
-                    outputs[index].sizes().vec() != shape) {
+                    outputs[index].sizes().vec() != shape ||
+                    outputs[index].scalar_type() != output_dtype) {
                 throw std::runtime_error(
                     "NCCL tensor-parallel reduction received mismatched shards");
             }
             MfqCudaGuard guard(device);
+            if (fp16_reduce) {
+                outputs[index] = outputs[index].contiguous();
+            }
             const auto producer =
                 mfq_get_current_cuda_stream(device);
             MFQ_CUDA_CHECK(cudaEventRecord(
@@ -12223,11 +12240,14 @@ static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
             const auto communication = runtime.streams[index];
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(
                 communication.stream(), runtime.ready[index], 0));
-            {
+            if (fp16_reduce) {
+                mfq_cuda_record_stream(outputs[index], communication);
+            } else {
                 MfqCudaStreamGuard stream_guard(communication);
                 auto & buffer = runtime.reduction_buffers[index];
                 if (!buffer.defined() || buffer.sizes().vec() != shape ||
-                        buffer.get_device() != device) {
+                        buffer.get_device() != device ||
+                        buffer.scalar_type() != mfq_tensor_backend::kFloat32) {
                     buffer = mfq_tensor_backend::empty(
                         shape,
                         outputs[index].options().dtype(mfq_tensor_backend::kFloat32));
@@ -12241,11 +12261,14 @@ static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
         for (size_t index = 0; index < outputs.size(); ++index) {
             auto & buffer = runtime.reduction_buffers[index];
             if (tensor_parallel_reduce_to_primary_enabled()) {
+                void * reduction_data = fp16_reduce
+                    ? outputs[index].data_ptr()
+                    : buffer.data_ptr<float>();
                 MFQ_NCCL_CHECK(ncclReduce(
-                    buffer.data_ptr<float>(),
-                    buffer.data_ptr<float>(),
+                    reduction_data,
+                    reduction_data,
                     static_cast<size_t>(elements),
-                    ncclFloat32,
+                    fp16_reduce ? ncclFloat16 : ncclFloat32,
                     ncclSum,
                     static_cast<int>(primary_rank),
                     runtime.communicators[index],
@@ -12268,9 +12291,13 @@ static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
             MfqCudaGuard guard(runtime.devices[index]);
             const auto communication = runtime.streams[index];
             if (runtime.devices[index] == primary) {
-                MfqCudaStreamGuard stream_guard(communication);
-                result = runtime.reduction_buffers[index]
-                    .to(output_dtype).contiguous();
+                if (fp16_reduce) {
+                    result = outputs[index];
+                } else {
+                    MfqCudaStreamGuard stream_guard(communication);
+                    result = runtime.reduction_buffers[index]
+                        .to(output_dtype).contiguous();
+                }
             }
             MFQ_CUDA_CHECK(cudaEventRecord(
                 runtime.completed[index], communication.stream()));

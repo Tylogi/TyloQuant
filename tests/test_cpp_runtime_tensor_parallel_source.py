@@ -76,6 +76,16 @@ def test_tensor_parallel_graph_primes_and_captures_nccl_peer_transfers():
     assert "for (int pass = 0; pass < 2; ++pass)" in SOURCE
 
 
+def test_two_rank_fp16_reduce_avoids_round_trip_casts():
+    assert '"MFQ_TP_FP16_REDUCE"' in SOURCE
+    assert "tensor_parallel_fp16_reduce_enabled()" in SOURCE
+    assert "environment == nullptr || std::atoi(environment) != 0" in SOURCE
+    assert "outputs.size() == 2" in SOURCE
+    assert "output_dtype == mfq_tensor_backend::kFloat16" in SOURCE
+    assert "fp16_reduce ? ncclFloat16 : ncclFloat32" in SOURCE
+    assert "result = outputs[index]" in SOURCE
+
+
 def test_tensor_parallel_projection_groups_share_each_rank_input_transfer():
     assert 'std::getenv(\n        "MFQ_TP_GROUPED_PROJECTIONS")' in SOURCE
     assert "environment == nullptr || std::atoi(environment) != 0" in SOURCE
