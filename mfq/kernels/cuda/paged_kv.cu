@@ -457,7 +457,7 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     constexpr int Threads = D / ValuesPerThread;
     constexpr int Warps = Threads / 32;
     static_assert(IndependentWarps == 1 ||
-        (IndependentWarps == 2 && Warps == 1));
+        ((IndependentWarps == 2 || IndependentWarps == 4) && Warps == 1));
     static_assert(ValuesPerThread == 1 || ValuesPerThread == 2 ||
         ValuesPerThread == 4 || ValuesPerThread == 8);
     const int part = blockIdx.x % parts;
@@ -656,53 +656,81 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
             }
         }
     } else {
-        __shared__ float second_value[Rep][D];
-        __shared__ float second_maximum[Rep];
-        __shared__ float second_denominator[Rep];
-        if (worker == 1) {
+        __shared__ float other_value[IndependentWarps - 1][Rep][D];
+        __shared__ float other_maximum[IndependentWarps - 1][Rep];
+        __shared__ float other_denominator[IndependentWarps - 1][Rep];
+        if (worker > 0) {
+            const int other = worker - 1;
             #pragma unroll
             for (int index = 0; index < Rep; ++index) {
                 paged_store_floats(
-                    second_value[index] + first_dimension,
+                    other_value[other][index] + first_dimension,
                     value_sum[index]);
                 if (tid == index) {
-                    second_maximum[index] =
+                    other_maximum[other][index] =
                         start < end ? maximum : -1e30f;
-                    second_denominator[index] =
+                    other_denominator[other][index] =
                         start < end ? denominator : 0.0f;
                 }
             }
         }
         __syncthreads();
         if (worker == 0) {
-            float first_factor = 0.0f;
-            float second_factor = 0.0f;
+            float worker_factor[IndependentWarps];
+            #pragma unroll
+            for (int worker_index = 0;
+                    worker_index < IndependentWarps; ++worker_index) {
+                worker_factor[worker_index] = 0.0f;
+            }
             if (lane < Rep) {
-                const float other_maximum = second_maximum[lane];
-                const float other_denominator = second_denominator[lane];
-                const float combined_maximum = fmaxf(
-                    maximum, other_maximum);
-                first_factor = denominator > 0.0f
+                float combined_maximum = maximum;
+                #pragma unroll
+                for (int other = 0;
+                        other < IndependentWarps - 1; ++other) {
+                    combined_maximum = fmaxf(
+                        combined_maximum, other_maximum[other][lane]);
+                }
+                worker_factor[0] = denominator > 0.0f
                     ? expf(maximum - combined_maximum) : 0.0f;
-                second_factor = other_denominator > 0.0f
-                    ? expf(other_maximum - combined_maximum) : 0.0f;
-                denominator = denominator * first_factor +
-                    other_denominator * second_factor;
+                float combined_denominator =
+                    denominator * worker_factor[0];
+                #pragma unroll
+                for (int other = 0;
+                        other < IndependentWarps - 1; ++other) {
+                    const float local_denominator =
+                        other_denominator[other][lane];
+                    worker_factor[other + 1] = local_denominator > 0.0f
+                        ? expf(other_maximum[other][lane] -
+                            combined_maximum) : 0.0f;
+                    combined_denominator += local_denominator *
+                        worker_factor[other + 1];
+                }
+                denominator = combined_denominator;
                 maximum = combined_maximum;
             }
             #pragma unroll
             for (int index = 0; index < Rep; ++index) {
-                const float active_first_factor = __shfl_sync(
-                    0xffffffffu, first_factor, index);
-                const float active_second_factor = __shfl_sync(
-                    0xffffffffu, second_factor, index);
+                float active_factor[IndependentWarps];
+                #pragma unroll
+                for (int worker_index = 0;
+                        worker_index < IndependentWarps; ++worker_index) {
+                    active_factor[worker_index] = __shfl_sync(
+                        0xffffffffu, worker_factor[worker_index], index);
+                }
                 #pragma unroll
                 for (int value_index = 0;
                         value_index < ValuesPerThread; ++value_index) {
-                    value_sum[index][value_index] =
-                        value_sum[index][value_index] * active_first_factor +
-                        second_value[index][first_dimension + value_index] *
-                            active_second_factor;
+                    float combined_value = value_sum[index][value_index] *
+                        active_factor[0];
+                    #pragma unroll
+                    for (int other = 0;
+                            other < IndependentWarps - 1; ++other) {
+                        combined_value +=
+                            other_value[other][index]
+                                [first_dimension + value_index] *
+                            active_factor[other + 1];
+                    }
+                    value_sum[index][value_index] = combined_value;
                 }
                 const int query_index =
                     batch * Hq + first_query_head + index;
@@ -986,8 +1014,8 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
             if (D == 256 && gqa_ratio == 4) {
                 if (page == 16 && chunk_pages == 64) {
                     paged_attention_decode_split_gqa4_d256_kernel<
-                        16, 64, 8, 2, scalar_t><<<
-                        B * Hk * split_parts, 64, 0, stream>>>(
+                        16, 64, 8, 4, scalar_t><<<
+                        B * Hk * split_parts, 128, 0, stream>>>(
                         q.data_ptr<scalar_t>(), k_chunk_ptrs.data_ptr<int64_t>(),
                         v_chunk_ptrs.data_ptr<int64_t>(),
                         page_table.data_ptr<int32_t>(), seq_len.data_ptr<int64_t>(),
