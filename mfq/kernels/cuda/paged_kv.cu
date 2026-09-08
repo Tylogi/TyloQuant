@@ -478,8 +478,6 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     __shared__ float warp_dot[Rep][Warps];
     __shared__ float previous_factor[Rep];
     __shared__ float probability[Rep];
-    __shared__ uintptr_t key_page_address;
-    __shared__ uintptr_t value_page_address;
     float maximum = -1e30f;
     float denominator = 0.0f;
     const size_t page_elements =
@@ -496,41 +494,27 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
             offset = token % page_size;
             logical_page = token / page_size;
         }
-        if (tid == 0) {
-            const int physical = page_table[
-                static_cast<size_t>(batch) * logical_pages + logical_page];
-            int chunk = -1;
-            int local_page = 0;
-            if constexpr (FixedGeometry) {
-                chunk = physical >= 0 ? physical >> 6 : -1;
-                local_page = physical & (FixedPagesPerChunk - 1);
-            } else {
-                chunk = physical >= 0
-                    ? physical / pages_per_chunk : -1;
-                local_page = physical - chunk * pages_per_chunk;
-            }
-            key_page_address = chunk >= 0 && chunk < chunks &&
-                    k_chunk_ptrs[chunk] != 0
-                ? reinterpret_cast<uintptr_t>(
-                    reinterpret_cast<const scalar_t *>(
-                        static_cast<uintptr_t>(k_chunk_ptrs[chunk])) +
-                    static_cast<size_t>(local_page) * page_elements) : 0;
-            value_page_address = chunk >= 0 && chunk < chunks &&
-                    v_chunk_ptrs[chunk] != 0
-                ? reinterpret_cast<uintptr_t>(
-                    reinterpret_cast<const scalar_t *>(
-                        static_cast<uintptr_t>(v_chunk_ptrs[chunk])) +
-                    static_cast<size_t>(local_page) * page_elements) : 0;
-        }
-        if constexpr (Warps == 1) {
-            __syncwarp();
+        const int physical = page_table[
+            static_cast<size_t>(batch) * logical_pages + logical_page];
+        int chunk = -1;
+        int local_page = 0;
+        if constexpr (FixedGeometry) {
+            chunk = physical >= 0 ? physical >> 6 : -1;
+            local_page = physical & (FixedPagesPerChunk - 1);
         } else {
-            __syncthreads();
+            chunk = physical >= 0 ? physical / pages_per_chunk : -1;
+            local_page = physical - chunk * pages_per_chunk;
         }
-        const auto * key_page = reinterpret_cast<const scalar_t *>(
-            key_page_address);
-        const auto * value_page = reinterpret_cast<const scalar_t *>(
-            value_page_address);
+        const auto * key_page = chunk >= 0 && chunk < chunks &&
+                k_chunk_ptrs[chunk] != 0
+            ? reinterpret_cast<const scalar_t *>(
+                static_cast<uintptr_t>(k_chunk_ptrs[chunk])) +
+                static_cast<size_t>(local_page) * page_elements : nullptr;
+        const auto * value_page = chunk >= 0 && chunk < chunks &&
+                v_chunk_ptrs[chunk] != 0
+            ? reinterpret_cast<const scalar_t *>(
+                static_cast<uintptr_t>(v_chunk_ptrs[chunk])) +
+                static_cast<size_t>(local_page) * page_elements : nullptr;
         const int page_end = min(
             end, token + active_page_size - offset);
         #pragma unroll 4
