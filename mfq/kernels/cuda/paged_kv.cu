@@ -579,8 +579,8 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                 if (lane < Rep) {
                     const float score = head_dot * scale;
                     const float new_maximum = fmaxf(maximum, score);
-                    previous_factor[lane] = expf(maximum - new_maximum);
-                    probability[lane] = expf(score - new_maximum);
+                    previous_factor[lane] = __expf(maximum - new_maximum);
+                    probability[lane] = __expf(score - new_maximum);
                     denominator = denominator * previous_factor[lane] +
                         probability[lane];
                     maximum = new_maximum;
@@ -600,8 +600,8 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                     if (lane < Rep) {
                         const float score = head_dot * scale;
                         const float new_maximum = fmaxf(maximum, score);
-                        previous_factor[lane] = expf(maximum - new_maximum);
-                        probability[lane] = expf(score - new_maximum);
+                        previous_factor[lane] = __expf(maximum - new_maximum);
+                        probability[lane] = __expf(score - new_maximum);
                         denominator = denominator * previous_factor[lane] +
                             probability[lane];
                         maximum = new_maximum;
