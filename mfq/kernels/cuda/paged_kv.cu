@@ -812,8 +812,8 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
             if (D == 256 && gqa_ratio == 4) {
                 if (page == 16 && chunk_pages == 64) {
                     paged_attention_decode_split_gqa4_d256_kernel<
-                        16, 64, 8, scalar_t><<<
-                        B * Hk * split_parts, 32, 0, stream>>>(
+                        16, 64, 4, scalar_t><<<
+                        B * Hk * split_parts, 64, 0, stream>>>(
                         q.data_ptr<scalar_t>(), k_chunk_ptrs.data_ptr<int64_t>(),
                         v_chunk_ptrs.data_ptr<int64_t>(),
                         page_table.data_ptr<int32_t>(), seq_len.data_ptr<int64_t>(),
