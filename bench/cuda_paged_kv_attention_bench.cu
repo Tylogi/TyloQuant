@@ -59,6 +59,7 @@ float median(std::vector<float> values) {
 template <typename Function>
 std::vector<float> measure(
         Function && function, int warmup, int iterations, int samples) {
+    const cudaStream_t stream = mfq_current_cuda_stream();
     std::vector<Tensor> warmup_outputs;
     warmup_outputs.reserve(static_cast<size_t>(warmup));
     for (int index = 0; index < warmup; ++index) {
@@ -76,11 +77,11 @@ std::vector<float> measure(
         check_cuda(cudaEventCreate(&end), "cudaEventCreate(end)");
         std::vector<Tensor> outputs;
         outputs.reserve(static_cast<size_t>(iterations));
-        check_cuda(cudaEventRecord(start), "cudaEventRecord(start)");
+        check_cuda(cudaEventRecord(start, stream), "cudaEventRecord(start)");
         for (int iteration = 0; iteration < iterations; ++iteration) {
             outputs.push_back(function());
         }
-        check_cuda(cudaEventRecord(end), "cudaEventRecord(end)");
+        check_cuda(cudaEventRecord(end, stream), "cudaEventRecord(end)");
         check_cuda(cudaEventSynchronize(end), "cudaEventSynchronize(end)");
         float elapsed_ms = 0.0f;
         check_cuda(
