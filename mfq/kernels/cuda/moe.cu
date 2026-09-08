@@ -2851,9 +2851,11 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                 m = neuron_min[weight_row] * static_cast<float>(sub_min[meta]);
                 qg = q_packed + meta * QBYTES;
             }
+            int packed = valid ? unpack_four<BITS>(qg, 0) : 0;
 #pragma unroll
             for (int i = 0; i < GS; i += 4) {
-                const int packed = valid ? unpack_four<BITS>(qg, i) : 0;
+                const int next = i + 4 < GS && valid
+                    ? unpack_four<BITS>(qg, i + 4) : 0;
                 const float q0 = static_cast<float>(packed & 255);
                 const float q1 = static_cast<float>((packed >> 8) & 255);
                 const float q2 = static_cast<float>((packed >> 16) & 255);
@@ -2862,6 +2864,7 @@ __device__ __forceinline__ void nint_moe_mma_profile(
                     __floats2half2_rn(d * q0 - m, d * q1 - m);
                 *reinterpret_cast<__half2 *>(&W_s[nn][gl * GS + i + 2]) =
                     __floats2half2_rn(d * q2 - m, d * q3 - m);
+                packed = next;
             }
         }
 
