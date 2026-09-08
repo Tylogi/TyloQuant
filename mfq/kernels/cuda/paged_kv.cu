@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 #include <utility>
 
 namespace {
@@ -22,6 +23,35 @@ __device__ __forceinline__ scalar_t * page_address(
     return reinterpret_cast<scalar_t *>(
         static_cast<uintptr_t>(chunk_ptrs[chunk])) +
         static_cast<size_t>(local_page) * page_elements;
+}
+
+template <int Count, typename scalar_t>
+__device__ __forceinline__ void paged_load_values(
+        const scalar_t * source, float (&values)[Count]) {
+    if constexpr (Count == 8 && std::is_same_v<scalar_t, mfq_half>) {
+        const uint4 packed = *reinterpret_cast<const uint4 *>(source);
+        values[0] = __half2float(__ushort_as_half(
+            static_cast<unsigned short>(packed.x)));
+        values[1] = __half2float(__ushort_as_half(
+            static_cast<unsigned short>(packed.x >> 16)));
+        values[2] = __half2float(__ushort_as_half(
+            static_cast<unsigned short>(packed.y)));
+        values[3] = __half2float(__ushort_as_half(
+            static_cast<unsigned short>(packed.y >> 16)));
+        values[4] = __half2float(__ushort_as_half(
+            static_cast<unsigned short>(packed.z)));
+        values[5] = __half2float(__ushort_as_half(
+            static_cast<unsigned short>(packed.z >> 16)));
+        values[6] = __half2float(__ushort_as_half(
+            static_cast<unsigned short>(packed.w)));
+        values[7] = __half2float(__ushort_as_half(
+            static_cast<unsigned short>(packed.w >> 16)));
+    } else {
+        #pragma unroll
+        for (int index = 0; index < Count; ++index) {
+            values[index] = static_cast<float>(source[index]);
+        }
+    }
 }
 
 template <typename scalar_t>
@@ -435,12 +465,13 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
     float value_sum[Rep][ValuesPerThread];
     #pragma unroll
     for (int index = 0; index < Rep; ++index) {
+        const auto * query_source = q +
+            (static_cast<size_t>(batch) * Hq + first_query_head + index) * D +
+            first_dimension;
+        paged_load_values(query_source, query[index]);
         #pragma unroll
         for (int value_index = 0;
                 value_index < ValuesPerThread; ++value_index) {
-            query[index][value_index] = static_cast<float>(q[
-                (static_cast<size_t>(batch) * Hq + first_query_head + index) *
-                D + first_dimension + value_index]);
             value_sum[index][value_index] = 0.0f;
         }
     }
@@ -516,15 +547,23 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
             first_dimension;
         float key[ValuesPerThread];
         float value[ValuesPerThread];
-        #pragma unroll
-        for (int value_index = 0;
-                value_index < ValuesPerThread; ++value_index) {
-            key[value_index] = key_page != nullptr
-                ? static_cast<float>(key_page[first_element + value_index])
-                : 0.0f;
-            value[value_index] = value_page != nullptr
-                ? static_cast<float>(value_page[first_element + value_index])
-                : 0.0f;
+        if (key_page != nullptr) {
+            paged_load_values(key_page + first_element, key);
+        } else {
+            #pragma unroll
+            for (int value_index = 0;
+                    value_index < ValuesPerThread; ++value_index) {
+                key[value_index] = 0.0f;
+            }
+        }
+        if (value_page != nullptr) {
+            paged_load_values(value_page + first_element, value);
+        } else {
+            #pragma unroll
+            for (int value_index = 0;
+                    value_index < ValuesPerThread; ++value_index) {
+                value[value_index] = 0.0f;
+            }
         }
         #pragma unroll
         for (int index = 0; index < Rep; ++index) {
