@@ -85,20 +85,29 @@ void check_kernels() {
         .to(gpu).to(mfq::cuda::kFloat16).contiguous();
     auto q = mfq::cuda::tensor<float>(q_host).reshape({B, Hq, 1, D})
         .to(gpu).to(mfq::cuda::kFloat16).contiguous();
-    auto k_chunk = mfq::cuda::empty(
+    auto k_chunk_0 = mfq::cuda::empty(
         {PagesPerChunk, Hk, Page, D},
         TensorOptions().device(gpu).dtype(mfq::cuda::kFloat16));
-    auto v_chunk = mfq::cuda::empty_like(k_chunk);
-    const auto k_pointer = static_cast<std::int64_t>(
-        reinterpret_cast<std::intptr_t>(k_chunk.data_ptr()));
-    const auto v_pointer = static_cast<std::int64_t>(
-        reinterpret_cast<std::intptr_t>(v_chunk.data_ptr()));
-    auto k_chunks = mfq::cuda::tensor<std::int64_t>({k_pointer}).to(gpu);
-    auto v_chunks = mfq::cuda::tensor<std::int64_t>({v_pointer}).to(gpu);
-    // Logical pages deliberately map to non-contiguous physical pages.
+    auto v_chunk_0 = mfq::cuda::empty_like(k_chunk_0);
+    auto k_chunk_1 = mfq::cuda::empty_like(k_chunk_0);
+    auto v_chunk_1 = mfq::cuda::empty_like(k_chunk_0);
+    const auto k_pointer_0 = static_cast<std::int64_t>(
+        reinterpret_cast<std::intptr_t>(k_chunk_0.data_ptr()));
+    const auto v_pointer_0 = static_cast<std::int64_t>(
+        reinterpret_cast<std::intptr_t>(v_chunk_0.data_ptr()));
+    const auto k_pointer_1 = static_cast<std::int64_t>(
+        reinterpret_cast<std::intptr_t>(k_chunk_1.data_ptr()));
+    const auto v_pointer_1 = static_cast<std::int64_t>(
+        reinterpret_cast<std::intptr_t>(v_chunk_1.data_ptr()));
+    auto k_chunks = mfq::cuda::tensor<std::int64_t>({
+        k_pointer_0, k_pointer_1}).to(gpu);
+    auto v_chunks = mfq::cuda::tensor<std::int64_t>({
+        v_pointer_0, v_pointer_1}).to(gpu);
+    // Logical pages deliberately map to non-contiguous physical pages and
+    // cross the chunk boundary at physical page 4.
     auto page_table = mfq::cuda::tensor<std::int32_t>({
-        2, 0, -1, -1,
-        1, 3, -1, -1,
+        2, 4, -1, -1,
+        5, 3, -1, -1,
     }).reshape({B, LogicalPages}).to(gpu).contiguous();
     auto positions = mfq::cuda::tensor<std::int64_t>({
         0, 1, 2, 3, 4, 5, 6,
@@ -201,6 +210,6 @@ int main() {
     }
     check_allocator();
     check_kernels();
-    std::cout << "paged_kv_test PASS page_size=4 gqa=4 split=1\n";
+    std::cout << "paged_kv_test PASS page_size=4 chunks=2 gqa=4 split=1\n";
     return 0;
 }
