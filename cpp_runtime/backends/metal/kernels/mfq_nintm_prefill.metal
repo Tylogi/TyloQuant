@@ -650,6 +650,78 @@ inline void decode_nint_group_slice(
     }
 }
 
+inline void decode_nint5_group28_slice(
+    const device int* d,
+    const device uchar* values,
+    const device uchar* sub_scales,
+    const device uchar* sub_mins,
+    const device float* anchor_scales,
+    const device float* anchor_mins,
+    threadgroup half* target,
+    uint row,
+    uint group,
+    uint first_element,
+    uint element_count) {
+    if (uint(d[10]) == 0u) {
+        decode_nint_group_slice<5u, 28u>(
+            d, values, sub_scales, sub_mins,
+            anchor_scales, anchor_mins, target,
+            row, group, first_element, element_count);
+        return;
+    }
+    constexpr uint GROUP_SIZE = 28u;
+    constexpr uint LOW_BYTES = 14u;
+    constexpr uint RECORD_BYTES = 18u;
+    uint groups = uint(d[6]);
+    uint metadata = row * groups + group;
+    uint q_offset = uint(d[7]);
+    uint sub_offset = uint(d[8]);
+    uint anchor_offset = uint(d[9]);
+    float scale = anchor_scales[anchor_offset + row]
+        * float(sub_scales[sub_offset + metadata]);
+    float minimum = anchor_mins[anchor_offset + row]
+        * float(sub_mins[sub_offset + metadata]);
+    uint packed_base = q_offset + metadata * RECORD_BYTES;
+    uchar4 high = uchar4(
+        values[packed_base + LOW_BYTES],
+        values[packed_base + LOW_BYTES + 1u],
+        values[packed_base + LOW_BYTES + 2u],
+        values[packed_base + LOW_BYTES + 3u]);
+#pragma clang loop unroll(full)
+    for (uint element = 0u; element < GROUP_SIZE; element += 4u) {
+        if (element >= element_count) {
+            continue;
+        }
+        uint source_element = first_element + element;
+        uchar2 low = *reinterpret_cast<device const uchar2*>(
+            values + packed_base + (source_element >> 1u));
+        uint high_bits = uint(high[source_element >> 3u]);
+        uint high_shift = source_element & 7u;
+        ushort4 quantized = ushort4(
+            uint(low.x & 15u)
+                | (((high_bits >> high_shift) & 1u) << 4u),
+            uint(low.x >> 4u)
+                | (((high_bits >> (high_shift + 1u)) & 1u) << 4u),
+            uint(low.y & 15u)
+                | (((high_bits >> (high_shift + 2u)) & 1u) << 4u),
+            uint(low.y >> 4u)
+                | (((high_bits >> (high_shift + 3u)) & 1u) << 4u));
+        half4 decoded = half4(
+            scale * float4(quantized) - float4(minimum));
+        if (element + 4u <= element_count) {
+            *reinterpret_cast<threadgroup half4*>(
+                target + element) = decoded;
+        } else {
+#pragma clang loop unroll(full)
+            for (uint lane = 0u; lane < 4u; ++lane) {
+                if (element + lane < element_count) {
+                    target[element + lane] = decoded[lane];
+                }
+            }
+        }
+    }
+}
+
 inline half decode_nint_value(
     const device int* d,
     const device uchar* values,
@@ -1659,7 +1731,7 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                             local_expert * uint(matrix_output_width)
                             + uint(output_base) + output_row
                             + uint(projection * output_width);
-                        decode_nint_group_slice<5u, GROUP_SIZE>(
+                        decode_nint5_group28_slice(
                             descriptor, nint_q, nint_sub_scale,
                             nint_sub_min, nint_anchor_scale,
                             nint_anchor_min,
@@ -2160,7 +2232,7 @@ template <
                                 * uint(params.matrix_output_width)
                             + uint(output_base) + output_row
                             + uint(projection * params.output_width);
-                        decode_nint_group_slice<5u, GROUP_SIZE>(
+                        decode_nint5_group28_slice(
                             descriptor, nint_q, nint_sub_scale,
                             nint_sub_min, nint_anchor_scale,
                             nint_anchor_min,

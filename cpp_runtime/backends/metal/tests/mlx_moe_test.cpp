@@ -4655,6 +4655,49 @@ void test_grouped_nint2_pair_prefill() {
     }
 }
 
+void test_grouped_nint5_group28_tail_prefill() {
+    constexpr int output = 16;
+    constexpr int input_width = 640;
+    const auto fixture = make_moe_fixture(
+        {"NINT5"}, output, input_width, 37, 28);
+    const auto weight = mfq::metal::MlxMoeWeight::from_blob(
+        fixture.blob);
+    require(
+        weight.supports_grouped_mmq(),
+        "NINT5-28 tail fixture must support grouped prefill");
+    const auto exercise = [&](int tokens) {
+        std::vector<float> input(tokens * input_width);
+        for (std::size_t index = 0; index < input.size(); ++index) {
+            input[index] = static_cast<float>(
+                static_cast<int>((index * 19 + 11) % 37) - 18)
+                / 256.0f;
+        }
+        const std::vector<std::int32_t> ids(tokens, 0);
+        const auto actual = evaluated_floats(
+            weight.routed_matmul(
+                mlx::core::astype(
+                    mlx::core::array(
+                        input.begin(),
+                        mlx::core::Shape{tokens, input_width}),
+                    mlx::core::float16),
+                mlx::core::array(
+                    ids.begin(), mlx::core::Shape{tokens, 1})));
+        for (int token = 0; token < tokens; ++token) {
+            for (int row = 0; row < output; ++row) {
+                float expected = 0.0f;
+                for (int column = 0; column < input_width; ++column) {
+                    expected += input[token * input_width + column]
+                        * fixture.dense[row * input_width + column];
+                }
+                require_close(
+                    actual[token * output + row], expected, 8e-2f);
+            }
+        }
+    };
+    exercise(49);
+    exercise(1025);
+}
+
 void test_grouped_nint8_group48_tail_prefill() {
     constexpr int tokens = 1025;
     constexpr int output = 24;
@@ -5235,6 +5278,7 @@ int main(int argc, char** argv) {
         test_grouped_vq_decoder_tail_prefill();
         test_grouped_nint_mmq_prefill();
         test_grouped_nint2_pair_prefill();
+        test_grouped_nint5_group28_tail_prefill();
         test_grouped_nint8_group48_tail_prefill();
         test_grouped_dense_quad_tail_prefill();
         test_mixed_nintm_native_and_grouped_dispatch();
