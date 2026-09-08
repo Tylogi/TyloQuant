@@ -1,6 +1,7 @@
 #include "mfq_tensor_backend.h"
 #include "mfq_cuda_model_plan.h"
 #include "mfq_cuda_mtp.h"
+#include "mfq_cuda_paged_kv.h"
 #include "flash_next/config.h"
 #include "flash_next/state.h"
 #include "flash_next/qwen4.h"
@@ -15384,7 +15385,17 @@ struct FFN {
 struct KVCache {
     mfq_tensor_backend::Tensor k;
     mfq_tensor_backend::Tensor v;
+    mfq_tensor_backend::Tensor k_chunk_ptrs;
+    mfq_tensor_backend::Tensor v_chunk_ptrs;
+    mfq_tensor_backend::Tensor page_table;
     bool ring = false;
+    int64_t paged_batch = 0;
+    int64_t paged_heads = 0;
+    int64_t paged_head_dim = 0;
+    int64_t page_size = 0;
+    int64_t pages_per_chunk = 0;
+    mfq_tensor_backend::ScalarType paged_dtype =
+        mfq_tensor_backend::kFloat16;
     KVCache() = default;
     KVCache(
             int64_t B,
@@ -15399,12 +15410,65 @@ struct KVCache {
         k = mfq_tensor_backend::zeros({B, H, max_seq, D}, opts);
         v = mfq_tensor_backend::zeros({B, H, max_seq, D}, opts);
     }
+
+    static KVCache paged_view(
+            mfq_tensor_backend::Tensor key_chunks,
+            mfq_tensor_backend::Tensor value_chunks,
+            mfq_tensor_backend::Tensor pages,
+            int64_t batch, int64_t heads, int64_t head_dim,
+            int64_t tokens_per_page, int64_t chunk_pages,
+            mfq_tensor_backend::ScalarType dtype) {
+        KVCache result;
+        result.k_chunk_ptrs = std::move(key_chunks);
+        result.v_chunk_ptrs = std::move(value_chunks);
+        result.page_table = std::move(pages);
+        result.paged_batch = batch;
+        result.paged_heads = heads;
+        result.paged_head_dim = head_dim;
+        result.page_size = tokens_per_page;
+        result.pages_per_chunk = chunk_pages;
+        result.paged_dtype = dtype;
+        return result;
+    }
+
+    bool is_paged() const noexcept { return page_size > 0; }
+
+    bool defined() const noexcept {
+        return is_paged()
+            ? k_chunk_ptrs.defined() && v_chunk_ptrs.defined() &&
+                page_table.defined()
+            : k.defined() && v.defined();
+    }
+
+    int64_t batch_size() const noexcept {
+        return is_paged() ? paged_batch : (k.defined() ? k.size(0) : 0);
+    }
+
+    mfq_tensor_backend::ScalarType scalar_type() const {
+        return is_paged() ? paged_dtype : k.scalar_type();
+    }
+
     std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> append(
             mfq_tensor_backend::Tensor kk, mfq_tensor_backend::Tensor vv, mfq_tensor_backend::Tensor pos,
             int64_t start_pos, int64_t end_pos) {
         (void)start_pos;
-        auto kh = kk.to(k.scalar_type()).contiguous();
-        auto vh = vv.to(v.scalar_type()).contiguous();
+        auto kh = kk.to(scalar_type()).contiguous();
+        auto vh = vv.to(scalar_type()).contiguous();
+        if (is_paged()) {
+            MFQ_RUNTIME_CHECK(
+                paged_batch == kh.size(0) && paged_heads == kh.size(1) &&
+                paged_head_dim == kh.size(3) &&
+                page_size > 0 && pages_per_chunk > 0,
+                "Paged KV cache geometry does not match the write");
+            paged_kv_cache_write_cuda(
+                k_chunk_ptrs, v_chunk_ptrs, page_table,
+                kh, vh, pos, page_size, pages_per_chunk);
+            // Continuous-batching prefill starts from an empty sequence, so
+            // the projected K/V tensors are already the logical contiguous
+            // view needed by causal prefill attention. Decode consumes the
+            // physical pages directly below.
+            return {kh, vh};
+        }
         MFQ_RUNTIME_CHECK(
             kh.dim() == 4 && vh.sizes() == kh.sizes() &&
             kh.size(0) == k.size(0) && kh.size(1) == k.size(1) &&
@@ -16435,7 +16499,7 @@ struct FullBlock : Block {
     static constexpr int64_t kDecodeAttentionMaxParts = 16;
 
     void reset(int64_t B) override {
-        if (cache.k.defined() && cache.k.size(0) == B) return;
+        if (cache.defined() && cache.batch_size() == B) return;
         cache = KVCache();
         decode_partial_o = mfq_tensor_backend::Tensor();
         decode_partial_m = mfq_tensor_backend::Tensor();
@@ -16473,7 +16537,7 @@ struct FullBlock : Block {
                          cache_pos + T, g_kl_kv_cache_capacity)
                    : c.max_position_embeddings);
         const RopeCache & active_rope = attention_rope.cos.defined() ? attention_rope : rope;
-        if (!cache.k.defined() || cache.k.numel() == 0) {
+        if (!cache.defined()) {
             cache = KVCache(
                 B, nkh, cache_capacity, hd, sliding, x.device(),
                 official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16);
@@ -16554,12 +16618,12 @@ struct FullBlock : Block {
         const char * fused_qk_rope_kv_env =
             std::getenv("MFQ_MINICPM_FUSED_QK_NORM_ROPE_KV");
         const bool fused_qk_rope_kv = official_bf16 && x.is_cuda() &&
-            write_positions.dim() == 1 && pos.dim() == 1 &&
-            T == 1 && !cache.ring && !v_norm.defined() &&
+            write_positions.dim() == 1 && pos.dim() == 1 && T == 1 &&
+            !cache.is_paged() && !cache.ring && !v_norm.defined() &&
             q_norm.defined() && k_norm.defined() &&
             active_rope.rotary_dim == 128 &&
             active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 &&
-            hd == 128 && cache.k.scalar_type() == mfq_tensor_backend::kBFloat16 &&
+            hd == 128 && cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
             (fused_qk_rope_kv_env == nullptr ||
              fused_qk_rope_kv_env[0] != '0');
         std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> kv;
@@ -16631,10 +16695,10 @@ struct FullBlock : Block {
         const char * fused_rope_kv_env =
             std::getenv("MFQ_MINICPM_FUSED_ROPE_KV");
         const bool fused_rope_kv = official_bf16 && x.is_cuda() &&
-            write_positions.dim() == 1 && pos.dim() == 1 &&
-            T == 1 && !cache.ring && active_rope.rotary_dim == 128 &&
+            write_positions.dim() == 1 && pos.dim() == 1 && T == 1 &&
+            !cache.is_paged() && !cache.ring && active_rope.rotary_dim == 128 &&
             active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 &&
-            hd == 128 && cache.k.scalar_type() == mfq_tensor_backend::kBFloat16 &&
+            hd == 128 && cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
             (fused_rope_kv_env == nullptr || fused_rope_kv_env[0] != '0');
         if (fused_rope_kv) {
             q = g_profiler.measure("full.rope_kv_write", [&]() {
@@ -16892,7 +16956,26 @@ struct FullBlock : Block {
                             {2 * meta_float2}, cuda.dtype(mfq_tensor_backend::kFloat32));
                     }
                 };
-                if (aten_decode_enabled) {
+                if (cache.is_paged()) {
+                    const char * split_env =
+                        std::getenv("MFQ_ATTENTION_DECODE_SPLITK");
+                    const bool split_enabled =
+                        split_env == nullptr || split_env[0] != '0';
+                    int64_t parts = split_enabled && cache_pos >= 192
+                        ? (cache_pos + 127) / 128 : 1;
+                    const bool dynamic_parts =
+                        split_enabled && g_decode_graph_attention_parts > 1;
+                    if (dynamic_parts) parts = g_decode_graph_attention_parts;
+                    parts = std::min<int64_t>(
+                        parts, kDecodeAttentionMaxParts);
+                    a = attention_paged_cache_decode_cuda(
+                        qh, cache.k_chunk_ptrs, cache.v_chunk_ptrs,
+                        cache.page_table, seq_len.value(), attn_scale,
+                        cache.page_size, cache.pages_per_chunk,
+                        cache.paged_heads,
+                        decode_partial_o, decode_partial_m, decode_partial_l,
+                        parts, dynamic_parts);
+                } else if (aten_decode_enabled) {
                     const int64_t visible_len = sliding
                         ? std::min<int64_t>(attention_window, cache_pos + T)
                         : cache_pos + T;
@@ -28898,6 +28981,10 @@ int main(int argc, char ** argv) {
                     << "continuous_batching enabled=1 max_sequences="
                     << continuous_batching
                     << " decode=target_only mtp=disabled"
+                    << " paged_kv="
+                    << (continuous_batcher->paged_kv_enabled() ? 1 : 0)
+                    << " page_size="
+                    << continuous_batcher->paged_kv_page_size()
                     << " prefix_cache=fresh_prefill\n";
             }
             std::optional<MiniCPMO45DuplexSession> minicpmo_duplex_session;

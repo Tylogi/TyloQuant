@@ -1,5 +1,7 @@
 #pragma once
 
+#include "qwen_paged_kv.h"
+
 // Included by mfq_decode.cpp after the CUDA Qwen model and sampler are defined.
 // The scheduler owns request concurrency; the adapter below owns the hybrid
 // full-attention/recurrent state carried between decode iterations.
@@ -14,6 +16,7 @@ struct QwenBatchLayerState {
     Tensor first;
     Tensor second;
     bool ring = false;
+    bool paged = false;
 };
 
 struct QwenBatchState {
@@ -90,7 +93,13 @@ static bool qwen_continuous_batch_cuda_graph_enabled(const Model & model) {
         tensor_parallel_cuda_graph_enabled();
 }
 
-static QwenBatchState take_qwen_batch_state(Model & model, int64_t batch) {
+static bool qwen_continuous_paged_kv_enabled() {
+    const char * environment = std::getenv("MFQ_CONTINUOUS_PAGED_KV");
+    return environment == nullptr || std::atoi(environment) != 0;
+}
+
+static QwenBatchState take_qwen_batch_state(
+        Model & model, int64_t batch, QwenPagedKvArena * paged_kv) {
     MFQ_RUNTIME_CHECK(model.speculative_start < 0,
         "continuous batching cannot detach speculative state");
     QwenBatchState state;
@@ -100,15 +109,23 @@ static QwenBatchState take_qwen_batch_state(Model & model, int64_t batch) {
         MfqCudaGuard guard(block->cuda_device);
         QwenBatchLayerState layer;
         if (auto * full = dynamic_cast<FullBlock *>(block.get())) {
-            MFQ_RUNTIME_CHECK(full->cache.k.defined() && full->cache.v.defined() &&
-                full->cache.k.dim() == 4 &&
-                full->cache.k.size(0) == batch &&
-                full->cache.v.sizes() == full->cache.k.sizes(),
-                "continuous batching full-attention state is unavailable");
             layer.kind = QwenBatchLayerState::Kind::FullAttention;
-            layer.first = full->cache.k;
-            layer.second = full->cache.v;
-            layer.ring = full->cache.ring;
+            layer.paged = paged_kv != nullptr;
+            if (layer.paged) {
+                MFQ_RUNTIME_CHECK(full->cache.is_paged() &&
+                    full->cache.batch_size() == batch,
+                    "continuous batching paged KV state is unavailable");
+            } else {
+                MFQ_RUNTIME_CHECK(
+                    full->cache.k.defined() && full->cache.v.defined() &&
+                    full->cache.k.dim() == 4 &&
+                    full->cache.k.size(0) == batch &&
+                    full->cache.v.sizes() == full->cache.k.sizes(),
+                    "continuous batching full-attention state is unavailable");
+                layer.first = full->cache.k;
+                layer.second = full->cache.v;
+                layer.ring = full->cache.ring;
+            }
             full->cache = KVCache();
             clear_full_attention_decode_workspaces(*full);
         } else if (auto * linear = dynamic_cast<LinearBlock *>(block.get())) {
@@ -152,7 +169,7 @@ static Tensor merge_batch_tensors(
 
 static void restore_qwen_batch_states(
         Model & model, const std::vector<QwenBatchState> & states,
-        int64_t cache_position) {
+        int64_t cache_position, QwenPagedKvArena * paged_kv) {
     MFQ_RUNTIME_CHECK(!states.empty(),
         "continuous batching cannot restore an empty state list");
     int64_t batch = 0;
@@ -175,10 +192,19 @@ static void restore_qwen_batch_states(
             MFQ_RUNTIME_CHECK(kind ==
                 QwenBatchLayerState::Kind::FullAttention,
                 "continuous batching full-attention state kind changed");
+            if (paged_kv != nullptr) {
+                for (const auto & state : states) {
+                    MFQ_RUNTIME_CHECK(state.layers[layer_index].paged,
+                        "continuous batching lost paged KV state");
+                }
+                full->cache = KVCache();
+                clear_full_attention_decode_workspaces(*full);
+                continue;
+            }
             const auto shape = states.front().layers[layer_index].first.sizes();
             for (const auto & state : states) {
                 const auto & saved = state.layers[layer_index];
-                MFQ_RUNTIME_CHECK(!saved.ring &&
+                MFQ_RUNTIME_CHECK(!saved.paged && !saved.ring &&
                     saved.first.dim() == 4 &&
                     saved.second.sizes() == saved.first.sizes() &&
                     saved.first.size(1) == shape[1] &&
@@ -221,23 +247,33 @@ static void restore_qwen_batch_states(
 
 static void compact_qwen_batch_state(
         Model & model, const std::vector<int64_t> & rows,
-        int64_t cache_position) {
+        int64_t cache_position, QwenPagedKvArena * paged_kv) {
     MFQ_RUNTIME_CHECK(!rows.empty(),
         "continuous batching cannot compact to an empty batch");
     for (auto & block : model.blocks) {
         MfqCudaGuard guard(block->cuda_device);
-        auto indices = mfq_tensor_backend::tensor(
-            rows, mfq_tensor_backend::TensorOptions()
-                .dtype(mfq_tensor_backend::kInt64)
-                .device(mfq_tensor_backend::Device(
-                    mfq_tensor_backend::kCUDA, block->cuda_device)));
         if (auto * full = dynamic_cast<FullBlock *>(block.get())) {
-            full->cache.k = full->cache.k
-                .index_select(0, indices).contiguous();
-            full->cache.v = full->cache.v
-                .index_select(0, indices).contiguous();
+            if (paged_kv != nullptr) {
+                full->cache = KVCache();
+                clear_full_attention_decode_workspaces(*full);
+                continue;
+            }
+            auto indices = mfq_tensor_backend::tensor(
+                rows, mfq_tensor_backend::TensorOptions()
+                    .dtype(mfq_tensor_backend::kInt64)
+                    .device(mfq_tensor_backend::Device(
+                        mfq_tensor_backend::kCUDA, block->cuda_device)));
+            full->cache.k = full->cache.k.index_select(
+                0, indices).contiguous();
+            full->cache.v = full->cache.v.index_select(
+                0, indices).contiguous();
             clear_full_attention_decode_workspaces(*full);
         } else if (auto * linear = dynamic_cast<LinearBlock *>(block.get())) {
+            auto indices = mfq_tensor_backend::tensor(
+                rows, mfq_tensor_backend::TensorOptions()
+                    .dtype(mfq_tensor_backend::kInt64)
+                    .device(mfq_tensor_backend::Device(
+                        mfq_tensor_backend::kCUDA, block->cuda_device)));
             linear->conv_state = linear->conv_state
                 .index_select(0, indices).contiguous();
             linear->gdn_state = linear->gdn_state
@@ -267,8 +303,14 @@ static std::vector<const void *> qwen_decode_state_addresses(Model & model) {
     addresses.reserve(2 * model.blocks.size());
     for (auto & block : model.blocks) {
         if (auto * full = dynamic_cast<FullBlock *>(block.get())) {
-            addresses.push_back(full->cache.k.data_ptr());
-            addresses.push_back(full->cache.v.data_ptr());
+            if (full->cache.is_paged()) {
+                addresses.push_back(full->cache.k_chunk_ptrs.data_ptr());
+                addresses.push_back(full->cache.v_chunk_ptrs.data_ptr());
+                addresses.push_back(full->cache.page_table.data_ptr());
+            } else {
+                addresses.push_back(full->cache.k.data_ptr());
+                addresses.push_back(full->cache.v.data_ptr());
+            }
         } else if (auto * linear = dynamic_cast<LinearBlock *>(block.get())) {
             addresses.push_back(linear->conv_state.data_ptr());
             addresses.push_back(linear->gdn_state.data_ptr());
@@ -344,6 +386,10 @@ public:
             qwen_continuous_batching_incompatibility(model_);
         if (!incompatibility.empty()) {
             throw std::runtime_error(incompatibility);
+        }
+        if (qwen_continuous_paged_kv_enabled()) {
+            paged_kv_ = std::make_unique<QwenPagedKvArena>(
+                model_, max_sequences_);
         }
         worker_ = std::thread([this] { worker_main(); });
     }
@@ -494,11 +540,36 @@ public:
                 static_cast<double>(mtp_bypasses_.load())},
             {"continuous_batching_prefix_cache_bypasses",
                 static_cast<double>(prefix_cache_bypasses_.load())},
+            {"continuous_batching_paged_kv",
+                paged_kv_ ? 1.0 : 0.0},
+            {"paged_kv_page_size",
+                paged_kv_ ? static_cast<double>(paged_kv_->page_size()) : 0.0},
+            {"paged_kv_live_pages",
+                paged_kv_ ? static_cast<double>(paged_kv_->live_pages()) : 0.0},
+            {"paged_kv_peak_live_pages",
+                paged_kv_ ? static_cast<double>(paged_kv_->peak_live_pages()) : 0.0},
+            {"paged_kv_capacity_pages",
+                paged_kv_ ? static_cast<double>(paged_kv_->capacity_pages()) : 0.0},
+            {"paged_kv_reserved_bytes",
+                paged_kv_ ? static_cast<double>(paged_kv_->reserved_bytes()) : 0.0},
+            {"paged_kv_page_allocations",
+                paged_kv_ ? static_cast<double>(paged_kv_->allocation_count()) : 0.0},
+            {"paged_kv_page_reuses",
+                paged_kv_ ? static_cast<double>(paged_kv_->reuse_count()) : 0.0},
+            {"paged_kv_page_releases",
+                paged_kv_ ? static_cast<double>(paged_kv_->release_count()) : 0.0},
+            {"paged_kv_table_updates",
+                paged_kv_ ? static_cast<double>(paged_kv_->page_table_updates()) : 0.0},
         };
     }
 
     int64_t queued_requests() const {
         return queued_.load(std::memory_order_relaxed);
+    }
+
+    bool paged_kv_enabled() const noexcept { return paged_kv_ != nullptr; }
+    int64_t paged_kv_page_size() const noexcept {
+        return paged_kv_ ? paged_kv_->page_size() : 0;
     }
 
 private:
@@ -521,6 +592,7 @@ private:
         int32_t produced = 0;
         int64_t pending_token = 0;
         int64_t cache_length = 0;
+        QwenPagedKvSequence paged_kv;
         std::mutex mutex;
         std::condition_variable output_ready;
         std::optional<MfqPrefillTiming> prefill_timing;
@@ -559,6 +631,29 @@ private:
             request->output_tokens.push_back(token);
         }
         request->output_ready.notify_one();
+    }
+
+    void bind_paged_requests(
+            const std::vector<std::shared_ptr<Request>> & requests) {
+        if (!paged_kv_) return;
+        std::vector<const QwenPagedKvSequence *> sequences;
+        sequences.reserve(requests.size());
+        for (const auto & request : requests) {
+            sequences.push_back(&request->paged_kv);
+        }
+        paged_kv_->bind(sequences);
+    }
+
+    void release_paged_requests(
+            const std::vector<std::shared_ptr<Request>> & requests) {
+        if (!paged_kv_) return;
+        for (const auto & request : requests) {
+            paged_kv_->release(request->paged_kv);
+        }
+    }
+
+    void detach_paged_kv() {
+        if (paged_kv_) paged_kv_->detach();
     }
 
     void fail_requests(
@@ -616,13 +711,20 @@ private:
         states.reserve(1 + incoming.size());
         if (!active_.empty()) {
             states.push_back(take_qwen_batch_state(
-                model_, static_cast<int64_t>(active_.size())));
+                model_, static_cast<int64_t>(active_.size()),
+                paged_kv_.get()));
         }
         std::vector<std::shared_ptr<Request>> admitted;
         admitted.reserve(incoming.size());
         for (const auto & request : incoming) {
             try {
                 model_.reset(1);
+                if (paged_kv_) {
+                    paged_kv_->ensure_tokens(
+                        request->paged_kv,
+                        static_cast<int64_t>(request->prompt.size()));
+                    bind_paged_requests({request});
+                }
                 auto ids = mfq_tensor_backend::tensor(
                     request->prompt,
                     mfq_tensor_backend::TensorOptions()
@@ -654,6 +756,10 @@ private:
                 if (request->cancel_requested.load(
                             std::memory_order_acquire) ||
                         request->produced >= request->generation_limit) {
+                    if (paged_kv_) {
+                        paged_kv_->release(request->paged_kv);
+                        detach_paged_kv();
+                    }
                     complete_request(request);
                     continue;
                 }
@@ -661,11 +767,16 @@ private:
                     sample_token_counts_add_cuda(
                         request->counts, next.contiguous());
                 }
-                states.push_back(take_qwen_batch_state(model_, 1));
+                states.push_back(take_qwen_batch_state(
+                    model_, 1, paged_kv_.get()));
                 admitted.push_back(request);
                 ++admissions_;
                 ++requests_;
             } catch (...) {
+                if (paged_kv_) {
+                    try { paged_kv_->release(request->paged_kv); } catch (...) {}
+                    detach_paged_kv();
+                }
                 try { model_.reset(1); } catch (...) {}
                 complete_request(request, std::current_exception());
             }
@@ -678,9 +789,11 @@ private:
                     max_cache_position, request->cache_length);
             }
             restore_qwen_batch_states(
-                model_, states, max_cache_position);
+                model_, states, max_cache_position, paged_kv_.get());
+            bind_paged_requests(active_);
         } else {
             model_.reset(1);
+            detach_paged_kv();
         }
         active_count_.store(
             static_cast<int64_t>(active_.size()),
@@ -714,9 +827,14 @@ private:
         invalidate_decode_graph();
         if (survivors.empty()) {
             model_.reset(1);
+            release_paged_requests(cancelled);
+            detach_paged_kv();
         } else {
             compact_qwen_batch_state(
-                model_, survivor_rows, survivor_max_position);
+                model_, survivor_rows, survivor_max_position,
+                paged_kv_.get());
+            release_paged_requests(cancelled);
+            bind_paged_requests(survivors);
             ++compactions_;
         }
         active_ = std::move(survivors);
@@ -754,6 +872,15 @@ private:
         MfqCudaGuard primary_guard(primary);
         retire_cancelled_requests();
         if (active_.empty()) return;
+        if (paged_kv_) {
+            bool page_table_changed = false;
+            for (const auto & request : active_) {
+                page_table_changed = paged_kv_->ensure_tokens(
+                    request->paged_kv, request->cache_length + 1) ||
+                    page_table_changed;
+            }
+            if (page_table_changed) bind_paged_requests(active_);
+        }
         const int64_t batch = static_cast<int64_t>(active_.size());
         const bool batch_greedy = std::all_of(
             active_.begin(), active_.end(),
@@ -930,6 +1057,8 @@ private:
             g_decode_graph_attention_parts = 0;
             try { model_.reset(1); } catch (...) {}
             fail_requests(active_, error);
+            release_paged_requests(active_);
+            detach_paged_kv();
             active_.clear();
             active_count_.store(0);
             return;
@@ -1018,10 +1147,20 @@ private:
         if (survivors.empty()) {
             invalidate_decode_graph();
             model_.reset(1);
+            release_paged_requests(active_);
+            detach_paged_kv();
         } else if (survivors.size() != active_.size()) {
             invalidate_decode_graph();
             compact_qwen_batch_state(
-                model_, survivor_rows, survivor_max_position);
+                model_, survivor_rows, survivor_max_position,
+                paged_kv_.get());
+            std::vector<std::shared_ptr<Request>> retired;
+            retired.reserve(completions.size());
+            for (const auto & completion : completions) {
+                retired.push_back(completion.first);
+            }
+            release_paged_requests(retired);
+            bind_paged_requests(survivors);
             ++compactions_;
         } else {
             model_.cache_pos = survivor_max_position;
@@ -1057,11 +1196,13 @@ private:
                         lock.unlock();
                         fail_requests(pending, error);
                         fail_requests(active_, error);
+                        release_paged_requests(active_);
                         active_.clear();
                         active_count_.store(0);
                         try {
                             std::lock_guard<std::mutex> model_lock(model_mutex_);
                             model_.reset(1);
+                            detach_paged_kv();
                         } catch (...) {}
                         return;
                     }
@@ -1083,11 +1224,13 @@ private:
             } catch (...) {
                 auto error = std::current_exception();
                 fail_requests(active_, error);
+                release_paged_requests(active_);
                 active_.clear();
                 active_count_.store(0);
                 try {
                     std::lock_guard<std::mutex> model_lock(model_mutex_);
                     model_.reset(1);
+                    detach_paged_kv();
                 } catch (...) {}
             }
         }
@@ -1119,6 +1262,7 @@ private:
     std::atomic<int64_t> prefix_cache_bypasses_{0};
     Tensor decode_metadata_host_;
     Tensor decode_metadata_cuda_;
+    std::unique_ptr<QwenPagedKvArena> paged_kv_;
     std::unique_ptr<QwenContinuousDecodeGraph> decode_graph_;
 };
 
