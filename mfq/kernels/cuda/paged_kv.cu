@@ -476,8 +476,7 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
         }
     }
     __shared__ float warp_dot[Rep][Warps];
-    __shared__ float previous_factor[Rep];
-    __shared__ float probability[Rep];
+    __shared__ float2 softmax_factor[Rep];
     __shared__ uintptr_t key_page_address;
     __shared__ uintptr_t value_page_address;
     float maximum[Rep];
@@ -576,11 +575,13 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                 if (lane == 0) {
                     const float score = dot * scale;
                     const float new_maximum = fmaxf(maximum[index], score);
-                    previous_factor[index] = expf(
+                    const float previous_factor = expf(
                         maximum[index] - new_maximum);
-                    probability[index] = expf(score - new_maximum);
+                    const float probability = expf(score - new_maximum);
+                    softmax_factor[index] = make_float2(
+                        previous_factor, probability);
                     denominator[index] = denominator[index] *
-                        previous_factor[index] + probability[index];
+                        previous_factor + probability;
                     maximum[index] = new_maximum;
                 }
             } else if (lane == 0) {
@@ -600,11 +601,13 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
                         const float score = dot * scale;
                         const float new_maximum = fmaxf(
                             maximum[index], score);
-                        previous_factor[index] = expf(
+                        const float previous_factor = expf(
                             maximum[index] - new_maximum);
-                        probability[index] = expf(score - new_maximum);
+                        const float probability = expf(score - new_maximum);
+                        softmax_factor[index] = make_float2(
+                            previous_factor, probability);
                         denominator[index] = denominator[index] *
-                            previous_factor[index] + probability[index];
+                            previous_factor + probability;
                         maximum[index] = new_maximum;
                     }
                 }
@@ -613,12 +616,13 @@ __global__ void paged_attention_decode_split_gqa4_d256_kernel(
         }
         #pragma unroll
         for (int index = 0; index < Rep; ++index) {
+            const float2 factor = softmax_factor[index];
             #pragma unroll
             for (int value_index = 0;
                     value_index < ValuesPerThread; ++value_index) {
                 value_sum[index][value_index] =
-                    value_sum[index][value_index] * previous_factor[index] +
-                    probability[index] * value[value_index];
+                    value_sum[index][value_index] * factor.x +
+                    factor.y * value[value_index];
             }
         }
     }
