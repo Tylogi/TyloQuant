@@ -2874,6 +2874,7 @@ struct GroupedMmqConfig {
     int fused_swiglu = 0;
     int has_nepq_residual = 0;
     int family_mask = 127;
+    int nint_profile_mask = 127;
     int vq_profile_mask = 0;
     bool use_nax = false;
     bool direct_nax = false;
@@ -3456,7 +3457,8 @@ public:
                     : "mfq_grouped_mmq_v13");
         }
         if (config_.use_nax) {
-            library_name += "_fm" + std::to_string(config_.family_mask);
+            library_name += "_fm" + std::to_string(config_.family_mask)
+                + "_nm" + std::to_string(config_.nint_profile_mask);
         }
         auto* library = device.get_library(
             library_name,
@@ -3467,6 +3469,9 @@ public:
                 vector_jsc_extended,
                 family_mask = config_.use_nax
                     ? config_.family_mask
+                    : 127,
+                nint_profile_mask = config_.use_nax
+                    ? config_.nint_profile_mask
                     : 127
             ] {
                 std::string source;
@@ -3495,6 +3500,9 @@ public:
                 if (use_nax) {
                     source += "#define MFQ_GROUPED_FAMILY_MASK ";
                     source += std::to_string(family_mask);
+                    source += "\n";
+                    source += "#define MFQ_GROUPED_NINT_PROFILE_MASK ";
+                    source += std::to_string(nint_profile_mask);
                     source += "\n";
                 }
                 source += "using namespace metal;\n";
@@ -3639,6 +3647,8 @@ public:
             && primitive->config_.has_nepq_residual
                 == config_.has_nepq_residual
             && primitive->config_.family_mask == config_.family_mask
+            && primitive->config_.nint_profile_mask
+                == config_.nint_profile_mask
             && primitive->config_.vq_profile_mask == config_.vq_profile_mask
             && primitive->config_.use_nax == config_.use_nax
             && primitive->config_.direct_nax == config_.direct_nax
@@ -6578,6 +6588,7 @@ struct MlxNintMoeWeight::Impl {
     int neuron_len = 0;
     int projections = 0;
     std::uint32_t family_mask = 0;
+    std::uint32_t nint_profile_mask = 0;
     std::uint32_t vq_profile_mask = 0;
     bool jsc_execution_layout = false;
     bool npq_grouped_indices = true;
@@ -6669,6 +6680,26 @@ struct MlxNintMoeWeight::Impl {
             if (family >= 0 && family < 7) {
                 family_mask |= std::uint32_t{1}
                     << static_cast<unsigned>(family);
+            }
+            if (family == kFamilyNint) {
+                const auto bits = descriptor_values[base + kNintBits];
+                const auto group_size =
+                    descriptor_values[base + kNintGroupSize];
+                std::uint32_t profile = std::uint32_t{1} << 6;
+                if (bits == 2 && group_size == 16) {
+                    profile = std::uint32_t{1} << 0;
+                } else if (bits == 3 && group_size == 24) {
+                    profile = std::uint32_t{1} << 1;
+                } else if (bits == 4 && group_size == 24) {
+                    profile = std::uint32_t{1} << 2;
+                } else if (bits == 5 && group_size == 28) {
+                    profile = std::uint32_t{1} << 3;
+                } else if (bits == 6 && group_size == 24) {
+                    profile = std::uint32_t{1} << 4;
+                } else if (bits == 8 && group_size == 48) {
+                    profile = std::uint32_t{1} << 5;
+                }
+                nint_profile_mask |= profile;
             }
             if (family == kFamilyVq) {
                 const auto profile = descriptor_values[
@@ -6801,6 +6832,7 @@ struct MlxNintMoeWeight::Impl {
             && std::string_view(specialize_env) == "0"
         ) {
             family_mask = 127;
+            nint_profile_mask = 127;
             vq_profile_mask = 255;
         }
         const char* npq_indices_env = std::getenv(
@@ -8282,6 +8314,8 @@ array MlxNintMoeWeight::routed_matmul_sorted(
             .has_nepq_residual = static_cast<int>(
                 impl_->has_nepq_residual),
             .family_mask = static_cast<int>(impl_->family_mask),
+            .nint_profile_mask = static_cast<int>(
+                impl_->nint_profile_mask),
             .vq_profile_mask = static_cast<int>(
                 impl_->vq_profile_mask),
             .use_nax = use_grouped_nax,
@@ -8581,6 +8615,8 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .has_nepq_residual = static_cast<int>(
                     impl_->has_nepq_residual),
                 .family_mask = static_cast<int>(impl_->family_mask),
+                .nint_profile_mask = static_cast<int>(
+                    impl_->nint_profile_mask),
                 .vq_profile_mask = static_cast<int>(
                     impl_->vq_profile_mask),
                 .use_nax = use_grouped_nax,

@@ -7,6 +7,10 @@ using namespace metal;
 #define MFQ_GROUPED_FAMILY_MASK 127
 #endif
 
+#ifndef MFQ_GROUPED_NINT_PROFILE_MASK
+#define MFQ_GROUPED_NINT_PROFILE_MASK 127
+#endif
+
 namespace {
 
 inline uint read_bits(
@@ -2215,6 +2219,20 @@ template <
         (MFQ_GROUPED_FAMILY_MASK & (32 | 64)) != 0;
     constexpr bool HAS_VQ_FAMILY =
         (MFQ_GROUPED_FAMILY_MASK & 2) != 0;
+    constexpr bool HAS_NINT2_PROFILE =
+        (MFQ_GROUPED_NINT_PROFILE_MASK & 1) != 0;
+    constexpr bool HAS_NINT3_PROFILE =
+        (MFQ_GROUPED_NINT_PROFILE_MASK & 2) != 0;
+    constexpr bool HAS_NINT4_PROFILE =
+        (MFQ_GROUPED_NINT_PROFILE_MASK & 4) != 0;
+    constexpr bool HAS_NINT5_PROFILE =
+        (MFQ_GROUPED_NINT_PROFILE_MASK & 8) != 0;
+    constexpr bool HAS_NINT6_PROFILE =
+        (MFQ_GROUPED_NINT_PROFILE_MASK & 16) != 0;
+    constexpr bool HAS_NINT8_PROFILE =
+        (MFQ_GROUPED_NINT_PROFILE_MASK & 32) != 0;
+    constexpr bool HAS_NINT_SCALAR_PROFILE =
+        (MFQ_GROUPED_NINT_PROFILE_MASK & 64) != 0;
     uint local_expert = uint(descriptor[1]);
     uint rotation = uint(descriptor[27]);
     short valid_n = short(min(BN, params.output_width - output_base));
@@ -2297,17 +2315,50 @@ template <
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
 
+                // A homogeneous NINT profile becomes entirely constant;
+                // mixed pools still prune every decoder absent from their
+                // descriptor-derived profile mask. Unknown layouts retain
+                // the scalar fallback bit and continue reading the runtime
+                // descriptor unchanged.
+#if MFQ_GROUPED_NINT_PROFILE_MASK == 1
+                constexpr uint nint_bits = 2u;
+                constexpr uint nint_group_size = 16u;
+#elif MFQ_GROUPED_NINT_PROFILE_MASK == 2
+                constexpr uint nint_bits = 3u;
+                constexpr uint nint_group_size = 24u;
+#elif MFQ_GROUPED_NINT_PROFILE_MASK == 4
+                constexpr uint nint_bits = 4u;
+                constexpr uint nint_group_size = 24u;
+#elif MFQ_GROUPED_NINT_PROFILE_MASK == 8
+                constexpr uint nint_bits = 5u;
+                constexpr uint nint_group_size = 28u;
+#elif MFQ_GROUPED_NINT_PROFILE_MASK == 16
+                constexpr uint nint_bits = 6u;
+                constexpr uint nint_group_size = 24u;
+#elif MFQ_GROUPED_NINT_PROFILE_MASK == 32
+                constexpr uint nint_bits = 8u;
+                constexpr uint nint_group_size = 48u;
+#elif MFQ_GROUPED_NINT_PROFILE_MASK == 0
+                constexpr uint nint_bits = 0u;
+                constexpr uint nint_group_size = 1u;
+#else
                 uint nint_bits = uint(descriptor[4]);
                 uint nint_group_size = uint(descriptor[5]);
+#endif
                 bool aligned_nint = HAS_NINT_FAMILY && family == 0u && (
-                    (nint_bits == 2u && nint_group_size == 16u)
-                    || ((nint_bits == 3u || nint_bits == 4u
-                         || nint_bits == 6u)
+                    (HAS_NINT2_PROFILE
+                        && nint_bits == 2u && nint_group_size == 16u)
+                    || (((HAS_NINT3_PROFILE && nint_bits == 3u)
+                         || (HAS_NINT4_PROFILE && nint_bits == 4u)
+                         || (HAS_NINT6_PROFILE && nint_bits == 6u))
                         && nint_group_size == 24u)
-                    || (nint_bits == 8u && nint_group_size == 48u));
-                bool sliced_nint5 = HAS_NINT_FAMILY && family == 0u
+                    || (HAS_NINT8_PROFILE
+                        && nint_bits == 8u && nint_group_size == 48u));
+                bool sliced_nint5 = HAS_NINT_FAMILY
+                    && HAS_NINT5_PROFILE && family == 0u
                     && nint_bits == 5u && nint_group_size == 28u;
                 bool scalar_decode = HAS_NINT_FAMILY
+                    && HAS_NINT_SCALAR_PROFILE
                     && family == 0u && !aligned_nint;
                 if (aligned_nint) {
                     uint groups_per_tile = uint(BK) / nint_group_size;
@@ -2341,7 +2392,7 @@ template <
                         threadgroup half* target =
                             Ws + output_row * uint(W_STRIDE)
                             + local_group * nint_group_size;
-                        if (nint_bits == 2u) {
+                        if (HAS_NINT2_PROFILE && nint_bits == 2u) {
                             if (local_group + 1u < groups_per_tile
                                 && input_column + nint_group_size
                                     < uint(params.input_width)) {
@@ -2355,17 +2406,17 @@ template <
                                     nint_sub_min, nint_anchor_scale,
                                     nint_anchor_min, target, pool_row, group);
                             }
-                        } else if (nint_bits == 3u) {
+                        } else if (HAS_NINT3_PROFILE && nint_bits == 3u) {
                             decode_nint3_group24(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
                                 nint_anchor_min, target, pool_row, group);
-                        } else if (nint_bits == 4u) {
+                        } else if (HAS_NINT4_PROFILE && nint_bits == 4u) {
                             decode_nint4_group24(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
                                 nint_anchor_min, target, pool_row, group);
-                        } else if (nint_bits == 6u) {
+                        } else if (HAS_NINT6_PROFILE && nint_bits == 6u) {
                             decode_nint6_group24(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
