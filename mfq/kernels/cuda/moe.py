@@ -306,6 +306,9 @@ class MoeRoutePlan:
     expert_bounds: torch.Tensor
     tile_bounds: torch.Tensor
     tile_experts: torch.Tensor
+    mma_tile_bounds: torch.Tensor
+    mma_tile_experts: torch.Tensor
+    mma_tile_m: int
     counts: torch.Tensor
     cursors: torch.Tensor
 
@@ -330,6 +333,15 @@ class MoeRoutePlan:
             ids_dst, expert_bounds, tile_bounds, tile_experts, counts = (
                 ext().moe_build_expert_map_cuda(ids, int(n_experts), 8)
             )
+            if ids.numel() >= 8192:
+                mma_tile_bounds, mma_tile_experts = ext().moe_build_tile_map_cuda(
+                    expert_bounds, ids.numel(), 64
+                )
+                mma_tile_m = 64
+            else:
+                mma_tile_bounds = tile_bounds
+                mma_tile_experts = tile_experts
+                mma_tile_m = 8
             cursors = torch.empty(0, device=ids.device, dtype=torch.int32)
         else:
             empty = torch.empty(0, device=ids.device, dtype=torch.int32)
@@ -337,6 +349,9 @@ class MoeRoutePlan:
             expert_bounds = empty
             tile_bounds = empty
             tile_experts = empty
+            mma_tile_bounds = empty
+            mma_tile_experts = empty
+            mma_tile_m = 8
             counts = empty
             cursors = empty
         return cls(
@@ -346,6 +361,9 @@ class MoeRoutePlan:
             expert_bounds=expert_bounds,
             tile_bounds=tile_bounds,
             tile_experts=tile_experts,
+            mma_tile_bounds=mma_tile_bounds,
+            mma_tile_experts=mma_tile_experts,
+            mma_tile_m=mma_tile_m,
             counts=counts,
             cursors=cursors,
         )

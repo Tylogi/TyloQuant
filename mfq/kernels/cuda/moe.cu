@@ -555,6 +555,27 @@ __global__ void fill_tile_experts_kernel(
     }
 }
 
+__global__ void build_tile_map_from_bounds_kernel(
+        const int32_t * __restrict__ expert_bounds,
+        int32_t * __restrict__ tile_bounds,
+        int32_t * __restrict__ tile_experts,
+        int experts,
+        int tile_m) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int tile_offset = 0;
+    tile_bounds[0] = 0;
+    for (int expert = 0; expert < experts; ++expert) {
+        const int count = expert_bounds[expert + 1] -
+            expert_bounds[expert];
+        const int tiles = (count + tile_m - 1) / tile_m;
+        for (int tile = 0; tile < tiles; ++tile) {
+            tile_experts[tile_offset + tile] = expert;
+        }
+        tile_offset += tiles;
+        tile_bounds[expert + 1] = tile_offset;
+    }
+}
+
 __global__ void scatter_routes_kernel(
         const int32_t * __restrict__ ids,
         const int32_t * __restrict__ expert_bounds,
@@ -3290,7 +3311,7 @@ __global__ void __launch_bounds__(256, 1) nint8_zero_moe_mma_kernel(
     }
 }
 
-template <int BM>
+template <int BM, bool COARSE_TILES = false>
 __global__ void __launch_bounds__(256, BM >= 32 ? 3 : 1) nint_moe_hetero_mma_kernel(
         const int64_t * __restrict__ weight_ptrs,
         const int32_t * __restrict__ pool_params,
@@ -3323,15 +3344,18 @@ __global__ void __launch_bounds__(256, BM >= 32 ? 3 : 1) nint_moe_hetero_mma_ker
         const int ntile = static_cast<int>(task - static_cast<int64_t>(fine_tile) * ntiles_n);
         const int expert = tile_experts[fine_tile];
         const int local_fine_tile = fine_tile - tile_bounds[expert];
-        if (local_fine_tile % fine_tiles_per_mma != 0) {
-            continue;
+        if constexpr (!COARSE_TILES) {
+            if (local_fine_tile % fine_tiles_per_mma != 0) {
+                continue;
+            }
         }
         const int pool = expert_pool[expert];
         const int local_expert = expert_local[expert];
         if (pool < 0 || local_expert < 0) {
             continue;
         }
-        const int first = expert_bounds[expert] + local_fine_tile * kRouteTile;
+        const int first = expert_bounds[expert] + local_fine_tile *
+            (COARSE_TILES ? BM : kRouteTile);
         const int last = min(first + BM, expert_bounds[expert + 1]);
         const int n0 = ntile * kMoeMmaBn;
         const int64_t * weights = weight_ptrs + static_cast<size_t>(pool) * 5;
@@ -4123,6 +4147,30 @@ std::vector<mfq_tensor_backend::Tensor> moe_build_expert_map_cuda(
     return {ids_dst, expert_bounds, tile_bounds, tile_experts, counts};
 }
 
+std::vector<mfq_tensor_backend::Tensor> moe_build_tile_map_cuda(
+        mfq_tensor_backend::Tensor expert_bounds,
+        int64_t pair_capacity,
+        int64_t tile_m) {
+    MFQ_RUNTIME_CHECK(expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
+        expert_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
+        expert_bounds.dim() == 1 && expert_bounds.numel() >= 2,
+        "expert_bounds must be contiguous CUDA int32 [experts+1]");
+    MFQ_RUNTIME_CHECK(pair_capacity > 0 && pair_capacity <= INT_MAX,
+        "pair_capacity must be positive");
+    MFQ_RUNTIME_CHECK(tile_m > 0 && tile_m <= 1024,
+        "tile_m must be in [1, 1024]");
+    const int experts = static_cast<int>(expert_bounds.numel() - 1);
+    auto tile_bounds = mfq_tensor_backend::empty(
+        {experts + 1}, expert_bounds.options());
+    auto tile_experts = mfq_tensor_backend::empty(
+        {pair_capacity}, expert_bounds.options());
+    build_tile_map_from_bounds_kernel<<<1, 1, 0, mfq_current_cuda_stream()>>>(
+        expert_bounds.data_ptr<int32_t>(), tile_bounds.data_ptr<int32_t>(),
+        tile_experts.data_ptr<int32_t>(), experts, static_cast<int>(tile_m));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return {tile_bounds, tile_experts};
+}
+
 void nint_moe_quantize_input_ws_cuda(
         mfq_tensor_backend::Tensor x,
         int64_t gs,
@@ -4724,6 +4772,7 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
         mfq_tensor_backend::Tensor expert_bounds,
         mfq_tensor_backend::Tensor tile_bounds,
         mfq_tensor_backend::Tensor tile_experts,
+        int64_t route_tile_m,
         int64_t weight_out_stride,
         int64_t weight_row_offset) {
     MFQ_RUNTIME_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1,4096]");
@@ -4735,6 +4784,9 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
         weight_row_offset + out_per_expert <= weight_out_stride,
         "weight row slice must fit within weight_out_stride");
     MFQ_RUNTIME_CHECK(input_width > 0 && input_width <= INT_MAX, "input_width must be positive");
+    MFQ_RUNTIME_CHECK(route_tile_m == kRouteTile || route_tile_m == 16 ||
+        route_tile_m == 32 || route_tile_m == 64,
+        "route_tile_m must be 8, 16, 32, or 64");
     MFQ_RUNTIME_CHECK(weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
         weight_ptrs.scalar_type() == mfq_tensor_backend::kInt64 && weight_ptrs.dim() == 2 &&
         weight_ptrs.size(0) > 0 && weight_ptrs.size(1) == 5,
@@ -4793,8 +4845,6 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
 
     const int output_width = static_cast<int>(out_per_expert);
     const int ntiles_n = (output_width + kMoeMmaBn - 1) / kMoeMmaBn;
-    const int64_t max_fine_tiles = (pairs + kRouteTile - 1) / kRouteTile + experts;
-    const int64_t max_tasks = max_fine_tiles * ntiles_n;
     static const int block_cap = [] {
         const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_BLOCKS");
         return value == nullptr ? 4096 : std::max(1, std::atoi(value));
@@ -4805,46 +4855,52 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
         const int parsed = std::atoi(value);
         return parsed == 16 || parsed == 32 || parsed == 64 ? parsed : 0;
     }();
-    const int blocks = static_cast<int>(
-        std::max<int64_t>(1, std::min<int64_t>(block_cap, max_tasks)));
     const dim3 threads(32, 8);
     const cudaStream_t stream = mfq_current_cuda_stream();
-    const int bm = forced_bm != 0 ? forced_bm :
-        (tokens <= 128 ? 64 : (tokens <= 512 ? 32 : 64));
+    const int tile_m = static_cast<int>(route_tile_m);
+    const int bm = tile_m != kRouteTile ? tile_m :
+        (forced_bm != 0 ? forced_bm :
+            (tokens <= 128 ? 64 : (tokens <= 512 ? 32 : 64)));
+    const bool coarse_tiles = tile_m == bm;
+    MFQ_RUNTIME_CHECK(tile_m == kRouteTile || coarse_tiles,
+        "coarse route tile size must match the MMA row tile");
+    const int64_t max_tiles = (pairs + tile_m - 1) / tile_m + experts;
+    const int64_t max_tasks = max_tiles * ntiles_n;
+    const int blocks = static_cast<int>(
+        std::max<int64_t>(1, std::min<int64_t>(block_cap, max_tasks)));
+
+#define MFQ_LAUNCH_MOE_MMA(BM_VALUE, COARSE_VALUE) \
+    nint_moe_hetero_mma_kernel<BM_VALUE, COARSE_VALUE><<<blocks, threads, 0, stream>>>( \
+        weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(), \
+        expert_pool.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(), \
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), \
+        ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(), \
+        tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(), \
+        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts, \
+        output_width, static_cast<int>(weight_out_stride), \
+        static_cast<int>(weight_row_offset), static_cast<int>(input_width), \
+        routed_input)
+
     if (bm == 16) {
-        nint_moe_hetero_mma_kernel<16><<<blocks, threads, 0, stream>>>(
-            weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(),
-            expert_pool.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
-            ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),
-            tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
-            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts,
-            output_width, static_cast<int>(weight_out_stride),
-            static_cast<int>(weight_row_offset),
-            static_cast<int>(input_width), routed_input);
+        if (coarse_tiles) {
+            MFQ_LAUNCH_MOE_MMA(16, true);
+        } else {
+            MFQ_LAUNCH_MOE_MMA(16, false);
+        }
     } else if (bm == 32) {
-        nint_moe_hetero_mma_kernel<32><<<blocks, threads, 0, stream>>>(
-            weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(),
-            expert_pool.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
-            ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),
-            tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
-            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts,
-            output_width, static_cast<int>(weight_out_stride),
-            static_cast<int>(weight_row_offset),
-            static_cast<int>(input_width), routed_input);
+        if (coarse_tiles) {
+            MFQ_LAUNCH_MOE_MMA(32, true);
+        } else {
+            MFQ_LAUNCH_MOE_MMA(32, false);
+        }
     } else {
-        nint_moe_hetero_mma_kernel<64><<<blocks, threads, 0, stream>>>(
-            weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(),
-            expert_pool.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
-            ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),
-            tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
-            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts,
-            output_width, static_cast<int>(weight_out_stride),
-            static_cast<int>(weight_row_offset),
-            static_cast<int>(input_width), routed_input);
+        if (coarse_tiles) {
+            MFQ_LAUNCH_MOE_MMA(64, true);
+        } else {
+            MFQ_LAUNCH_MOE_MMA(64, false);
+        }
     }
+#undef MFQ_LAUNCH_MOE_MMA
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
@@ -4864,11 +4920,12 @@ mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_cuda(
         mfq_tensor_backend::Tensor ids_dst,
         mfq_tensor_backend::Tensor expert_bounds,
         mfq_tensor_backend::Tensor tile_bounds,
-        mfq_tensor_backend::Tensor tile_experts) {
+        mfq_tensor_backend::Tensor tile_experts,
+        int64_t route_tile_m) {
     return nint_moe_grouped_matmul_hetero_f16_impl(
         weight_ptrs, pool_params, expert_pool, expert_local, x, ids,
         n_experts, out_per_expert, input_width, routed_input, out,
-        ids_dst, expert_bounds, tile_bounds, tile_experts,
+        ids_dst, expert_bounds, tile_bounds, tile_experts, route_tile_m,
         out_per_expert, 0);
 }
 
@@ -4888,12 +4945,13 @@ mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
         mfq_tensor_backend::Tensor expert_bounds,
         mfq_tensor_backend::Tensor tile_bounds,
         mfq_tensor_backend::Tensor tile_experts,
+        int64_t route_tile_m,
         int64_t weight_out_stride,
         int64_t weight_row_offset) {
     return nint_moe_grouped_matmul_hetero_f16_impl(
         weight_ptrs, pool_params, expert_pool, expert_local, x, ids,
         n_experts, out_per_expert, input_width, routed_input, out,
-        ids_dst, expert_bounds, tile_bounds, tile_experts,
+        ids_dst, expert_bounds, tile_bounds, tile_experts, route_tile_m,
         weight_out_stride, weight_row_offset);
 }
 

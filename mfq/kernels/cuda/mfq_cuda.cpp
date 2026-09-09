@@ -80,6 +80,8 @@ torch::Tensor moe_sqrtsoftplus_weights_cuda(
     torch::Tensor logits, torch::Tensor ids, double norm_floor, double scale);
 std::vector<torch::Tensor> moe_build_expert_map_cuda(
     torch::Tensor ids, int64_t n_experts, int64_t tile_m);
+std::vector<torch::Tensor> moe_build_tile_map_cuda(
+    torch::Tensor expert_bounds, int64_t pair_capacity, int64_t tile_m);
 void nint_moe_quantize_input_ws_cuda(
     torch::Tensor x, int64_t gs, torch::Tensor qx, torch::Tensor xscale);
 void nint_moe_quantize_24_28_ws_cuda(
@@ -112,7 +114,7 @@ torch::Tensor nint_moe_grouped_matmul_hetero_f16_cuda(
     int64_t n_experts, int64_t out_per_expert, int64_t input_width,
     bool routed_input, torch::Tensor out,
     torch::Tensor ids_dst, torch::Tensor expert_bounds, torch::Tensor tile_bounds,
-    torch::Tensor tile_experts);
+    torch::Tensor tile_experts, int64_t route_tile_m);
 torch::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
     torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
     torch::Tensor neuron_scale, torch::Tensor neuron_min,
@@ -635,6 +637,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_sqrtsoftplus_weights_cuda", &moe_sqrtsoftplus_weights_cuda,
           "Gather and normalize sqrt-softplus hash-route weights (CUDA)");
     m.def("moe_build_expert_map_cuda", &moe_build_expert_map_cuda, "Build compact expert route map (CUDA)");
+    m.def("moe_build_tile_map_cuda", &moe_build_tile_map_cuda,
+          "Build a compact expert tile map from existing route bounds (CUDA)");
     m.def("nint_moe_quantize_input_ws_cuda", &nint_moe_quantize_input_ws_cuda,
           "Quantize one activation layout for heterogeneous expert NINT (CUDA)");
     m.def("nint_moe_quantize_24_28_ws_cuda", &nint_moe_quantize_24_28_ws_cuda,

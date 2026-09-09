@@ -275,6 +275,9 @@ mfq_tensor_backend::Tensor moe_sqrtsoftplus_weights_cuda(
     mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor ids, double norm_floor, double scale);
 std::vector<mfq_tensor_backend::Tensor> moe_build_expert_map_cuda(
     mfq_tensor_backend::Tensor ids, int64_t n_experts, int64_t tile_m);
+std::vector<mfq_tensor_backend::Tensor> moe_build_tile_map_cuda(
+    mfq_tensor_backend::Tensor expert_bounds, int64_t pair_capacity,
+    int64_t tile_m);
 void nint_moe_quantize_input_ws_cuda(
     mfq_tensor_backend::Tensor x, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 void nint_moe_quantize_24_28_ws_cuda(
@@ -319,7 +322,7 @@ mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_cuda(
     int64_t n_experts, int64_t out_per_expert, int64_t input_width,
     bool routed_input, mfq_tensor_backend::Tensor out,
     mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
-    mfq_tensor_backend::Tensor tile_experts);
+    mfq_tensor_backend::Tensor tile_experts, int64_t route_tile_m);
 mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
     mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params,
     mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local,
@@ -327,7 +330,8 @@ mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
     int64_t n_experts, int64_t out_per_expert, int64_t input_width,
     bool routed_input, mfq_tensor_backend::Tensor out,
     mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
-    mfq_tensor_backend::Tensor tile_experts, int64_t weight_out_stride,
+    mfq_tensor_backend::Tensor tile_experts, int64_t route_tile_m,
+    int64_t weight_out_stride,
     int64_t weight_row_offset);
 mfq_tensor_backend::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
@@ -3658,9 +3662,12 @@ struct MoeRoutePlan {
     mfq_tensor_backend::Tensor expert_bounds;
     mfq_tensor_backend::Tensor tile_bounds;
     mfq_tensor_backend::Tensor tile_experts;
+    mfq_tensor_backend::Tensor mma_tile_bounds;
+    mfq_tensor_backend::Tensor mma_tile_experts;
     mfq_tensor_backend::Tensor counts;
     mfq_tensor_backend::Tensor cursors;
     int n_experts = 0;
+    int mma_tile_m = 8;
     bool map_ready = false;
     uint64_t generation = 0;
     mutable std::shared_ptr<std::vector<int32_t>>
@@ -3727,9 +3734,17 @@ private:
         copy_tensor(destination.expert_bounds, source.expert_bounds, device);
         copy_tensor(destination.tile_bounds, source.tile_bounds, device);
         copy_tensor(destination.tile_experts, source.tile_experts, device);
+        if (source.mma_tile_m == 8) {
+            destination.mma_tile_bounds = destination.tile_bounds;
+            destination.mma_tile_experts = destination.tile_experts;
+        } else {
+            copy_tensor(destination.mma_tile_bounds, source.mma_tile_bounds, device);
+            copy_tensor(destination.mma_tile_experts, source.mma_tile_experts, device);
+        }
         copy_tensor(destination.counts, source.counts, device);
         copy_tensor(destination.cursors, source.cursors, device);
         destination.n_experts = source.n_experts;
+        destination.mma_tile_m = source.mma_tile_m;
         destination.map_ready = source.map_ready;
         destination.generation = source.generation;
         destination.host_unique_experts = source.host_unique_experts;
@@ -3759,6 +3774,8 @@ static MoeRoutePlan build_moe_route_plan(mfq_tensor_backend::Tensor ids, int n_e
     result.expert_bounds = empty;
     result.tile_bounds = empty;
     result.tile_experts = empty;
+    result.mma_tile_bounds = empty;
+    result.mma_tile_experts = empty;
     result.counts = empty;
     result.cursors = empty;
     if (result.ids.size(0) > 8) {
@@ -3768,6 +3785,17 @@ static MoeRoutePlan build_moe_route_plan(mfq_tensor_backend::Tensor ids, int n_e
         result.tile_bounds = mapped.at(2);
         result.tile_experts = mapped.at(3);
         result.counts = mapped.at(4);
+        if (result.ids.numel() >= 8192) {
+            auto mma_mapped = moe_build_tile_map_cuda(
+                result.expert_bounds, result.ids.numel(), 64);
+            result.mma_tile_bounds = mma_mapped.at(0);
+            result.mma_tile_experts = mma_mapped.at(1);
+            result.mma_tile_m = 64;
+        } else {
+            result.mma_tile_bounds = result.tile_bounds;
+            result.mma_tile_experts = result.tile_experts;
+            result.mma_tile_m = 8;
+        }
     }
     result.map_ready = result.ids.size(0) <= 8 ||
         result.ids_dst.numel() == result.ids.numel();
@@ -4050,8 +4078,8 @@ struct NintMoeWeight {
                 weight_ptrs, pool_params, expert_pool, expert_local,
                 prepared, route.ids, n_experts, out_per_expert,
                 neuron_len, x.dim() == 3, output, route.ids_dst,
-                route.expert_bounds, route.tile_bounds,
-                route.tile_experts);
+                route.expert_bounds, route.mma_tile_bounds,
+                route.mma_tile_experts, route.mma_tile_m);
         }
         static const bool disable_prefill_mma = [] {
             const char * value = std::getenv("MFQ_DISABLE_MOE_PREFILL_MMA");
@@ -4067,7 +4095,8 @@ struct NintMoeWeight {
             return nint_moe_grouped_matmul_hetero_f16_cuda(
                 weight_ptrs, pool_params, expert_pool, expert_local, x, route.ids,
                 n_experts, out_per_expert, neuron_len, x.dim() == 3, output,
-                route.ids_dst, route.expert_bounds, route.tile_bounds, route.tile_experts);
+                route.ids_dst, route.expert_bounds, route.mma_tile_bounds,
+                route.mma_tile_experts, route.mma_tile_m);
         }
         if (hetero_supported && moe_small_hetero_enabled(tokens) &&
                 hetero_workspaces.find(input_rows) == hetero_workspaces.end()) {
@@ -25678,7 +25707,8 @@ static int run_nintm_tensor_check(
                 x, route.ids, weight.n_experts, width,
                 weight.neuron_len, false, segment,
                 route.ids_dst, route.expert_bounds,
-                route.tile_bounds, route.tile_experts,
+                route.mma_tile_bounds, route.mma_tile_experts,
+                route.mma_tile_m,
                 weight.out_per_expert, row_offset);
         };
         mfq_tensor_backend::Tensor merged;
