@@ -129,10 +129,16 @@ def test_persistent_prefix_cache_is_content_addressed_and_restart_safe() -> None
     assert "enforce_disk_budget_locked" in PAGED_SOURCE
     assert "void pin(" in PAGED_HEADER
     assert "void unpin(" in PAGED_HEADER
+    assert "load_prefix(" in PAGED_HEADER
+    assert "max_parallel_reads" in PAGED_HEADER
+    assert "LoadSource::Disk" in PAGED_SOURCE
+    assert "std::vector<std::thread> readers" in PAGED_SOURCE
+    assert "read_header(input, header)" in PAGED_SOURCE
 
 
 def test_metal_paged_codec_preserves_raw_kv_tensor_storage() -> None:
     assert "encode_state(" in METAL_PAGED_CODEC
+    assert "encode_block(" in METAL_PAGED_CODEC
     assert "decode_blocks(" in METAL_PAGED_CODEC
     assert "value.data<std::uint8_t>()" in METAL_PAGED_CODEC
     assert "MlxMiniCPMO45TextSessionState" in METAL_PAGED_CODEC
@@ -141,12 +147,14 @@ def test_metal_paged_codec_preserves_raw_kv_tensor_storage() -> None:
     assert "prefix_cache_disk_blocks" in METAL_DECODE
     assert "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES" in METAL_DECODE
     assert "prefix_cache_pending_max_bytes" in METAL_DECODE
+    assert "paged_cache_->load_prefix(match.blocks)" in METAL_DECODE
 
 
 def test_cuda_paged_cache_only_accepts_linear_full_attention_kv() -> None:
     assert "supports_paged_text_session_state" in DECODE
     assert "return full != nullptr && !full->sliding" in DECODE
     assert "encode_cuda_paged_session(" in DECODE
+    assert "encode_cuda_paged_block(" in DECODE
     assert "decode_cuda_paged_session(" in DECODE
     assert "if (layer.ring" in DECODE
     assert "make_cuda_paged_prefix_cache(" in DECODE
@@ -154,3 +162,4 @@ def test_cuda_paged_cache_only_accepts_linear_full_attention_kv() -> None:
     assert "prefix_cache_disk_blocks" in DECODE
     assert "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES" in DECODE
     assert "prefix_cache_pending_max_bytes" in DECODE
+    assert "paged_cache_->load_prefix(match.blocks)" in DECODE

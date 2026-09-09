@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iterator>
@@ -17,6 +18,10 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+
+#if defined(__APPLE__)
+#include <CommonCrypto/CommonDigest.h>
+#endif
 
 #if defined(_WIN32)
 #include <fcntl.h>
@@ -266,9 +271,26 @@ void sync_directory_best_effort(const std::filesystem::path& path) noexcept {
 } // namespace
 
 BlockHash sha256(const void* data, std::size_t size) {
+#if defined(__APPLE__)
+    CC_SHA256_CTX state;
+    CC_SHA256_Init(&state);
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    while (size > 0) {
+        const auto count = std::min<std::size_t>(
+            size, std::numeric_limits<CC_LONG>::max());
+        CC_SHA256_Update(
+            &state, bytes, static_cast<CC_LONG>(count));
+        bytes += count;
+        size -= count;
+    }
+    BlockHash digest{};
+    CC_SHA256_Final(digest.data(), &state);
+    return digest;
+#else
     Sha256State state;
     state.update(data, size);
     return state.finish();
+#endif
 }
 
 BlockHash sha256(std::string_view value) {
@@ -318,6 +340,19 @@ private:
         BlockHash payload_hash{};
     };
 
+    enum class LoadSource {
+        Hot,
+        Pending,
+        Disk,
+    };
+
+    struct LoadRequest {
+        BlockHash hash{};
+        LoadSource source = LoadSource::Disk;
+        PagedPrefixPayload payload;
+        std::filesystem::path path;
+    };
+
 public:
     explicit Implementation(PagedPrefixCacheConfig config)
         : config_(std::move(config)),
@@ -335,6 +370,9 @@ public:
         }
         if (config_.max_pending_writes == 0) {
             config_.max_pending_writes = 1;
+        }
+        if (config_.max_parallel_reads == 0) {
+            config_.max_parallel_reads = 1;
         }
         namespace_dir_ = config_.cache_dir /
             block_hash_hex(compatibility_hash_);
@@ -401,21 +439,33 @@ public:
         PrefixMatch result;
         BlockHash parent{};
         const auto full_blocks = token_ids.size() / config_.block_size_tokens;
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (record_query) ++metrics_.queries;
+        // Hashing a long prompt is pure CPU work. Keep it outside the cache
+        // mutex so SSD writers, hot-cache hits, and unrelated requests are
+        // not serialized behind the full token walk. Check after each block
+        // so a cold miss still stops hashing immediately.
+        if (record_query) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++metrics_.queries;
+        }
         for (std::size_t index = 0; index < full_blocks; ++index) {
             const auto offset = index * config_.block_size_tokens;
-            const auto hash = block_hash(
+            parent = block_hash(
                 parent,
                 token_ids.data() + offset,
                 config_.block_size_tokens,
                 extra_key);
-            if (disk_.count(hash) == 0 && pending_.count(hash) == 0) break;
-            result.blocks.push_back(hash);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (disk_.count(parent) == 0 &&
+                    pending_.count(parent) == 0) {
+                    break;
+                }
+            }
+            result.blocks.push_back(parent);
             result.matched_tokens += config_.block_size_tokens;
-            parent = hash;
         }
         if (record_query && result.matched_tokens > 0) {
+            std::lock_guard<std::mutex> lock(mutex_);
             ++metrics_.hits;
             metrics_.hit_tokens += result.matched_tokens;
         }
@@ -479,37 +529,131 @@ public:
     }
 
     std::optional<std::vector<std::uint8_t>> load(const BlockHash& hash) {
-        std::filesystem::path path;
+        const auto payloads = load_prefix({hash});
+        if (payloads.empty()) return std::nullopt;
+        return *payloads.front();
+    }
+
+    std::vector<PagedPrefixPayload> load_prefix(
+        const std::vector<BlockHash>& hashes) {
+        std::vector<LoadRequest> requests;
+        requests.reserve(hashes.size());
+        std::uint64_t load_epoch = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            const auto hot = hot_.find(hash);
-            if (hot != hot_.end()) {
-                hot->second.last_used = ++clock_;
-                ++metrics_.hot_hits;
-                return *hot->second.payload;
+            load_epoch = cache_epoch_;
+            for (const auto& hash : hashes) {
+                const auto hot = hot_.find(hash);
+                if (hot != hot_.end()) {
+                    requests.push_back(LoadRequest{
+                        hash,
+                        LoadSource::Hot,
+                        hot->second.payload,
+                        {},
+                    });
+                    continue;
+                }
+                const auto queued = pending_.find(hash);
+                if (queued != pending_.end()) {
+                    requests.push_back(LoadRequest{
+                        hash,
+                        LoadSource::Pending,
+                        queued->second,
+                        {},
+                    });
+                    continue;
+                }
+                const auto found = disk_.find(hash);
+                if (found == disk_.end()) break;
+                requests.push_back(LoadRequest{
+                    hash,
+                    LoadSource::Disk,
+                    {},
+                    found->second.path,
+                });
             }
-            const auto queued = pending_.find(hash);
-            if (queued != pending_.end()) {
-                ++metrics_.hot_hits;
-                return *queued->second;
-            }
-            const auto found = disk_.find(hash);
-            if (found == disk_.end()) return std::nullopt;
-            path = found->second.path;
         }
-        auto loaded = read_payload(path, hash);
+
+        std::vector<std::optional<std::vector<std::uint8_t>>> cold_payloads(
+            requests.size());
+        std::vector<std::size_t> cold_indices;
+        cold_indices.reserve(requests.size());
+        for (std::size_t index = 0; index < requests.size(); ++index) {
+            if (requests[index].source == LoadSource::Disk) {
+                cold_indices.push_back(index);
+            }
+        }
+
+        const auto read_cold = [&](std::size_t cold_index) {
+            const auto request_index = cold_indices[cold_index];
+            const auto& request = requests[request_index];
+            cold_payloads[request_index] = read_payload(
+                request.path, request.hash);
+        };
+        if (cold_indices.size() == 1 || config_.max_parallel_reads == 1) {
+            for (std::size_t index = 0; index < cold_indices.size(); ++index) {
+                read_cold(index);
+            }
+        } else if (!cold_indices.empty()) {
+            const auto worker_count = std::min(
+                cold_indices.size(), config_.max_parallel_reads);
+            std::atomic<std::size_t> next{0};
+            std::mutex error_mutex;
+            std::exception_ptr first_error;
+            std::vector<std::thread> readers;
+            readers.reserve(worker_count);
+            for (std::size_t worker = 0; worker < worker_count; ++worker) {
+                readers.emplace_back([&] {
+                    while (true) {
+                        const auto index = next.fetch_add(1);
+                        if (index >= cold_indices.size()) break;
+                        try {
+                            read_cold(index);
+                        } catch (...) {
+                            std::lock_guard<std::mutex> lock(error_mutex);
+                            if (!first_error) {
+                                first_error = std::current_exception();
+                            }
+                        }
+                    }
+                });
+            }
+            for (auto& reader : readers) reader.join();
+            if (first_error) std::rethrow_exception(first_error);
+        }
+
+        std::vector<PagedPrefixPayload> result;
+        result.reserve(requests.size());
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!loaded) {
-            erase_corrupt_locked(hash);
-            return std::nullopt;
+        if (load_epoch != cache_epoch_) return result;
+        for (std::size_t index = 0; index < requests.size(); ++index) {
+            auto& request = requests[index];
+            if (request.source == LoadSource::Disk) {
+                if (!cold_payloads[index]) {
+                    erase_corrupt_locked(request.hash);
+                    break;
+                }
+                request.payload =
+                    std::make_shared<const std::vector<std::uint8_t>>(
+                        std::move(*cold_payloads[index]));
+                put_hot_locked(request.hash, request.payload);
+                const auto found = disk_.find(request.hash);
+                if (found != disk_.end()) {
+                    found->second.last_used = ++clock_;
+                }
+                ++metrics_.disk_hits;
+            } else {
+                if (request.source == LoadSource::Hot) {
+                    const auto hot = hot_.find(request.hash);
+                    if (hot != hot_.end()) {
+                        hot->second.last_used = ++clock_;
+                    }
+                }
+                ++metrics_.hot_hits;
+            }
+            result.push_back(std::move(request.payload));
         }
-        auto payload = std::make_shared<const std::vector<std::uint8_t>>(
-            std::move(*loaded));
-        put_hot_locked(hash, payload);
-        auto found = disk_.find(hash);
-        if (found != disk_.end()) found->second.last_used = ++clock_;
-        ++metrics_.disk_hits;
-        return *payload;
+        return result;
     }
 
     void pin(const std::vector<BlockHash>& blocks) {
@@ -559,6 +703,7 @@ public:
         disk_bytes_ = 0;
         hot_bytes_ = 0;
         pending_write_bytes_ = 0;
+        ++cache_epoch_;
         sync_metrics_locked();
         return removed;
     }
@@ -583,10 +728,8 @@ private:
     }
 
     bool read_header(
-        const std::filesystem::path& path,
+        std::istream& input,
         ParsedHeader& header) const {
-        std::ifstream input(path, std::ios::binary);
-        if (!input) return false;
         std::array<std::uint8_t, 8> magic{};
         input.read(
             reinterpret_cast<char*>(magic.data()),
@@ -616,16 +759,35 @@ private:
                     std::numeric_limits<std::streamsize>::max());
     }
 
+    bool read_header(
+        const std::filesystem::path& path,
+        ParsedHeader& header) const {
+        std::ifstream input(path, std::ios::binary);
+        return input && read_header(input, header);
+    }
+
     std::optional<std::vector<std::uint8_t>> read_payload(
         const std::filesystem::path& path,
         const BlockHash& expected_hash) const {
-        ParsedHeader header;
-        if (!read_header(path, header) || header.hash != expected_hash) {
-            return std::nullopt;
-        }
         std::ifstream input(path, std::ios::binary);
         if (!input) return std::nullopt;
-        input.seekg(static_cast<std::streamoff>(kHeaderBytes));
+        ParsedHeader header;
+        if (!read_header(input, header) || header.hash != expected_hash) {
+            return std::nullopt;
+        }
+        const auto payload_start = input.tellg();
+        input.seekg(0, std::ios::end);
+        const auto file_end = input.tellg();
+        if (payload_start != static_cast<std::streamoff>(kHeaderBytes) ||
+            file_end < 0 ||
+            header.payload_bytes >
+                std::numeric_limits<std::uint64_t>::max() - kHeaderBytes ||
+            static_cast<std::uint64_t>(file_end) !=
+                kHeaderBytes + header.payload_bytes) {
+            return std::nullopt;
+        }
+        input.seekg(payload_start);
+        if (!input) return std::nullopt;
         std::vector<std::uint8_t> payload(
             static_cast<std::size_t>(header.payload_bytes));
         input.read(
@@ -917,6 +1079,7 @@ private:
     std::uint64_t hot_bytes_ = 0;
     std::uint64_t pending_write_bytes_ = 0;
     std::uint64_t clock_ = 0;
+    std::uint64_t cache_epoch_ = 0;
     std::size_t active_writes_ = 0;
     bool stopping_ = false;
     PagedPrefixCacheMetrics metrics_;
@@ -970,6 +1133,11 @@ BlockHash PagedPrefixCache::store(
 std::optional<std::vector<std::uint8_t>> PagedPrefixCache::load(
     const BlockHash& hash) {
     return implementation_->load(hash);
+}
+
+std::vector<PagedPrefixPayload> PagedPrefixCache::load_prefix(
+    const std::vector<BlockHash>& blocks) {
+    return implementation_->load_prefix(blocks);
 }
 
 void PagedPrefixCache::pin(const std::vector<BlockHash>& blocks) {

@@ -1870,6 +1870,11 @@ public:
         cache_->restore_snapshot(snapshot);
     }
 
+    void restore_cache(MlxKvCacheSnapshot&& snapshot) {
+        reset_cache(snapshot.batch, snapshot.position);
+        cache_->restore_snapshot(std::move(snapshot));
+    }
+
     array forward(
         const array& input,
         const array* positions,
@@ -2346,6 +2351,27 @@ public:
             cache_position_ = state.cache_position;
             cache_batch_ = state.cache_batch;
             stable_cache_tokens_ = state.tokens;
+        } catch (...) {
+            clear_cache();
+            throw;
+        }
+    }
+
+    void restore_text_session_state(MlxMiniCPMO45TextSessionState&& state) {
+        if (state.cache_batch != 1 || state.cache_position <= 0 ||
+            static_cast<std::size_t>(state.cache_position) !=
+                state.tokens.size() ||
+            state.layers.size() != blocks_.size()) {
+            throw std::runtime_error(
+                "MiniCPM-o text session state is incompatible");
+        }
+        try {
+            for (std::size_t index = 0; index < blocks_.size(); ++index) {
+                blocks_[index].restore_cache(std::move(state.layers[index]));
+            }
+            cache_position_ = state.cache_position;
+            cache_batch_ = state.cache_batch;
+            stable_cache_tokens_ = std::move(state.tokens);
         } catch (...) {
             clear_cache();
             throw;
@@ -5683,6 +5709,12 @@ void MlxMiniCPMO45Runtime::restore_text_session_state(
     const MlxMiniCPMO45TextSessionState& state) {
     implementation_->duplex.reset();
     implementation_->language.restore_text_session_state(state);
+}
+
+void MlxMiniCPMO45Runtime::restore_text_session_state(
+    MlxMiniCPMO45TextSessionState&& state) {
+    implementation_->duplex.reset();
+    implementation_->language.restore_text_session_state(std::move(state));
 }
 
 } // namespace mfq::metal

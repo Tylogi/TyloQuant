@@ -13,6 +13,8 @@
 namespace mfq::cache {
 
 using BlockHash = std::array<std::uint8_t, 32>;
+using PagedPrefixPayload =
+    std::shared_ptr<const std::vector<std::uint8_t>>;
 
 BlockHash sha256(const void* data, std::size_t size);
 BlockHash sha256(std::string_view value);
@@ -28,6 +30,10 @@ struct PagedPrefixCacheConfig {
     // Zero forces writes onto the caller instead of retaining raw KV payloads
     // in the asynchronous queue.  The count limit remains a second guard.
     std::uint64_t max_pending_bytes = 512ULL * 1024ULL * 1024ULL;
+    // Cold blocks are independent content-addressed files. Reading and
+    // checksumming a matched chain in parallel substantially reduces restore
+    // latency without involving a backend device or its command stream.
+    std::size_t max_parallel_reads = 4;
 };
 
 struct PrefixMatch {
@@ -85,6 +91,13 @@ public:
         std::string_view extra_key = {});
 
     std::optional<std::vector<std::uint8_t>> load(const BlockHash& hash);
+
+    // Load the longest readable prefix of a matched block chain. Payloads are
+    // shared with the RAM hot tier instead of copied; cold files are opened,
+    // read, and verified once, with bounded parallelism. The result stops at
+    // the first missing or corrupt block.
+    std::vector<PagedPrefixPayload> load_prefix(
+        const std::vector<BlockHash>& blocks);
 
     void pin(const std::vector<BlockHash>& blocks);
     void unpin(const std::vector<BlockHash>& blocks);

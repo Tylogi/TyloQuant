@@ -901,21 +901,12 @@ private:
         auto match = paged_cache_->match(candidate);
         if (match.matched_tokens == 0) return 0;
 
-        std::vector<std::vector<std::uint8_t>> payloads;
-        payloads.reserve(match.blocks.size());
-        for (std::size_t index = 0; index < match.blocks.size(); ++index) {
-            auto payload = paged_cache_->load(match.blocks[index]);
-            if (!payload) {
-                match.blocks.resize(index);
-                match.matched_tokens =
-                    index * paged_cache_->block_size_tokens();
-                break;
-            }
-            payloads.push_back(std::move(*payload));
-        }
+        auto payloads = paged_cache_->load_prefix(match.blocks);
         if (payloads.empty()) return 0;
         if (payloads.size() != match.blocks.size()) {
-            payloads.resize(match.blocks.size());
+            match.blocks.resize(payloads.size());
+            match.matched_tokens =
+                payloads.size() * paged_cache_->block_size_tokens();
         }
         std::vector<std::int64_t> matched_tokens(
             prompt.begin(),
@@ -926,7 +917,7 @@ private:
                 payloads,
                 matched_tokens,
                 paged_cache_->block_size_tokens());
-            runtime.restore_text_session_state(state);
+            runtime.restore_text_session_state(std::move(state));
             bind_paged_session(
                 requested_session, match.blocks, match.matched_tokens);
             if (trace_) {
@@ -964,23 +955,18 @@ private:
             throw std::runtime_error(
                 "paged prefix match exceeds the session state");
         }
-        const auto first_block = existing.blocks.size();
-        auto payloads = Codec::encode(
-            state, block_size, first_block);
-        if (payloads.size() != full_blocks - first_block) {
-            throw std::runtime_error(
-                "paged Metal session codec returned the wrong block count");
-        }
         auto blocks = std::move(existing.blocks);
         mfq::cache::BlockHash parent{};
         if (!blocks.empty()) parent = blocks.back();
         for (std::size_t index = blocks.size(); index < full_blocks; ++index) {
             const auto token_offset = index * block_size;
+            auto payload = Codec::encode_block(
+                state, block_size, index);
             parent = paged_cache_->store(
                 parent,
                 state.tokens.data() + token_offset,
                 block_size,
-                payloads[index - first_block]);
+                std::move(payload));
             blocks.push_back(parent);
         }
         bind_paged_session(

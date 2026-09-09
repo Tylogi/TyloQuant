@@ -199,6 +199,8 @@ public:
         const std::vector<std::int64_t>& tokens) const;
     void restore_text_session_state(
         const MlxMiniCPMO45TextSessionState& state);
+    void restore_text_session_state(
+        MlxMiniCPMO45TextSessionState&& state);
     bool supports_text_session_state() const noexcept {
         return true;
     }

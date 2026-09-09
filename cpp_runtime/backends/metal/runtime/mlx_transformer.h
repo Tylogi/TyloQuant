@@ -115,6 +115,10 @@ public:
     // arrays, so a resumed decode cannot mutate another session snapshot.
     MlxKvCacheSnapshot snapshot() const;
     void restore_snapshot(const MlxKvCacheSnapshot& snapshot);
+    // A freshly decoded persistent snapshot has no other owner. Adopt its
+    // compact K/V allocations directly; the normal growth path reserves more
+    // capacity on the first append when needed.
+    void restore_snapshot(MlxKvCacheSnapshot&& snapshot);
 
     int position() const noexcept {
         return position_;

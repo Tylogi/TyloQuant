@@ -630,4 +630,22 @@ void MlxKvCache::restore_snapshot(
     position_ = snapshot.position;
 }
 
+void MlxKvCache::restore_snapshot(MlxKvCacheSnapshot&& snapshot) {
+    if (snapshot.batch != batch_ || snapshot.heads != heads_ ||
+        snapshot.maximum_sequence != maximum_sequence_ ||
+        snapshot.head_dimension != head_dimension_ ||
+        snapshot.dtype != dtype_ || snapshot.capacity <= 0 ||
+        snapshot.capacity > maximum_sequence_ || snapshot.position <= 0 ||
+        snapshot.position > snapshot.capacity || snapshot.key.ndim() != 4 ||
+        snapshot.value.shape() != snapshot.key.shape() ||
+        snapshot.key.shape() != Shape{
+            batch_, heads_, snapshot.position, head_dimension_} ||
+        snapshot.key.dtype() != dtype_ || snapshot.value.dtype() != dtype_) {
+        throw std::runtime_error("KV cache snapshot topology mismatch");
+    }
+    key_ = std::move(snapshot.key);
+    value_ = std::move(snapshot.value);
+    position_ = snapshot.position;
+}
+
 } // namespace mfq::metal

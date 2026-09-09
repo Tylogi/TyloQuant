@@ -19425,7 +19425,8 @@ struct CudaDecodedPagedBlock {
 static std::vector<CudaPagedPayload> encode_cuda_paged_session(
         const TextSessionState & state,
         size_t block_size,
-        size_t first_block) {
+        size_t first_block,
+        size_t maximum_blocks = std::numeric_limits<size_t>::max()) {
     static constexpr std::array<uint8_t, 8> magic{
         'M', 'F', 'Q', 'C', 'U', 'D', '1', 0};
     if (state.kind != TextSessionStateKind::FullAttention ||
@@ -19438,10 +19439,13 @@ static std::vector<CudaPagedPayload> encode_cuda_paged_session(
     if (first_block > full_blocks) {
         throw std::runtime_error("invalid CUDA cache first block");
     }
+    const size_t end_block = maximum_blocks > full_blocks - first_block
+        ? full_blocks
+        : first_block + maximum_blocks;
     std::vector<CudaPagedPayload> result;
-    result.reserve(full_blocks - first_block);
+    result.reserve(end_block - first_block);
     for (size_t block_index = first_block;
-            block_index < full_blocks; ++block_index) {
+            block_index < end_block; ++block_index) {
         const int64_t start = static_cast<int64_t>(block_index * block_size);
         CudaPagedWriter writer;
         writer.raw(magic.data(), magic.size());
@@ -19466,6 +19470,18 @@ static std::vector<CudaPagedPayload> encode_cuda_paged_session(
         result.push_back(std::move(writer).finish());
     }
     return result;
+}
+
+static CudaPagedPayload encode_cuda_paged_block(
+        const TextSessionState & state,
+        size_t block_size,
+        size_t block_index) {
+    auto result = encode_cuda_paged_session(
+        state, block_size, block_index, 1);
+    if (result.size() != 1) {
+        throw std::runtime_error("invalid CUDA cache block index");
+    }
+    return std::move(result.front());
 }
 
 static CudaDecodedPagedBlock decode_cuda_paged_block(
@@ -19509,7 +19525,7 @@ static CudaDecodedPagedBlock decode_cuda_paged_block(
 }
 
 static TextSessionState decode_cuda_paged_session(
-        const std::vector<std::vector<uint8_t>> & payloads,
+        const std::vector<CudaPagedPayload> & payloads,
         const std::vector<int64_t> & tokens,
         size_t block_size) {
     if (payloads.empty() || tokens.size() != payloads.size() * block_size) {
@@ -19521,7 +19537,11 @@ static TextSessionState decode_cuda_paged_session(
     size_t expected_start = 0;
     size_t layer_count = 0;
     for (const auto & payload : payloads) {
-        auto block = decode_cuda_paged_block(payload);
+        if (!payload) {
+            throw std::runtime_error(
+                "CUDA paged cache block payload is null");
+        }
+        auto block = decode_cuda_paged_block(*payload);
         if (block.start != expected_start || block.count != block_size ||
                 (layer_count != 0 && block.layers.size() != layer_count)) {
             throw std::runtime_error(
@@ -22086,21 +22106,12 @@ private:
         auto match = paged_cache_->match(candidate);
         if (match.matched_tokens == 0) return 0;
 
-        std::vector<std::vector<uint8_t>> payloads;
-        payloads.reserve(match.blocks.size());
-        for (size_t index = 0; index < match.blocks.size(); ++index) {
-            auto payload = paged_cache_->load(match.blocks[index]);
-            if (!payload) {
-                match.blocks.resize(index);
-                match.matched_tokens =
-                    index * paged_cache_->block_size_tokens();
-                break;
-            }
-            payloads.push_back(std::move(*payload));
-        }
+        auto payloads = paged_cache_->load_prefix(match.blocks);
         if (payloads.empty()) return 0;
         if (payloads.size() != match.blocks.size()) {
-            payloads.resize(match.blocks.size());
+            match.blocks.resize(payloads.size());
+            match.matched_tokens =
+                payloads.size() * paged_cache_->block_size_tokens();
         }
         std::vector<int64_t> matched_tokens(
             prompt.begin(),
@@ -22149,23 +22160,18 @@ private:
             throw std::runtime_error(
                 "paged prefix match exceeds the CUDA session state");
         }
-        const auto first_block = existing.blocks.size();
-        auto payloads = encode_cuda_paged_session(
-            state, block_size, first_block);
-        if (payloads.size() != full_blocks - first_block) {
-            throw std::runtime_error(
-                "paged CUDA session codec returned the wrong block count");
-        }
         auto blocks = std::move(existing.blocks);
         mfq::cache::BlockHash parent{};
         if (!blocks.empty()) parent = blocks.back();
         for (size_t index = blocks.size(); index < full_blocks; ++index) {
             const auto token_offset = index * block_size;
+            auto payload = encode_cuda_paged_block(
+                state, block_size, index);
             parent = paged_cache_->store(
                 parent,
                 state.tokens.data() + token_offset,
                 block_size,
-                payloads[index - first_block]);
+                std::move(payload));
             blocks.push_back(parent);
         }
         bind_paged_session(

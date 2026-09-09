@@ -73,6 +73,17 @@ private:
     std::vector<std::uint8_t> bytes_;
 };
 
+struct SerializedTensor {
+    // Non-owning view into a PagedPrefixPayload. decode() keeps every shared
+    // payload alive until reconstruction completes, so block tensors can be
+    // copied directly into their final full-prefix allocation instead of
+    // allocating one MLX array per block and concatenating a second time.
+    Dtype dtype = mlx::core::float16;
+    Shape shape;
+    const std::uint8_t* data = nullptr;
+    std::size_t bytes = 0;
+};
+
 class Reader {
 public:
     explicit Reader(const std::vector<std::uint8_t>& bytes)
@@ -102,7 +113,7 @@ public:
         cursor_ += size;
     }
 
-    array tensor() {
+    SerializedTensor tensor() {
         const auto dtype_value = scalar<std::uint8_t>("dtype");
         const auto rank = scalar<std::uint8_t>("rank");
         (void)scalar<std::uint16_t>("tensor flags");
@@ -126,14 +137,17 @@ public:
         const auto dtype = dtype_from_value(
             static_cast<Dtype::Val>(dtype_value));
         const auto bytes = scalar<std::uint64_t>("tensor size");
-        if (bytes != elements * dtype.size() || bytes > remaining()) {
+        if (elements > std::numeric_limits<std::size_t>::max() / dtype.size() ||
+            bytes != elements * dtype.size() || bytes > remaining()) {
             throw std::runtime_error("invalid MLX cache tensor size");
         }
-        auto result = array(
-            mlx::core::allocator::malloc(static_cast<std::size_t>(bytes)),
+        SerializedTensor result{
+            dtype,
             std::move(shape),
-            dtype);
-        raw(result.data<std::uint8_t>(), static_cast<std::size_t>(bytes), "tensor");
+            cursor_,
+            static_cast<std::size_t>(bytes),
+        };
+        cursor_ += static_cast<std::size_t>(bytes);
         return result;
     }
 
@@ -181,8 +195,8 @@ struct DecodedLayer {
     int capacity = 0;
     int position = 0;
     Dtype dtype = mlx::core::float16;
-    std::optional<array> first;
-    std::optional<array> second;
+    SerializedTensor first;
+    SerializedTensor second;
 };
 
 struct DecodedBlock {
@@ -285,14 +299,14 @@ DecodedBlock read_block(const std::vector<std::uint8_t>& payload) {
             reader.scalar<std::int32_t>("head dimension");
         layer.capacity = reader.scalar<std::int32_t>("capacity");
         layer.position = reader.scalar<std::int32_t>("position");
-        layer.first.emplace(reader.tensor());
-        layer.second.emplace(reader.tensor());
+        layer.first = reader.tensor();
+        layer.second = reader.tensor();
         if (layer.kind == kKvLayer) {
             if (dtype_value >
                 static_cast<std::uint8_t>(Dtype::Val::complex64)) {
                 throw std::runtime_error("invalid MLX KV layer dtype");
             }
-            layer.dtype = layer.first->dtype();
+            layer.dtype = layer.first.dtype;
             if (layer.dtype.val() != static_cast<Dtype::Val>(dtype_value)) {
                 throw std::runtime_error("MLX KV layer dtype mismatch");
             }
@@ -306,7 +320,7 @@ DecodedBlock read_block(const std::vector<std::uint8_t>& payload) {
 }
 
 std::vector<DecodedBlock> decode_blocks(
-    const std::vector<std::vector<std::uint8_t>>& payloads,
+    const std::vector<MlxPagedPayload>& payloads,
     std::uint32_t expected_runtime,
     std::size_t token_count,
     std::size_t block_size) {
@@ -318,7 +332,10 @@ std::vector<DecodedBlock> decode_blocks(
     std::size_t expected_start = 0;
     std::size_t expected_layers = 0;
     for (const auto& payload : payloads) {
-        auto block = read_block(payload);
+        if (!payload) {
+            throw std::runtime_error("MLX cache block payload is null");
+        }
+        auto block = read_block(*payload);
         if (block.runtime != expected_runtime || block.start != expected_start ||
             block.count != block_size ||
             (expected_layers != 0 && block.layers.size() != expected_layers)) {
@@ -335,26 +352,90 @@ MlxKvCacheSnapshot rebuild_kv(
     const std::vector<DecodedBlock>& blocks,
     std::size_t layer_index,
     std::size_t token_count) {
-    std::vector<array> keys;
-    std::vector<array> values;
-    keys.reserve(blocks.size());
-    values.reserve(blocks.size());
+    if (token_count > static_cast<std::size_t>(
+            std::numeric_limits<int>::max())) {
+        throw std::runtime_error("MLX cache token count is too large");
+    }
     const auto& final = blocks.back().layers.at(layer_index);
+    if (final.batch <= 0 || final.heads <= 0 ||
+        final.head_dimension <= 0) {
+        throw std::runtime_error("invalid MLX KV cache topology");
+    }
+    const auto expected_shape = [&](std::size_t count) {
+        return Shape{
+            final.batch,
+            final.heads,
+            static_cast<int>(count),
+            final.head_dimension,
+        };
+    };
     for (const auto& block : blocks) {
         const auto& layer = block.layers.at(layer_index);
         if (layer.kind != kKvLayer || layer.batch != final.batch ||
             layer.heads != final.heads ||
             layer.maximum_sequence != final.maximum_sequence ||
             layer.head_dimension != final.head_dimension ||
-            layer.dtype != final.dtype || !layer.first || !layer.second) {
+            layer.dtype != final.dtype ||
+            layer.first.dtype != final.dtype ||
+            layer.second.dtype != final.dtype ||
+            layer.first.shape != expected_shape(block.count) ||
+            layer.second.shape != expected_shape(block.count) ||
+            layer.first.data == nullptr || layer.second.data == nullptr ||
+            static_cast<std::size_t>(block.start) + block.count > token_count) {
             throw std::runtime_error("inconsistent MLX KV cache block topology");
         }
-        keys.push_back(*layer.first);
-        values.push_back(*layer.second);
     }
-    auto key = mlx::core::concatenate(std::move(keys), 2);
-    auto value = mlx::core::concatenate(std::move(values), 2);
-    mlx::core::eval(key, value);
+
+    const auto element_bytes = final.dtype.size();
+    const auto batch = static_cast<std::size_t>(final.batch);
+    const auto heads = static_cast<std::size_t>(final.heads);
+    const auto dimension = static_cast<std::size_t>(final.head_dimension);
+    if (batch > std::numeric_limits<std::size_t>::max() / heads ||
+        token_count > std::numeric_limits<std::size_t>::max() / dimension ||
+        token_count * dimension >
+            std::numeric_limits<std::size_t>::max() / element_bytes) {
+        throw std::runtime_error("MLX KV cache tensor size overflow");
+    }
+    const auto lanes = batch * heads;
+    const auto target_lane_bytes = token_count *
+        dimension * element_bytes;
+    if (target_lane_bytes != 0 &&
+        lanes > std::numeric_limits<std::size_t>::max() / target_lane_bytes) {
+        throw std::runtime_error("MLX KV cache allocation size overflow");
+    }
+    const auto total_bytes = lanes * target_lane_bytes;
+    const auto target_shape = expected_shape(token_count);
+    auto rebuild = [&](bool key) {
+        auto result = array(
+            mlx::core::allocator::malloc(total_bytes),
+            target_shape,
+            final.dtype);
+        auto* destination = result.data<std::uint8_t>();
+        for (const auto& block : blocks) {
+            const auto& tensor = key
+                ? block.layers.at(layer_index).first
+                : block.layers.at(layer_index).second;
+            const auto block_lane_bytes =
+                static_cast<std::size_t>(block.count) *
+                dimension * element_bytes;
+            if (tensor.bytes != lanes * block_lane_bytes) {
+                throw std::runtime_error("invalid MLX KV cache tensor size");
+            }
+            const auto destination_offset =
+                static_cast<std::size_t>(block.start) *
+                dimension * element_bytes;
+            for (std::size_t lane = 0; lane < lanes; ++lane) {
+                std::memcpy(
+                    destination + lane * target_lane_bytes +
+                        destination_offset,
+                    tensor.data + lane * block_lane_bytes,
+                    block_lane_bytes);
+            }
+        }
+        return result;
+    };
+    auto key = rebuild(true);
+    auto value = rebuild(false);
     const int position = static_cast<int>(token_count);
     return MlxKvCacheSnapshot{
         final.batch,
@@ -375,12 +456,20 @@ MlxQwen35LinearAttentionCacheSnapshot rebuild_recurrent(
     std::size_t token_count) {
     const auto& final = blocks.back().layers.at(layer_index);
     if (final.kind != kRecurrentLayer || final.batch != 1 ||
-        !final.first || !final.second) {
+        final.first.data == nullptr || final.second.data == nullptr) {
         throw std::runtime_error("invalid recurrent cache boundary block");
     }
+    const auto copy = [](const SerializedTensor& source) {
+        auto result = array(
+            mlx::core::allocator::malloc(source.bytes),
+            source.shape,
+            source.dtype);
+        std::memcpy(result.data<std::uint8_t>(), source.data, source.bytes);
+        return result;
+    };
     return MlxQwen35LinearAttentionCacheSnapshot{
-        *final.first,
-        *final.second,
+        copy(final.first),
+        copy(final.second),
         static_cast<int>(token_count),
         final.batch,
     };
@@ -391,6 +480,7 @@ std::vector<MlxPagedPayload> encode_state(
     const State& state,
     std::size_t block_size,
     std::size_t first_block,
+    std::size_t maximum_blocks,
     std::uint32_t runtime,
     LayerWriter write_layer) {
     if (block_size == 0 || state.cache_batch != 1 ||
@@ -403,9 +493,12 @@ std::vector<MlxPagedPayload> encode_state(
     if (first_block > full_blocks) {
         throw std::runtime_error("invalid MLX cache first block");
     }
+    const auto end_block = maximum_blocks > full_blocks - first_block
+        ? full_blocks
+        : first_block + maximum_blocks;
     std::vector<MlxPagedPayload> result;
-    result.reserve(full_blocks - first_block);
-    for (std::size_t block = first_block; block < full_blocks; ++block) {
+    result.reserve(end_block - first_block);
+    for (std::size_t block = first_block; block < end_block; ++block) {
         const auto start = block * block_size;
         Writer writer;
         write_header(
@@ -433,6 +526,7 @@ MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState>::encode(
         state,
         block_size,
         first_block,
+        std::numeric_limits<std::size_t>::max(),
         kMiniRuntime,
         [](Writer& writer, const MlxKvCacheSnapshot& layer,
            std::size_t start, std::size_t count) {
@@ -444,9 +538,34 @@ MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState>::encode(
         });
 }
 
+MlxPagedPayload
+MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState>::encode_block(
+    const MlxMiniCPMO45TextSessionState& state,
+    std::size_t block_size,
+    std::size_t block_index) {
+    auto result = encode_state(
+        state,
+        block_size,
+        block_index,
+        1,
+        kMiniRuntime,
+        [](Writer& writer, const MlxKvCacheSnapshot& layer,
+           std::size_t start, std::size_t count) {
+            write_kv_layer(
+                writer,
+                layer,
+                static_cast<int>(start),
+                static_cast<int>(count));
+        });
+    if (result.size() != 1) {
+        throw std::runtime_error("invalid MiniCPM cache block index");
+    }
+    return std::move(result.front());
+}
+
 MlxMiniCPMO45TextSessionState
 MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState>::decode(
-    const std::vector<std::vector<std::uint8_t>>& payloads,
+    const std::vector<MlxPagedPayload>& payloads,
     const std::vector<std::int64_t>& tokens,
     std::size_t block_size) {
     auto blocks = decode_blocks(
@@ -473,6 +592,7 @@ MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode(
         state,
         block_size,
         first_block,
+        std::numeric_limits<std::size_t>::max(),
         kQwen35Runtime,
         [](Writer& writer, const MlxQwen35LayerCacheSnapshot& layer,
            std::size_t start, std::size_t count) {
@@ -496,9 +616,47 @@ MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode(
         });
 }
 
+MlxPagedPayload
+MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode_block(
+    const MlxQwen35TextSessionState& state,
+    std::size_t block_size,
+    std::size_t block_index) {
+    auto result = encode_state(
+        state,
+        block_size,
+        block_index,
+        1,
+        kQwen35Runtime,
+        [](Writer& writer, const MlxQwen35LayerCacheSnapshot& layer,
+           std::size_t start, std::size_t count) {
+            std::visit(
+                [&](const auto& snapshot) {
+                    using Snapshot = std::decay_t<decltype(snapshot)>;
+                    if constexpr (std::is_same_v<
+                                      Snapshot, MlxKvCacheSnapshot>) {
+                        write_kv_layer(
+                            writer,
+                            snapshot,
+                            static_cast<int>(start),
+                            static_cast<int>(count));
+                    } else {
+                        write_recurrent_layer(
+                            writer,
+                            snapshot,
+                            static_cast<int>(start + count));
+                    }
+                },
+                layer);
+        });
+    if (result.size() != 1) {
+        throw std::runtime_error("invalid Qwen3.5 cache block index");
+    }
+    return std::move(result.front());
+}
+
 MlxQwen35TextSessionState
 MlxPagedSessionCodec<MlxQwen35TextSessionState>::decode(
-    const std::vector<std::vector<std::uint8_t>>& payloads,
+    const std::vector<MlxPagedPayload>& payloads,
     const std::vector<std::int64_t>& tokens,
     std::size_t block_size) {
     auto blocks = decode_blocks(

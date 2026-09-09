@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mfq_paged_prefix_cache.h"
 #include "mlx_minicpmo45.h"
 #include "mlx_qwen35_causal_lm.h"
 
@@ -11,8 +12,7 @@
 
 namespace mfq::metal {
 
-using MlxPagedPayload =
-    std::shared_ptr<const std::vector<std::uint8_t>>;
+using MlxPagedPayload = mfq::cache::PagedPrefixPayload;
 
 template <typename SessionState>
 struct MlxPagedSessionCodec {
@@ -28,8 +28,12 @@ struct MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState> {
         const MlxMiniCPMO45TextSessionState& state,
         std::size_t block_size,
         std::size_t first_block = 0);
+    static MlxPagedPayload encode_block(
+        const MlxMiniCPMO45TextSessionState& state,
+        std::size_t block_size,
+        std::size_t block_index);
     static MlxMiniCPMO45TextSessionState decode(
-        const std::vector<std::vector<std::uint8_t>>& payloads,
+        const std::vector<MlxPagedPayload>& payloads,
         const std::vector<std::int64_t>& tokens,
         std::size_t block_size);
 };
@@ -45,8 +49,12 @@ struct MlxPagedSessionCodec<MlxQwen35TextSessionState> {
         const MlxQwen35TextSessionState& state,
         std::size_t block_size,
         std::size_t first_block = 0);
+    static MlxPagedPayload encode_block(
+        const MlxQwen35TextSessionState& state,
+        std::size_t block_size,
+        std::size_t block_index);
     static MlxQwen35TextSessionState decode(
-        const std::vector<std::vector<std::uint8_t>>& payloads,
+        const std::vector<MlxPagedPayload>& payloads,
         const std::vector<std::int64_t>& tokens,
         std::size_t block_size);
 };
