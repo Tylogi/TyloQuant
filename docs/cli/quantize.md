@@ -60,7 +60,7 @@ uv run mfq quantize model-hf model-NINT4-all.mfq \
 Built-in standard mixtures are available without supplying a recipe GGUF:
 
 ```shell
-uv run mfq quantize model-hf model-S4-M.mfq --preset Q4_K_M
+uv run mfq quantize model-hf model-S4-M.mfq --preset S4-M
 ```
 
 ## Full-precision MFQ

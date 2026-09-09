@@ -1,10 +1,4 @@
-"""Architecture-neutral tensor roles and standard mixed-bit presets.
-
-The policy mirrors llama.cpp's common K-quant mixtures, but it does not know
-about any concrete model class.  Checkpoint-specific code only supplies tensor
-names/shapes and a small topology summary; this module turns them into semantic
-roles and target recipe types.
-"""
+"""Architecture-neutral tensor roles and MFQ standard mixed-bit presets."""
 
 from __future__ import annotations
 
@@ -14,37 +8,31 @@ from dataclasses import dataclass
 from enum import Enum
 
 STANDARD_PRESET_NAMES = (
-    "Q2_K_S",
-    "Q2_K",
-    "Q3_K_S",
-    "Q3_K_M",
-    "Q3_K_L",
-    "Q4_K_S",
-    "Q4_K_M",
-    "Q5_K_S",
-    "Q5_K_M",
-    "Q6_K",
-    "Q8_0",
+    "S2-S",
+    "S2-M",
+    "S3-S",
+    "S3-M",
+    "S3-L",
+    "S4-S",
+    "S4-M",
+    "S5-S",
+    "S5-M",
+    "S6",
+    "S8",
 )
 
-_ALIASES = {
-    "Q3_K": "Q3_K_M",
-    "Q4_K": "Q4_K_M",
-    "Q5_K": "Q5_K_M",
-}
-
-_DEFAULT_TYPE = {
-    "Q2_K_S": "Q2_K",
-    "Q2_K": "Q2_K",
-    "Q3_K_S": "Q3_K",
-    "Q3_K_M": "Q3_K",
-    "Q3_K_L": "Q3_K",
-    "Q4_K_S": "Q4_K",
-    "Q4_K_M": "Q4_K",
-    "Q5_K_S": "Q5_K",
-    "Q5_K_M": "Q5_K",
-    "Q6_K": "Q6_K",
-    "Q8_0": "Q8_0",
+_DEFAULT_DTYPE = {
+    "S2-S": "NINT2",
+    "S2-M": "NINT2",
+    "S3-S": "NINT3",
+    "S3-M": "NINT3",
+    "S3-L": "NINT3",
+    "S4-S": "NINT4",
+    "S4-M": "NINT4",
+    "S5-S": "NINT5",
+    "S5-M": "NINT5",
+    "S6": "NINT6",
+    "S8": "NINT8",
 }
 
 
@@ -154,9 +142,8 @@ _DENSE_COMPONENTS = frozenset(
 
 
 def normalize_preset(value: str) -> str:
-    preset = value.strip().upper().replace("-", "_")
-    preset = _ALIASES.get(preset, preset)
-    if preset not in _DEFAULT_TYPE:
+    preset = value.strip().upper().replace("_", "-")
+    if preset not in _DEFAULT_DTYPE:
         supported = ", ".join(STANDARD_PRESET_NAMES)
         raise ValueError(
             f"unsupported standard quantization preset {value!r}; choose one of: {supported}"
@@ -166,9 +153,7 @@ def normalize_preset(value: str) -> str:
 
 def _is_ple_path(name: str) -> bool:
     components = set(name.split("."))
-    return "ple" in components or bool(
-        re.search(r"(?:^|\.)block\.\d+\.position_embedding\.", name)
-    )
+    return "ple" in components or bool(re.search(r"(?:^|\.)block\.\d+\.position_embedding\.", name))
 
 
 def _scope(name: str) -> TensorScope:
@@ -179,9 +164,7 @@ def _scope(name: str) -> TensorScope:
         return TensorScope.PREDICTOR
     if _is_ple_path(name):
         return TensorScope.PLE
-    if components & {"language_model", "text_model", "llm"} or name.startswith(
-        ("model.", "blk.")
-    ):
+    if components & {"language_model", "text_model", "llm"} or name.startswith(("model.", "blk.")):
         return TensorScope.TEXT
     return TensorScope.OTHER
 
@@ -190,8 +173,7 @@ def _role(name: str, canonical_name: str | None) -> TensorRole:
     canonical = canonical_name or name
     names = (name, canonical)
     if (
-        ".position_embedding.ngram.shard." in canonical
-        or ".ngram_embedding.shard_" in name
+        ".position_embedding.ngram.shard." in canonical or ".ngram_embedding.shard_" in name
     ) and canonical.endswith(".weight"):
         return TensorRole.PLE_EMBEDDING
     if canonical in {"output.weight", "model.output.weight"} or name.endswith("lm_head.weight"):
@@ -216,8 +198,7 @@ def _role(name: str, canonical_name: str | None) -> TensorRole:
     if any(
         value.endswith(".weight")
         and any(
-            component in {"conv", "conv1d", "ssm_conv1d"}
-            or component.endswith("_conv")
+            component in {"conv", "conv1d", "ssm_conv1d"} or component.endswith("_conv")
             for component in value.split(".")
         )
         for value in names
@@ -230,8 +211,7 @@ def _role(name: str, canonical_name: str | None) -> TensorRole:
     ):
         return TensorRole.SHARED_EXPERT
     if any(
-        any(component in {"experts", "expert"} for component in value.split("."))
-        for value in names
+        any(component in {"experts", "expert"} for component in value.split(".")) for value in names
     ):
         return TensorRole.ROUTED_EXPERT
     if any(_is_ple_path(value) for value in names):
@@ -352,7 +332,7 @@ def use_more_bits(index: int, count: int) -> bool:
     return index < eighth or index >= 7 * eighth or (index - eighth) % 3 == 2
 
 
-def select_recipe_type(
+def select_target_dtype(
     preset: str,
     role: TensorRole,
     *,
@@ -362,54 +342,54 @@ def select_recipe_type(
     attention_count: int,
     gqa: int,
 ) -> str:
-    """Select one llama.cpp recipe type from a semantic tensor role."""
+    """Select one native MFQ target dtype from a semantic tensor role."""
 
     preset = normalize_preset(preset)
-    target = _DEFAULT_TYPE[preset]
+    target = _DEFAULT_DTYPE[preset]
     if role in {TensorRole.OUTPUT, TensorRole.TOKEN_EMBEDDING}:
-        return "Q8_0" if preset == "Q8_0" else "Q6_K"
+        return "NINT8" if preset == "S8" else "NINT6"
     if role is TensorRole.SHARED_EXPERT:
-        return "Q8_0"
+        return "NINT8"
     if role is TensorRole.ATTENTION_V:
         index = attention_index or 0
-        if preset == "Q2_K":
-            return "Q4_K" if gqa >= 4 else "Q3_K"
-        if preset == "Q2_K_S" and gqa >= 4:
-            return "Q4_K"
-        if preset == "Q3_K_M":
-            return "Q5_K" if index < 2 else "Q4_K"
-        if preset == "Q3_K_L":
-            return "Q5_K"
-        if preset in {"Q4_K_M", "Q5_K_M"} and use_more_bits(index, attention_count):
-            return "Q6_K"
-        if preset == "Q4_K_S" and index < 4:
-            return "Q5_K"
+        if preset == "S2-M":
+            return "NINT4" if gqa >= 4 else "NINT3"
+        if preset == "S2-S" and gqa >= 4:
+            return "NINT4"
+        if preset == "S3-M":
+            return "NINT5" if index < 2 else "NINT4"
+        if preset == "S3-L":
+            return "NINT5"
+        if preset in {"S4-M", "S5-M"} and use_more_bits(index, attention_count):
+            return "NINT6"
+        if preset == "S4-S" and index < 4:
+            return "NINT5"
         return target
     if role is TensorRole.FFN_DOWN:
         index = layer_index or 0
         layers = max(1, layer_count)
-        if preset == "Q2_K":
-            return "Q3_K"
-        if preset == "Q2_K_S" and index < layers // 8:
-            return "Q4_K"
-        if preset == "Q3_K_M":
+        if preset == "S2-M":
+            return "NINT3"
+        if preset == "S2-S" and index < layers // 8:
+            return "NINT4"
+        if preset == "S3-M":
             if index < layers // 16:
-                return "Q5_K"
-            return "Q4_K" if use_more_bits(index, layers) else "Q3_K"
-        if preset == "Q3_K_L":
-            return "Q5_K"
-        if preset in {"Q4_K_M", "Q5_K_M"} and use_more_bits(index, layers):
-            return "Q6_K"
-        if preset == "Q4_K_S" and index < layers // 8:
-            return "Q5_K"
+                return "NINT5"
+            return "NINT4" if use_more_bits(index, layers) else "NINT3"
+        if preset == "S3-L":
+            return "NINT5"
+        if preset in {"S4-M", "S5-M"} and use_more_bits(index, layers):
+            return "NINT6"
+        if preset == "S4-S" and index < layers // 8:
+            return "NINT5"
         return target
     if role is TensorRole.ATTENTION_OUTPUT:
-        if preset == "Q2_K":
-            return "Q3_K"
-        if preset == "Q3_K_M":
-            return "Q4_K"
-        if preset == "Q3_K_L":
-            return "Q5_K"
+        if preset == "S2-M":
+            return "NINT3"
+        if preset == "S3-M":
+            return "NINT4"
+        if preset == "S3-L":
+            return "NINT5"
     return target
 
 
@@ -421,6 +401,6 @@ __all__ = [
     "TensorScope",
     "describe_tensor",
     "normalize_preset",
-    "select_recipe_type",
+    "select_target_dtype",
     "use_more_bits",
 ]

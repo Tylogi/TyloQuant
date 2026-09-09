@@ -52,8 +52,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         dest="standard_preset",
         default="",
         help=(
-            "built-in llama.cpp-style tensor mixture "
-            "(Q2_K[_S], Q3_K_[S/M/L], Q4_K_[S/M], Q5_K_[S/M], Q6_K, Q8_0)"
+            "built-in MFQ tensor precision preset "
+            "(S2-S/S2-M, S3-S/S3-M/S3-L, S4-S/S4-M, "
+            "S5-S/S5-M, S6, S8)"
         ),
     )
     precision.add_argument(
@@ -512,9 +513,7 @@ def _run_in(args: argparse.Namespace, baseline: Path, output: Path) -> None:
 
 
 def _validate(args: argparse.Namespace, source_format: str) -> None:
-    if args.staged_blobs and (
-        source_format == "gguf" or args.bf16 or args.important_neurons
-    ):
+    if args.staged_blobs and (source_format == "gguf" or args.bf16 or args.important_neurons):
         raise ValueError(
             "--staged-blobs applies only to quantized HF or full-precision MFQ sources"
         )
@@ -536,9 +535,7 @@ def _validate(args: argparse.Namespace, source_format: str) -> None:
             )
     if args.bf16 and source_format != "hf":
         raise ValueError("--full-precision requires an HF safetensors source")
-    if args.bf16 and (
-        args.recipe or args.standard_preset or args.scheme or args.imatrix
-    ):
+    if args.bf16 and (args.recipe or args.standard_preset or args.scheme or args.imatrix):
         raise ValueError(
             "--full-precision cannot be combined with --recipe, "
             "--standard-preset, --scheme, or --imatrix"
@@ -546,9 +543,7 @@ def _validate(args: argparse.Namespace, source_format: str) -> None:
     if args.bf16 and args.tensor_overrides:
         raise ValueError("--tensor-overrides do not apply to --full-precision")
     if args.bf16 and (args.quantize_vision or args.quantize_mtp):
-        raise ValueError(
-            "--quantize-vision and --quantize-mtp do not apply to --full-precision"
-        )
+        raise ValueError("--quantize-vision and --quantize-mtp do not apply to --full-precision")
     if args.bf16 and args.important_neurons:
         raise ValueError("--full-precision cannot be combined with important-neuron quantization")
     if args.bf16 and (args.bits, args.groupsize, args.sub_bits) != (4, 24, 6):
@@ -564,15 +559,12 @@ def _validate(args: argparse.Namespace, source_format: str) -> None:
     if args.standard_preset and args.scheme:
         raise ValueError("--standard-preset cannot be combined with --scheme")
     if args.standard_preset and (args.bits, args.groupsize, args.sub_bits) != (4, 24, 6):
-        raise ValueError(
-            "--bits, --groupsize, and --sub-bits cannot override a standard preset"
-        )
+        raise ValueError("--bits, --groupsize, and --sub-bits cannot override a standard preset")
     if source_format == "gguf" and args.text_only:
         raise ValueError("--text-only is only valid for an HF source")
     if source_format == "gguf" and (args.quantize_vision or args.quantize_mtp):
         raise ValueError(
-            "--quantize-vision and --quantize-mtp require an HF or "
-            "full-precision MFQ source"
+            "--quantize-vision and --quantize-mtp require an HF or full-precision MFQ source"
         )
     if args.text_only and args.quantize_vision:
         raise ValueError("--quantize-vision cannot be combined with --text-only")

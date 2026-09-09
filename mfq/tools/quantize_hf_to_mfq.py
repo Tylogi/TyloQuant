@@ -1,9 +1,8 @@
 """Convert an HF safetensors checkpoint to MFQ.
 
-Besides explicit GGUF recipes and calibration schemes, the converter exposes
-llama.cpp-style standard presets.  The latter reproduce the useful part of
-the upstream K-quant policy (sensitive tensor classes receive more bits)
-while selecting the equivalent native MFQ NINT storage families.
+Besides explicit GGUF import recipes and calibration schemes, the converter
+exposes native MFQ standard presets. Sensitive tensor classes receive more
+bits while every selected storage family remains an MFQ dtype.
 """
 
 from __future__ import annotations
@@ -26,9 +25,11 @@ import torch
 from safetensors import safe_open
 
 from mfq.architectures.tensor_schema import (
+    TensorComponent,
     graph_spec_for_plan,
     map_source_tensor_name,
     tensor_schema_for_config,
+    topology_from_config,
 )
 from mfq.calibration.artifact import (
     CalibrationScheme,
@@ -193,6 +194,7 @@ from mfq.formats.runtime_profile import (
 from mfq.formats.shards import (
     SPLIT_KEYS,
     StreamingBlobShardWriter,
+    copy_sparse_range,
     matching_shard_paths,
     parse_size,
     validate_split_limits,
@@ -215,6 +217,7 @@ from mfq.quantize.expert_nint import (
     resolve_precision_artifact,
 )
 from mfq.quantize.imatrix import ImportanceMatrix, load_importance_matrix
+from mfq.quantize.mxfp import decode_e8m0, decode_mxfp4
 from mfq.quantize.nepq import NepqQuantConfig, quantize_nepq_fixed
 from mfq.quantize.nepq_a import (
     NepqAArtifact,
@@ -232,7 +235,7 @@ from mfq.quantize.standard_presets import (
     TensorRole,
     TensorScope,
     describe_tensor,
-    select_recipe_type,
+    select_target_dtype,
 )
 from mfq.quantize.standard_presets import (
     normalize_preset as _normalize_standard_preset,
@@ -264,6 +267,7 @@ class TensorPlan:
     expert_source_quantizations: tuple[tuple[str | None, ...], ...] | None = None
     expert_source_scale_names: tuple[tuple[str | None, ...], ...] | None = None
     expert_source_scale_shards: tuple[tuple[str | None, ...], ...] | None = None
+    precision_locked: bool = False
 
     @property
     def expert_specs(self) -> tuple[NintSpec, ...] | None:
@@ -341,6 +345,9 @@ class _RawSafeTensorSlice:
         # NumPy has no portable float8 dtype, so decode through Torch below.
         "F8_E4M3": np.dtype("u1"),
         "F8_E5M2": np.dtype("u1"),
+        # E8M0 is an unsigned exponent byte, not an arithmetic Torch dtype.
+        # Keep the raw byte here and decode it only when applying an MX scale.
+        "F8_E8M0": np.dtype("u1"),
     }
 
     def __init__(self, path: str | Path, name: str) -> None:
@@ -492,8 +499,13 @@ class _ScaledFp8TensorSlice:
         self.shape = weight.shape
         self.rows = weight.rows
         self.columns = weight.columns
-        self._scale = scale.tensor().to(torch.float32)
-        if scheme == "fp8_block128_inv":
+        raw_scale = scale.tensor()
+        self._scale = (
+            decode_e8m0(raw_scale, device="cpu")
+            if scale.dtype_name == "F8_E8M0"
+            else raw_scale.to(torch.float32)
+        )
+        if scheme in {"fp8_block128_inv", "mxfp8_block128"}:
             expected = (
                 math.ceil(self.rows / 128),
                 math.ceil(self.columns / 128),
@@ -571,6 +583,54 @@ class _ScaledFp8TensorSlice:
     def __getitem__(self, key: slice) -> torch.Tensor:
         if not isinstance(key, slice) or key.step not in (None, 1):
             raise TypeError("scaled float8 source accepts contiguous slices")
+        start = 0 if key.start is None else int(key.start)
+        end = self.rows if key.stop is None else int(key.stop)
+        return self.read_rows(start, end)
+
+
+class _Mxfp4TensorSlice:
+    """Expose packed E2M1/E8M0 storage as one logical floating matrix."""
+
+    def __init__(
+        self,
+        weight: _RawSafeTensorSlice,
+        scale: _RawSafeTensorSlice,
+    ) -> None:
+        if weight.dtype_name != "I8" or len(weight.shape) != 2:
+            raise ValueError(f"MXFP4 source requires a rank-2 I8 payload: {weight.name}")
+        if scale.dtype_name != "F8_E8M0" or len(scale.shape) != 2:
+            raise ValueError(f"MXFP4 source requires a rank-2 E8M0 scale: {scale.name}")
+        self.weight = weight
+        self.scale_source = scale
+        self.shape = (weight.shape[0], weight.shape[1] * 2)
+        self.rows, self.columns = self.shape
+        expected_scale = (self.rows, self.columns // 32)
+        if self.columns % 32 or scale.shape != expected_scale:
+            raise ValueError(
+                f"MXFP4 scale shape differs for {weight.name}: {scale.shape} != {expected_scale}"
+            )
+
+    def read_rows(
+        self,
+        start: int | np.ndarray,
+        end: int | None = None,
+        *,
+        device: str | torch.device = "cpu",
+    ) -> torch.Tensor:
+        packed = self.weight.read_rows(start, end, device="cpu")
+        scales = self.scale_source.read_rows(start, end, device="cpu")
+        return decode_mxfp4(
+            packed.view(torch.uint8),
+            scales,
+            device=device,
+        )
+
+    def tensor(self) -> torch.Tensor:
+        return self.read_rows(0, self.rows)
+
+    def __getitem__(self, key: slice) -> torch.Tensor:
+        if not isinstance(key, slice) or key.step not in (None, 1):
+            raise TypeError("MXFP4 source accepts contiguous slices")
         start = 0 if key.start is None else int(key.start)
         end = self.rows if key.stop is None else int(key.stop)
         return self.read_rows(start, end)
@@ -660,38 +720,99 @@ class _SourceQuantization:
     scheme: str
     scale_name: str
     scale_shard: str
+    logical_shape: tuple[int, ...] | None = None
+    logical_dtype: str | None = None
 
 
 def _source_quantization(
     name: str,
     inventory: dict[str, SourceTensorMetadata],
+    *,
+    canonical_sources: dict[str, str] | None = None,
+    config: dict[str, object] | None = None,
 ) -> _SourceQuantization | None:
-    """Resolve the scale contract of one standard HF/ModelOpt float8 tensor."""
+    """Resolve one float8 tensor's scale through its source-storage contract.
+
+    Raw checkpoint spellings are import details.  Conventional adjacent names
+    remain supported for unregistered checkpoints, while registered schemas
+    pair ``*.weight`` with canonical ``*.weight_scale`` regardless of whether
+    the source called it ``scale``, ``weight_scale`` or ``scale_inv``.
+    """
 
     metadata = inventory[name]
-    if metadata.dtype not in _HF_FP8_DTYPES:
+    if metadata.dtype not in _HF_FP8_DTYPES and metadata.dtype != "I8":
         return None
     if len(metadata.shape) != 2:
-        raise ValueError(f"float8 HF source must be a matrix: {name} {metadata.shape}")
+        if metadata.dtype in _HF_FP8_DTYPES:
+            raise ValueError(f"float8 HF source must be a matrix: {name} {metadata.shape}")
+        return None
 
-    block_scale_name = name + "_scale_inv"
-    block_scale = inventory.get(block_scale_name)
-    if block_scale is not None:
+    scale_names = [
+        name + "_scale_inv",
+        name + "_scale",
+    ]
+    if name.endswith(".weight"):
+        scale_names.append(name.removesuffix(".weight") + ".scale")
+    if canonical_sources is not None and config is not None:
+        mapping = map_source_tensor_name(name, config)
+        if mapping is not None and mapping.canonical_name.endswith(".weight"):
+            canonical_scale = mapping.canonical_name.removesuffix(".weight") + ".weight_scale"
+            source_scale = canonical_sources.get(canonical_scale)
+            if source_scale is not None:
+                scale_names.insert(0, source_scale)
+    # Preserve order while avoiding a source alias being validated twice.
+    scale_names = list(dict.fromkeys(scale_names))
+    if metadata.dtype == "I8":
+        logical_shape = (metadata.shape[0], metadata.shape[1] * 2)
+        expected = (logical_shape[0], logical_shape[1] // 32)
+        for scale_name in scale_names:
+            scale = inventory.get(scale_name)
+            if scale is None:
+                continue
+            if logical_shape[1] % 32 or scale.shape != expected:
+                continue
+            if scale.dtype != "F8_E8M0":
+                raise ValueError(
+                    f"packed MXFP4 scale has unsupported dtype for {name}: {scale.dtype}"
+                )
+            return _SourceQuantization(
+                "mxfp4_block32",
+                scale_name,
+                scale.shard,
+                logical_shape=logical_shape,
+                logical_dtype="MXFP4",
+            )
+        return None
+
+    for scale_name in scale_names:
+        block_scale = inventory.get(scale_name)
+        if block_scale is None:
+            continue
         expected = (
             math.ceil(metadata.shape[0] / 128),
             math.ceil(metadata.shape[1] / 128),
         )
-        if block_scale.shape != expected:
-            raise ValueError(
-                f"float8 block scale shape differs for {name}: {block_scale.shape} != {expected}"
+        if block_scale.shape == expected:
+            if block_scale.dtype == "F8_E8M0":
+                scheme = "mxfp8_block128"
+            elif block_scale.dtype in {"BF16", "F16", "F32"}:
+                scheme = "fp8_block128_inv"
+            else:
+                raise ValueError(
+                    f"float8 block scale has unsupported dtype for {name}: {block_scale.dtype}"
+                )
+            return _SourceQuantization(scheme, scale_name, block_scale.shard)
+        if int(np.prod(block_scale.shape)) == 1:
+            if block_scale.dtype not in {"BF16", "F16", "F32", "F8_E8M0"}:
+                raise ValueError(
+                    f"float8 tensor scale has unsupported dtype for {name}: {block_scale.dtype}"
+                )
+            return _SourceQuantization(
+                "fp8_tensor_scale",
+                scale_name,
+                block_scale.shard,
             )
-        return _SourceQuantization(
-            "fp8_block128_inv",
-            block_scale_name,
-            block_scale.shard,
-        )
-
-    tensor_scale_names = [name + "_scale"]
+    tensor_scale_names: list[str] = []
     ngram_match = re.match(r"^(.+\.ngram_embedding)\.shard_\d+\.weight$", name)
     canonical_ngram_match = re.match(
         r"^(.+\.position_embedding\.ngram)\.shard\.\d+\.weight$",
@@ -722,13 +843,31 @@ def _source_quantization(
 
 def _source_quantizations(
     inventory: dict[str, SourceTensorMetadata],
+    config: dict[str, object] | None = None,
 ) -> tuple[dict[str, _SourceQuantization], set[str]]:
+    canonical_sources: dict[str, str] = {}
+    if config is not None and tensor_schema_for_config(config) is not None:
+        for source_name in inventory:
+            mapping = map_source_tensor_name(source_name, config)
+            if mapping is None:
+                continue
+            previous = canonical_sources.setdefault(mapping.canonical_name, source_name)
+            if previous != source_name:
+                raise ValueError(
+                    "multiple checkpoint tensors map to canonical tensor "
+                    f"{mapping.canonical_name}: {previous}, {source_name}"
+                )
     resolved: dict[str, _SourceQuantization] = {}
     auxiliaries: set[str] = set()
     for name, metadata in inventory.items():
-        if metadata.dtype not in _HF_FP8_DTYPES:
+        if metadata.dtype not in _HF_FP8_DTYPES and metadata.dtype != "I8":
             continue
-        value = _source_quantization(name, inventory)
+        value = _source_quantization(
+            name,
+            inventory,
+            canonical_sources=canonical_sources,
+            config=config,
+        )
         if value is None:  # pragma: no cover - guarded by dtype above
             continue
         resolved[name] = value
@@ -747,6 +886,8 @@ def _raw_source_for_plan(root: Path, item: TensorPlan):
         root / item.source_scale_shard,
         item.source_scale_name,
     )
+    if item.source_quantization == "mxfp4_block32":
+        return _Mxfp4TensorSlice(weight, scale)
     return _ScaledFp8TensorSlice(weight, scale, item.source_quantization)
 
 
@@ -896,8 +1037,16 @@ def _validate_native_source_precision(plan: Sequence[TensorPlan]) -> None:
             else [item.target_dtype]
         )
         for family in families:
+            if family == item.source_dtype:
+                # Exact native preservation is lossless and does not pretend
+                # to recover precision absent from the source checkpoint.
+                continue
             target_bits = _compact_family_bits(family)
-            if target_bits is None or target_bits >= source_bits:
+            # A dense target is a faithful materialization of native values,
+            # not a claim that the checkpoint contained extra information.
+            if target_bits is None:
+                continue
+            if target_bits >= source_bits:
                 raise ValueError(
                     f"native {item.source_dtype} source {item.name} cannot be "
                     f"converted to {family}; target precision must be strictly "
@@ -1057,6 +1206,82 @@ def _mtp_inventory_status(
 ) -> tuple[bool, int]:
     """Validate that an optional predictor component is complete or absent."""
 
+    # Registered architectures share one component-level validation path.
+    # Source spellings and predictor topology belong to the tensor schema;
+    # they must not fall through to a Qwen-shaped default contract.
+    if tensor_schema_for_config(model_config) is not None:
+        count = topology_from_config(model_config).predictor_layers
+        canonical_sources: dict[str, str] = {}
+        for source_name in inventory:
+            mapping = map_source_tensor_name(source_name, model_config)
+            if mapping is None or mapping.component != TensorComponent.PREDICTOR:
+                continue
+            previous = canonical_sources.setdefault(mapping.canonical_name, source_name)
+            if previous != source_name:
+                raise ValueError(
+                    "predictor tensor mapping collision: "
+                    f"{previous} and {source_name} -> {mapping.canonical_name}"
+                )
+
+        names = set(canonical_sources)
+        if count <= 0:
+            if names:
+                raise ValueError(
+                    "checkpoint contains predictor tensors but its canonical "
+                    "topology declares no predictor stages"
+                )
+            return False, 0
+        if not names:
+            return False, count
+
+        stage_pattern = re.compile(r"^predictor\.(?:block|stage)\.(\d+)\.(.+)$")
+        stages: dict[int, set[str]] = {}
+        for name in names:
+            match = stage_pattern.match(name)
+            if match is not None:
+                stages.setdefault(int(match.group(1)), set()).add(match.group(2))
+        expected = set(range(count))
+        if set(stages) != expected:
+            missing = sorted(expected - set(stages))
+            extra = sorted(set(stages) - expected)
+            raise ValueError(
+                f"incomplete canonical predictor stages: missing={missing[:8]} extra={extra[:8]}"
+            )
+
+        # Within every separately stored routed bank, all experts must carry
+        # the same projection/metadata leaves and IDs must be contiguous.
+        expert_pattern = re.compile(
+            r"^(predictor\.(?:block|stage)\.\d+\.mlp\.experts)\."
+            r"(\d+)\.(.+)$"
+        )
+        expert_groups: dict[str, dict[int, set[str]]] = {}
+        for name in names:
+            match = expert_pattern.match(name)
+            if match is None:
+                continue
+            prefix, expert_raw, suffix = match.groups()
+            expert_groups.setdefault(prefix, {}).setdefault(int(expert_raw), set()).add(suffix)
+        for prefix, experts in expert_groups.items():
+            expected_ids = set(range(len(experts)))
+            if set(experts) != expected_ids:
+                missing = sorted(expected_ids - set(experts))
+                extra = sorted(set(experts) - expected_ids)
+                raise ValueError(
+                    f"incomplete predictor expert IDs under {prefix}: "
+                    f"missing={missing[:8]} extra={extra[:8]}"
+                )
+            leaves = experts[0]
+            for expert, current in experts.items():
+                if current != leaves:
+                    raise ValueError(
+                        f"predictor expert {expert} differs under {prefix}: "
+                        f"missing={sorted(leaves - current)[:8]} "
+                        f"extra={sorted(current - leaves)[:8]}"
+                    )
+        return True, count
+
+    # Compatibility for old unregistered Qwen-family inputs. Registered
+    # schemas above are the production path and never reach this legacy shape.
     count = int(
         model_config.get(
             "mtp_num_hidden_layers",
@@ -1068,8 +1293,7 @@ def _mtp_inventory_status(
     if model_type == "glm5_next_text":
         base = int(model_config.get("num_hidden_layers", 0) or 0)
         predictor_prefixes = tuple(
-            f"model.language_model.layers.{base + index}."
-            for index in range(max(0, count))
+            f"model.language_model.layers.{base + index}." for index in range(max(0, count))
         )
         names = {
             name
@@ -1110,8 +1334,7 @@ def _mtp_inventory_status(
         missing = sorted(required - names)
         if missing:
             raise ValueError(
-                "incomplete GLM-5-Next predictor; missing tensors: "
-                + ", ".join(missing[:8])
+                "incomplete GLM-5-Next predictor; missing tensors: " + ", ".join(missing[:8])
             )
         return True, count
 
@@ -1910,15 +2133,13 @@ def _apply_balanced_random_expert_mix(
         return plan
     result: list[TensorPlan] = []
     for item in plan:
-        if item.target_dtype != "NINTM" or item.expert_shape is None:
+        if item.target_dtype != "NINTM" or item.expert_shape is None or item.precision_locked:
             result.append(item)
             continue
         n_experts = int(item.expert_shape[0])
         indices = np.arange(n_experts, dtype=np.int64) % len(profiles)
         name_seed = tuple(item.name.encode("utf-8"))
-        rng = np.random.default_rng(
-            np.random.SeedSequence((int(seed), n_experts, *name_seed))
-        )
+        rng = np.random.default_rng(np.random.SeedSequence((int(seed), n_experts, *name_seed)))
         rng.shuffle(indices)
         assigned = tuple(profiles[int(index)] for index in indices)
         result.append(replace(item, target_spec=None, expert_precisions=assigned))
@@ -1991,6 +2212,15 @@ def _apply_standard_preset(
     for item in plan:
         gguf_name, descriptor, layer, scope_enabled = details[item.name]
         if not descriptor.quantizable or not scope_enabled:
+            if item.precision_locked:
+                result.append(
+                    replace(
+                        item,
+                        gguf_name=gguf_name,
+                        gguf_type=None,
+                    )
+                )
+                continue
             result.append(
                 replace(
                     item,
@@ -1998,8 +2228,7 @@ def _apply_standard_preset(
                         item.target_dtype
                         if descriptor.role is TensorRole.PLE_EMBEDDING
                         else item.source_dtype
-                        if item.source_dtype
-                        in {"BF16", "F16", "F32", "I32", "I64"}
+                        if item.source_dtype in {"BF16", "F16", "F32", "I32", "I64"}
                         else "F16"
                     ),
                     gguf_name=gguf_name,
@@ -2016,7 +2245,7 @@ def _apply_standard_preset(
         is_vision = descriptor.scope is TensorScope.VISION
         attention_indices = vision_attention_indices if is_vision else text_attention_indices
         attention_count = len(vision_attention) if is_vision else len(text_attention)
-        recipe_type = select_recipe_type(
+        target = select_target_dtype(
             preset,
             role,
             layer_index=layer,
@@ -2025,7 +2254,6 @@ def _apply_standard_preset(
             attention_count=attention_count,
             gqa=topology.vision_gqa if is_vision else topology.text_gqa,
         )
-        target = _dtype_for_recipe_type(recipe_type, "F16")
         spec = _spec_for_target(target, NintSpec())
         if len(item.shape) == 3:
             expert_shape = tuple(int(value) for value in item.shape)
@@ -2035,7 +2263,7 @@ def _apply_standard_preset(
                     item,
                     target_dtype="NINTM",
                     gguf_name=gguf_name,
-                    gguf_type=recipe_type,
+                    gguf_type=None,
                     target_spec=None,
                     expert_shape=expert_shape,
                     expert_precisions=(precision,) * expert_shape[0],
@@ -2047,7 +2275,7 @@ def _apply_standard_preset(
                     item,
                     target_dtype=target,
                     gguf_name=gguf_name,
-                    gguf_type=recipe_type,
+                    gguf_type=None,
                     target_spec=spec,
                     expert_shape=None,
                     expert_precisions=None,
@@ -2201,7 +2429,8 @@ def _glm_expert_precisions(
 
 _FLASH_NEXT_TEXT_TYPES = frozenset({"qwen4_exp_text", "glm5_next_text"})
 _CANONICAL_SEPARATE_EXPERT_RE = re.compile(
-    r"^((?:model|predictor|vision)\.block\.\d+\.mlp\.experts)\."
+    r"^((?:model|vision)\.block\.\d+\.mlp\.experts|"
+    r"predictor\.(?:block|stage)\.\d+\.mlp\.experts)\."
     r"(\d+)\.(gate|up|down)\.weight$"
 )
 
@@ -2245,6 +2474,9 @@ def _separate_hf_expert_plans(
     source_quantizations: dict[str, _SourceQuantization],
     calibration_scheme: CalibrationScheme | None,
     default_spec: NintSpec,
+    *,
+    quantize_vision: bool = False,
+    quantize_mtp: bool = False,
 ) -> tuple[list[TensorPlan], set[str]]:
     """Normalize separately stored HF experts into canonical grouped projections."""
 
@@ -2264,6 +2496,22 @@ def _separate_hf_expert_plans(
     plans: list[TensorPlan] = []
     consumed: set[str] = set()
 
+    def logical_shape(name: str) -> tuple[int, ...]:
+        encoding = source_quantizations.get(name)
+        return (
+            encoding.logical_shape
+            if encoding is not None and encoding.logical_shape is not None
+            else inventory[name].shape
+        )
+
+    def logical_dtype(name: str) -> str:
+        encoding = source_quantizations.get(name)
+        return (
+            encoding.logical_dtype
+            if encoding is not None and encoding.logical_dtype is not None
+            else inventory[name].dtype
+        )
+
     def source_fields(
         tuples: list[tuple[str, ...]],
     ) -> tuple[
@@ -2282,6 +2530,12 @@ def _separate_hf_expert_plans(
         return tuple(schemes), tuple(scale_names), tuple(scale_shards)
 
     for prefix, experts in sorted(groups.items()):
+        preserve_source = (
+            prefix.startswith("predictor.")
+            and not quantize_mtp
+            or prefix.startswith("vision.")
+            and not quantize_vision
+        )
         expected_experts = len(experts)
         expected_ids = set(range(expected_experts))
         if set(experts) != expected_ids:
@@ -2305,9 +2559,8 @@ def _separate_hf_expert_plans(
             gate = projections["gate"]
             up = projections["up"]
             down = projections["down"]
-            gate_shape = inventory[gate].shape
-            up_shape = inventory[up].shape
-            down_shape = inventory[down].shape
+            gate_shape = logical_shape(gate)
+            down_shape = logical_shape(down)
             if len(gate_shape) != 2:
                 raise ValueError(f"routed Gate source must be rank-2: {gate}")
             expert_hidden, hidden = map(int, gate_shape)
@@ -2316,10 +2569,11 @@ def _separate_hf_expert_plans(
                 (up, (expert_hidden, hidden)),
                 (down, (hidden, expert_hidden)),
             ):
-                if inventory[name].shape != expected_shape:
+                actual_shape = logical_shape(name)
+                if actual_shape != expected_shape:
                     raise ValueError(
                         f"expert source shape differs for {name}: "
-                        f"{inventory[name].shape} != {expected_shape}"
+                        f"{actual_shape} != {expected_shape}"
                     )
             gate_names.append((gate,))
             gate_shards.append((inventory[gate].shard,))
@@ -2337,67 +2591,91 @@ def _separate_hf_expert_plans(
         gate_q, gate_scale_names, gate_scale_shards = source_fields(gate_names)
         up_q, up_scale_names, up_scale_shards = source_fields(up_names)
         down_q, down_scale_names, down_scale_shards = source_fields(down_names)
+
+        def target_fields(
+            names: list[tuple[str, ...]],
+            target_name: str,
+            target_shape: tuple[int, int, int],
+            *,
+            preserve_source: bool = preserve_source,
+        ) -> dict[str, object]:
+            native_mxfp4 = all(
+                logical_dtype(source_name) == "MXFP4"
+                for sources in names
+                for source_name in sources
+            )
+            if preserve_source and native_mxfp4:
+                return {
+                    "target_dtype": "NINTM",
+                    "expert_shape": target_shape,
+                    "expert_precisions": (ExpertPrecision(family="MXFP4"),) * target_shape[0],
+                    "precision_locked": True,
+                }
+            if preserve_source:
+                dense_sources = {
+                    logical_dtype(source_name) for sources in names for source_name in sources
+                }
+                target_dtype = (
+                    next(iter(dense_sources))
+                    if len(dense_sources) == 1
+                    and next(iter(dense_sources)) in {"BF16", "F16", "F32"}
+                    else "F16"
+                )
+                return {
+                    "target_dtype": target_dtype,
+                    "precision_locked": True,
+                }
+            return {
+                "target_dtype": "NINTM",
+                "expert_shape": target_shape,
+                "expert_precisions": _glm_expert_precisions(
+                    target_name,
+                    target_shape,
+                    calibration_scheme,
+                    default_spec,
+                ),
+            }
+
         plans.extend(
             (
                 TensorPlan(
                     name=gate_target,
                     shard=gate_shards[0][0],
                     shape=projection_shape,
-                    source_dtype=inventory[gate_names[0][0]].dtype,
-                    target_dtype="NINTM",
-                    expert_shape=projection_shape,
-                    expert_precisions=_glm_expert_precisions(
-                        gate_target,
-                        projection_shape,
-                        calibration_scheme,
-                        default_spec,
-                    ),
+                    source_dtype=logical_dtype(gate_names[0][0]),
                     transform="hf_expert_gate",
                     expert_source_names=tuple(gate_names),
                     expert_source_shards=tuple(gate_shards),
                     expert_source_quantizations=gate_q,
                     expert_source_scale_names=gate_scale_names,
                     expert_source_scale_shards=gate_scale_shards,
+                    **target_fields(gate_names, gate_target, projection_shape),
                 ),
                 TensorPlan(
                     name=up_target,
                     shard=up_shards[0][0],
                     shape=projection_shape,
-                    source_dtype=inventory[up_names[0][0]].dtype,
-                    target_dtype="NINTM",
-                    expert_shape=projection_shape,
-                    expert_precisions=_glm_expert_precisions(
-                        up_target,
-                        projection_shape,
-                        calibration_scheme,
-                        default_spec,
-                    ),
+                    source_dtype=logical_dtype(up_names[0][0]),
                     transform="hf_expert_up",
                     expert_source_names=tuple(up_names),
                     expert_source_shards=tuple(up_shards),
                     expert_source_quantizations=up_q,
                     expert_source_scale_names=up_scale_names,
                     expert_source_scale_shards=up_scale_shards,
+                    **target_fields(up_names, up_target, projection_shape),
                 ),
                 TensorPlan(
                     name=down_target,
                     shard=down_shards[0][0],
                     shape=down_shape,
-                    source_dtype=inventory[down_names[0][0]].dtype,
-                    target_dtype="NINTM",
-                    expert_shape=down_shape,
-                    expert_precisions=_glm_expert_precisions(
-                        down_target,
-                        down_shape,
-                        calibration_scheme,
-                        default_spec,
-                    ),
+                    source_dtype=logical_dtype(down_names[0][0]),
                     transform="hf_expert_down",
                     expert_source_names=tuple(down_names),
                     expert_source_shards=tuple(down_shards),
                     expert_source_quantizations=down_q,
                     expert_source_scale_names=down_scale_names,
                     expert_source_scale_shards=down_scale_shards,
+                    **target_fields(down_names, down_target, down_shape),
                 ),
             )
         )
@@ -2413,7 +2691,6 @@ def _glm_derived_plans(
 ) -> list[TensorPlan]:
     layers = int(config["num_hidden_layers"])
     heads = int(config["num_attention_heads"])
-    hidden = int(config["hidden_size"])
     kv_rank = int(config["kv_lora_rank"])
     nope = int(config["qk_nope_head_dim"])
     value = int(config["v_head_dim"])
@@ -2515,9 +2792,7 @@ def _glm5_next_mla_derived_plans(
             ("unembed_out", "glm_kv_b_unembed_out", (heads, value, kv_rank)),
         ):
             source_target = prefix + suffix
-            target_mapping = map_source_tensor_name(
-                source_target, config, require_registered=True
-            )
+            target_mapping = map_source_tensor_name(source_target, config, require_registered=True)
             assert target_mapping is not None
             target = target_mapping.canonical_name
             plans.append(
@@ -2591,7 +2866,7 @@ def _plan(
             "Qwen4-Exp/GLM-5-Next GGUF recipe mapping is not implemented; "
             "use the native HF conversion policy or a calibration scheme"
         )
-    source_quantizations, source_auxiliaries = _source_quantizations(inventory)
+    source_quantizations, source_auxiliaries = _source_quantizations(inventory, raw_config)
     preserved_ple_scale_names: set[str] = set()
     if not quantize_ple:
         for source_name, source_quantization in source_quantizations.items():
@@ -2622,6 +2897,8 @@ def _plan(
             source_quantizations,
             calibration_scheme,
             _spec_for_target(default_nint_dtype, NintSpec()),
+            quantize_vision=quantize_vision,
+            quantize_mtp=quantize_mtp,
         )
     glm_layers = int(model_config.get("num_hidden_layers", 0)) if is_glm_dsa else 0
     linear_qkv_split = (
@@ -2651,11 +2928,7 @@ def _plan(
                 continue
         if recipe_types is not None:
             canonical_mapping = map_source_tensor_name(name, raw_config)
-            if (
-                canonical_schema is not None
-                and canonical_mapping is None
-                and not legacy_mfq_input
-            ):
+            if canonical_schema is not None and canonical_mapping is None and not legacy_mfq_input:
                 raise KeyError(
                     f"{canonical_schema.architecture} source tensor has no "
                     f"canonical mapping: {name}"
@@ -2671,9 +2944,7 @@ def _plan(
                 metadata.shape,
                 metadata.dtype,
                 canonical_name=(
-                    canonical_mapping.canonical_name
-                    if canonical_mapping is not None
-                    else gguf_name
+                    canonical_mapping.canonical_name if canonical_mapping is not None else gguf_name
                 ),
             )
             preserve_scope = (
@@ -2716,9 +2987,17 @@ def _plan(
     for shard in sorted(by_shard):
         for name in sorted(by_shard[shard]):
             metadata = inventory[name]
-            shape = metadata.shape
-            source_dtype = metadata.dtype
             source_quantization = source_quantizations.get(name)
+            shape = (
+                source_quantization.logical_shape
+                if source_quantization is not None and source_quantization.logical_shape is not None
+                else metadata.shape
+            )
+            source_dtype = (
+                source_quantization.logical_dtype
+                if source_quantization is not None and source_quantization.logical_dtype is not None
+                else metadata.dtype
+            )
             if (
                 (is_glm_dsa or is_glm5_next)
                 and not mostly_bf16
@@ -2736,11 +3015,7 @@ def _plan(
                 source_dtypes[name] = source_dtype
                 continue
             canonical_mapping = map_source_tensor_name(name, raw_config)
-            if (
-                canonical_schema is not None
-                and canonical_mapping is None
-                and not legacy_mfq_input
-            ):
+            if canonical_schema is not None and canonical_mapping is None and not legacy_mfq_input:
                 raise KeyError(
                     f"{canonical_schema.architecture} source tensor has no "
                     f"canonical mapping: {name}"
@@ -3038,12 +3313,7 @@ def _dense_blob_from_tensor(t: torch.Tensor, blob_path: Path, dtype: str) -> int
         arr = t.to(torch.bfloat16).contiguous().cpu().view(torch.uint16).numpy()
         arr = np.ascontiguousarray(arr, dtype="<u2")
     elif dtype == "F8_E4M3":
-        arr = (
-            t.to(device="cpu", dtype=torch.float8_e4m3fn)
-            .contiguous()
-            .view(torch.uint8)
-            .numpy()
-        )
+        arr = t.to(device="cpu", dtype=torch.float8_e4m3fn).contiguous().view(torch.uint8).numpy()
         arr = np.ascontiguousarray(arr, dtype=np.uint8)
     elif dtype == "I32":
         arr = t.to(torch.int32).contiguous().cpu().numpy()
@@ -3119,9 +3389,7 @@ def _write_float8_e4m3_axis0_blob(
             end = min(start + row_chunk, rows)
             chunk = source.read_rows(start, end, device="cpu")
             if chunk.dtype != torch.float8_e4m3fn:
-                raise TypeError(
-                    "raw E4M3 preservation requires float8_e4m3fn source rows"
-                )
+                raise TypeError("raw E4M3 preservation requires float8_e4m3fn source rows")
             if tuple(chunk.shape) != (end - start, columns):
                 raise ValueError(
                     f"raw E4M3 row source returned {tuple(chunk.shape)}, "
@@ -3316,8 +3584,8 @@ class _ExpertPoolRowSource:
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
 
 
-class _GlmExpertRowSource:
-    """Read separate HF expert matrices without stacking a complete layer."""
+class _SeparateExpertRowSource:
+    """Read canonical separately stored experts without stacking a whole layer."""
 
     def __init__(
         self,
@@ -3370,10 +3638,11 @@ class _GlmExpertRowSource:
             scale_shard = self.source_scale_shards[expert][index]
             if scale_name is None or scale_shard is None:
                 raise ValueError(f"scaled expert source lacks scale metadata: {name}")
-            reader = _ScaledFp8TensorSlice(
-                weight,
-                _RawSafeTensorSlice(self.root / scale_shard, scale_name),
-                scheme,
+            scale = _RawSafeTensorSlice(self.root / scale_shard, scale_name)
+            reader = (
+                _Mxfp4TensorSlice(weight, scale)
+                if scheme == "mxfp4_block32"
+                else _ScaledFp8TensorSlice(weight, scale, scheme)
             )
         self._reader_key = key
         self._reader = reader
@@ -3384,24 +3653,91 @@ class _GlmExpertRowSource:
         shards = self.source_shards[expert]
         if len(names) == 0 or len(names) != len(shards):
             raise ValueError("invalid HF expert source tuple")
-        if self.rows_per_expert % len(names) != 0:
-            raise ValueError("HF fused expert rows do not split evenly")
-        rows_per_source = self.rows_per_expert // len(names)
         pieces: list[torch.Tensor] = []
-        cursor = start
-        while cursor < end:
-            source_index = cursor // rows_per_source
-            local_row = cursor % rows_per_source
-            take = min(end - cursor, rows_per_source - local_row)
-            pieces.append(
-                self._source(expert, source_index).read_rows(
-                    local_row,
-                    local_row + take,
-                    device="cpu",
+        source_row = 0
+        for source_index in range(len(names)):
+            reader = self._source(expert, source_index)
+            source_end = source_row + int(reader.rows)
+            overlap_start = max(start, source_row)
+            overlap_end = min(end, source_end)
+            if overlap_start < overlap_end:
+                pieces.append(
+                    reader.read_rows(
+                        overlap_start - source_row,
+                        overlap_end - source_row,
+                        device="cpu",
+                    )
+                )
+            source_row = source_end
+        if source_row != self.rows_per_expert:
+            raise ValueError(
+                "separate expert sources have wrong logical row count: "
+                f"{source_row} != {self.rows_per_expert}"
+            )
+        if not pieces and start != end:
+            raise ValueError("separate expert row range did not resolve to a source")
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+
+    @staticmethod
+    def _copy_raw_payload(source: _RawSafeTensorSlice, output) -> None:
+        remaining = source.data_nbytes
+        with source.path.open("rb", buffering=0) as handle:
+            handle.seek(source.data_offset)
+            while remaining:
+                chunk = handle.read(min(16 * 1024 * 1024, remaining))
+                if not chunk:
+                    raise EOFError(f"short safetensors payload read for {source.name}")
+                output.write(chunk)
+                remaining -= len(chunk)
+
+    def write_mxfp4_expert_pool(
+        self,
+        expert_ids: tuple[int, ...],
+        output_path: str | Path,
+    ) -> int:
+        """Copy native MXFP4 experts exactly into a runtime pool."""
+
+        ids = tuple(int(value) for value in expert_ids)
+        if not ids or len(set(ids)) != len(ids):
+            raise ValueError("MXFP4 expert pool requires unique expert IDs")
+        if any(value < 0 or value >= self.n_experts for value in ids):
+            raise IndexError("MXFP4 expert pool contains an invalid expert ID")
+        readers: dict[tuple[int, int], _Mxfp4TensorSlice] = {}
+        for expert in ids:
+            logical_rows = 0
+            for index in range(len(self.source_names[expert])):
+                reader = self._source(expert, index)
+                if not isinstance(reader, _Mxfp4TensorSlice):
+                    raise TypeError("MXFP4 preservation requires native MXFP4 source storage")
+                if reader.columns != self.columns:
+                    raise ValueError(
+                        f"MXFP4 expert width differs: {reader.columns} != {self.columns}"
+                    )
+                logical_rows += reader.rows
+                readers[(expert, index)] = reader
+            if logical_rows != self.rows_per_expert:
+                raise ValueError(
+                    f"MXFP4 expert rows differ: {logical_rows} != {self.rows_per_expert}"
+                )
+
+        target = Path(output_path)
+        rows = len(ids) * self.rows_per_expert
+        with target.open("wb") as output:
+            output.write(
+                mx_header_bytes(
+                    "MXFP4",
+                    (rows, self.columns),
+                    (rows, self.columns // 2),
+                    (rows, self.columns // 32),
                 )
             )
-            cursor += take
-        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+            for expert in ids:
+                for index in range(len(self.source_names[expert])):
+                    self._copy_raw_payload(readers[(expert, index)].weight, output)
+            for expert in ids:
+                for index in range(len(self.source_names[expert])):
+                    self._copy_raw_payload(readers[(expert, index)].scale_source, output)
+        return target.stat().st_size
 
     def read_rows(
         self,
@@ -3433,6 +3769,11 @@ class _GlmExpertRowSource:
         start = 0 if key.start is None else int(key.start)
         end = total_rows if key.stop is None else int(key.stop)
         return self.read_rows(start, end, device="cpu")
+
+
+# Compatibility for external tests/tools that imported the old architecture-
+# specific private name.  Production code uses the storage-oriented name.
+_GlmExpertRowSource = _SeparateExpertRowSource
 
 
 class _MfqGlmExpertRowSource:
@@ -3627,7 +3968,7 @@ def _write_nint_moe_axis0_blob(
                 output.write(np.asarray(expert_ids, dtype=np.int32).tobytes())
                 output.write(dtype)
                 with pool_path.open("rb") as pool_file:
-                    shutil.copyfileobj(pool_file, output, length=32 * 1024 * 1024)
+                    copy_sparse_range(pool_file, output, pool_nbytes)
         return blob_path.stat().st_size
     finally:
         for pool_path in pool_paths:
@@ -4406,7 +4747,7 @@ def _write_mixed_moe_axis0_blob(
                 output.write(dtype)
                 output.write(runtime_payload)
                 with pool_path.open("rb") as pool_file:
-                    shutil.copyfileobj(pool_file, output, length=32 * 1024 * 1024)
+                    copy_sparse_range(pool_file, output, pool_nbytes)
         return blob_path.stat().st_size
     finally:
         for pool_path in pool_paths:
@@ -4452,7 +4793,12 @@ def _write_mfq(
         for rec in records:
             try:
                 with rec.path.open("rb") as src:
-                    shutil.copyfileobj(src, out, length=32 * 1024 * 1024)
+                    copy_sparse_range(
+                        src,
+                        out,
+                        rec.nbytes,
+                        offset=rec.offset,
+                    )
             finally:
                 if consume_blobs:
                     rec.path.unlink(missing_ok=True)
@@ -4819,9 +5165,7 @@ def convert(args: argparse.Namespace) -> None:
     validate_split_limits(split_max_size, split_max_tensors)
     resume_temp = bool(getattr(args, "resume_temp", False))
     staged_blobs = bool(
-        getattr(args, "staged_blobs", False)
-        or resume_temp
-        or getattr(args, "keep_temp", False)
+        getattr(args, "staged_blobs", False) or resume_temp or getattr(args, "keep_temp", False)
     )
     writer_mode = "staged_blobs" if staged_blobs else "streaming"
     if (output.exists() or matching_shard_paths(output)) and not args.overwrite:
@@ -5043,9 +5387,7 @@ def convert(args: argparse.Namespace) -> None:
                 "recipe": _artifact_provenance_name(recipe_gguf),
                 "standard_preset": standard_preset or None,
                 "random_expert_mix": [value.family for value in random_expert_mix],
-                "random_expert_mix_seed": (
-                    random_expert_mix_seed if random_expert_mix else None
-                ),
+                "random_expert_mix_seed": (random_expert_mix_seed if random_expert_mix else None),
                 "synthetic_expert_weights": synthetic_expert_weights,
                 "quantize_vision": quantize_vision,
                 "quantize_mtp": quantize_mtp,
@@ -5075,7 +5417,7 @@ def convert(args: argparse.Namespace) -> None:
                 "text_only": args.text_only,
                 "dense_dtype": "MOSTLY_BF16" if mostly_bf16 else dense_dtype,
                 "mostly_bf16": mostly_bf16,
-                "mapping": dict(sorted(_RECIPE_TARGETS.items())),
+                "recipe_mapping": (dict(sorted(_RECIPE_TARGETS.items())) if recipe_gguf else None),
                 "nvq_calibration": calibration_mode,
                 "nvq_codebook_scope": nvq_codebook_scope,
                 "tensor_precision_overrides": dict(sorted(tensor_precision_overrides.items())),
@@ -5248,7 +5590,7 @@ def convert(args: argparse.Namespace) -> None:
                             item.expert_source_names,
                         )
                         if mfq_checkpoint is not None
-                        else _GlmExpertRowSource(
+                        else _SeparateExpertRowSource(
                             root,
                             item.shape,
                             item.expert_source_names,
@@ -5305,10 +5647,7 @@ def convert(args: argparse.Namespace) -> None:
                     if mfq_checkpoint is not None:
                         raw_source = mfq_checkpoint.tensor_source(source_name)
                         if item.source_quantization is not None and not preserve_raw_e4m3:
-                            if (
-                                item.source_scale_name is None
-                                or item.source_scale_shard is None
-                            ):
+                            if item.source_scale_name is None or item.source_scale_shard is None:
                                 raise ValueError(
                                     f"scaled MFQ source lacks scale metadata: {item.name}"
                                 )
@@ -5696,7 +6035,7 @@ def convert(args: argparse.Namespace) -> None:
                     "gguf-recipe-split-qkv"
                     if recipe_gguf
                     else (
-                        f"llama.cpp-style-standard-preset:{standard_preset};"
+                        f"mfq-standard-preset:{standard_preset};"
                         f"vision={'quantized' if quantize_vision else 'source'};"
                         f"mtp={'quantized' if quantize_mtp else 'source'};"
                         f"ple={'quantized' if quantize_ple else 'source'}"
@@ -5851,26 +6190,28 @@ def convert(args: argparse.Namespace) -> None:
                     "groupsize": spec.groupsize,
                     "sub_bits": spec.sub_bits,
                 },
-                "recipe_specs": {
-                    "Q4_0": {"bits": 4, "groupsize": 24, "sub_bits": 6},
-                    "Q4_1": {"bits": 4, "groupsize": 24, "sub_bits": 6},
-                    "Q4_K": {"bits": 4, "groupsize": 24, "sub_bits": 6},
-                    "Q5_0": {"bits": 5, "groupsize": 28, "sub_bits": 7},
-                    "Q5_1": {"bits": 5, "groupsize": 28, "sub_bits": 7},
-                    "Q5_K": {"bits": 5, "groupsize": 28, "sub_bits": 7},
-                    "Q6_K": {"bits": 6, "groupsize": 24, "sub_bits": 7},
-                    "Q8_0": {"bits": 8, "groupsize": 48, "sub_bits": 7},
-                },
+                "recipe_specs": (
+                    {
+                        "Q4_0": {"bits": 4, "groupsize": 24, "sub_bits": 6},
+                        "Q4_1": {"bits": 4, "groupsize": 24, "sub_bits": 6},
+                        "Q4_K": {"bits": 4, "groupsize": 24, "sub_bits": 6},
+                        "Q5_0": {"bits": 5, "groupsize": 28, "sub_bits": 7},
+                        "Q5_1": {"bits": 5, "groupsize": 28, "sub_bits": 7},
+                        "Q5_K": {"bits": 5, "groupsize": 28, "sub_bits": 7},
+                        "Q6_K": {"bits": 6, "groupsize": 24, "sub_bits": 7},
+                        "Q8_0": {"bits": 8, "groupsize": 48, "sub_bits": 7},
+                    }
+                    if recipe_gguf
+                    else None
+                ),
                 "standard_preset": standard_preset or None,
                 "standard_preset_policy": (
-                    "llama.cpp/src/llama-quant.cpp tensor categories translated to MFQ NINT"
+                    "semantic tensor roles mapped to native MFQ mixed precision"
                     if standard_preset
                     else None
                 ),
                 "random_expert_mix": [value.family for value in random_expert_mix],
-                "random_expert_mix_seed": (
-                    random_expert_mix_seed if random_expert_mix else None
-                ),
+                "random_expert_mix_seed": (random_expert_mix_seed if random_expert_mix else None),
                 "synthetic_expert_weights": synthetic_expert_weights,
                 "quantize_vision": quantize_vision,
                 "quantize_mtp": quantize_mtp,
@@ -5882,7 +6223,7 @@ def convert(args: argparse.Namespace) -> None:
                 "hf_config": config,
                 ASSET_MANIFEST_KEY: runtime_asset_manifest(runtime_assets),
                 "target_counts": target_counts,
-                "recipe_mapping": dict(sorted(_RECIPE_TARGETS.items())),
+                "recipe_mapping": (dict(sorted(_RECIPE_TARGETS.items())) if recipe_gguf else None),
                 "tensor_precision_overrides": dict(sorted(tensor_precision_overrides.items())),
                 "nvq_calibration": calibration_mode,
                 "nvq_codebook_scope": nvq_codebook_scope,
@@ -5943,8 +6284,10 @@ def convert(args: argparse.Namespace) -> None:
     finally:
         if stream_writer is not None and not completed:
             stream_writer.abort()
-        if not getattr(args, "keep_temp", False) and tmp_root.exists() and (
-            completed or not resume_temp
+        if (
+            not getattr(args, "keep_temp", False)
+            and tmp_root.exists()
+            and (completed or not resume_temp)
         ):
             shutil.rmtree(tmp_root)
         if mfq_checkpoint is not None:
@@ -5994,7 +6337,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--preset",
         dest="standard_preset",
         default="",
-        help=("built-in llama.cpp-style tensor mixture: " + ", ".join(STANDARD_PRESET_NAMES)),
+        help=("built-in MFQ tensor precision preset: " + ", ".join(STANDARD_PRESET_NAMES)),
     )
     parser.add_argument(
         "--random-expert-mix",

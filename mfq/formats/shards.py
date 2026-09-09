@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -28,9 +29,7 @@ SPLIT_KEYS = frozenset(
     }
 )
 
-_SHARD_RE = re.compile(
-    r"^(?P<stem>.+)-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})\.mfq$"
-)
+_SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})\.mfq$")
 
 
 class BlobRecordLike(Protocol):
@@ -78,8 +77,7 @@ def shard_paths_from_any(path: str | Path, count: int) -> list[Path]:
     base, _, filename_count = parsed
     if filename_count != count:
         raise ValueError(
-            f"MFQ shard count mismatch in filename/metadata: "
-            f"{filename_count} != {count}: {path}"
+            f"MFQ shard count mismatch in filename/metadata: {filename_count} != {count}: {path}"
         )
     return [format_shard_path(base, index, count) for index in range(1, count + 1)]
 
@@ -156,10 +154,7 @@ def plan_record_shards(
             and tensor_counts[current] > 0
             and payload_sizes[current] + int(record.nbytes) > split_max_size
         )
-        exceeds_count = bool(
-            split_max_tensors
-            and tensor_counts[current] >= split_max_tensors
-        )
+        exceeds_count = bool(split_max_tensors and tensor_counts[current] >= split_max_tensors)
         if exceeds_size or exceeds_count:
             shards.append([])
             payload_sizes.append(0)
@@ -238,19 +233,87 @@ def _write_header_and_table(
         output.write(struct.pack("<Q", int(record.nbytes)))
 
 
-def _copy_record(record: BlobRecordLike, target) -> None:
-    remaining = int(record.nbytes)
-    with Path(record.path).open("rb") as source:
-        source.seek(int(getattr(record, "offset", 0)))
+def copy_sparse_range(source, target, nbytes: int, *, offset: int = 0) -> None:
+    """Copy an exact file range while retaining source holes when supported."""
+
+    size = int(nbytes)
+    start = int(offset)
+    if size < 0 or start < 0:
+        raise ValueError("sparse copy range must be non-negative")
+    end = start + size
+    destination_start = target.tell()
+    if size == 0:
+        return
+    source_size = os.fstat(source.fileno()).st_size
+    if source_size < end:
+        raise EOFError(f"truncated blob source: {end - source_size} bytes missing")
+
+    def copy_bytes(begin: int, stop: int) -> None:
+        source.seek(begin)
+        remaining = stop - begin
         while remaining:
             chunk = source.read(min(32 * 1024 * 1024, remaining))
             if not chunk:
-                raise EOFError(
-                    f"truncated MFQ blob source for {record.name}: "
-                    f"{remaining} bytes missing"
-                )
+                raise EOFError(f"truncated blob source: {remaining} bytes missing")
             target.write(chunk)
             remaining -= len(chunk)
+
+    try:
+        data = os.lseek(source.fileno(), start, os.SEEK_DATA)
+    except OSError as exc:
+        if exc.errno == errno.ENXIO:
+            target.truncate(destination_start + size)
+            target.seek(destination_start + size)
+            return
+        if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
+            raise
+        target.seek(destination_start)
+        copy_bytes(start, end)
+        return
+
+    cursor = start
+    while data < end:
+        try:
+            hole = os.lseek(source.fileno(), data, os.SEEK_HOLE)
+        except OSError as exc:  # pragma: no cover - paired seek support is expected
+            if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.ENXIO}:
+                raise
+            hole = end
+        copy_end = min(hole, end)
+        target.seek(destination_start + data - start)
+        copy_bytes(data, copy_end)
+        cursor = copy_end
+        if cursor >= end:
+            break
+        try:
+            data = os.lseek(source.fileno(), cursor, os.SEEK_DATA)
+        except OSError as exc:
+            if exc.errno == errno.ENXIO:
+                break
+            raise
+    target.truncate(
+        max(
+            os.fstat(target.fileno()).st_size,
+            target.tell(),
+            destination_start + size,
+        )
+    )
+    target.seek(destination_start + size)
+
+
+def _copy_record(record: BlobRecordLike, target) -> None:
+    try:
+        with Path(record.path).open("rb") as source:
+            copy_sparse_range(
+                source,
+                target,
+                int(record.nbytes),
+                offset=int(getattr(record, "offset", 0)),
+            )
+    except EOFError as exc:
+        raise EOFError(
+            f"truncated MFQ blob source for {record.name}: {record.nbytes} bytes expected"
+        ) from exc
 
 
 class StreamingBlobShardWriter:
@@ -333,8 +396,7 @@ class StreamingBlobShardWriter:
             and self._payload_sizes[current] + nbytes > self.split_max_size
         )
         exceeds_count = bool(
-            self.split_max_tensors
-            and len(self._record_shards[current]) >= self.split_max_tensors
+            self.split_max_tensors and len(self._record_shards[current]) >= self.split_max_tensors
         )
         if exceeds_size or exceeds_count:
             self._new_payload()
@@ -343,7 +405,8 @@ class StreamingBlobShardWriter:
         payload = self._payload_paths[current]
         start = self._payload_sizes[current]
         try:
-            with payload.open("ab") as target:
+            with payload.open("r+b") as target:
+                target.seek(0, os.SEEK_END)
                 _copy_record(record, target)
         except Exception:
             with payload.open("r+b") as target:
@@ -527,8 +590,7 @@ def write_blob_record_shards(
         destinations = [Path(output)]
     else:
         destinations = [
-            format_shard_path(output, index, len(planned))
-            for index in range(1, len(planned) + 1)
+            format_shard_path(output, index, len(planned)) for index in range(1, len(planned) + 1)
         ]
     stale_outputs = set(matching_shard_paths(output))
     if not sharded_output and Path(output).exists():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,7 @@ from mfq.formats.assets import (
 from mfq.formats.header import FileHeader
 from mfq.formats.io import is_bfloat16_array, load_mmap, open_mmap, save, unpack_dense
 from mfq.formats.moe import NintMoePool, NintMoeTensor
+from mfq.formats.mx import unpack_mx
 from mfq.formats.nint import NintSpec
 from mfq.formats.shards import format_shard_path
 from mfq.quantize.imatrix import ImportanceEntry, ImportanceMatrix
@@ -34,10 +36,13 @@ from mfq.tools.quantize_hf_to_mfq import (
     _GlmExpertRowSource,
     _hf_to_gguf_name,
     _minicpmo45_quantizable_matrix,
+    _Mxfp4TensorSlice,
     _normalize_hf_expert_storage,
     _RawSafeTensorSlice,
     _ScaledFp8TensorSlice,
+    _SeparateExpertRowSource,
     _source_quantization,
+    _source_quantizations,
     _transform_glm_kv_b,
     _validate_runtime_fused_pairs,
     _write_dense_axis0_blob,
@@ -46,6 +51,22 @@ from mfq.tools.quantize_hf_to_mfq import (
 from mfq.tools.quantize_hf_to_mfq import (
     _plan as build_hf_plan,
 )
+
+
+def _write_raw_safetensor(path: Path, tensors: dict[str, tuple[str, tuple[int, ...], bytes]]):
+    header: dict[str, object] = {}
+    payload = bytearray()
+    for name, (dtype, shape, raw) in tensors.items():
+        start = len(payload)
+        payload.extend(raw)
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [start, len(payload)],
+        }
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * (-len(encoded) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
 
 
 def _plan(name: str, spec: NintSpec) -> TensorPlan:
@@ -83,15 +104,15 @@ def test_streamed_dense_writer_preserves_three_dimensional_expert_geometry(tmp_p
     np.testing.assert_array_equal(restored, values.numpy().reshape(2, 3, 4))
 
 
-def test_standard_preset_aliases_match_llamacpp() -> None:
-    assert hf_to_mfq._normalize_standard_preset("q3-k") == "Q3_K_M"
-    assert hf_to_mfq._normalize_standard_preset("Q4_K") == "Q4_K_M"
-    assert hf_to_mfq._normalize_standard_preset("q5_k") == "Q5_K_M"
+def test_standard_preset_names_are_native_mfq_and_reject_legacy_names() -> None:
+    assert hf_to_mfq._normalize_standard_preset("s3-m") == "S3-M"
+    assert hf_to_mfq._normalize_standard_preset("S4_M") == "S4-M"
+    assert hf_to_mfq._normalize_standard_preset("s5-m") == "S5-M"
     with pytest.raises(ValueError, match="unsupported standard quantization preset"):
-        hf_to_mfq._normalize_standard_preset("Q7_K")
+        hf_to_mfq._normalize_standard_preset("Q4_K_M")
 
 
-def test_q4_k_m_standard_preset_raises_sensitive_text_matrices() -> None:
+def test_s4_m_standard_preset_raises_sensitive_text_matrices() -> None:
     plans = [
         _standard_plan("model.language_model.embed_tokens.weight"),
         _standard_plan("lm_head.weight"),
@@ -102,7 +123,7 @@ def test_q4_k_m_standard_preset_raises_sensitive_text_matrices() -> None:
     ]
     mapped = hf_to_mfq._apply_standard_preset(
         plans,
-        "Q4_K_M",
+        "S4-M",
         {
             "text_config": {
                 "num_hidden_layers": 64,
@@ -121,14 +142,14 @@ def test_q4_k_m_standard_preset_raises_sensitive_text_matrices() -> None:
     assert by_name["model.language_model.layers.10.self_attn.o_proj.weight"].target_dtype == "NINT4"
 
 
-def test_q3_k_m_standard_preset_matches_attention_v_mixture() -> None:
+def test_s3_m_standard_preset_matches_attention_v_mixture() -> None:
     plans = [
         _standard_plan(f"model.language_model.layers.{layer}.self_attn.v_proj.weight")
         for layer in range(3)
     ]
     mapped = hf_to_mfq._apply_standard_preset(
         plans,
-        "Q3_K_M",
+        "S3-M",
         {
             "num_hidden_layers": 3,
             "num_attention_heads": 8,
@@ -139,7 +160,7 @@ def test_q3_k_m_standard_preset_matches_attention_v_mixture() -> None:
     assert [item.target_dtype for item in mapped] == ["NINT5", "NINT5", "NINT4"]
 
 
-def test_q2_k_standard_preset_uses_gqa_sensitive_types() -> None:
+def test_s2_m_standard_preset_uses_gqa_sensitive_types() -> None:
     plans = [
         _standard_plan("model.language_model.layers.7.self_attn.v_proj.weight"),
         _standard_plan("model.language_model.layers.7.self_attn.o_proj.weight"),
@@ -147,7 +168,7 @@ def test_q2_k_standard_preset_uses_gqa_sensitive_types() -> None:
     ]
     mapped = hf_to_mfq._apply_standard_preset(
         plans,
-        "Q2_K",
+        "S2-M",
         {
             "num_hidden_layers": 8,
             "num_attention_heads": 24,
@@ -169,7 +190,7 @@ def test_standard_preset_keeps_all_vision_and_predictor_tensors_native_by_defaul
     ]
     mapped = hf_to_mfq._apply_standard_preset(
         plans,
-        "Q4_K_M",
+        "S4-M",
         {
             "text_config": {"num_hidden_layers": 64},
             "vision_config": {"depth": 27},
@@ -196,7 +217,7 @@ def test_standard_preset_keeps_small_sensitive_control_paths_native() -> None:
     ]
     mapped = hf_to_mfq._apply_standard_preset(
         plans,
-        "Q4_K_M",
+        "S4-M",
         {"num_hidden_layers": 1},
     )
 
@@ -206,9 +227,9 @@ def test_standard_preset_keeps_small_sensitive_control_paths_native() -> None:
 @pytest.mark.parametrize(
     ("preset", "expected"),
     [
-        ("Q2_K_S", "NINT6"),
-        ("Q4_K_M", "NINT6"),
-        ("Q8_0", "NINT8"),
+        ("S2-S", "NINT6"),
+        ("S4-M", "NINT6"),
+        ("S8", "NINT8"),
     ],
 )
 def test_standard_preset_matches_embedding_to_output_precision(
@@ -246,8 +267,7 @@ def test_standard_preset_always_uses_nint8_for_shared_expert_weights(
 
     for projection in ("gate", "up", "down"):
         assert (
-            by_name[f"model.block.0.mlp.shared_expert.{projection}.weight"].target_dtype
-            == "NINT8"
+            by_name[f"model.block.0.mlp.shared_expert.{projection}.weight"].target_dtype == "NINT8"
         )
     assert by_name["model.block.0.mlp.shared_expert.router.weight"].target_dtype == "BF16"
 
@@ -259,7 +279,7 @@ def test_standard_preset_only_treats_schema_expert_banks_as_nintm() -> None:
     ]
     mapped = hf_to_mfq._apply_standard_preset(
         plans,
-        "Q4_K_M",
+        "S4-M",
         {"num_hidden_layers": 1},
     )
 
@@ -276,7 +296,7 @@ def test_standard_preset_quantizes_vision_and_predictor_only_with_opt_in() -> No
     ]
     mapped = hf_to_mfq._apply_standard_preset(
         plans,
-        "Q4_K_M",
+        "S4-M",
         {
             "text_config": {"num_hidden_layers": 64},
             "vision_config": {"depth": 27},
@@ -416,6 +436,91 @@ def test_scaled_fp8_tensor_slice_applies_modelopt_block_multipliers(tmp_path):
     torch.testing.assert_close(actual, weight[rows].float() * expected_scale)
 
 
+def test_canonical_source_contract_resolves_and_decodes_mxfp8_e8m0(tmp_path):
+    path = tmp_path / "model.safetensors"
+    weight_name = "layers.0.attn.wq_a.weight"
+    scale_name = "layers.0.attn.wq_a.scale"
+    encoded = np.full((128, 128), 0x38, dtype=np.uint8)
+    scales = np.full((1, 1), 128, dtype=np.uint8)
+    _write_raw_safetensor(
+        path,
+        {
+            weight_name: ("F8_E4M3", encoded.shape, encoded.tobytes()),
+            scale_name: ("F8_E8M0", scales.shape, scales.tobytes()),
+        },
+    )
+    inventory = hf_to_mfq._hf_source_inventory(tmp_path)
+    config = {"model_type": "deepseek_v4", "num_hidden_layers": 1}
+
+    encodings, auxiliaries = _source_quantizations(inventory, config)
+
+    assert encodings[weight_name].scheme == "mxfp8_block128"
+    assert encodings[weight_name].scale_name == scale_name
+    assert auxiliaries == {scale_name}
+    source = _ScaledFp8TensorSlice(
+        _RawSafeTensorSlice(path, weight_name),
+        _RawSafeTensorSlice(path, scale_name),
+        encodings[weight_name].scheme,
+    )
+    torch.testing.assert_close(source.read_rows(0, 2), torch.full((2, 128), 2.0))
+
+
+def test_canonical_source_contract_decodes_and_exactly_copies_mxfp4(tmp_path):
+    path = tmp_path / "model.safetensors"
+    config = {
+        "model_type": "deepseek_v4",
+        "num_hidden_layers": 1,
+        "n_routed_experts": 1,
+        "hidden_size": 32,
+        "moe_intermediate_size": 32,
+    }
+    tensors: dict[str, tuple[str, tuple[int, ...], bytes]] = {}
+    for part in ("w1", "w2", "w3"):
+        weight_name = f"layers.0.ffn.experts.0.{part}.weight"
+        scale_name = f"layers.0.ffn.experts.0.{part}.scale"
+        packed = np.full((32, 16), 0x22, dtype=np.uint8)
+        scales = np.full((32, 1), 127, dtype=np.uint8)
+        tensors[weight_name] = ("I8", packed.shape, packed.tobytes())
+        tensors[scale_name] = ("F8_E8M0", scales.shape, scales.tobytes())
+    _write_raw_safetensor(path, tensors)
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    inventory = hf_to_mfq._hf_source_inventory(tmp_path)
+    encodings, _ = _source_quantizations(inventory, config)
+    gate_name = "layers.0.ffn.experts.0.w1.weight"
+    gate_encoding = encodings[gate_name]
+    assert gate_encoding.scheme == "mxfp4_block32"
+    assert gate_encoding.logical_shape == (32, 32)
+    assert gate_encoding.logical_dtype == "MXFP4"
+    decoded = _Mxfp4TensorSlice(
+        _RawSafeTensorSlice(path, gate_name),
+        _RawSafeTensorSlice(path, gate_encoding.scale_name),
+    )
+    torch.testing.assert_close(decoded.read_rows(0, 2), torch.ones((2, 32)))
+
+    plan = build_hf_plan(tmp_path, True, None, "F16")
+    gate = next(item for item in plan if item.name.endswith(".experts.gate.weight"))
+    assert gate.shape == (1, 32, 32)
+    assert gate.source_dtype == "MXFP4"
+    source = _SeparateExpertRowSource(
+        tmp_path,
+        gate.expert_shape,
+        gate.expert_source_names,
+        gate.expert_source_shards,
+        gate.expert_source_quantizations,
+        gate.expert_source_scale_names,
+        gate.expert_source_scale_shards,
+    )
+    blob = tmp_path / "gate.mxfp4"
+    try:
+        source.write_mxfp4_expert_pool((0,), blob)
+    finally:
+        source.close()
+    exact = unpack_mx("MXFP4", blob.read_bytes())
+    np.testing.assert_array_equal(exact.values, np.full((32, 16), 0x22, dtype=np.uint8))
+    np.testing.assert_array_equal(exact.scales, np.full((32, 1), 127, dtype=np.uint8))
+
+
 @pytest.mark.skipif(
     not torch.backends.mps.is_available(),
     reason="requires the Apple MPS backend",
@@ -471,14 +576,8 @@ def test_scaled_fp8_tensor_slice_applies_shared_ngram_scale(tmp_path):
 
 
 def test_qwen4_ple_defaults_to_raw_fp8_and_requires_explicit_quantization(tmp_path):
-    weight_name = (
-        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
-        "shard_0.weight"
-    )
-    scale_name = (
-        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
-        "weight_scale"
-    )
+    weight_name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    scale_name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale"
     inventory = {
         weight_name: hf_to_mfq.SourceTensorMetadata(
             name=weight_name,
@@ -654,6 +753,44 @@ def test_qwen35_mtp_inventory_is_all_or_nothing():
     inventory.pop("mtp.fc.weight")
     with pytest.raises(ValueError, match="incomplete Qwen MTP head"):
         hf_to_mfq._mtp_inventory_status(inventory, {"mtp_num_hidden_layers": 1})
+
+
+def test_registered_predictor_inventory_is_validated_through_canonical_schema():
+    config = {
+        "model_type": "deepseek_v4",
+        "num_hidden_layers": 43,
+        "n_mtp_layers": 2,
+    }
+    inventory = {
+        "mtp.0.norm.weight": None,
+        "mtp.0.main_norm.weight": None,
+        "mtp.1.norm.weight": None,
+        "mtp.1.main_norm.weight": None,
+    }
+    assert hf_to_mfq._mtp_inventory_status(inventory, config) == (True, 2)
+
+    inventory.pop("mtp.1.norm.weight")
+    inventory.pop("mtp.1.main_norm.weight")
+    with pytest.raises(ValueError, match="incomplete canonical predictor stages"):
+        hf_to_mfq._mtp_inventory_status(inventory, config)
+
+
+def test_registered_predictor_inventory_rejects_incomplete_expert_bank():
+    config = {
+        "model_type": "deepseek_v4",
+        "num_hidden_layers": 43,
+        "n_mtp_layers": 1,
+    }
+    inventory = {
+        "mtp.0.norm.weight": None,
+        "mtp.0.ffn.experts.0.w1.weight": None,
+        "mtp.0.ffn.experts.0.w2.weight": None,
+        "mtp.0.ffn.experts.0.w3.weight": None,
+        "mtp.0.ffn.experts.1.w1.weight": None,
+        "mtp.0.ffn.experts.1.w2.weight": None,
+    }
+    with pytest.raises(ValueError, match="predictor expert 1 differs"):
+        hf_to_mfq._mtp_inventory_status(inventory, config)
 
 
 def test_qwen35_mtp_plan_preserves_complete_head_and_protected_weights(tmp_path):
@@ -1160,9 +1297,7 @@ def test_minicpmo45_plan_preserves_raw_graph_matrices(tmp_path):
         "F16",
         quantize_vision=True,
     )
-    assert {item.name: item.target_dtype for item in all_quantized}[
-        vision_name
-    ] == "NINT4"
+    assert {item.name: item.target_dtype for item in all_quantized}[vision_name] == "NINT4"
 
 
 def test_minicpmo45_llm_recipe_keeps_other_components_at_source_precision(tmp_path):
@@ -1849,20 +1984,12 @@ def test_separate_expert_plan_dequantizes_fp8_without_coupling_projections(
         canonical_prefix + ".down.weight",
         canonical_metadata,
     }
-    assert all(
-        item.target_dtype == "NINTM"
-        for item in plan
-        if item.name != canonical_metadata
-    )
-    assert next(
-        item for item in plan if item.name == canonical_metadata
-    ).target_dtype == "I64"
+    assert all(item.target_dtype == "NINTM" for item in plan if item.name != canonical_metadata)
+    assert next(item for item in plan if item.name == canonical_metadata).target_dtype == "I64"
     assert not any("scale_inv" in item.name for item in plan)
 
     for projection, multiplier in (("gate", 0.01), ("up", 0.02)):
-        item = next(
-            value for value in plan if value.name.endswith(f".{projection}.weight")
-        )
+        item = next(value for value in plan if value.name.endswith(f".{projection}.weight"))
         stream = _GlmExpertRowSource(
             root,
             item.expert_shape,
@@ -2003,11 +2130,7 @@ def test_glm5_next_plan_derives_scaled_fp8_mla_for_backbone_and_mtp(tmp_path):
     for layer, multiplier in ((3, 0.25), (4, 0.5)):
         attention = f"model.language_model.layers.{layer}.self_attn"
         assert attention + ".kv_b_proj.weight" not in by_name
-        canonical = (
-            "model.block.3.attention"
-            if layer == 3
-            else "predictor.block.0.attention"
-        )
+        canonical = "model.block.3.attention" if layer == 3 else "predictor.block.0.attention"
         embed = by_name[canonical + ".latent.query_embedding.weight"]
         unembed = by_name[canonical + ".latent.output_unembedding.weight"]
         assert embed.expert_shape == (heads, kv_rank, nope)
