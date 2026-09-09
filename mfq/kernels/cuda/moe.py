@@ -330,13 +330,15 @@ class MoeRoutePlan:
             raise ValueError("ids must have [tokens, routes] shape")
         ids = ids.contiguous().to(device=ids.device, dtype=torch.int32)
         if int(ids.shape[0]) > 8:
-            ids_dst, expert_bounds, tile_bounds, tile_experts, counts = (
-                ext().moe_build_expert_map_cuda(ids, int(n_experts), 8)
+            use_coarse_mma = ids.numel() >= 8192
+            mapped = (
+                ext().moe_build_expert_maps_cuda(ids, int(n_experts), 8, 64)
+                if use_coarse_mma
+                else ext().moe_build_expert_map_cuda(ids, int(n_experts), 8)
             )
-            if ids.numel() >= 8192:
-                mma_tile_bounds, mma_tile_experts = ext().moe_build_tile_map_cuda(
-                    expert_bounds, ids.numel(), 64
-                )
+            ids_dst, expert_bounds, tile_bounds, tile_experts, counts = mapped[:5]
+            if use_coarse_mma:
+                mma_tile_bounds, mma_tile_experts = mapped[5:]
                 mma_tile_m = 64
             else:
                 mma_tile_bounds = tile_bounds

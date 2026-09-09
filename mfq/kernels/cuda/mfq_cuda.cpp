@@ -80,8 +80,9 @@ torch::Tensor moe_sqrtsoftplus_weights_cuda(
     torch::Tensor logits, torch::Tensor ids, double norm_floor, double scale);
 std::vector<torch::Tensor> moe_build_expert_map_cuda(
     torch::Tensor ids, int64_t n_experts, int64_t tile_m);
-std::vector<torch::Tensor> moe_build_tile_map_cuda(
-    torch::Tensor expert_bounds, int64_t pair_capacity, int64_t tile_m);
+std::vector<torch::Tensor> moe_build_expert_maps_cuda(
+    torch::Tensor ids, int64_t n_experts, int64_t tile_m,
+    int64_t secondary_tile_m);
 void nint_moe_quantize_input_ws_cuda(
     torch::Tensor x, int64_t gs, torch::Tensor qx, torch::Tensor xscale);
 void nint_moe_quantize_24_28_ws_cuda(
@@ -637,8 +638,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_sqrtsoftplus_weights_cuda", &moe_sqrtsoftplus_weights_cuda,
           "Gather and normalize sqrt-softplus hash-route weights (CUDA)");
     m.def("moe_build_expert_map_cuda", &moe_build_expert_map_cuda, "Build compact expert route map (CUDA)");
-    m.def("moe_build_tile_map_cuda", &moe_build_tile_map_cuda,
-          "Build a compact expert tile map from existing route bounds (CUDA)");
+    m.def("moe_build_expert_maps_cuda", &moe_build_expert_maps_cuda,
+          "Build compact expert route maps for two tile sizes (CUDA)");
     m.def("nint_moe_quantize_input_ws_cuda", &nint_moe_quantize_input_ws_cuda,
           "Quantize one activation layout for heterogeneous expert NINT (CUDA)");
     m.def("nint_moe_quantize_24_28_ws_cuda", &nint_moe_quantize_24_28_ws_cuda,

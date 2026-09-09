@@ -275,9 +275,9 @@ mfq_tensor_backend::Tensor moe_sqrtsoftplus_weights_cuda(
     mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor ids, double norm_floor, double scale);
 std::vector<mfq_tensor_backend::Tensor> moe_build_expert_map_cuda(
     mfq_tensor_backend::Tensor ids, int64_t n_experts, int64_t tile_m);
-std::vector<mfq_tensor_backend::Tensor> moe_build_tile_map_cuda(
-    mfq_tensor_backend::Tensor expert_bounds, int64_t pair_capacity,
-    int64_t tile_m);
+std::vector<mfq_tensor_backend::Tensor> moe_build_expert_maps_cuda(
+    mfq_tensor_backend::Tensor ids, int64_t n_experts, int64_t tile_m,
+    int64_t secondary_tile_m);
 void nint_moe_quantize_input_ws_cuda(
     mfq_tensor_backend::Tensor x, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 void nint_moe_quantize_24_28_ws_cuda(
@@ -3779,17 +3779,18 @@ static MoeRoutePlan build_moe_route_plan(mfq_tensor_backend::Tensor ids, int n_e
     result.counts = empty;
     result.cursors = empty;
     if (result.ids.size(0) > 8) {
-        auto mapped = moe_build_expert_map_cuda(result.ids, n_experts, 8);
+        const bool use_coarse_mma = result.ids.numel() >= 8192;
+        auto mapped = use_coarse_mma
+            ? moe_build_expert_maps_cuda(result.ids, n_experts, 8, 64)
+            : moe_build_expert_map_cuda(result.ids, n_experts, 8);
         result.ids_dst = mapped.at(0);
         result.expert_bounds = mapped.at(1);
         result.tile_bounds = mapped.at(2);
         result.tile_experts = mapped.at(3);
         result.counts = mapped.at(4);
-        if (result.ids.numel() >= 8192) {
-            auto mma_mapped = moe_build_tile_map_cuda(
-                result.expert_bounds, result.ids.numel(), 64);
-            result.mma_tile_bounds = mma_mapped.at(0);
-            result.mma_tile_experts = mma_mapped.at(1);
+        if (use_coarse_mma) {
+            result.mma_tile_bounds = mapped.at(5);
+            result.mma_tile_experts = mapped.at(6);
             result.mma_tile_m = 64;
         } else {
             result.mma_tile_bounds = result.tile_bounds;
