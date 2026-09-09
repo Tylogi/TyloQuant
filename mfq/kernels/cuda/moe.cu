@@ -4884,9 +4884,9 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
 
     const int output_width = static_cast<int>(out_per_expert);
     const int ntiles_n = (output_width + kMoeMmaBn - 1) / kMoeMmaBn;
-    static const int block_cap = [] {
+    static const int forced_block_cap = [] {
         const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_BLOCKS");
-        return value == nullptr ? 4096 : std::max(1, std::atoi(value));
+        return value == nullptr ? 0 : std::max(1, std::atoi(value));
     }();
     static const int forced_bm = [] {
         const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_BM");
@@ -4903,6 +4903,8 @@ static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
     const bool coarse_tiles = tile_m == bm;
     MFQ_RUNTIME_CHECK(tile_m == kRouteTile || coarse_tiles,
         "coarse route tile size must match the MMA row tile");
+    const int block_cap = forced_block_cap != 0 ? forced_block_cap :
+        (pairs >= 32768 ? 8192 : 4096);
     const int64_t max_tiles = (pairs + tile_m - 1) / tile_m + experts;
     const int64_t max_tasks = max_tiles * ntiles_n;
     const int blocks = static_cast<int>(
