@@ -3,6 +3,10 @@
 
 using namespace metal;
 
+#ifndef MFQ_GROUPED_FAMILY_MASK
+#define MFQ_GROUPED_FAMILY_MASK 127
+#endif
+
 namespace {
 
 inline uint read_bits(
@@ -2182,7 +2186,35 @@ template <
 
     const device int* descriptor =
         descriptors + expert * params.descriptor_size;
+#if MFQ_GROUPED_FAMILY_MASK == 1
+    constexpr uint family = 0u;
+#elif MFQ_GROUPED_FAMILY_MASK == 2
+    constexpr uint family = 1u;
+#elif MFQ_GROUPED_FAMILY_MASK == 4
+    constexpr uint family = 2u;
+#elif MFQ_GROUPED_FAMILY_MASK == 8
+    constexpr uint family = 3u;
+#elif MFQ_GROUPED_FAMILY_MASK == 16
+    constexpr uint family = 4u;
+#elif MFQ_GROUPED_FAMILY_MASK == 32
+    constexpr uint family = 5u;
+#elif MFQ_GROUPED_FAMILY_MASK == 64
+    constexpr uint family = 6u;
+#else
     uint family = uint(descriptor[0]);
+#endif
+    constexpr bool HAS_NINT_FAMILY =
+        (MFQ_GROUPED_FAMILY_MASK & 1) != 0;
+    constexpr bool HAS_Q8_FAMILY =
+        (MFQ_GROUPED_FAMILY_MASK & 4) != 0;
+    constexpr bool HAS_MXFP4_FAMILY =
+        (MFQ_GROUPED_FAMILY_MASK & 8) != 0;
+    constexpr bool HAS_MXFP8_FAMILY =
+        (MFQ_GROUPED_FAMILY_MASK & 16) != 0;
+    constexpr bool HAS_DENSE_FAMILY =
+        (MFQ_GROUPED_FAMILY_MASK & (32 | 64)) != 0;
+    constexpr bool HAS_VQ_FAMILY =
+        (MFQ_GROUPED_FAMILY_MASK & 2) != 0;
     uint local_expert = uint(descriptor[1]);
     uint rotation = uint(descriptor[27]);
     short valid_n = short(min(BN, params.output_width - output_base));
@@ -2267,15 +2299,16 @@ template <
 
                 uint nint_bits = uint(descriptor[4]);
                 uint nint_group_size = uint(descriptor[5]);
-                bool aligned_nint = family == 0u && (
+                bool aligned_nint = HAS_NINT_FAMILY && family == 0u && (
                     (nint_bits == 2u && nint_group_size == 16u)
                     || ((nint_bits == 3u || nint_bits == 4u
                          || nint_bits == 6u)
                         && nint_group_size == 24u)
                     || (nint_bits == 8u && nint_group_size == 48u));
-                bool sliced_nint5 = family == 0u
+                bool sliced_nint5 = HAS_NINT_FAMILY && family == 0u
                     && nint_bits == 5u && nint_group_size == 28u;
-                bool scalar_decode = family == 0u && !aligned_nint;
+                bool scalar_decode = HAS_NINT_FAMILY
+                    && family == 0u && !aligned_nint;
                 if (aligned_nint) {
                     uint groups_per_tile = uint(BK) / nint_group_size;
                     uint decode_units_per_tile = nint_bits == 2u
@@ -2393,7 +2426,7 @@ template <
                             pool_row, group, slice_start - group_start,
                             slice_end - slice_start);
                     }
-                } else if (family == 4u) {
+                } else if (HAS_MXFP8_FAMILY && family == 4u) {
                     constexpr uint VALUES_PER_ITEM = 4u;
                     constexpr uint ITEMS_PER_ROW = uint(BK) / VALUES_PER_ITEM;
                     for (uint item = thread_id;
@@ -2417,7 +2450,8 @@ template <
                                 uint(params.input_width));
                         }
                     }
-                } else if (family == 5u || family == 6u) {
+                } else if (HAS_DENSE_FAMILY
+                    && (family == 5u || family == 6u)) {
                     constexpr uint VALUES_PER_ITEM = 4u;
                     constexpr uint ITEMS_PER_ROW = uint(BK) / VALUES_PER_ITEM;
                     for (uint item = thread_id;
@@ -2471,25 +2505,11 @@ template <
                                 local_expert * uint(params.matrix_output_width)
                                 + uint(output_base) + output_row
                                 + uint(projection * params.output_width);
-                            half value;
-                            if (family == 0u) {
-                                value = decode_nint_value(
+                            Ws[output_row * uint(W_STRIDE) + local_column] =
+                                decode_nint_value(
                                     descriptor, nint_q, nint_sub_scale,
                                     nint_sub_min, nint_anchor_scale,
                                     nint_anchor_min, pool_row, input_column);
-                            } else if (family == 4u) {
-                                value = decode_mxfp8_value_at(
-                                    descriptor, mx_values, mx_scales,
-                                    pool_row, input_column,
-                                    uint(params.input_width));
-                            } else {
-                                value = decode_dense_value_at(
-                                    descriptor, q8_q, family, pool_row,
-                                    input_column,
-                                    uint(params.input_width));
-                            }
-                            Ws[output_row * uint(W_STRIDE) + local_column] =
-                                value;
                         }
                     }
                 } else {
@@ -2499,7 +2519,8 @@ template <
                          item += TGP_SIZE) {
                         uint output_row = item / GROUPS_PER_TILE;
                         uint local_group = item - output_row * GROUPS_PER_TILE;
-                        if (output_row < uint(valid_n) && family == 2u
+                        if (output_row < uint(valid_n) && HAS_Q8_FAMILY
+                            && family == 2u
                             && local_group < uint(BK / 32)) {
                             uint input_column =
                                 uint(k_base) + local_group * 32u;
@@ -2517,7 +2538,7 @@ template <
                                     + local_group * 32u,
                                 pool_row, group);
                         } else if (output_row < uint(valid_n)
-                            && family == 3u
+                            && HAS_MXFP4_FAMILY && family == 3u
                             && local_group < uint(BK / 32)) {
                             uint input_column =
                                 uint(k_base) + local_group * 32u;
@@ -2536,7 +2557,7 @@ template <
                                 pool_row, group,
                                 uint(params.input_width));
                         } else if (output_row < uint(valid_n)
-                            && family == 1u) {
+                            && HAS_VQ_FAMILY && family == 1u) {
                             uint input_column =
                                 uint(k_base) + local_group * 24u;
                             if (input_column >= uint(params.input_width)) {

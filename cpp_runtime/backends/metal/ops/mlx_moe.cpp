@@ -2873,6 +2873,7 @@ struct GroupedMmqConfig {
     int input_sorted = 0;
     int fused_swiglu = 0;
     int has_nepq_residual = 0;
+    int family_mask = 127;
     int vq_profile_mask = 0;
     bool use_nax = false;
     bool direct_nax = false;
@@ -3436,7 +3437,7 @@ public:
         const bool vector_jsc_extended =
             (static_cast<std::uint32_t>(config_.vq_profile_mask)
                 & kGroupedJscExtendedProfileMask) != 0;
-        const char* library_name;
+        std::string library_name;
         if (config_.use_nax) {
             library_name = vector_vq
                 ? (vector_jsc_extended
@@ -3454,13 +3455,19 @@ public:
                     ? "mfq_grouped_mmq_v13_jsc_extended"
                     : "mfq_grouped_mmq_v13");
         }
+        if (config_.use_nax) {
+            library_name += "_fm" + std::to_string(config_.family_mask);
+        }
         auto* library = device.get_library(
             library_name,
             compile_options,
             [
                 use_nax = config_.use_nax,
                 vector_vq,
-                vector_jsc_extended
+                vector_jsc_extended,
+                family_mask = config_.use_nax
+                    ? config_.family_mask
+                    : 127
             ] {
                 std::string source;
                 source.reserve(
@@ -3484,6 +3491,11 @@ public:
                 if (vector_jsc_extended) {
                     source +=
                         "#define MFQ_ENABLE_JSC_EXTENDED_VECTOR 1\n";
+                }
+                if (use_nax) {
+                    source += "#define MFQ_GROUPED_FAMILY_MASK ";
+                    source += std::to_string(family_mask);
+                    source += "\n";
                 }
                 source += "using namespace metal;\n";
                 source += "using bfloat16_t = bfloat;\n";
@@ -3626,6 +3638,8 @@ public:
             && primitive->config_.fused_swiglu == config_.fused_swiglu
             && primitive->config_.has_nepq_residual
                 == config_.has_nepq_residual
+            && primitive->config_.family_mask == config_.family_mask
+            && primitive->config_.vq_profile_mask == config_.vq_profile_mask
             && primitive->config_.use_nax == config_.use_nax
             && primitive->config_.direct_nax == config_.direct_nax
             && primitive->config_.swiglu_limit == config_.swiglu_limit;
@@ -8267,6 +8281,7 @@ array MlxNintMoeWeight::routed_matmul_sorted(
             .fused_swiglu = static_cast<int>(fused_swiglu),
             .has_nepq_residual = static_cast<int>(
                 impl_->has_nepq_residual),
+            .family_mask = static_cast<int>(impl_->family_mask),
             .vq_profile_mask = static_cast<int>(
                 impl_->vq_profile_mask),
             .use_nax = use_grouped_nax,
@@ -8565,6 +8580,7 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .fused_swiglu = static_cast<int>(fused_swiglu),
                 .has_nepq_residual = static_cast<int>(
                     impl_->has_nepq_residual),
+                .family_mask = static_cast<int>(impl_->family_mask),
                 .vq_profile_mask = static_cast<int>(
                     impl_->vq_profile_mask),
                 .use_nax = use_grouped_nax,
