@@ -569,7 +569,8 @@ inline void decode_nint_aligned_group(
     }
 }
 
-inline void decode_nint8_group48(
+template <uint SLICE_SIZE>
+inline void decode_nint8_group48_slice(
     const device int* d,
     const device uchar* values,
     const device uchar* sub_scales,
@@ -579,8 +580,10 @@ inline void decode_nint8_group48(
     threadgroup half* target,
     uint row,
     uint group,
+    uint first_element,
     uint neuron_len) {
     constexpr uint GROUP_SIZE = 48u;
+    static_assert(SLICE_SIZE == 24u || SLICE_SIZE == GROUP_SIZE);
     uint groups = uint(d[6]);
     uint q_offset = uint(d[7]);
     uint sub_offset = uint(d[8]);
@@ -590,13 +593,13 @@ inline void decode_nint8_group48(
         * float(sub_scales[sub_offset + metadata]);
     float minimum = anchor_mins[anchor_offset + row]
         * float(sub_mins[sub_offset + metadata]);
-    uint first_column = group * GROUP_SIZE;
+    uint first_column = group * GROUP_SIZE + first_element;
     uint valid = first_column < neuron_len
-        ? min(GROUP_SIZE, neuron_len - first_column)
+        ? min(SLICE_SIZE, neuron_len - first_column)
         : 0u;
-    uint packed_base = q_offset + metadata * GROUP_SIZE;
+    uint packed_base = q_offset + metadata * GROUP_SIZE + first_element;
 #pragma clang loop unroll(full)
-    for (uint column = 0u; column < GROUP_SIZE; column += 4u) {
+    for (uint column = 0u; column < SLICE_SIZE; column += 4u) {
         uchar4 packed = *reinterpret_cast<device const uchar4*>(
             values + packed_base + column);
         half4 decoded = half4(
@@ -1739,6 +1742,8 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                     uint groups_per_tile = uint(BK) / nint_group_size;
                     uint decode_units_per_tile = nint_bits == 2u
                         ? (groups_per_tile + 1u) / 2u
+                        : nint_bits == 8u
+                        ? groups_per_tile * 2u
                         : groups_per_tile;
                     for (uint item = thread_id;
                          item < uint(BN) * decode_units_per_tile;
@@ -1748,6 +1753,8 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                             item - output_row * decode_units_per_tile;
                         uint local_group = nint_bits == 2u
                             ? decode_unit * 2u
+                            : nint_bits == 8u
+                            ? decode_unit / 2u
                             : decode_unit;
                         uint input_column =
                             uint(k_base) + local_group * nint_group_size;
@@ -1793,10 +1800,13 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                                 nint_sub_min, nint_anchor_scale,
                                 nint_anchor_min, target, pool_row, group);
                         } else {
-                            decode_nint8_group48(
+                            uint first_element =
+                                (decode_unit & 1u) * 24u;
+                            decode_nint8_group48_slice<24u>(
                                 descriptor, nint_q, nint_sub_scale,
                                 nint_sub_min, nint_anchor_scale,
-                                nint_anchor_min, target, pool_row, group,
+                                nint_anchor_min, target + first_element,
+                                pool_row, group, first_element,
                                 uint(input_width));
                         }
                     }
@@ -2151,6 +2161,11 @@ template <
     constexpr short TN = SN / 16;
     constexpr short TK = SK / 16;
     constexpr int PROJECTIONS = FUSED_SWIGLU ? 2 : 1;
+    // Split NINT8's two GS48 groups only when a full-group decoder would
+    // leave SIMD lanes idle. BM32/BN128 already fills its threadgroup and
+    // keeps one decoder per group to avoid duplicate metadata work.
+    constexpr bool SPLIT_NINT8 =
+        uint(BN) * uint(BK / 48) < TGP_SIZE;
 
     int output_base = int(tid.x) * BN;
     int block_id = int(tid.y);
@@ -2265,6 +2280,8 @@ template <
                     uint groups_per_tile = uint(BK) / nint_group_size;
                     uint decode_units_per_tile = nint_bits == 2u
                         ? (groups_per_tile + 1u) / 2u
+                        : nint_bits == 8u && SPLIT_NINT8
+                        ? groups_per_tile * 2u
                         : groups_per_tile;
                     for (uint item = thread_id;
                          item < uint(BN) * decode_units_per_tile;
@@ -2274,6 +2291,8 @@ template <
                             item - output_row * decode_units_per_tile;
                         uint local_group = nint_bits == 2u
                             ? decode_unit * 2u
+                            : nint_bits == 8u && SPLIT_NINT8
+                            ? decode_unit / 2u
                             : decode_unit;
                         uint input_column =
                             uint(k_base) + local_group * nint_group_size;
@@ -2319,11 +2338,23 @@ template <
                                 nint_sub_min, nint_anchor_scale,
                                 nint_anchor_min, target, pool_row, group);
                         } else {
-                            decode_nint8_group48(
-                                descriptor, nint_q, nint_sub_scale,
-                                nint_sub_min, nint_anchor_scale,
-                                nint_anchor_min, target, pool_row, group,
-                                uint(params.input_width));
+                            if constexpr (SPLIT_NINT8) {
+                                uint first_element =
+                                    (decode_unit & 1u) * 24u;
+                                decode_nint8_group48_slice<24u>(
+                                    descriptor, nint_q, nint_sub_scale,
+                                    nint_sub_min, nint_anchor_scale,
+                                    nint_anchor_min, target + first_element,
+                                    pool_row, group, first_element,
+                                    uint(params.input_width));
+                            } else {
+                                decode_nint8_group48_slice<48u>(
+                                    descriptor, nint_q, nint_sub_scale,
+                                    nint_sub_min, nint_anchor_scale,
+                                    nint_anchor_min, target,
+                                    pool_row, group, 0u,
+                                    uint(params.input_width));
+                            }
                         }
                     }
                 } else if (sliced_nint5) {
