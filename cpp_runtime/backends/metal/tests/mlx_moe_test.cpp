@@ -4604,7 +4604,7 @@ void test_grouped_nint_mmq_prefill() {
     }
 }
 
-void test_large_fused_grouped_tile_policy() {
+void test_grouped_padded_row_tile_policy() {
     const auto gate_fixture = make_moe_fixture(
         {"NINT4"}, 48, 96, 31, 24);
     const auto down_fixture = make_moe_fixture(
@@ -4632,18 +4632,40 @@ void test_large_fused_grouped_tile_policy() {
     setenv("MFQ_METAL_NINT_PREFILL_NAX_DIRECT", "0", 1);
     unsetenv("MFQ_METAL_GROUPED_MMQ_BLOCK_ROWS");
 
-    require(
-        gate.recommended_grouped_mmq_block_rows(511, true) == 32,
-        "fused grouped gate/up must retain BM32 below high occupancy");
-    require(
-        gate.recommended_grouped_mmq_block_rows(512, true) == 64,
-        "fused grouped gate/up must use BM64 at high occupancy");
-    require(
-        gate.recommended_grouped_mmq_block_rows(512, false) == 32,
-        "ordinary narrow grouped projection unexpectedly selected BM64");
-    require(
-        down.recommended_grouped_mmq_block_rows(512, false) == 64,
-        "wide grouped down projection must use BM64 at high occupancy");
+    constexpr std::array<std::pair<int, int>, 18> expected_tiles{{
+        {96, 96},
+        {97, 64},
+        {100, 64},
+        {120, 64},
+        {128, 64},
+        {129, 80},
+        {160, 80},
+        {161, 64},
+        {192, 64},
+        {193, 80},
+        {200, 80},
+        {240, 80},
+        {241, 64},
+        {320, 64},
+        {400, 80},
+        {480, 80},
+        {511, 64},
+        {512, 64},
+    }};
+    for (const auto& [routes, expected] : expected_tiles) {
+        require(
+            gate.recommended_grouped_mmq_block_rows(routes, true)
+                == expected,
+            "fused grouped gate/up padded-row tile mismatch");
+        require(
+            gate.recommended_grouped_mmq_block_rows(routes, false)
+                == expected,
+            "ordinary narrow grouped padded-row tile mismatch");
+        require(
+            down.recommended_grouped_mmq_block_rows(routes, false)
+                == expected,
+            "wide grouped down padded-row tile mismatch");
+    }
 
     const auto restore = [](const char* name,
                             const std::optional<std::string>& value) {
@@ -5419,7 +5441,7 @@ int main(int argc, char** argv) {
         test_grouped_mmq_prefill();
         test_grouped_vq_decoder_tail_prefill();
         test_grouped_nint_mmq_prefill();
-        test_large_fused_grouped_tile_policy();
+        test_grouped_padded_row_tile_policy();
         test_large_grouped_block_chunk_order();
         test_grouped_nint2_pair_prefill();
         test_grouped_nint5_group28_tail_prefill();

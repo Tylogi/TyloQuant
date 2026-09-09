@@ -7815,9 +7815,10 @@ int MlxNintMoeWeight::recommended_grouped_mmq_block_rows(
     const int mean_routes = (route_count + impl_->experts - 1)
         / impl_->experts;
     // Up to 96 mean routes, use one 16-row-aligned block per expert to avoid
-    // wasting SIMD rows. Once multiple blocks are inevitable, choose from the
-    // projection aspect ratio: narrow outputs benefit from BM32/BN128's
-    // activation reuse, while wide outputs benefit from BM64's weight reuse.
+    // wasting SIMD rows. Once multiple blocks are inevitable, choose between
+    // the two high-occupancy plans by their actual padded-row cost. This keeps
+    // the decision independent of model family, projection role, and packed
+    // weight format while still preferring BM64 when both plans do equal work.
     if (mean_routes <= 32) {
         return 32;
     }
@@ -7833,21 +7834,14 @@ int MlxNintMoeWeight::recommended_grouped_mmq_block_rows(
     if (mean_routes <= 96) {
         return 96;
     }
-    const int logical_output_width = fused_swiglu
-        ? impl_->out_per_expert / 2
-        : impl_->out_per_expert;
-    if (logical_output_width <= impl_->neuron_len) {
-        // At very high occupancy the fused gate/up projection no longer
-        // benefits from BM32 enough to justify a second block plan beside a
-        // wide BM64 down projection. BM64 is neutral-to-positive once there
-        // are at least eight 64-row blocks per expert; retain BM32 below that
-        // point because its BN128 geometry is materially faster there.
-        if (fused_swiglu && mean_routes >= 512) {
-            return 64;
-        }
-        return 32;
-    }
-    return 64;
+    (void)fused_swiglu;
+    const auto padded_rows = [mean_routes](int rows) {
+        return (
+            (static_cast<std::int64_t>(mean_routes) + rows - 1)
+            / rows
+        ) * rows;
+    };
+    return padded_rows(80) < padded_rows(64) ? 80 : 64;
 }
 
 MlxGroupedMmqPlan MlxNintMoeWeight::build_grouped_mmq_plan(
