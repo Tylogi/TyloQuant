@@ -6680,6 +6680,7 @@ struct MixedMoeRuntime {
     int neuron_len = 0;
     bool partial_experts = false;
     std::vector<MixedMoePool> pools;
+    std::shared_ptr<NintMoeWeight> nint_dispatch;
     MoeActivationWorkspace & activation_workspace(
             mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
             MixedMoeTransformKey transform) const {
@@ -6776,6 +6777,12 @@ struct MixedMoeRuntime {
             tokens >= prefill_mma_min_tokens && route.map_ready &&
             route.ids_dst.numel() == route.ids.numel();
         const bool use_kl_mmq = g_kl_mmq_mode != KlMmqMode::Default;
+        const bool use_nint_prefill =
+            use_f16_mma && !use_kl_mmq && nint_dispatch &&
+            nint_dispatch->hetero_supported;
+        const bool use_nint_decode =
+            !use_f16_mma && !use_kl_mmq && nint_dispatch &&
+            nint_dispatch->hetero_supported;
         if (input_prequantized && use_kl_mmq) {
             throw std::runtime_error(
                 "mixed prequantized activation reuse is unavailable in KLD MMQ mode");
@@ -6786,7 +6793,28 @@ struct MixedMoeRuntime {
                 "KLD mixed routed FP16 requires the compact route map");
         }
 
+        if (use_nint_prefill) {
+            nint_moe_grouped_matmul_hetero_f16_cuda(
+                nint_dispatch->weight_ptrs,
+                nint_dispatch->pool_params,
+                nint_dispatch->expert_pool,
+                nint_dispatch->expert_local,
+                x, route.ids, n_experts, out_per_expert,
+                neuron_len, x.dim() == 3, output,
+                route.ids_dst, route.expert_bounds,
+                route.mma_tile_bounds, route.mma_tile_experts,
+                route.mma_tile_m);
+        } else if (use_nint_decode) {
+            output = input_prequantized
+                ? nint_dispatch->forward_prequantized(x, route)
+                : nint_dispatch->forward(x, route);
+        }
+
         for (const auto & pool : pools) {
+            if (pool.family == MixedMoeFamily::Nint &&
+                    (use_nint_prefill || use_nint_decode)) {
+                continue;
+            }
             int gs = 24;
             int groups = 0;
             MixedMoeTransformKey transform{};
@@ -6900,6 +6928,18 @@ struct MixedMoeRuntime {
                     route.ids, pool.expert_local, n_experts,
                     pool.local_experts, out_per_expert, neuron_len,
                     pool.tpq.vector_size, pool.tpq.index_bits, output,
+                    route.ids_dst, route.expert_bounds,
+                    route.tile_bounds, route.tile_experts);
+                continue;
+            }
+            if (pool.family == MixedMoeFamily::Nvq && use_f16_mma) {
+                nvq_moe_grouped_matmul_pool_f16_cuda(
+                    pool.nvq.indices_packed, pool.nvq.aux_packed,
+                    pool.nvq.sub_scale_packed, pool.nvq.neuron_scale,
+                    pool.nvq.codebook, value, pool.expert_local,
+                    n_experts, pool.local_experts, out_per_expert,
+                    neuron_len, pool.nvq.gs, pool.nvq.sub_bits,
+                    pool.nvq.kernel_format, pool.nvq.sign_mode, output,
                     route.ids_dst, route.expert_bounds,
                     route.tile_bounds, route.tile_experts);
                 continue;
@@ -7064,6 +7104,53 @@ struct MixedMoeRuntime {
     }
 };
 
+static void initialize_mixed_nint_dispatch(
+        MixedMoeRuntime & runtime) {
+    runtime.nint_dispatch.reset();
+
+    std::vector<int32_t> expert_pool(
+        static_cast<size_t>(runtime.n_experts), -1);
+    std::vector<int32_t> expert_local(
+        static_cast<size_t>(runtime.n_experts), -1);
+    NintMoeWeight dispatch;
+    dispatch.n_experts = runtime.n_experts;
+    dispatch.out_per_expert = runtime.out_per_expert;
+    dispatch.neuron_len = runtime.neuron_len;
+    dispatch.partial_experts = true;
+    int dispatch_pool = 0;
+    for (const auto & pool : runtime.pools) {
+        if (pool.family != MixedMoeFamily::Nint) continue;
+        NintMoePoolWeight dispatch_weight;
+        dispatch_weight.weight = pool.nint;
+        dispatch_weight.expert_local = pool.expert_local;
+        dispatch_weight.local_experts = pool.local_experts;
+        dispatch.pools.push_back(std::move(dispatch_weight));
+
+        auto local_host = pool.expert_local
+            .to(mfq_tensor_backend::kCPU,
+                mfq_tensor_backend::kInt32)
+            .contiguous();
+        const int32_t * local = local_host.data_ptr<int32_t>();
+        for (int expert = 0; expert < runtime.n_experts; ++expert) {
+            if (local[expert] < 0) continue;
+            if (local[expert] >= pool.local_experts ||
+                    expert_pool[static_cast<size_t>(expert)] >= 0) {
+                throw std::runtime_error(
+                    "mixed NINT prefill has invalid expert ownership");
+            }
+            expert_pool[static_cast<size_t>(expert)] = dispatch_pool;
+            expert_local[static_cast<size_t>(expert)] = local[expert];
+        }
+        ++dispatch_pool;
+    }
+    if (dispatch.pools.empty()) return;
+    initialize_nint_moe_dispatch(
+        dispatch, expert_pool, expert_local);
+    if (!dispatch.hetero_supported) return;
+    runtime.nint_dispatch =
+        std::make_shared<NintMoeWeight>(std::move(dispatch));
+}
+
 static int64_t tensor_storage_bytes(const mfq_tensor_backend::Tensor & value) {
     return value.defined()
         ? value.numel() * (int64_t)value.element_size()
@@ -7072,6 +7159,12 @@ static int64_t tensor_storage_bytes(const mfq_tensor_backend::Tensor & value) {
 
 static int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
     int64_t bytes = 0;
+    if (runtime.nint_dispatch) {
+        bytes += tensor_storage_bytes(runtime.nint_dispatch->weight_ptrs);
+        bytes += tensor_storage_bytes(runtime.nint_dispatch->pool_params);
+        bytes += tensor_storage_bytes(runtime.nint_dispatch->expert_pool);
+        bytes += tensor_storage_bytes(runtime.nint_dispatch->expert_local);
+    }
     for (const auto & pool : runtime.pools) {
         bytes += tensor_storage_bytes(pool.expert_local);
         if (pool.family == MixedMoeFamily::Nint) {
@@ -7198,6 +7291,7 @@ static std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
         }
         runtime->pools.push_back(std::move(pool));
     }
+    if (cuda) initialize_mixed_nint_dispatch(*runtime);
     return runtime;
 }
 
@@ -7351,6 +7445,7 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
         throw std::runtime_error(
             "expert-parallel MoE shard has no owned experts");
     }
+    initialize_mixed_nint_dispatch(*runtime);
     return wrap_mixed_moe_runtime(runtime);
 }
 
@@ -7519,6 +7614,7 @@ static NintMoeWeight stage_cpu_mixed_moe(
         }
         runtime->pools.push_back(std::move(pool));
     }
+    initialize_mixed_nint_dispatch(*runtime);
     return wrap_mixed_moe_runtime(runtime);
 }
 
