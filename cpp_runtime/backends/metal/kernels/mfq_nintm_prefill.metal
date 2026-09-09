@@ -420,18 +420,32 @@ inline void decode_nint6_group24(
         * float(sub_mins[sub_offset + metadata]);
     uint packed_base = q_offset + metadata * 18u;
 #pragma clang loop unroll(full)
-    for (uint chunk = 0u; chunk < 6u; ++chunk) {
-        uint chunk_base = packed_base + chunk * 3u;
-        uint packed = uint(values[chunk_base])
-            | (uint(values[chunk_base + 1u]) << 8u)
-            | (uint(values[chunk_base + 2u]) << 16u);
-        half4 decoded = half4(
-            scale * float(packed & 63u) - minimum,
-            scale * float((packed >> 6u) & 63u) - minimum,
-            scale * float((packed >> 12u) & 63u) - minimum,
-            scale * float((packed >> 18u) & 63u) - minimum);
+    for (uint pair = 0u; pair < 3u; ++pair) {
+        uint pair_base = packed_base + pair * 6u;
+        uchar4 first_bytes = *reinterpret_cast<device const uchar4*>(
+            values + pair_base);
+        uchar2 second_bytes = *reinterpret_cast<device const uchar2*>(
+            values + pair_base + 4u);
+        uint first = uint(first_bytes.x)
+            | (uint(first_bytes.y) << 8u)
+            | (uint(first_bytes.z) << 16u);
+        uint second = uint(first_bytes.w)
+            | (uint(second_bytes.x) << 8u)
+            | (uint(second_bytes.y) << 16u);
+        half4 first_decoded = half4(
+            scale * float(first & 63u) - minimum,
+            scale * float((first >> 6u) & 63u) - minimum,
+            scale * float((first >> 12u) & 63u) - minimum,
+            scale * float((first >> 18u) & 63u) - minimum);
+        half4 second_decoded = half4(
+            scale * float(second & 63u) - minimum,
+            scale * float((second >> 6u) & 63u) - minimum,
+            scale * float((second >> 12u) & 63u) - minimum,
+            scale * float((second >> 18u) & 63u) - minimum);
         *reinterpret_cast<threadgroup half4*>(
-            target + chunk * 4u) = decoded;
+            target + pair * 8u) = first_decoded;
+        *reinterpret_cast<threadgroup half4*>(
+            target + pair * 8u + 4u) = second_decoded;
     }
 }
 
@@ -687,12 +701,15 @@ inline void decode_nint5_group28_slice(
         values[packed_base + LOW_BYTES + 1u],
         values[packed_base + LOW_BYTES + 2u],
         values[packed_base + LOW_BYTES + 3u]);
-#pragma clang loop unroll(full)
-    for (uint element = 0u; element < GROUP_SIZE; element += 4u) {
-        if (element >= element_count) {
-            continue;
-        }
-        uint source_element = first_element + element;
+
+    uint source_element = first_element;
+    uint target_element = 0u;
+    uint remaining = element_count;
+    // A slice may start on the upper half of an eight-value high-bit byte.
+    // Peel that quad, then decode aligned octets with one uchar4 low-plane
+    // load and one shared high byte instead of two independent uchar2 loads.
+    if ((source_element & 7u) != 0u && remaining != 0u) {
+        uint count = min(remaining, 4u);
         uchar2 low = *reinterpret_cast<device const uchar2*>(
             values + packed_base + (source_element >> 1u));
         uint high_bits = uint(high[source_element >> 3u]);
@@ -708,14 +725,67 @@ inline void decode_nint5_group28_slice(
                 | (((high_bits >> (high_shift + 3u)) & 1u) << 4u));
         half4 decoded = half4(
             scale * float4(quantized) - float4(minimum));
-        if (element + 4u <= element_count) {
+        if (count == 4u) {
             *reinterpret_cast<threadgroup half4*>(
-                target + element) = decoded;
+                target + target_element) = decoded;
         } else {
 #pragma clang loop unroll(full)
             for (uint lane = 0u; lane < 4u; ++lane) {
-                if (element + lane < element_count) {
-                    target[element + lane] = decoded[lane];
+                if (lane < count) {
+                    target[target_element + lane] = decoded[lane];
+                }
+            }
+        }
+        source_element += count;
+        target_element += count;
+        remaining -= count;
+    }
+
+    for (; remaining >= 8u;
+         source_element += 8u, target_element += 8u, remaining -= 8u) {
+        uchar4 low = *reinterpret_cast<device const uchar4*>(
+            values + packed_base + (source_element >> 1u));
+        uint high_bits = uint(high[source_element >> 3u]);
+        ushort4 first = ushort4(
+            uint(low.x & 15u) | ((high_bits & 1u) << 4u),
+            uint(low.x >> 4u) | (((high_bits >> 1u) & 1u) << 4u),
+            uint(low.y & 15u) | (((high_bits >> 2u) & 1u) << 4u),
+            uint(low.y >> 4u) | (((high_bits >> 3u) & 1u) << 4u));
+        ushort4 second = ushort4(
+            uint(low.z & 15u) | (((high_bits >> 4u) & 1u) << 4u),
+            uint(low.z >> 4u) | (((high_bits >> 5u) & 1u) << 4u),
+            uint(low.w & 15u) | (((high_bits >> 6u) & 1u) << 4u),
+            uint(low.w >> 4u) | (((high_bits >> 7u) & 1u) << 4u));
+        *reinterpret_cast<threadgroup half4*>(target + target_element) =
+            half4(scale * float4(first) - float4(minimum));
+        *reinterpret_cast<threadgroup half4*>(target + target_element + 4u) =
+            half4(scale * float4(second) - float4(minimum));
+    }
+
+    if (remaining != 0u) {
+        uchar2 low = *reinterpret_cast<device const uchar2*>(
+            values + packed_base + (source_element >> 1u));
+        uint high_bits = uint(high[source_element >> 3u]);
+        uint high_shift = source_element & 7u;
+        ushort4 quantized = ushort4(
+            uint(low.x & 15u)
+                | (((high_bits >> high_shift) & 1u) << 4u),
+            uint(low.x >> 4u)
+                | (((high_bits >> (high_shift + 1u)) & 1u) << 4u),
+            uint(low.y & 15u)
+                | (((high_bits >> (high_shift + 2u)) & 1u) << 4u),
+            uint(low.y >> 4u)
+                | (((high_bits >> (high_shift + 3u)) & 1u) << 4u));
+        half4 decoded = half4(
+            scale * float4(quantized) - float4(minimum));
+        if (remaining == 4u) {
+            *reinterpret_cast<threadgroup half4*>(
+                target + target_element) = decoded;
+        } else {
+#pragma clang loop unroll(full)
+            for (uint lane = 0u; lane < 4u; ++lane) {
+                if (lane < remaining) {
+                    target[target_element + lane] = decoded[lane];
                 }
             }
         }
