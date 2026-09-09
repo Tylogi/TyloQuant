@@ -2904,7 +2904,7 @@ constexpr int kMoeMmaBn = 64;
 constexpr int kMoeMmaMaxBkStride = 120;
 
 template <int BM>
-constexpr int kMoeMmaBkStride = BM == 64 ? 112 : kMoeMmaMaxBkStride;
+constexpr int kMoeMmaBkStride = BM == 64 ? 120 : kMoeMmaMaxBkStride;
 
 template <int BITS, int GS, int GROUPS_PER_CHUNK, int BM>
 __device__ __forceinline__ void nint_moe_mma_profile(
