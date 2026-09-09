@@ -3128,10 +3128,8 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
             route_order,
             0));
     const bool cohort_ordered = experts >= 128
-        && route_count > experts * 64;
-    const int block_chunk = cohort_ordered
-        ? (route_count > experts * 96 ? 2 : 1)
-        : 0;
+        && route_count > experts * 96;
+    const int block_chunk = cohort_ordered ? 2 : 0;
     std::vector<array> builder_inputs{
         std::move(sorted_ids),
     };
@@ -3157,11 +3155,10 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
             {"MAX_BLOCKS", max_blocks},
             {
                 "BLOCK_CHUNK",
-                // At more than 64 mean routes, deterministic cohort order is
-                // already enough to repay the short serial emission pass.
-                // Above 96, pair adjacent blocks to retain packed-weight
-                // locality without serializing an entire expert. Smaller
-                // pools and sparse route sets keep the parallel atomic path.
+                // Above 96 mean routes, pair adjacent blocks in deterministic
+                // cohort order to retain packed-weight locality without
+                // serializing an entire expert. Smaller pools and route sets
+                // keep the original parallel atomic path.
                 block_chunk,
             },
         },
