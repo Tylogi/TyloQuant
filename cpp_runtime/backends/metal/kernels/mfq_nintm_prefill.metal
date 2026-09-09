@@ -379,9 +379,12 @@ inline void decode_nint3_group24(
 #pragma clang loop unroll(full)
     for (uint chunk = 0u; chunk < 3u; ++chunk) {
         uint chunk_base = packed_base + chunk * 3u;
-        uint packed = uint(values[chunk_base])
-            | (uint(values[chunk_base + 1u]) << 8u)
-            | (uint(values[chunk_base + 2u]) << 16u);
+        packed_uchar3 bytes =
+            *reinterpret_cast<device const packed_uchar3*>(
+                values + chunk_base);
+        uint packed = uint(bytes.x)
+            | (uint(bytes.y) << 8u)
+            | (uint(bytes.z) << 16u);
         half4 first = half4(
             scale * float(packed & 7u) - minimum,
             scale * float((packed >> 3u) & 7u) - minimum,
@@ -1663,34 +1666,57 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
 
     thread mma_t gate_mma(simd_group_id, simd_lane_id);
     thread mma_t up_mma(simd_group_id, simd_lane_id);
-        for (int k_base = 0; k_base < input_width; k_base += BK) {
-            for (uint item = thread_id;
-                 item < uint(BM * BK_padded);
-                 item += TGP_SIZE) {
-                uint row = item / uint(BK_padded);
-                uint column = item - row * uint(BK_padded);
-                half value = half(0.0f);
-                int input_column = k_base + int(column);
-                if (int(row) < row_count && column < uint(BK)
-                    && input_column < input_width) {
-                    uint route_index =
-                        uint(route_order[row_base + int(row)]);
-                    uint source_row = input_sorted != 0
-                        ? uint(row_base) + row
-                        : (shared_input != 0
-                            ? route_index / uint(routes)
-                            : route_index);
-                    uint source_offset =
-                        (rotation * uint(variant_stride) + source_row)
-                        * uint(input_width);
-                    value = x[source_offset + uint(input_column)];
+    // Give each thread one contiguous fragment of a routed activation row.
+    // The route/source lookup is invariant across K tiles, and packed_half4
+    // keeps the gather at its natural two-byte alignment.
+    constexpr uint X_LOAD_LANES = TGP_SIZE / uint(BM);
+    constexpr uint X_VALUES_PER_LANE = uint(BK) / X_LOAD_LANES;
+    static_assert(TGP_SIZE % uint(BM) == 0u);
+    static_assert(uint(BK) % X_LOAD_LANES == 0u);
+    static_assert(X_VALUES_PER_LANE % 4u == 0u);
+    uint row = thread_id / X_LOAD_LANES;
+    uint load_lane = thread_id - row * X_LOAD_LANES;
+    uint local_column = load_lane * X_VALUES_PER_LANE;
+    bool valid_row = int(row) < row_count;
+    uint source_offset = 0u;
+    if (valid_row) {
+        uint route_index = uint(route_order[row_base + int(row)]);
+        uint source_row = input_sorted != 0
+            ? uint(row_base) + row
+            : (shared_input != 0
+                ? route_index / uint(routes)
+                : route_index);
+        source_offset =
+            (rotation * uint(variant_stride) + source_row)
+            * uint(input_width);
+    }
+    for (int k_base = 0; k_base < input_width; k_base += BK) {
+#pragma clang loop unroll(full)
+        for (uint column = 0u;
+             column < X_VALUES_PER_LANE;
+             column += 4u) {
+            uint input_column = uint(k_base) + local_column + column;
+            half4 value = half4(0.0h);
+            if (valid_row && input_column + 4u <= uint(input_width)) {
+                packed_half4 packed =
+                    *reinterpret_cast<device const packed_half4*>(
+                        x + source_offset + input_column);
+                value = half4(packed);
+            } else if (valid_row && input_column < uint(input_width)) {
+#pragma clang loop unroll(full)
+                for (uint lane = 0u; lane < 4u; ++lane) {
+                    if (input_column + lane < uint(input_width)) {
+                        value[lane] = x[source_offset + input_column + lane];
+                    }
                 }
-                Xs[item] = value;
             }
-            constexpr int PROJECTIONS = FUSED_SWIGLU ? 2 : 1;
-            for (int projection = 0;
-                 projection < PROJECTIONS;
-                 ++projection) {
+            *reinterpret_cast<threadgroup half4*>(
+                Xs + row * uint(BK_padded) + local_column + column) = value;
+        }
+        constexpr int PROJECTIONS = FUSED_SWIGLU ? 2 : 1;
+        for (int projection = 0;
+             projection < PROJECTIONS;
+             ++projection) {
                 for (uint item = thread_id;
                      item < uint(BN * BK_padded);
                      item += TGP_SIZE) {
@@ -2160,28 +2186,53 @@ template <
     gate_tile.clear();
     up_tile.clear();
 
+    // Match activation-loader lanes to this NAX tile's thread geometry.  This
+    // computes the routed source once, then moves contiguous FP16 quads.
+    constexpr uint X_LOAD_LANES = TGP_SIZE / uint(BM);
+    constexpr uint X_VALUES_PER_LANE = uint(BK) / X_LOAD_LANES;
+    static_assert(TGP_SIZE % uint(BM) == 0u);
+    static_assert(uint(BK) % X_LOAD_LANES == 0u);
+    static_assert(X_VALUES_PER_LANE % 4u == 0u);
+    uint row = thread_id / X_LOAD_LANES;
+    uint load_lane = thread_id - row * X_LOAD_LANES;
+    uint local_column = load_lane * X_VALUES_PER_LANE;
+    bool valid_row = int(row) < row_count;
+    uint source_offset = 0u;
+    if (valid_row) {
+        uint route_index = uint(route_order[row_base + int(row)]);
+        uint source_row = params.input_sorted != 0
+            ? uint(row_base) + row
+            : (params.shared_input != 0
+                ? route_index / uint(params.routes)
+                : route_index);
+        source_offset =
+            (rotation * uint(params.variant_stride) + source_row)
+            * uint(params.input_width);
+    }
     for (int k_base = 0; k_base < params.input_width; k_base += BK) {
-        for (uint item = thread_id;
-             item < uint(BM * BK);
-             item += TGP_SIZE) {
-            uint row = item / uint(BK);
-            uint column = item - row * uint(BK);
-            half value = half(0.0f);
-            int input_column = k_base + int(column);
-            if (int(row) < row_count && column < uint(BK)
-                && input_column < params.input_width) {
-                uint route_index = uint(route_order[row_base + int(row)]);
-                uint source_row = params.input_sorted != 0
-                    ? uint(row_base) + row
-                    : (params.shared_input != 0
-                        ? route_index / uint(params.routes)
-                        : route_index);
-                uint source_offset =
-                    (rotation * uint(params.variant_stride) + source_row)
-                    * uint(params.input_width);
-                value = x[source_offset + uint(input_column)];
+#pragma clang loop unroll(full)
+        for (uint column = 0u;
+             column < X_VALUES_PER_LANE;
+             column += 4u) {
+            uint input_column = uint(k_base) + local_column + column;
+            half4 value = half4(0.0h);
+            if (valid_row
+                && input_column + 4u <= uint(params.input_width)) {
+                packed_half4 packed =
+                    *reinterpret_cast<device const packed_half4*>(
+                        x + source_offset + input_column);
+                value = half4(packed);
+            } else if (valid_row
+                && input_column < uint(params.input_width)) {
+#pragma clang loop unroll(full)
+                for (uint lane = 0u; lane < 4u; ++lane) {
+                    if (input_column + lane < uint(params.input_width)) {
+                        value[lane] = x[source_offset + input_column + lane];
+                    }
+                }
             }
-            Xs[row * uint(X_STRIDE) + column] = value;
+            *reinterpret_cast<threadgroup half4*>(
+                Xs + row * uint(X_STRIDE) + local_column + column) = value;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
