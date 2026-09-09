@@ -18549,18 +18549,38 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i) {
     const std::string p =
         c.tensor_root + ".block." + std::to_string(i) + ".mlp.";
     const std::string expert_gate_up = p + "experts.gate_up.weight";
+    const std::string expert_gate = p + "experts.gate.weight";
+    const std::string expert_up = p + "experts.up.weight";
     const std::string expert_down = p + "experts.down.weight";
-    if (mfq.has_record(expert_gate_up) || mfq.has_record(expert_down)) {
-        if (!mfq.has_record(expert_gate_up) || !mfq.has_record(expert_down)) {
-            throw std::runtime_error("MoE layer has only one expert tensor: " + p);
+    const bool has_expert_gate_up = mfq.has_record(expert_gate_up);
+    const bool has_expert_gate = mfq.has_record(expert_gate);
+    const bool has_expert_up = mfq.has_record(expert_up);
+    const bool has_expert_down = mfq.has_record(expert_down);
+    if (has_expert_gate_up || has_expert_gate ||
+            has_expert_up || has_expert_down) {
+        if (has_expert_gate != has_expert_up) {
+            throw std::runtime_error(
+                "MoE split Gate/Up records are incomplete: " + p);
+        }
+        if (has_expert_gate_up == has_expert_gate || !has_expert_down) {
+            throw std::runtime_error(
+                "MoE layer requires exactly one fused or split Gate/Up representation: " + p);
         }
         if (c.num_experts <= 0 || c.num_experts_per_tok <= 0 ||
             c.moe_intermediate_size <= 0 || c.shared_expert_intermediate_size <= 0) {
             throw std::runtime_error("MoE config fields are missing");
         }
         f.is_moe = true;
-        f.moe_gate_up = load_nint_moe_gpu(
-            mfq, expert_gate_up, true, i, "gate_up");
+        f.moe_split_gate_up = has_expert_gate;
+        if (f.moe_split_gate_up) {
+            f.moe_gate = load_nint_moe_gpu(
+                mfq, expert_gate, true, i, "gate");
+            f.moe_up = load_nint_moe_gpu(
+                mfq, expert_up, true, i, "up");
+        } else {
+            f.moe_gate_up = load_nint_moe_gpu(
+                mfq, expert_gate_up, true, i, "gate_up");
+        }
         f.moe_down = load_nint_moe_gpu(
             mfq, expert_down, true, i, "down");
         f.moe_router = load_dense_gpu(
@@ -18583,10 +18603,18 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i) {
             p + "shared_expert.up.weight"},
             f.shared->down);
         prepare_ffn_workspaces(*f.shared);
-        if (f.moe_gate_up.n_experts != c.num_experts ||
+        const bool routed_gate_shapes = f.moe_split_gate_up
+            ? f.moe_gate.n_experts == c.num_experts &&
+                f.moe_up.n_experts == c.num_experts &&
+                f.moe_gate.neuron_len == c.hidden_size &&
+                f.moe_up.neuron_len == c.hidden_size &&
+                f.moe_gate.out_per_expert == c.moe_intermediate_size &&
+                f.moe_up.out_per_expert == c.moe_intermediate_size
+            : f.moe_gate_up.n_experts == c.num_experts &&
+                f.moe_gate_up.neuron_len == c.hidden_size &&
+                f.moe_gate_up.out_per_expert == 2 * c.moe_intermediate_size;
+        if (!routed_gate_shapes ||
             f.moe_down.n_experts != c.num_experts ||
-            f.moe_gate_up.neuron_len != c.hidden_size ||
-            f.moe_gate_up.out_per_expert != 2 * c.moe_intermediate_size ||
             f.moe_down.neuron_len != c.moe_intermediate_size ||
             f.moe_down.out_per_expert != c.hidden_size ||
             f.moe_router.dim() != 2 || f.moe_router.size(0) != c.num_experts ||
