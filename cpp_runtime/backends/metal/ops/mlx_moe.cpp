@@ -27,6 +27,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <span>
@@ -2899,16 +2900,22 @@ static_assert(sizeof(GroupedMmqParameters) == 48);
 // already been sorted, so one GPU thread can find each expert's contiguous
 // range and split it into independently schedulable BM-row blocks.
 const mlx::core::fast::CustomKernelFunction&
-grouped_mmq_block_builder() {
-    static const auto builder = [] {
+grouped_mmq_block_builder(bool cohort_ordered) {
+    const auto make_builder = [](bool ordered) {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        return mlx::core::fast::metal_kernel(
-            "mfq_grouped_mmq_block_builder",
-            {"indices"},
-            {"block_meta", "block_count"},
+        std::vector<std::string> inputs{"indices"};
+        if (ordered) {
+            inputs.emplace_back("expert_order");
+        }
+        std::string source = ordered
+            ? "#define MFQ_SCHEDULED_EXPERT(index) expert_order[index]\n"
+            : "#define MFQ_SCHEDULED_EXPERT(index) int(index)\n";
+        source +=
             R"METAL(
-                const uint expert = thread_index_in_threadgroup;
+                const uint schedule_index = thread_index_in_threadgroup;
+                const uint expert = uint(
+                    MFQ_SCHEDULED_EXPERT(schedule_index));
 
                 threadgroup atomic_int local_count;
                 threadgroup int expert_starts[NUM_EXPERTS];
@@ -2967,8 +2974,8 @@ grouped_mmq_block_builder() {
                             memory_order_relaxed);
                     }
                 } else {
-                    expert_starts[expert] = start;
-                    expert_rows[expert] = end - start;
+                    expert_starts[schedule_index] = start;
+                    expert_rows[schedule_index] = end - start;
                     threadgroup_barrier(mem_flags::mem_threadgroup);
 
                     if (expert == 0) {
@@ -3021,6 +3028,8 @@ grouped_mmq_block_builder() {
                              first < maximum_blocks;
                              first += BLOCK_CHUNK) {
                             for (uint item = 0; item < NUM_EXPERTS; ++item) {
+                                const int scheduled_expert = int(
+                                    MFQ_SCHEDULED_EXPERT(item));
                                 int count =
                                     (expert_rows[item] + BM - 1) / BM;
                                 for (int local = 0;
@@ -3031,7 +3040,8 @@ grouped_mmq_block_builder() {
                                         + (first + local) * BM;
                                     if (slot < MAX_BLOCKS) {
                                         block_meta[slot * 3 + 0] = row;
-                                        block_meta[slot * 3 + 1] = int(item);
+                                        block_meta[slot * 3 + 1] =
+                                            scheduled_expert;
                                         block_meta[slot * 3 + 2] = min(
                                             BM,
                                             expert_starts[item]
@@ -3044,18 +3054,28 @@ grouped_mmq_block_builder() {
                         block_count[0] = slot;
                     }
                 }
-            )METAL",
+            )METAL";
+        return mlx::core::fast::metal_kernel(
+            ordered
+                ? "mfq_grouped_mmq_block_builder_cohort"
+                : "mfq_grouped_mmq_block_builder",
+            std::move(inputs),
+            {"block_meta", "block_count"},
+            std::move(source),
             "",
             true,
             false,
             options);
-    }();
-    return builder;
+    };
+    static const auto unordered_builder = make_builder(false);
+    static const auto ordered_builder = make_builder(true);
+    return cohort_ordered ? ordered_builder : unordered_builder;
 }
 
 MlxGroupedMmqPlan make_grouped_mmq_plan(
     const array& expert_ids,
     const array& route_order_value,
+    const array& expert_order,
     int experts,
     int block_rows = 32) {
     if (block_rows != 32 && block_rows != 48 && block_rows != 64
@@ -3066,6 +3086,14 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
     if (experts <= 0 || experts > 1024) {
         throw std::invalid_argument(
             "grouped MMQ block builder requires 1..1024 experts");
+    }
+    if (
+        expert_order.dtype() != mlx::core::int32
+        || expert_order.ndim() != 1
+        || expert_order.size() != static_cast<std::size_t>(experts)
+    ) {
+        throw std::invalid_argument(
+            "grouped MMQ expert order must contain every expert");
     }
     auto ids = mlx::core::contiguous(
         mlx::core::astype(expert_ids, mlx::core::int32));
@@ -3099,8 +3127,19 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
             mlx::core::reshape(ids, Shape{route_count}),
             route_order,
             0));
-    auto outputs = grouped_mmq_block_builder()(
-        {std::move(sorted_ids)},
+    const bool cohort_ordered = experts >= 128
+        && route_count > experts * 64;
+    const int block_chunk = cohort_ordered
+        ? (route_count > experts * 96 ? 2 : 1)
+        : 0;
+    std::vector<array> builder_inputs{
+        std::move(sorted_ids),
+    };
+    if (cohort_ordered) {
+        builder_inputs.push_back(expert_order);
+    }
+    auto outputs = grouped_mmq_block_builder(cohort_ordered)(
+        std::move(builder_inputs),
         {
             Shape{max_blocks, 3},
             Shape{1},
@@ -3118,11 +3157,12 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
             {"MAX_BLOCKS", max_blocks},
             {
                 "BLOCK_CHUNK",
-                // Two adjacent blocks retain useful packed-weight locality
-                // without serializing the entire expert. Below 96 mean rows
-                // there is too little reuse to repay deterministic planning;
-                // small expert pools remain on the lower-overhead builder.
-                experts >= 128 && route_count > experts * 96 ? 2 : 0,
+                // At more than 64 mean routes, deterministic cohort order is
+                // already enough to repay the short serial emission pass.
+                // Above 96, pair adjacent blocks to retain packed-weight
+                // locality without serializing an entire expert. Smaller
+                // pools and sparse route sets keep the parallel atomic path.
+                block_chunk,
             },
         },
         std::nullopt,
@@ -6520,6 +6560,7 @@ struct MlxNintMoeWeight::Impl {
     array mx_scales;
     std::vector<RotationSpec> rotations;
     std::vector<std::int32_t> descriptor_values;
+    std::optional<array> expert_order;
     std::vector<ReferenceMoeCohort> reference_cohorts;
     int experts = 0;
     int out_per_expert = 0;
@@ -6673,6 +6714,54 @@ struct MlxNintMoeWeight::Impl {
                 jsc_execution_layout = true;
             }
         }
+        if (
+            descriptor_values.size()
+                == static_cast<std::size_t>(experts) * kDescriptorSize
+        ) {
+            std::vector<std::int32_t> schedule(
+                static_cast<std::size_t>(experts));
+            std::iota(schedule.begin(), schedule.end(), 0);
+            // Keep adjacent threadgroups on one exact decoder cohort and walk
+            // each cohort's packed rows monotonically. Quantization assigns
+            // formats independently of global expert ID, so the default ID
+            // order otherwise jumps among unrelated packed streams on every
+            // block. Row destinations remain route-order based; this only
+            // changes execution order.
+            std::stable_sort(
+                schedule.begin(),
+                schedule.end(),
+                [this](std::int32_t left, std::int32_t right) {
+                    const auto left_base = static_cast<std::size_t>(left)
+                        * kDescriptorSize;
+                    const auto right_base = static_cast<std::size_t>(right)
+                        * kDescriptorSize;
+                    const auto compare_field = [&](int field) {
+                        return descriptor_values[left_base + field]
+                            < descriptor_values[right_base + field]
+                            ? -1
+                            : descriptor_values[left_base + field]
+                                > descriptor_values[right_base + field]
+                            ? 1
+                            : 0;
+                    };
+                    if (const int family = compare_field(kFamily);
+                        family != 0) {
+                        return family < 0;
+                    }
+                    for (int field = 4; field < kDescriptorSize; ++field) {
+                        if (const int value = compare_field(field);
+                            value != 0) {
+                            return value < 0;
+                        }
+                    }
+                    return descriptor_values[left_base + kLocalExpert]
+                        < descriptor_values[right_base + kLocalExpert];
+                });
+            expert_order.emplace(make_int32_array(
+                schedule,
+                Shape{experts}));
+        }
+        grouped_mmq = grouped_mmq && expert_order.has_value();
         grouped_nint4_group24 =
             grouped_nint4_group24 && grouped_mmq;
         if (
@@ -7855,6 +7944,7 @@ MlxGroupedMmqPlan MlxNintMoeWeight::build_grouped_mmq_plan(
     return make_grouped_mmq_plan(
         expert_ids,
         route_order,
+        *impl_->expert_order,
         impl_->experts,
         block_rows);
 }
@@ -8126,6 +8216,7 @@ array MlxNintMoeWeight::routed_matmul_sorted(
             make_grouped_mmq_plan(
                 ids,
                 route_order,
+                *impl_->expert_order,
                 impl_->experts,
                 recommended_grouped_mmq_block_rows(
                     route_count,
@@ -8443,6 +8534,7 @@ array MlxNintMoeWeight::routed_matmul_impl(
         auto plan = make_grouped_mmq_plan(
             ids,
             route_order,
+            *impl_->expert_order,
             impl_->experts,
             recommended_grouped_mmq_block_rows(
                 variant_stride,

@@ -4706,12 +4706,12 @@ void test_large_grouped_block_chunk_order() {
     const int count = plan.block_count.data<std::int32_t>()[0];
     require(count == 396, "large grouped block count mismatch");
     const std::array<std::array<std::int32_t, 3>, 12> expected{{
-        {{0, 0, 32}}, {{32, 0, 32}},
-        {{97, 1, 32}}, {{129, 1, 32}},
-        {{194, 2, 32}}, {{226, 2, 32}},
-        {{291, 3, 32}}, {{323, 3, 32}},
-        {{388, 4, 32}}, {{420, 4, 32}},
-        {{485, 5, 32}}, {{517, 5, 32}},
+        {{12204, 127, 32}}, {{12236, 127, 32}},
+        {{12108, 126, 32}}, {{12140, 126, 32}},
+        {{12012, 125, 32}}, {{12044, 125, 32}},
+        {{11916, 124, 32}}, {{11948, 124, 32}},
+        {{11820, 123, 32}}, {{11852, 123, 32}},
+        {{11724, 122, 32}}, {{11756, 122, 32}},
     }};
     const auto* actual = plan.block_meta.data<std::int32_t>();
     for (int block = 0;
@@ -4722,7 +4722,7 @@ void test_large_grouped_block_chunk_order() {
                 actual[block * 3 + field]
                     == expected[static_cast<std::size_t>(block)]
                                [static_cast<std::size_t>(field)],
-                "large grouped block chunk order mismatch");
+                "large grouped block cohort order mismatch");
         }
     }
 
