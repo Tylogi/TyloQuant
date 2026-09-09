@@ -326,7 +326,7 @@ public:
         const std::string& prefix) {
         return Qwen4Moe(
             config,
-            moe_weight(model, prefix + ".experts.gate_up.weight"),
+            load_routed_gate_up_weight(model, prefix),
             moe_weight(model, prefix + ".experts.down.weight"),
             MlxLinear::load(model, prefix + ".router.weight"),
             DenseFfn::load(model, prefix + ".shared_expert"),
@@ -484,7 +484,9 @@ private:
         if (gate_up_.experts() != config_.num_experts ||
             down_.experts() != config_.num_experts ||
             gate_up_.neuron_len() != config_.hidden_size ||
-            gate_up_.out_per_expert() != 2 * config_.moe_intermediate_size ||
+            (gate_up_.projections() != 1 && gate_up_.projections() != 2) ||
+            gate_up_.out_per_expert() * gate_up_.projections() !=
+                2 * config_.moe_intermediate_size ||
             down_.neuron_len() != config_.moe_intermediate_size ||
             down_.out_per_expert() != config_.hidden_size) {
             throw std::runtime_error("Qwen4 routed expert geometry disagrees");

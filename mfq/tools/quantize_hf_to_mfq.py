@@ -1904,28 +1904,23 @@ def _apply_balanced_random_expert_mix(
     profiles: tuple[ExpertPrecision, ...],
     seed: int,
 ) -> list[TensorPlan]:
-    """Replace routed-expert policies with one balanced, reproducible mixture.
-
-    The assignment is cached by expert count, so mandatory fused projections
-    (notably gate/up) always receive identical expert-wise precision vectors.
-    """
+    """Assign each routed projection its own balanced reproducible mixture."""
 
     if not profiles:
         return plan
-    assignments: dict[int, tuple[ExpertPrecision, ...]] = {}
     result: list[TensorPlan] = []
     for item in plan:
         if item.target_dtype != "NINTM" or item.expert_shape is None:
             result.append(item)
             continue
         n_experts = int(item.expert_shape[0])
-        assigned = assignments.get(n_experts)
-        if assigned is None:
-            indices = np.arange(n_experts, dtype=np.int64) % len(profiles)
-            rng = np.random.default_rng(np.random.SeedSequence((int(seed), n_experts)))
-            rng.shuffle(indices)
-            assigned = tuple(profiles[int(index)] for index in indices)
-            assignments[n_experts] = assigned
+        indices = np.arange(n_experts, dtype=np.int64) % len(profiles)
+        name_seed = tuple(item.name.encode("utf-8"))
+        rng = np.random.default_rng(
+            np.random.SeedSequence((int(seed), n_experts, *name_seed))
+        )
+        rng.shuffle(indices)
+        assigned = tuple(profiles[int(index)] for index in indices)
         result.append(replace(item, target_spec=None, expert_precisions=assigned))
     return result
 
@@ -2098,6 +2093,11 @@ def _validate_runtime_fused_pairs(plan: list[TensorPlan]) -> None:
         for name, left in by_name.items():
             if not name.endswith(left_suffix):
                 continue
+            # Routed projections carry independent per-expert descriptors and
+            # are concatenated by the grouped MoE runtime, not a same-profile
+            # dense pair kernel.
+            if ".experts." in name:
+                continue
             right_name = name[: -len(left_suffix)] + right_suffix
             right = by_name.get(right_name)
             if right is None:
@@ -2200,9 +2200,9 @@ def _glm_expert_precisions(
 
 
 _FLASH_NEXT_TEXT_TYPES = frozenset({"qwen4_exp_text", "glm5_next_text"})
-_SEPARATE_EXPERT_RE = re.compile(
-    r"^((?:model\.language_model\.layers\.\d+|mtp\.layers\.\d+)"
-    r"\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+_CANONICAL_SEPARATE_EXPERT_RE = re.compile(
+    r"^((?:model|predictor|vision)\.block\.\d+\.mlp\.experts)\."
+    r"(\d+)\.(gate|up|down)\.weight$"
 )
 
 
@@ -2239,39 +2239,27 @@ def _source_precision_protected(
     return False
 
 
-def _flash_next_expert_plans(
+def _separate_hf_expert_plans(
     config: dict[str, object],
     inventory: dict[str, SourceTensorMetadata],
     source_quantizations: dict[str, _SourceQuantization],
     calibration_scheme: CalibrationScheme | None,
     default_spec: NintSpec,
 ) -> tuple[list[TensorPlan], set[str]]:
-    """Fuse separate per-expert HF matrices into runtime NINTM tensors."""
-
-    model_type = str(config.get("model_type", ""))
-    if model_type not in _FLASH_NEXT_TEXT_TYPES:
-        return [], set()
-    expected_experts = int(
-        config.get(
-            "num_experts" if model_type == "qwen4_exp_text" else "n_routed_experts",
-            0,
-        )
-        or 0
-    )
-    hidden = int(config.get("hidden_size", 0) or 0)
-    expert_hidden = int(config.get("moe_intermediate_size", 0) or 0)
-    if expected_experts <= 0 or hidden <= 0 or expert_hidden <= 0:
-        raise ValueError(f"incomplete {model_type} expert dimensions in model config")
+    """Normalize separately stored HF experts into canonical grouped projections."""
 
     groups: dict[str, dict[int, dict[str, str]]] = {}
     for name in inventory:
-        match = _SEPARATE_EXPERT_RE.match(name)
+        mapping = map_source_tensor_name(name, config)
+        if mapping is None:
+            continue
+        match = _CANONICAL_SEPARATE_EXPERT_RE.match(mapping.canonical_name)
         if match is None:
             continue
         prefix, expert_raw, projection = match.groups()
         groups.setdefault(prefix, {}).setdefault(int(expert_raw), {})[projection] = name
     if not groups:
-        raise ValueError(f"{model_type} checkpoint contains no separate routed experts")
+        return [], set()
 
     plans: list[TensorPlan] = []
     consumed: set[str] = set()
@@ -2294,6 +2282,7 @@ def _flash_next_expert_plans(
         return tuple(schemes), tuple(scale_names), tuple(scale_shards)
 
     for prefix, experts in sorted(groups.items()):
+        expected_experts = len(experts)
         expected_ids = set(range(expected_experts))
         if set(experts) != expected_ids:
             missing = sorted(expected_ids - set(experts))
@@ -2301,19 +2290,27 @@ def _flash_next_expert_plans(
             raise ValueError(
                 f"incomplete expert set under {prefix}: missing={missing[:8]} extra={extra[:8]}"
             )
-        gate_up_names: list[tuple[str, ...]] = []
-        gate_up_shards: list[tuple[str, ...]] = []
+        gate_names: list[tuple[str, ...]] = []
+        gate_shards: list[tuple[str, ...]] = []
+        up_names: list[tuple[str, ...]] = []
+        up_shards: list[tuple[str, ...]] = []
         down_names: list[tuple[str, ...]] = []
         down_shards: list[tuple[str, ...]] = []
         for expert in range(expected_experts):
             projections = experts[expert]
-            if set(projections) != {"gate_proj", "up_proj", "down_proj"}:
+            if set(projections) != {"gate", "up", "down"}:
                 raise ValueError(
                     f"incomplete expert {expert} under {prefix}: {sorted(projections)}"
                 )
-            gate = projections["gate_proj"]
-            up = projections["up_proj"]
-            down = projections["down_proj"]
+            gate = projections["gate"]
+            up = projections["up"]
+            down = projections["down"]
+            gate_shape = inventory[gate].shape
+            up_shape = inventory[up].shape
+            down_shape = inventory[down].shape
+            if len(gate_shape) != 2:
+                raise ValueError(f"routed Gate source must be rank-2: {gate}")
+            expert_hidden, hidden = map(int, gate_shape)
             for name, expected_shape in (
                 (gate, (expert_hidden, hidden)),
                 (up, (expert_hidden, hidden)),
@@ -2324,48 +2321,63 @@ def _flash_next_expert_plans(
                         f"expert source shape differs for {name}: "
                         f"{inventory[name].shape} != {expected_shape}"
                     )
-            gate_up_names.append((gate, up))
-            gate_up_shards.append((inventory[gate].shard, inventory[up].shard))
+            gate_names.append((gate,))
+            gate_shards.append((inventory[gate].shard,))
+            up_names.append((up,))
+            up_shards.append((inventory[up].shard,))
             down_names.append((down,))
             down_shards.append((inventory[down].shard,))
             consumed.update((gate, up, down))
 
-        gate_up_shape = (expected_experts, 2 * expert_hidden, hidden)
+        projection_shape = (expected_experts, expert_hidden, hidden)
         down_shape = (expected_experts, hidden, expert_hidden)
-        gate_up_source_target = prefix + ".gate_up_proj"
-        down_source_target = prefix + ".down_proj"
-        gate_up_mapping = map_source_tensor_name(
-            gate_up_source_target, config, require_registered=True
-        )
-        down_mapping = map_source_tensor_name(
-            down_source_target, config, require_registered=True
-        )
-        assert gate_up_mapping is not None and down_mapping is not None
-        gate_up_target = gate_up_mapping.canonical_name
-        down_target = down_mapping.canonical_name
-        gate_up_q, gate_up_scale_names, gate_up_scale_shards = source_fields(gate_up_names)
+        gate_target = prefix + ".gate.weight"
+        up_target = prefix + ".up.weight"
+        down_target = prefix + ".down.weight"
+        gate_q, gate_scale_names, gate_scale_shards = source_fields(gate_names)
+        up_q, up_scale_names, up_scale_shards = source_fields(up_names)
         down_q, down_scale_names, down_scale_shards = source_fields(down_names)
         plans.extend(
             (
                 TensorPlan(
-                    name=gate_up_target,
-                    shard=gate_up_shards[0][0],
-                    shape=gate_up_shape,
-                    source_dtype=inventory[gate_up_names[0][0]].dtype,
+                    name=gate_target,
+                    shard=gate_shards[0][0],
+                    shape=projection_shape,
+                    source_dtype=inventory[gate_names[0][0]].dtype,
                     target_dtype="NINTM",
-                    expert_shape=gate_up_shape,
+                    expert_shape=projection_shape,
                     expert_precisions=_glm_expert_precisions(
-                        gate_up_target,
-                        gate_up_shape,
+                        gate_target,
+                        projection_shape,
                         calibration_scheme,
                         default_spec,
                     ),
-                    transform="hf_expert_gate_up",
-                    expert_source_names=tuple(gate_up_names),
-                    expert_source_shards=tuple(gate_up_shards),
-                    expert_source_quantizations=gate_up_q,
-                    expert_source_scale_names=gate_up_scale_names,
-                    expert_source_scale_shards=gate_up_scale_shards,
+                    transform="hf_expert_gate",
+                    expert_source_names=tuple(gate_names),
+                    expert_source_shards=tuple(gate_shards),
+                    expert_source_quantizations=gate_q,
+                    expert_source_scale_names=gate_scale_names,
+                    expert_source_scale_shards=gate_scale_shards,
+                ),
+                TensorPlan(
+                    name=up_target,
+                    shard=up_shards[0][0],
+                    shape=projection_shape,
+                    source_dtype=inventory[up_names[0][0]].dtype,
+                    target_dtype="NINTM",
+                    expert_shape=projection_shape,
+                    expert_precisions=_glm_expert_precisions(
+                        up_target,
+                        projection_shape,
+                        calibration_scheme,
+                        default_spec,
+                    ),
+                    transform="hf_expert_up",
+                    expert_source_names=tuple(up_names),
+                    expert_source_shards=tuple(up_shards),
+                    expert_source_quantizations=up_q,
+                    expert_source_scale_names=up_scale_names,
+                    expert_source_scale_shards=up_scale_shards,
                 ),
                 TensorPlan(
                     name=down_target,
@@ -2405,16 +2417,6 @@ def _glm_derived_plans(
     kv_rank = int(config["kv_lora_rank"])
     nope = int(config["qk_nope_head_dim"])
     value = int(config["v_head_dim"])
-    experts = int(config["n_routed_experts"])
-    expert_hidden = int(config["moe_intermediate_size"])
-    first_sparse = int(config.get("first_k_dense_replace", 0))
-    moe_freq = max(1, int(config.get("moe_layer_freq", 1)))
-    mlp_types = list(config.get("mlp_layer_types") or [])
-    if mlp_types and len(mlp_types) != layers:
-        raise ValueError("GLM mlp_layer_types length does not match num_hidden_layers")
-    invalid_mlp_types = sorted(set(mlp_types) - {"dense", "sparse"})
-    if invalid_mlp_types:
-        raise ValueError(f"unsupported GLM MLP layer types: {invalid_mlp_types}")
     plans: list[TensorPlan] = []
 
     def require_shape(name: str, expected: tuple[int, ...]) -> None:
@@ -2455,79 +2457,6 @@ def _glm_derived_plans(
                 )
             )
 
-        sparse = (
-            mlp_types[layer] == "sparse"
-            if len(mlp_types) == layers
-            else layer >= first_sparse and layer % moe_freq == 0
-        )
-        if not sparse:
-            continue
-        mp = f"model.layers.{layer}.mlp."
-        gate_up_source_target = mp + "experts.gate_up_proj"
-        down_source_target = mp + "experts.down_proj"
-        gate_up_mapping = map_source_tensor_name(
-            gate_up_source_target,
-            config,
-            require_registered=True,
-        )
-        down_mapping = map_source_tensor_name(
-            down_source_target,
-            config,
-            require_registered=True,
-        )
-        assert gate_up_mapping is not None and down_mapping is not None
-        gate_up_target = gate_up_mapping.canonical_name
-        down_target = down_mapping.canonical_name
-        gate_up_shape = (experts, 2 * expert_hidden, hidden)
-        down_shape = (experts, hidden, expert_hidden)
-        gate_up_names: list[tuple[str, ...]] = []
-        gate_up_shards: list[tuple[str, ...]] = []
-        down_names: list[tuple[str, ...]] = []
-        down_shards: list[tuple[str, ...]] = []
-        for expert in range(experts):
-            ep = mp + f"experts.{expert}."
-            gate = ep + "gate_proj.weight"
-            up = ep + "up_proj.weight"
-            down = ep + "down_proj.weight"
-            require_shape(gate, (expert_hidden, hidden))
-            require_shape(up, (expert_hidden, hidden))
-            require_shape(down, (hidden, expert_hidden))
-            gate_up_names.append((gate, up))
-            gate_up_shards.append((weight_map[gate], weight_map[up]))
-            down_names.append((down,))
-            down_shards.append((weight_map[down],))
-        plans.append(
-            TensorPlan(
-                name=gate_up_target,
-                shard=gate_up_shards[0][0],
-                shape=gate_up_shape,
-                source_dtype=source_dtypes[gate_up_names[0][0]],
-                target_dtype="NINTM",
-                expert_shape=gate_up_shape,
-                expert_precisions=_glm_expert_precisions(
-                    gate_up_target, gate_up_shape, calibration_scheme
-                ),
-                transform="glm_expert_gate_up",
-                expert_source_names=tuple(gate_up_names),
-                expert_source_shards=tuple(gate_up_shards),
-            )
-        )
-        plans.append(
-            TensorPlan(
-                name=down_target,
-                shard=down_shards[0][0],
-                shape=down_shape,
-                source_dtype=source_dtypes[down_names[0][0]],
-                target_dtype="NINTM",
-                expert_shape=down_shape,
-                expert_precisions=_glm_expert_precisions(
-                    down_target, down_shape, calibration_scheme
-                ),
-                transform="glm_expert_down",
-                expert_source_names=tuple(down_names),
-                expert_source_shards=tuple(down_shards),
-            )
-        )
     return plans
 
 
@@ -2684,10 +2613,10 @@ def _plan(
                 and source_quantization.scheme == "fp8_tensor_scale"
             ):
                 preserved_ple_scale_names.add(source_quantization.scale_name)
-    flash_expert_plans: list[TensorPlan] = []
-    flash_expert_sources: set[str] = set()
-    if is_flash_next and not mostly_bf16:
-        flash_expert_plans, flash_expert_sources = _flash_next_expert_plans(
+    separate_expert_plans: list[TensorPlan] = []
+    separate_expert_sources: set[str] = set()
+    if not mostly_bf16:
+        separate_expert_plans, separate_expert_sources = _separate_hf_expert_plans(
             model_config,
             inventory,
             source_quantizations,
@@ -2705,7 +2634,7 @@ def _plan(
         if (
             name in source_auxiliaries
             and name not in preserved_ple_scale_names
-            or name in flash_expert_sources
+            or name in separate_expert_sources
         ):
             continue
         if text_only and not (
@@ -3083,7 +3012,7 @@ def _plan(
                 _spec_for_target(default_nint_dtype, NintSpec()),
             )
         )
-    out.extend(flash_expert_plans)
+    out.extend(separate_expert_plans)
     if calibration_scheme is not None:
         planned = {item.source_name or item.name for item in out}
         selected_names = set(calibration_scheme.selections) | set(

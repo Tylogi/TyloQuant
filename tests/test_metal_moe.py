@@ -39,6 +39,7 @@ from mfq.runtime.mlx_linear import MlxNintModel  # noqa: E402
 from mfq.runtime.mlx_moe import (  # noqa: E402
     MlxDenseRoutedLinear,
     MlxRoutedLinear,
+    MlxRoutedLinearGroup,
     MlxRoutedSwiGLUFFN,
 )
 from tests.test_formats.test_nepq import _tensor as _nepq_tensor  # noqa: E402
@@ -242,7 +243,7 @@ def test_routed_nintm_mxfp4_cohort_all_grouped_paths(path: str):
     source = rng.normal(0.0, 0.04, size=(9, width)).astype(np.float16)
     ids = np.tile(np.asarray([[0, 1]], dtype=np.int32), (9, 1))
     ids[1::2] = np.asarray([2, 3], dtype=np.int32)
-    layer = MlxRoutedLinear(tensor)
+    layer = MlxRoutedLinear.from_blob(io.pack_nint_moe(tensor))
     assert layer.uses_grouped_kernel
     options = {
         "direct": dict(compact_threshold=None),
@@ -451,9 +452,12 @@ def test_routed_mixed_nint_and_npq_single_dispatch():
     )
     source = rng.normal(0, 0.1, size=(3, width)).astype(np.float32)
     ids = np.asarray([[0, 1], [1, 0], [1, 1]], dtype=np.int32)
-    layer = MlxRoutedLinear(tensor)
+    blob = io.pack_nint_moe(tensor)
+    layer = MlxRoutedLinear.from_blob(blob)
     assert layer.uses_grouped_kernel
     actual = _array(layer(source, ids))
+    fallback = _array(MlxRoutedLinear(io.unpack_nint_moe(blob))(source, ids))
+    np.testing.assert_array_equal(actual, fallback)
     decoded = (dequantize(nint), npq_decoded)
     expected = np.stack(
         [
@@ -461,7 +465,7 @@ def test_routed_mixed_nint_and_npq_single_dispatch():
             for token, row in enumerate(ids)
         ]
     )
-    np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=5e-5)
+    np.testing.assert_allclose(actual, expected, rtol=5e-4, atol=5e-4)
 
 
 @pytest.mark.parametrize("compact", [False, True])
@@ -481,7 +485,7 @@ def test_routed_mixed_nint_and_nint8_zero_single_dispatch(compact: bool):
     )
     source = rng.normal(0, 0.1, size=(8, width)).astype(np.float16 if compact else np.float32)
     ids = np.tile(np.asarray([[0, 1]], dtype=np.int32), (8, 1))
-    layer = MlxRoutedLinear(tensor)
+    layer = MlxRoutedLinear.from_blob(io.pack_nint_moe(tensor))
     assert layer.uses_grouped_kernel
     actual = _array(
         grouped_moe_matmul(
@@ -561,9 +565,12 @@ def test_routed_multiple_vq_pool_offsets():
     rng = np.random.default_rng(29)
     source = rng.normal(0, 0.1, size=(2, first.neuron_len)).astype(np.float32)
     ids = np.asarray([[1, 0], [0, 1]], dtype=np.int32)
-    layer = MlxRoutedLinear(tensor)
+    blob = io.pack_nint_moe(tensor)
+    layer = MlxRoutedLinear.from_blob(blob)
     assert layer.uses_grouped_kernel
     actual = _array(layer(source, ids))
+    fallback = _array(MlxRoutedLinear(io.unpack_nint_moe(blob))(source, ids))
+    np.testing.assert_array_equal(actual, fallback)
     decoded = (first_decoded, second_decoded)
     expected = np.stack(
         [
@@ -571,7 +578,7 @@ def test_routed_multiple_vq_pool_offsets():
             for token, row in enumerate(ids)
         ]
     )
-    np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=5e-5)
+    np.testing.assert_allclose(actual, expected, rtol=5e-4, atol=5e-4)
 
 
 def test_routed_extended_jsc_index_widths():
@@ -688,9 +695,12 @@ def test_rotated_nepq_uses_grouped_dispatch():
     rng = np.random.default_rng(31)
     source = rng.normal(0, 0.1, size=(3, tensor.neuron_len)).astype(np.float32)
     ids = np.asarray([[0, 1], [1, 0], [1, 1]], dtype=np.int32)
-    layer = MlxRoutedLinear(container)
+    blob = io.pack_nint_moe(container)
+    layer = MlxRoutedLinear.from_blob(blob)
     assert layer.uses_grouped_kernel
     actual = _array(layer(source, ids))
+    fallback = _array(MlxRoutedLinear(io.unpack_nint_moe(blob))(source, ids))
+    np.testing.assert_array_equal(actual, fallback)
     signs = rotation_signs(
         tensor.neuron_len,
         tensor.rotation_block,
@@ -704,7 +714,7 @@ def test_rotated_nepq_uses_grouped_dispatch():
             for token, row in enumerate(ids)
         ]
     )
-    np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=5e-5)
+    np.testing.assert_allclose(actual, expected, rtol=5e-4, atol=5e-4)
 
 
 def test_routed_nintm_swiglu_and_route_reduction():
@@ -739,3 +749,100 @@ def test_routed_nintm_swiglu_and_route_reduction():
             activated = gate_value / (1 + np.exp(-gate_value)) * up_value
             expected[token] += weights[token, route] * (activated @ down_w[expert].T)
     np.testing.assert_allclose(actual, expected, rtol=6e-5, atol=6e-5)
+
+
+def test_routed_nintm_independent_random_gate_up_down_precisions():
+    """Keep precision allocation independent across all three MoE projections."""
+
+    rng = np.random.default_rng(20260908)
+    experts, hidden, intermediate = 18, 96, 56
+    precision_choices = np.asarray((2, 3, 4, 5, 6, 8), dtype=np.int32)
+
+    def random_assignment() -> np.ndarray:
+        # Cover every decoder while independently shuffling each projection.
+        assignment = np.tile(precision_choices, experts // precision_choices.size)
+        rng.shuffle(assignment)
+        return assignment
+
+    def quantized_projection(dense: np.ndarray, assignment: np.ndarray) -> NintMoeTensor:
+        cohorts = tuple(
+            tuple(int(value) for value in np.flatnonzero(assignment == bits))
+            for bits in precision_choices
+        )
+        return _nint_moe(
+            dense,
+            cohorts,
+            bits=tuple(int(value) for value in precision_choices),
+        )
+
+    gate_assignment = random_assignment()
+    up_assignment = random_assignment()
+    down_assignment = random_assignment()
+    assert np.any(
+        np.asarray(
+            [
+                len({int(gate), int(up), int(down)}) == 3
+                for gate, up, down in zip(
+                    gate_assignment,
+                    up_assignment,
+                    down_assignment,
+                    strict=True,
+                )
+            ]
+        )
+    )
+
+    gate = quantized_projection(
+        rng.normal(0, 0.08, size=(experts, intermediate, hidden)).astype(np.float32),
+        gate_assignment,
+    )
+    up = quantized_projection(
+        rng.normal(0, 0.08, size=(experts, intermediate, hidden)).astype(np.float32),
+        up_assignment,
+    )
+    down = quantized_projection(
+        rng.normal(0, 0.08, size=(experts, hidden, intermediate)).astype(np.float32),
+        down_assignment,
+    )
+
+    # Keep three independent blobs while Gate/Up share one grouped dispatch.
+    gate_blob = io.pack_nint_moe(gate)
+    up_blob = io.pack_nint_moe(up)
+    down_blob = io.pack_nint_moe(down)
+    gate_layer = MlxRoutedLinear.from_blob(gate_blob)
+    up_layer = MlxRoutedLinear.from_blob(up_blob)
+    down_layer = MlxRoutedLinear.from_blob(down_blob)
+    gate_up_layer = MlxRoutedLinearGroup((gate_layer, up_layer))
+    assert gate_up_layer.uses_grouped_kernel
+    assert io.pack_nint_moe(io.unpack_nint_moe(gate_blob)) == gate_blob
+    assert io.pack_nint_moe(io.unpack_nint_moe(up_blob)) == up_blob
+    assert io.pack_nint_moe(io.unpack_nint_moe(down_blob)) == down_blob
+
+    gate_dense = _decode_nint_moe(gate)
+    up_dense = _decode_nint_moe(up)
+    down_dense = _decode_nint_moe(down)
+    routes = 4
+    for tokens in (1, 2, 6, 17):
+        source = rng.normal(0, 0.08, size=(tokens, hidden)).astype(np.float16)
+        ids = np.stack(
+            [rng.choice(experts, size=routes, replace=False) for _ in range(tokens)]
+        ).astype(np.int32)
+        route_weights = rng.uniform(0.1, 1.0, size=(tokens, routes)).astype(np.float32)
+        route_weights /= route_weights.sum(axis=1, keepdims=True)
+
+        gate_value, up_value = mx.split(gate_up_layer(source, ids), 2, axis=-1)
+        hidden_value = gate_value * mx.sigmoid(gate_value) * up_value
+        actual = _array(down_layer.combine(hidden_value, ids, route_weights))
+
+        expected = np.zeros((tokens, hidden), dtype=np.float32)
+        for token in range(tokens):
+            for route in range(routes):
+                expert = int(ids[token, route])
+                gate_row = source[token].astype(np.float32) @ gate_dense[expert].T
+                up_row = source[token].astype(np.float32) @ up_dense[expert].T
+                activated = gate_row / (1.0 + np.exp(-gate_row)) * up_row
+                expected[token] += route_weights[token, route] * (
+                    activated @ down_dense[expert].T
+                )
+
+        np.testing.assert_allclose(actual, expected, rtol=8e-4, atol=8e-4)

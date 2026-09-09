@@ -46,6 +46,20 @@ static Routed routed(const MfqFile& file, const std::string& name, int layer,
     };
 }
 
+static Routed routed_gate_up(const MfqFile& file, const std::string& mlp_prefix,
+    int layer, int64_t experts, int64_t width, int64_t input) {
+    const auto base=mlp_prefix+".experts";
+    const auto gate_name=base+".gate.weight",up_name=base+".up.weight";
+    const bool has_gate=file.has_record(gate_name),has_up=file.has_record(up_name);
+    MFQ_RUNTIME_CHECK(has_gate==has_up,"incomplete routed Gate/Up pair under ",base);
+    if (!has_gate) return routed(file,base+".gate_up.weight",layer,experts,2*width,input);
+    auto gate=routed(file,gate_name,layer,experts,width,input);
+    auto up=routed(file,up_name,layer,experts,width,input);
+    return [gate=std::move(gate),up=std::move(up)](const Tensor& x,const Tensor& ids) {
+        return tb::cat({gate(x,ids),up(x,ids)},-1);
+    };
+}
+
 static Linear headwise(Routed projection,int64_t heads,int64_t output) {
     return [projection=std::move(projection),heads,output](const Tensor& x) {
         MFQ_RUNTIME_CHECK(x.dim()==4 && x.size(2)==heads,"Flash-Next head-wise projection shape mismatch");
@@ -66,7 +80,7 @@ static Linear dense_ffn(const MfqFile& file,const std::string& p,double limit) {
 static Linear glm_ffn(const MfqFile& file,const mfq::flash_next::GlmConfig& c,int i,const std::string& root="model") {
     const auto p=root+".block."+std::to_string(i)+".mlp";
     if (root=="model" && c.mlp_types.at(i)=="dense") return dense_ffn(file,p,c.swiglu_limit);
-    auto gate_up=routed(file,p+".experts.gate_up.weight",i,c.experts,2*c.moe_intermediate,c.hidden);
+    auto gate_up=routed_gate_up(file,p,i,c.experts,c.moe_intermediate,c.hidden);
     auto down=routed(file,p+".experts.down.weight",i,c.experts,c.hidden,c.moe_intermediate);
     auto router=linear(file,p+".router.weight"),shared=dense_ffn(file,p+".shared_expert",c.swiglu_limit);
     auto bias=dense(file,p+".router.bias").to(tb::kFloat32).contiguous();
@@ -106,7 +120,7 @@ struct Gr {
 
 static Linear qwen_ffn(const MfqFile& file,const mfq::flash_next::QwenConfig& c,int i,const std::string& root="model") {
     const auto p=root+".block."+std::to_string(i)+".mlp";
-    auto gate_up=routed(file,p+".experts.gate_up.weight",i,c.experts,2*c.moe_width,c.hidden);
+    auto gate_up=routed_gate_up(file,p,i,c.experts,c.moe_width,c.hidden);
     auto down=routed(file,p+".experts.down.weight",i,c.experts,c.hidden,c.moe_width);
     auto router=linear(file,p+".router.weight"),shared_gate=linear(file,p+".shared_expert.router.weight");
     auto sg=linear(file,p+".shared_expert.gate.weight"),su=linear(file,p+".shared_expert.up.weight"),sd=linear(file,p+".shared_expert.down.weight");

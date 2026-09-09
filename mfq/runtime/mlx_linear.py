@@ -646,6 +646,11 @@ class MlxNintModel:
         self.tensors = tensors
         self.legacy_semantics = getattr(tensors, "legacy_semantics", None)
 
+    def has_tensor(self, name: str) -> bool:
+        """Return whether a canonical tensor is available to this runtime."""
+
+        return name in self.tensors
+
     @classmethod
     def from_mfq(cls, path: str | Path, *, mmap: bool = True) -> MlxNintModel:
         _header, tensors = io.load_mmap(path) if mmap else io.load(path)

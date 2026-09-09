@@ -238,6 +238,12 @@ private:
 
 using MlxMoeWeight = MlxNintMoeWeight;
 
+// Resolve canonical split Gate/Up projections into one packed dispatch.
+// Legacy fused ``gate_up.weight`` remains a read-only compatibility input.
+MlxMoeWeight load_routed_gate_up_weight(
+    const MfqContainer& model,
+    const std::string& mlp_prefix);
+
 // One explicit-[tokens,routes] routed projection.
 class MlxRoutedLinear {
 public:

@@ -7785,6 +7785,33 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
     return MlxNintMoeWeight(std::move(impl));
 }
 
+MlxMoeWeight load_routed_gate_up_weight(
+    const MfqContainer& model,
+    const std::string& mlp_prefix) {
+    const auto base = mlp_prefix + ".experts";
+    const auto gate_name = base + ".gate.weight";
+    const auto up_name = base + ".up.weight";
+    const bool has_gate = model.contains(gate_name);
+    const bool has_up = model.contains(up_name);
+    if (has_gate != has_up) {
+        throw std::runtime_error(
+            "incomplete routed Gate/Up pair under " + base);
+    }
+    const auto load = [&model](const std::string& name) {
+        if (model.record(name).dtype != "NINTM") {
+            throw std::runtime_error(
+                "routed expert tensor must use NINTM: " + name);
+        }
+        const auto mapped = model.map_record(name);
+        return MlxMoeWeight::from_blob(mapped.view());
+    };
+    if (has_gate) {
+        return MlxMoeWeight::concatenate_projections(
+            std::vector<MlxMoeWeight>{load(gate_name), load(up_name)});
+    }
+    return load(base + ".gate_up.weight");
+}
+
 array MlxNintMoeWeight::routed_matmul(
     const array& input,
     const array& expert_ids) const {

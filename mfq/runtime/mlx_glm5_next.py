@@ -33,7 +33,7 @@ from mfq.kernels.metal.linear_attention import gated_delta_net, linear_conv_qkv
 from mfq.kernels.metal.moe_ops import moe_topk, weighted_reduce
 from mfq.kernels.metal.sampling import sample as _sample
 from mfq.runtime.mlx_linear import MlxLinearGroup, MlxNintModel, mlx_dense_array
-from mfq.runtime.mlx_moe import MlxRoutedLinear
+from mfq.runtime.mlx_moe import MlxRoutedLinear, load_routed_gate_up
 from mfq.runtime.mlx_ops import MlxRMSNorm
 
 
@@ -204,7 +204,7 @@ class MlxGlm5NextMoE:
         config: Glm5NextConfig,
         prefix: str,
     ) -> None:
-        gate_up = model.routed(prefix + ".experts.gate_up.weight")
+        gate_up = load_routed_gate_up(model, prefix)
         down = model.routed(prefix + ".experts.down.weight")
         if (
             gate_up.n_experts != config.num_experts

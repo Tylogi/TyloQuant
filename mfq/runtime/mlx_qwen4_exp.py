@@ -39,6 +39,7 @@ from mfq.runtime.mlx_linear import (
     MlxShardedEmbedding,
     mlx_dense_array,
 )
+from mfq.runtime.mlx_moe import load_routed_gate_up
 from mfq.runtime.mlx_ops import MlxRMSNorm, MlxRoPE
 
 
@@ -237,7 +238,7 @@ class MlxQwen4ExpMoE:
         config: Qwen4ExpConfig,
         prefix: str,
     ) -> None:
-        gate_up = model.routed(prefix + ".experts.gate_up.weight")
+        gate_up = load_routed_gate_up(model, prefix)
         down = model.routed(prefix + ".experts.down.weight")
         if (
             gate_up.n_experts != config.num_experts

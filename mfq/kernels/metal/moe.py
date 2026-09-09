@@ -2304,95 +2304,259 @@ class MetalMoeWeight:
 
     @classmethod
     def from_blob(cls, blob: bytes | memoryview) -> MetalMoeWeight:
-        """Upload an all-NINT NIM2 tensor without expanding its q bitstreams."""
+        """Upload a heterogeneous NIM2 tensor without expanding NINT q streams."""
 
         shape, pools = view_nint_moe_blob(blob)
         experts, out_per_expert, neuron_len = shape
         descriptors = np.zeros((experts, _DESCRIPTOR_SIZE), dtype=np.int32)
-        weights: list[MetalNintWeight] = []
-        q_offset = 0
-        sub_offset = 0
-        anchor_offset = 0
+
+        nint_q: list[mx.array] = []
+        nint_sub_scale: list[mx.array] = []
+        nint_sub_min: list[mx.array] = []
+        nint_anchor_scale: list[mx.array] = []
+        nint_anchor_min: list[mx.array] = []
+        q8_q: list[mx.array] = []
+        q8_scales: list[mx.array] = []
+        vq_indices: list[mx.array] = []
+        vq_state: list[mx.array] = []
+        vq_aux: list[mx.array] = []
+        vq_anchors: list[mx.array] = []
+        vq_codebooks: list[mx.array] = []
+        vq_scales: list[mx.array] = []
+        vq_state_to_codebank: list[mx.array] = []
+        vq_banks: list[mx.array] = []
+        vq_parameters: list[mx.array] = []
+        mx_values: list[mx.array] = []
+        mx_scales: list[mx.array] = []
+        residual_codebooks: list[mx.array] = []
+        residual_first: list[mx.array] = []
+        residual_second: list[mx.array] = []
+        offsets = {
+            "nint_q": 0,
+            "nint_sub": 0,
+            "nint_anchor": 0,
+            "q8_q": 0,
+            "q8_scale": 0,
+            "vq_indices": 0,
+            "vq_state": 0,
+            "vq_aux": 0,
+            "vq_anchor": 0,
+            "vq_codebook": 0,
+            "vq_scale": 0,
+            "vq_state_bank": 0,
+            "vq_bank": 0,
+            "vq_parameter": 0,
+            "mx_value": 0,
+            "mx_scale": 0,
+            "residual_codebook": 0,
+            "residual_record": 0,
+        }
+        rotation_variants: dict[tuple[int, int], int] = {}
+        rotation_specs: list[tuple[mx.array, int, int]] = []
+
         for pool in pools:
-            if not (pool.dtype.startswith("NINT") and pool.dtype[4:].isdigit()):
-                raise UnsupportedGroupedMoeError(
-                    "zero-expand NINTM loading currently requires all-NINT cohorts"
-                )
-            if len(pool.runtime_payload):
-                raise ValueError("NINT cohorts cannot carry NINTM runtime metadata")
-            weight = MetalNintWeight.from_blob(pool.tensor_payload)
             expert_ids = np.asarray(pool.expert_ids, dtype=np.int32).reshape(-1)
-            if (
-                weight.out != expert_ids.size * out_per_expert
-                or weight.neuron_len != neuron_len
-            ):
-                raise ValueError("NINTM NINT cohort dimensions are inconsistent")
+            expected_rows = int(expert_ids.size) * out_per_expert
+            runtime_nbytes = len(pool.runtime_payload)
+
+            if pool.dtype.startswith("NINT") and pool.dtype[4:].isdigit():
+                if runtime_nbytes:
+                    raise ValueError("NINT cohorts cannot carry NINTM runtime metadata")
+                weight = MetalNintWeight.from_blob(pool.tensor_payload)
+                if weight.out != expected_rows or weight.neuron_len != neuron_len:
+                    raise ValueError("NINTM NINT cohort dimensions are inconsistent")
+                for local_expert, expert in enumerate(expert_ids):
+                    descriptor = descriptors[int(expert)]
+                    descriptor[_FAMILY] = _FAMILY_NINT
+                    descriptor[_LOCAL_EXPERT] = local_expert
+                    descriptor[_OUT] = out_per_expert
+                    descriptor[_K] = neuron_len
+                    descriptor[_NINT_BITS] = weight.bits
+                    descriptor[_NINT_GS] = weight.groupsize
+                    descriptor[_NINT_NG] = weight.groups
+                    descriptor[_NINT_Q_OFFSET] = offsets["nint_q"]
+                    descriptor[_NINT_SUB_OFFSET] = offsets["nint_sub"]
+                    descriptor[_NINT_ANCHOR_OFFSET] = offsets["nint_anchor"]
+                    descriptor[_NINT_Q5_EXEC] = int(weight.q5_exec)
+                nint_q.append(weight.q_packed)
+                nint_sub_scale.append(weight.sub_scale)
+                nint_sub_min.append(weight.sub_min)
+                nint_anchor_scale.append(weight.neuron_scale)
+                nint_anchor_min.append(weight.neuron_min)
+                offsets["nint_q"] += _size(weight.q_packed) + 2
+                offsets["nint_sub"] += _size(weight.sub_scale)
+                offsets["nint_anchor"] += _size(weight.neuron_scale)
+                continue
+
+            if pool.dtype == "NINT8-0":
+                if runtime_nbytes:
+                    raise ValueError("NINT8-0 cohorts cannot carry NINTM runtime metadata")
+                weight = MetalNint8ZeroWeight.from_blob(pool.tensor_payload)
+                if weight.out != expected_rows or weight.neuron_len != neuron_len:
+                    raise ValueError("NINTM NINT8-0 cohort dimensions are inconsistent")
+                for local_expert, expert in enumerate(expert_ids):
+                    descriptor = descriptors[int(expert)]
+                    descriptor[_FAMILY] = _FAMILY_NINT8_ZERO
+                    descriptor[_LOCAL_EXPERT] = local_expert
+                    descriptor[_OUT] = out_per_expert
+                    descriptor[_K] = neuron_len
+                    descriptor[_Q8_NG] = weight.groups
+                    descriptor[_Q8_Q_OFFSET] = offsets["q8_q"]
+                    descriptor[_Q8_SCALE_OFFSET] = offsets["q8_scale"]
+                q8_q.append(weight.q)
+                q8_scales.append(weight.scales)
+                offsets["q8_q"] += _size(weight.q)
+                offsets["q8_scale"] += _size(weight.scales)
+                continue
+
+            if pool.dtype == MXFP4_DTYPE:
+                if runtime_nbytes:
+                    raise ValueError("MXFP4 cohorts cannot carry NINTM runtime metadata")
+                weight = MetalMxWeight.from_blob(pool.dtype, pool.tensor_payload)
+                if weight.out != expected_rows or weight.in_features != neuron_len:
+                    raise ValueError("NINTM MXFP4 cohort dimensions are inconsistent")
+                groups = neuron_len // 32
+                for local_expert, expert in enumerate(expert_ids):
+                    descriptor = descriptors[int(expert)]
+                    descriptor[_FAMILY] = _FAMILY_MXFP4
+                    descriptor[_LOCAL_EXPERT] = local_expert
+                    descriptor[_OUT] = out_per_expert
+                    descriptor[_K] = neuron_len
+                    descriptor[_MX_NG] = groups
+                    descriptor[_MX_VALUE_OFFSET] = offsets["mx_value"]
+                    descriptor[_MX_SCALE_OFFSET] = offsets["mx_scale"]
+                mx_values.append(weight.values)
+                mx_scales.append(weight.scales)
+                offsets["mx_value"] += _size(weight.values)
+                offsets["mx_scale"] += _size(weight.scales)
+                continue
+
+            try:
+                weight = MetalVqWeight.from_blob(pool.dtype, pool.tensor_payload)
+            except (TypeError, ValueError) as exc:
+                raise UnsupportedGroupedMoeError(
+                    f"unsupported zero-expand NINTM cohort {pool.dtype!r}"
+                ) from exc
+            if weight.out != expected_rows or weight.neuron_len != neuron_len:
+                raise ValueError("NINTM VQ cohort dimensions are inconsistent")
+            if bool(runtime_nbytes) != bool(weight.rotation_block):
+                raise ValueError("NINTM VQ rotation metadata presence is inconsistent")
+            rotation_variant = 0
+            if weight.rotation_block:
+                key = (weight.rotation_block, weight.rotation_seed)
+                rotation_variant = rotation_variants.get(key, 0)
+                if rotation_variant == 0:
+                    rotation_variant = len(rotation_specs) + 1
+                    rotation_variants[key] = rotation_variant
+                    rotation_specs.append(
+                        (weight.rotation_signs, weight.rotation_block, weight.rotation_seed)
+                    )
             for local_expert, expert in enumerate(expert_ids):
                 descriptor = descriptors[int(expert)]
-                descriptor[_FAMILY] = _FAMILY_NINT
+                descriptor[_FAMILY] = _FAMILY_VQ
                 descriptor[_LOCAL_EXPERT] = local_expert
                 descriptor[_OUT] = out_per_expert
                 descriptor[_K] = neuron_len
-                descriptor[_NINT_BITS] = weight.bits
-                descriptor[_NINT_GS] = weight.groupsize
-                descriptor[_NINT_NG] = weight.groups
-                descriptor[_NINT_Q_OFFSET] = q_offset
-                descriptor[_NINT_SUB_OFFSET] = sub_offset
-                descriptor[_NINT_ANCHOR_OFFSET] = anchor_offset
-                descriptor[_NINT_Q5_EXEC] = int(weight.q5_exec)
-            weights.append(weight)
-            q_offset += _size(weight.q_packed)
-            sub_offset += _size(weight.sub_scale)
-            anchor_offset += _size(weight.neuron_scale)
+                descriptor[_VQ_GS] = weight.groupsize
+                descriptor[_VQ_NG] = weight.groups
+                descriptor[_VQ_VECTOR_SIZE] = weight.vector_size
+                descriptor[_VQ_NVEC] = weight.vectors
+                descriptor[_VQ_INDEX_BITS] = weight.index_bits
+                descriptor[_VQ_STATE_BITS] = weight.state_bits
+                descriptor[_VQ_STATES] = weight.states
+                descriptor[_VQ_ENTRIES] = weight.entries
+                descriptor[_VQ_CODE_BANKS] = weight.code_banks
+                descriptor[_VQ_AUX_MODE] = weight.aux_mode
+                descriptor[_VQ_CODE_BANK_MODE] = weight.code_bank_mode
+                descriptor[_VQ_HAS_TABLE_BANKS] = int(weight.table_banks > 1)
+                descriptor[_VQ_GROUPS_PER_SUPER] = weight.groups_per_super
+                descriptor[_VQ_NSUPER] = weight.supergroups
+                descriptor[_VQ_INDICES_OFFSET] = offsets["vq_indices"]
+                descriptor[_VQ_STATE_OFFSET] = offsets["vq_state"]
+                descriptor[_VQ_AUX_OFFSET] = offsets["vq_aux"]
+                descriptor[_VQ_ANCHOR_OFFSET] = offsets["vq_anchor"]
+                descriptor[_VQ_CODEBOOK_OFFSET] = offsets["vq_codebook"]
+                descriptor[_VQ_SCALE_OFFSET] = offsets["vq_scale"]
+                descriptor[_VQ_STATE_BANK_OFFSET] = offsets["vq_state_bank"]
+                descriptor[_VQ_BANK_OFFSET] = offsets["vq_bank"]
+                descriptor[_VQ_PARAMETER_OFFSET] = offsets["vq_parameter"]
+                descriptor[_VQ_ROTATION_VARIANT] = rotation_variant
+                if weight.residual_position_bits:
+                    descriptor[_VQ_PROFILE] = (
+                        (weight.residual_position_bits << 8)
+                        | (weight.residual_block_vectors << 16)
+                    )
+                    descriptor[_VQ_RESIDUAL_CODEBOOK_OFFSET] = offsets[
+                        "residual_codebook"
+                    ]
+                    descriptor[_VQ_RESIDUAL_RECORD_OFFSET] = offsets[
+                        "residual_record"
+                    ]
+            vq_indices.append(weight.indices_packed)
+            vq_state.append(weight.state_packed)
+            vq_aux.append(weight.aux_packed)
+            vq_anchors.append(weight.anchors)
+            vq_codebooks.append(weight.codebooks)
+            vq_scales.append(weight.scale_lut)
+            vq_state_to_codebank.append(weight.state_to_codebank)
+            vq_banks.append(weight.bank_ids)
+            vq_parameters.append(weight.parameters)
+            if weight.residual_position_bits:
+                residual_codebooks.append(weight.residual_codebook)
+                residual_first.append(weight.residual_first)
+                residual_second.append(weight.residual_second)
+            offsets["vq_indices"] += _size(weight.indices_packed) + 2
+            offsets["vq_state"] += _size(weight.state_packed) + 2
+            offsets["vq_aux"] += _size(weight.aux_packed) + 2
+            offsets["vq_anchor"] += _size(weight.anchors)
+            offsets["vq_codebook"] += _size(weight.codebooks)
+            offsets["vq_scale"] += _size(weight.scale_lut)
+            offsets["vq_state_bank"] += _size(weight.state_to_codebank)
+            offsets["vq_bank"] += _size(weight.bank_ids)
+            offsets["vq_parameter"] += _size(weight.parameters)
+            if weight.residual_position_bits:
+                offsets["residual_codebook"] += _size(weight.residual_codebook)
+                offsets["residual_record"] += _size(weight.residual_first)
 
-        if len(weights) == 1:
-            # Shape is irrelevant to Metal pointer access.  Preserve the safe
-            # two-dimensional representation used for buffers above INT32_MAX.
-            nint_q = mx.contiguous(weights[0].q_packed)
-        else:
-            if q_offset > (1 << 31) - 1:
-                raise UnsupportedGroupedMoeError(
-                    "multi-cohort NINTM packed buffers above INT32_MAX require sharding"
-                )
-            nint_q = _join([weight.q_packed for weight in weights], dtype=mx.uint8)
+        if offsets["nint_q"] > (1 << 31) - 1:
+            raise UnsupportedGroupedMoeError(
+                "multi-cohort NINTM packed buffers above INT32_MAX require sharding"
+            )
+
+        # Keep the common single-cohort stream in its native shape.  Besides
+        # avoiding an unnecessary copy, this preserves the large-buffer path
+        # used by homogeneous NINTM tensors; offsets are zero in this case.
+        joined_nint_q = (
+            mx.contiguous(nint_q[0])
+            if len(nint_q) == 1
+            else _join(nint_q, dtype=mx.uint8, padding=2)
+        )
 
         return cls(
             descriptors=mx.array(descriptors),
-            nint_q=nint_q,
-            nint_sub_scale=_join(
-                [weight.sub_scale for weight in weights],
-                dtype=mx.uint8,
-            ),
-            nint_sub_min=_join(
-                [weight.sub_min for weight in weights],
-                dtype=mx.uint8,
-            ),
-            nint_anchor_scale=_join(
-                [weight.neuron_scale for weight in weights],
-                dtype=mx.float32,
-            ),
-            nint_anchor_min=_join(
-                [weight.neuron_min for weight in weights],
-                dtype=mx.float32,
-            ),
-            q8_q=_join([], dtype=mx.int8),
-            q8_scales=_join([], dtype=mx.float16),
-            vq_indices=_join([], dtype=mx.uint8, padding=2),
-            vq_state=_join([], dtype=mx.uint8, padding=2),
-            vq_aux=_join([], dtype=mx.uint8, padding=2),
-            vq_anchors=_join([], dtype=mx.float32),
-            vq_codebooks=_join([], dtype=mx.int8),
-            vq_scales=_join([], dtype=mx.float32),
-            vq_state_to_codebank=_join([], dtype=mx.uint8),
-            vq_banks=_join([], dtype=mx.uint8),
-            vq_parameters=_join([], dtype=mx.float32),
-            mx_values=_join([], dtype=mx.uint8),
-            mx_scales=_join([], dtype=mx.uint8),
-            residual_codebooks=_join([], dtype=mx.float16),
-            residual_first=_join([], dtype=mx.int16),
-            residual_second=_join([], dtype=mx.int16),
+            nint_q=joined_nint_q,
+            nint_sub_scale=_join(nint_sub_scale, dtype=mx.uint8),
+            nint_sub_min=_join(nint_sub_min, dtype=mx.uint8),
+            nint_anchor_scale=_join(nint_anchor_scale, dtype=mx.float32),
+            nint_anchor_min=_join(nint_anchor_min, dtype=mx.float32),
+            q8_q=_join(q8_q, dtype=mx.int8),
+            q8_scales=_join(q8_scales, dtype=mx.float16),
+            vq_indices=_join(vq_indices, dtype=mx.uint8, padding=2),
+            vq_state=_join(vq_state, dtype=mx.uint8, padding=2),
+            vq_aux=_join(vq_aux, dtype=mx.uint8, padding=2),
+            vq_anchors=_join(vq_anchors, dtype=mx.float32),
+            vq_codebooks=_join(vq_codebooks, dtype=mx.int8),
+            vq_scales=_join(vq_scales, dtype=mx.float32),
+            vq_state_to_codebank=_join(vq_state_to_codebank, dtype=mx.uint8),
+            vq_banks=_join(vq_banks, dtype=mx.uint8),
+            vq_parameters=_join(vq_parameters, dtype=mx.float32),
+            mx_values=_join(mx_values, dtype=mx.uint8),
+            mx_scales=_join(mx_scales, dtype=mx.uint8),
+            residual_codebooks=_join(residual_codebooks, dtype=mx.float16),
+            residual_first=_join(residual_first, dtype=mx.int16),
+            residual_second=_join(residual_second, dtype=mx.int16),
             descriptor_values=descriptors,
-            rotation_specs=(),
+            rotation_specs=tuple(rotation_specs),
             experts=experts,
             out_per_expert=out_per_expert,
             neuron_len=neuron_len,

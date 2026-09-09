@@ -313,6 +313,79 @@ class MlxRoutedLinear:
         return self.forward(x, expert_ids)
 
 
+class MlxRoutedLinearGroup:
+    """Shape-compatible routed projections combined behind one interface."""
+
+    def __init__(self, projections: tuple[MlxRoutedLinear | MlxDenseRoutedLinear, ...]) -> None:
+        if not projections:
+            raise ValueError("a routed projection group cannot be empty")
+        first = projections[0]
+        if any(
+            projection.n_experts != first.n_experts
+            or projection.out_per_expert != first.out_per_expert
+            or projection.neuron_len != first.neuron_len
+            for projection in projections[1:]
+        ):
+            raise ValueError("routed projection group shapes are incompatible")
+        grouped = tuple(
+            projection.grouped_weight
+            for projection in projections
+            if isinstance(projection, MlxRoutedLinear)
+            and isinstance(projection.grouped_weight, MetalMoeWeight)
+            and projection.grouped_weight.projections == 1
+            and projection.grouped_projection in (None, 0)
+        )
+        self.grouped_weight = (
+            MetalMoeWeight.concatenate_projections(grouped)
+            if len(grouped) == len(projections)
+            else None
+        )
+        self.projections = projections
+        self.n_experts = first.n_experts
+        self.out_per_expert = first.out_per_expert * len(projections)
+        self.neuron_len = first.neuron_len
+
+    @property
+    def uses_grouped_kernel(self) -> bool:
+        return self.grouped_weight is not None
+
+    def forward(
+        self,
+        x: mx.array | np.ndarray,
+        expert_ids: mx.array | np.ndarray,
+    ) -> mx.array:
+        if self.grouped_weight is not None:
+            return grouped_moe_matmul(self.grouped_weight, x, expert_ids)
+        return mx.concatenate(
+            tuple(projection(x, expert_ids) for projection in self.projections),
+            axis=-1,
+        )
+
+    def __call__(
+        self,
+        x: mx.array | np.ndarray,
+        expert_ids: mx.array | np.ndarray,
+    ) -> mx.array:
+        return self.forward(x, expert_ids)
+
+
+def load_routed_gate_up(model, prefix: str):
+    """Load canonical split Gate/Up, with legacy fused-record compatibility."""
+
+    base = prefix + ".experts"
+    gate_name = base + ".gate.weight"
+    up_name = base + ".up.weight"
+    has_gate = model.has_tensor(gate_name)
+    has_up = model.has_tensor(up_name)
+    if has_gate != has_up:
+        raise ValueError(f"incomplete routed Gate/Up pair under {base}")
+    if has_gate:
+        return MlxRoutedLinearGroup(
+            (model.routed(gate_name), model.routed(up_name))
+        )
+    return model.routed(base + ".gate_up.weight")
+
+
 class MlxRoutedSwiGLUFFN:
     """Routed gate/up/down NINTM FFN with route-weighted reduction."""
 

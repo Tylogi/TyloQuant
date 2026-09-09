@@ -313,7 +313,7 @@ def test_normalize_hf_expert_storage_preserves_mixed_nintm_plan() -> None:
     assert normalized[0].expert_precisions == precisions
 
 
-def test_balanced_random_expert_mix_is_reproducible_and_fusion_safe() -> None:
+def test_balanced_random_expert_mix_is_reproducible_and_projection_independent() -> None:
     plans = [
         TensorPlan(
             name=f"model.language_model.layers.0.mlp.experts.{suffix}.weight",
@@ -333,12 +333,13 @@ def test_balanced_random_expert_mix_is_reproducible_and_fusion_safe() -> None:
 
     assert mixed == repeated
     assignments = [item.expert_precisions for item in mixed]
-    assert assignments[0] == assignments[1] == assignments[2]
-    counts = {
-        family: sum(value.family == family for value in assignments[0] or ())
-        for family in ("NINT2", "NINT4", "NVQ2J")
-    }
-    assert max(counts.values()) - min(counts.values()) <= 1
+    assert len(set(assignments)) == len(assignments)
+    for assignment in assignments:
+        counts = {
+            family: sum(value.family == family for value in assignment or ())
+            for family in ("NINT2", "NINT4", "NVQ2J")
+        }
+        assert max(counts.values()) - min(counts.values()) <= 1
     _validate_runtime_fused_pairs(mixed)
 
 
@@ -1701,11 +1702,12 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
 
     plan = build_hf_plan(root, True, None, "F16")
     by_name = {item.name: item for item in plan}
-    assert len(plan) == 6
+    assert len(plan) == 7
     assert not any(name.startswith("model.block.2.") for name in by_name)
     embed_name = "model.block.0.attention.latent.query_embedding.weight"
     unembed_name = "model.block.0.attention.latent.output_unembedding.weight"
-    gate_up_name = "model.block.1.mlp.experts.gate_up.weight"
+    gate_name = "model.block.1.mlp.experts.gate.weight"
+    up_name = "model.block.1.mlp.experts.up.weight"
     embed = by_name[embed_name]
     unembed = by_name[unembed_name]
     assert embed.expert_shape == (2, 24, 8)
@@ -1718,20 +1720,20 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
     assert torch.equal(embed_weight, source_heads[:, :8].transpose(1, 2))
     assert torch.equal(unembed_weight, source_heads[:, 8:])
 
-    gate_up = by_name[gate_up_name]
+    gate = by_name[gate_name]
     stream = _GlmExpertRowSource(
         root,
-        gate_up.expert_shape,
-        gate_up.expert_source_names,
-        gate_up.expert_source_shards,
+        gate.expert_shape,
+        gate.expert_source_names,
+        gate.expert_source_shards,
     )
     try:
-        expert_one = stream[48:96]
+        expert_one = stream[24:48]
     finally:
         stream.close()
-    assert expert_one.shape == (48, 24)
-    assert torch.equal(expert_one[:24], tensors["model.layers.1.mlp.experts.1.gate_proj.weight"])
-    assert torch.equal(expert_one[24:], tensors["model.layers.1.mlp.experts.1.up_proj.weight"])
+    assert expert_one.shape == (24, 24)
+    assert torch.equal(expert_one, tensors["model.layers.1.mlp.experts.1.gate_proj.weight"])
+    assert by_name[up_name].expert_shape == (3, 24, 24)
 
     output = tmp_path / "tiny-glm.mfq"
     args = argparse.Namespace(
@@ -1764,11 +1766,8 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
             if not is_asset_record(record.name)
         )
         assert store[embed_name].shape == (2, 24, 8)
-        assert store[gate_up_name].shape == (
-            3,
-            48,
-            24,
-        )
+        assert store[gate_name].shape == (3, 24, 24)
+        assert store[up_name].shape == (3, 24, 24)
     finally:
         store.close()
 
@@ -1778,12 +1777,13 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
     split_args.split_max_size = 0
     split_args.split_max_tensors = 2
     convert(split_args)
-    last_shard = format_shard_path(split_output, 3, 3)
+    last_shard = format_shard_path(split_output, 4, 4)
     _header, split_store = load_mmap(last_shard)
     try:
-        assert len(split_store.paths) == 3
+        assert len(split_store.paths) == 4
         assert {name for name in split_store.records if not is_asset_record(name)} == set(by_name)
-        assert split_store[gate_up_name].shape == (3, 48, 24)
+        assert split_store[gate_name].shape == (3, 24, 24)
+        assert split_store[up_name].shape == (3, 24, 24)
     finally:
         split_store.close()
 
@@ -1795,7 +1795,7 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
         ("glm5_next", "glm5_next_text", "n_routed_experts", 3),
     ],
 )
-def test_flash_next_plan_dequantizes_and_fuses_separate_fp8_experts(
+def test_separate_expert_plan_dequantizes_fp8_without_coupling_projections(
     tmp_path,
     outer_type,
     text_type,
@@ -1844,7 +1844,8 @@ def test_flash_next_plan_dequantizes_and_fuses_separate_fp8_experts(
     canonical_prefix = f"model.block.{layer}.mlp.experts"
     canonical_metadata = "model.runtime.hash_metadata"
     assert {item.name for item in plan} == {
-        canonical_prefix + ".gate_up.weight",
+        canonical_prefix + ".gate.weight",
+        canonical_prefix + ".up.weight",
         canonical_prefix + ".down.weight",
         canonical_metadata,
     }
@@ -1858,29 +1859,28 @@ def test_flash_next_plan_dequantizes_and_fuses_separate_fp8_experts(
     ).target_dtype == "I64"
     assert not any("scale_inv" in item.name for item in plan)
 
-    gate_up = next(item for item in plan if item.name.endswith("gate_up.weight"))
-    stream = _GlmExpertRowSource(
-        root,
-        gate_up.expert_shape,
-        gate_up.expert_source_names,
-        gate_up.expert_source_shards,
-        gate_up.expert_source_quantizations,
-        gate_up.expert_source_scale_names,
-        gate_up.expert_source_scale_shards,
-    )
-    try:
-        expert_one = stream[2 * expert_hidden : 4 * expert_hidden]
-    finally:
-        stream.close()
-    assert expert_one.shape == (2 * expert_hidden, hidden)
-    torch.testing.assert_close(
-        expert_one[:expert_hidden],
-        tensors[f"{prefix}.1.gate_proj.weight"].float() * 0.01,
-    )
-    torch.testing.assert_close(
-        expert_one[expert_hidden:],
-        tensors[f"{prefix}.1.up_proj.weight"].float() * 0.02,
-    )
+    for projection, multiplier in (("gate", 0.01), ("up", 0.02)):
+        item = next(
+            value for value in plan if value.name.endswith(f".{projection}.weight")
+        )
+        stream = _GlmExpertRowSource(
+            root,
+            item.expert_shape,
+            item.expert_source_names,
+            item.expert_source_shards,
+            item.expert_source_quantizations,
+            item.expert_source_scale_names,
+            item.expert_source_scale_shards,
+        )
+        try:
+            expert_one = stream[expert_hidden : 2 * expert_hidden]
+        finally:
+            stream.close()
+        assert expert_one.shape == (expert_hidden, hidden)
+        torch.testing.assert_close(
+            expert_one,
+            tensors[f"{prefix}.1.{projection}_proj.weight"].float() * multiplier,
+        )
 
 
 def test_flash_next_conversion_embeds_self_contained_python_runtime_assets(tmp_path):
@@ -2025,7 +2025,8 @@ def test_glm5_next_plan_derives_scaled_fp8_mla_for_backbone_and_mtp(tmp_path):
 
     assert sum(name.endswith(".latent.query_embedding.weight") for name in by_name) == 2
     assert sum(name.endswith(".latent.output_unembedding.weight") for name in by_name) == 2
-    assert sum(name.endswith(".experts.gate_up.weight") for name in by_name) == 2
+    assert sum(name.endswith(".experts.gate.weight") for name in by_name) == 2
+    assert sum(name.endswith(".experts.up.weight") for name in by_name) == 2
     assert sum(name.endswith(".experts.down.weight") for name in by_name) == 2
 
 
