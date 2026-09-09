@@ -3071,46 +3071,41 @@ __device__ __forceinline__ void nint_moe_mma_profile(
             const int compact = first + tid;
             source_rows_s[tid] = compact < last ? ids_dst[compact] : -1;
         }
+        __syncthreads();
     }
 #pragma unroll
     for (int a = 0; a < ACCS_PER_WARP; ++a) {
         const int mi = warp_m0 + a * 2;
         const bool owns = mi < MTILES;
-        constexpr int output_phases = BM == 64 ? 2 : 1;
+        if (owns) {
+            nvcuda::wmma::store_matrix_sync(
+                &C_s[warp][0][0], acc[a], 16,
+                nvcuda::wmma::mem_row_major);
+        }
+        __syncwarp();
+        if (owns) {
+            const int compact0 = first + mi * 16;
+            const int gn0 = n0 + warp_n * 16;
 #pragma unroll
-        for (int phase = 0; phase < output_phases; ++phase) {
-            const bool phase_owns = owns && (BM != 64 || warp / 4 == phase);
-            const int scratch_warp = BM == 64 ? warp % 4 : warp;
-            if (phase_owns) {
-                nvcuda::wmma::store_matrix_sync(
-                    &C_s[scratch_warp][0][0], acc[a], 16,
-                    nvcuda::wmma::mem_row_major);
-            }
-            __syncthreads();
-            if (phase_owns) {
-                const int compact0 = first + mi * 16;
-                const int gn0 = n0 + warp_n * 16;
-#pragma unroll
-                for (int element = lane; element < 16 * 16; element += 32) {
-                    const int r = element / 16;
-                    const int c = element - r * 16;
-                    const int compact = compact0 + r;
-                    const int gn = gn0 + c;
-                    if (compact < last && gn < out_per_expert) {
-                        int pair;
-                        if constexpr (BM == 64) {
-                            pair = source_rows_s[mi * 16 + r];
-                        } else {
-                            pair = ids_dst[compact];
-                        }
-                        out[static_cast<size_t>(pair) * out_per_expert + gn] =
-                            __float2half_rn(C_s[scratch_warp][r][c]);
+            for (int element = lane; element < 16 * 16; element += 32) {
+                const int r = element / 16;
+                const int c = element - r * 16;
+                const int compact = compact0 + r;
+                const int gn = gn0 + c;
+                if (compact < last && gn < out_per_expert) {
+                    int pair;
+                    if constexpr (BM == 64) {
+                        pair = source_rows_s[mi * 16 + r];
+                    } else {
+                        pair = ids_dst[compact];
                     }
+                    out[static_cast<size_t>(pair) * out_per_expert + gn] =
+                        __float2half_rn(C_s[warp][r][c]);
                 }
             }
-            __syncthreads();
         }
     }
+    __syncthreads();
 }
 
 template <int GROUPS_PER_CHUNK, int BM>
@@ -3331,8 +3326,8 @@ __global__ void __launch_bounds__(256, BM >= 32 ? 3 : 1) nint_moe_hetero_mma_ker
     constexpr int fine_tiles_per_mma = BM / kRouteTile;
     __shared__ __half W_s[kMoeMmaBn][kMoeMmaBkStride<BM>];
     __shared__ __half X_s[BM][kMoeMmaBkStride<BM>];
-    __shared__ float C_s[BM == 64 ? 4 : 8][16][16];
     __shared__ int32_t source_rows_s[BM];
+    float (*C_s)[16][16] = reinterpret_cast<float (*)[16][16]>(W_s);
 
     const int ntiles_n = (out_per_expert + kMoeMmaBn - 1) / kMoeMmaBn;
     const int total_fine_tiles = tile_bounds[experts];
