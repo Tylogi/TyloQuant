@@ -561,6 +561,19 @@ void test_reduce_and_shared_gate() {
     require(
         gpu_inverse_order == inverse_order,
         "MoE inverse permutation mismatch");
+    const auto sorted_reduced = floats(
+        mfq::metal::moe_weighted_reduce_sorted(
+            mlx::core::astype(
+                array(
+                    sorted_pairs.begin(),
+                    Shape{tokens * routes, width}),
+                mlx::core::float16),
+            mfq::metal::moe_inverse_permutation(
+                array(route_order.begin(), Shape{tokens * routes})),
+            weight_array));
+    for (std::size_t index = 0; index < reduced_values.size(); ++index) {
+        require_close(sorted_reduced[index], reduced_values[index], 1e-6f);
+    }
     const auto sorted_fused = floats(
         mfq::metal::moe_weighted_reduce_shared_gate_sorted(
             mlx::core::astype(

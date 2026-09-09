@@ -68,6 +68,14 @@ mlx::core::array moe_weighted_reduce(
     const mlx::core::array& pair_output,
     const mlx::core::array& weights);
 
+// Reduce expert-contiguous routed output directly through the inverse route
+// permutation. This avoids materializing a second token-major routed tensor
+// before the weighted sum.
+mlx::core::array moe_weighted_reduce_sorted(
+    const mlx::core::array& sorted_pair_output,
+    const mlx::core::array& inverse_route_order,
+    const mlx::core::array& weights);
+
 // Invert a valid one-dimensional int32 permutation in one linear Metal pass.
 // This is substantially cheaper than argsort(order), especially for the
 // token*top_k route permutations used by grouped MoE prefill.

@@ -1508,14 +1508,9 @@ MlxDeepseekV4Moe::forward_branches(
                     "moe.routed_down",
                     down_sorted);
             }
-            auto routed_pairs = mlx::core::reshape(
-                mlx::core::take(
-                    std::move(down_sorted),
-                    moe_inverse_permutation(route_order),
-                    0),
-                Shape{rows, routes, hidden});
-            auto output = moe_weighted_reduce(
-                routed_pairs,
+            auto output = moe_weighted_reduce_sorted(
+                std::move(down_sorted),
+                moe_inverse_permutation(route_order),
                 route_weights);
             if (detail::component_profile_active()) {
                 detail::profile_eval(
@@ -1598,14 +1593,9 @@ MlxDeepseekV4Moe::forward_branches(
                     "moe.routed_down",
                     down_sorted);
             }
-            auto routed_pairs = mlx::core::reshape(
-                mlx::core::take(
-                    std::move(down_sorted),
-                    moe_inverse_permutation(route_order),
-                    0),
-                Shape{rows, routes, hidden});
-            auto output = moe_weighted_reduce(
-                routed_pairs,
+            auto output = moe_weighted_reduce_sorted(
+                std::move(down_sorted),
+                moe_inverse_permutation(route_order),
                 route_weights);
             if (detail::component_profile_active()) {
                 detail::profile_eval(

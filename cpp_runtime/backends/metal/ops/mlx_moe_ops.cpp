@@ -360,6 +360,24 @@ constexpr const char* kWeightedReduceSource = R"METAL(
     output[index] = T(value);
 )METAL";
 
+constexpr const char* kWeightedReduceSortedSource = R"METAL(
+    uint index = thread_position_in_grid.x;
+    if (index >= uint(TOKENS * WIDTH)) {
+        return;
+    }
+    uint token = index / uint(WIDTH);
+    uint column = index - token * uint(WIDTH);
+    float value = 0.0f;
+    for (uint route = 0u; route < uint(ROUTES); ++route) {
+        uint original_row = token * uint(ROUTES) + route;
+        uint sorted_row = uint(inverse_route_order[original_row]);
+        value += float(sorted_pair_output[
+            sorted_row * uint(WIDTH) + column
+        ]) * weights[original_row];
+    }
+    output[index] = T(value);
+)METAL";
+
 constexpr const char* kInversePermutationSource = R"METAL(
     uint sorted_row = thread_position_in_grid.x;
     if (sorted_row >= uint(SIZE)) {
@@ -556,6 +574,16 @@ weighted_reduce_kernel() {
         {"pair_output", "weights"},
         {"output"},
         kWeightedReduceSource);
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+weighted_reduce_sorted_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_moe_weighted_reduce_sorted",
+        {"sorted_pair_output", "inverse_route_order", "weights"},
+        {"output"},
+        kWeightedReduceSortedSource);
     return kernel;
 }
 
@@ -1130,6 +1158,50 @@ array moe_weighted_reduce(
         "weighted reduce size");
     auto outputs = weighted_reduce_kernel()(
         {pairs, route_weights},
+        {Shape{tokens, width}},
+        {pairs.dtype()},
+        {size, 1, 1},
+        {std::min(kThreads, size), 1, 1},
+        {
+            {"T", pairs.dtype()},
+            {"TOKENS", tokens},
+            {"ROUTES", routes},
+            {"WIDTH", width},
+        },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
+array moe_weighted_reduce_sorted(
+    const array& sorted_pair_output,
+    const array& inverse_route_order,
+    const array& weights) {
+    auto pairs = floating_contiguous(sorted_pair_output);
+    auto inverse = int32_contiguous(inverse_route_order);
+    auto route_weights = float32_contiguous(weights);
+    if (pairs.ndim() != 2 || inverse.ndim() != 1
+        || route_weights.ndim() != 2) {
+        throw std::invalid_argument(
+            "MoE sorted weighted reduction rank mismatch");
+    }
+    const int tokens = route_weights.shape(0);
+    const int routes = route_weights.shape(1);
+    const int width = pairs.shape(1);
+    const auto route_count = static_cast<std::size_t>(tokens)
+        * static_cast<std::size_t>(routes);
+    if (tokens <= 0 || routes <= 0 || width <= 0
+        || pairs.shape(0) != checked_int(route_count, "sorted route count")
+        || inverse.size() != route_count) {
+        throw std::invalid_argument(
+            "MoE sorted weighted reduction shape mismatch");
+    }
+    const int size = checked_int(
+        static_cast<std::size_t>(tokens) * width,
+        "sorted weighted reduce size");
+    auto outputs = weighted_reduce_sorted_kernel()(
+        {pairs, inverse, route_weights},
         {Shape{tokens, width}},
         {pairs.dtype()},
         {size, 1, 1},
