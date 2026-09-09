@@ -6810,6 +6810,28 @@ struct MixedMoeRuntime {
                 : nint_dispatch->forward(x, route);
         }
 
+        mfq_tensor_backend::Tensor shared_nint_qx;
+        mfq_tensor_backend::Tensor shared_nint_xscale;
+        int shared_nint_groups = 0;
+        int shared_nint_gs = 0;
+        if (use_nint_decode) {
+            const auto found =
+                nint_dispatch->hetero_workspaces.find(input_rows);
+            if (found != nint_dispatch->hetero_workspaces.end()) {
+                for (size_t index = 0;
+                        index < nint_dispatch->pools.size(); ++index) {
+                    const auto & weight =
+                        nint_dispatch->pools[index].weight;
+                    if (weight.gs != 24) continue;
+                    shared_nint_qx = found->second.qx[index];
+                    shared_nint_xscale = found->second.xscale[index];
+                    shared_nint_groups = static_cast<int>(weight.ng);
+                    shared_nint_gs = static_cast<int>(weight.gs);
+                    break;
+                }
+            }
+        }
+
         for (const auto & pool : pools) {
             if (pool.family == MixedMoeFamily::Nint &&
                     (use_nint_prefill || use_nint_decode)) {
@@ -6948,8 +6970,18 @@ struct MixedMoeRuntime {
                 input_rows, groups, gs, x.get_device(), transform};
             auto & workspace = activation_workspace(
                 value, input_rows, groups, gs, transform);
-            const bool input_quantized = input_prequantized ||
+            bool input_quantized = input_prequantized ||
                 quantized.find(activation_key) != quantized.end();
+            auto qx = workspace.qx;
+            auto xscale = workspace.xscale;
+            if (pool.family == MixedMoeFamily::Nvq &&
+                    shared_nint_qx.defined() &&
+                    groups == shared_nint_groups &&
+                    gs == shared_nint_gs) {
+                qx = shared_nint_qx;
+                xscale = shared_nint_xscale;
+                input_quantized = true;
+            }
             if (pool.family == MixedMoeFamily::Nint) {
                 nint_moe_grouped_matmul_pool_ws_cuda(
                     pool.nint.q_packed, pool.nint.sub_scale, pool.nint.sub_min,
@@ -6957,7 +6989,7 @@ struct MixedMoeRuntime {
                     route.ids, pool.expert_local, n_experts,
                     pool.local_experts, out_per_expert, gs, pool.nint.bits,
                     route.map_ready, input_quantized, output,
-                    workspace.qx, workspace.xscale, route.counts, route.cursors,
+                    qx, xscale, route.counts, route.cursors,
                     route.ids_dst, route.expert_bounds, route.tile_bounds,
                     route.tile_experts);
             } else if (pool.family == MixedMoeFamily::Nint8Zero) {
@@ -6966,7 +6998,7 @@ struct MixedMoeRuntime {
                     route.ids, pool.expert_local, n_experts,
                     pool.local_experts, out_per_expert, route.map_ready,
                     input_quantized, use_f16_mma, output,
-                    workspace.qx, workspace.xscale,
+                    qx, xscale,
                     route.counts, route.cursors, route.ids_dst,
                     route.expert_bounds, route.tile_bounds, route.tile_experts);
             } else if (pool.family == MixedMoeFamily::Nvq) {
@@ -6977,7 +7009,7 @@ struct MixedMoeRuntime {
                     n_experts, pool.local_experts, out_per_expert, neuron_len,
                     pool.nvq.gs, pool.nvq.sub_bits, pool.nvq.kernel_format,
                     pool.nvq.sign_mode, input_quantized, output,
-                    workspace.qx, workspace.xscale, route.ids_dst,
+                    qx, xscale, route.ids_dst,
                     route.expert_bounds, route.tile_bounds, route.tile_experts);
             } else {
                 nepq_moe_grouped_matmul_pool_ws_cuda(
@@ -6988,7 +7020,7 @@ struct MixedMoeRuntime {
                     pool.expert_local, n_experts, pool.local_experts,
                     out_per_expert, neuron_len, pool.nepq.state_bits,
                     pool.nepq.format, input_quantized, output,
-                    workspace.qx, workspace.xscale, route.ids_dst,
+                    qx, xscale, route.ids_dst,
                     route.expert_bounds, route.tile_bounds, route.tile_experts);
                 if (pool.nepq.residual) {
                     nepq_sparse_residual_grouped_cuda(
