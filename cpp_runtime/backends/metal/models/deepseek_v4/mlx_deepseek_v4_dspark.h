@@ -3,6 +3,7 @@
 #include "deepseek_v4_model.h"
 #include "mlx_deepseek_v4_moe.h"
 #include "mlx_hf_tensor.h"
+#include "mlx_mtp.h"
 #include "mlx_tensor.h"
 
 #include <cstddef>
@@ -140,9 +141,17 @@ public:
         MlxDeepseekV4DSparkState& state,
         int start_position) const;
 
-    // Produce 1..dspark_block_size tokens from anchor_ids [B,1].  Draft block
-    // attention is non-causal by checkpoint design; Markov bias is then
-    // applied left-to-right before each greedy decision.
+    // Produce 1..dspark_block_size tokens from anchor_ids [B,1]. Draft block
+    // attention is non-causal by checkpoint design; Markov bias is applied
+    // left-to-right and the backend-wide selector owns sampling policy.
+    MlxDeepseekV4DSparkDraft draft(
+        const mlx::core::array& anchor_ids,
+        MlxDeepseekV4DSparkState& state,
+        const MlxMtpTokenSelector& select_token,
+        int width = 0) const;
+
+    // Test/reference convenience; production generation uses draft() so it
+    // shares the runtime sampler with every other MTP implementation.
     MlxDeepseekV4DSparkDraft draft_greedy(
         const mlx::core::array& anchor_ids,
         MlxDeepseekV4DSparkState& state,

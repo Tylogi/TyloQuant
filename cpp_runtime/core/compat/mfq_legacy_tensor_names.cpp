@@ -710,8 +710,8 @@ void add_deepseek_v4_aliases(
     static const std::unordered_map<std::string_view, std::string_view>
         predictor_suffixes{
             {"main_norm.weight", "main_norm.weight"},
-            {"main_projection.weight", "main_proj.weight"},
-            {"output_norm.weight", "norm.weight"},
+            {"main_proj.weight", "main_projection.weight"},
+            {"norm.weight", "output_norm.weight"},
             {"hc_head_fn", "mhc.output.function"},
             {"hc_head_base", "mhc.output.base"},
             {"hc_head_scale", "mhc.output.scale"},

@@ -421,62 +421,6 @@ std::vector<array> expert_availability(
     return result;
 }
 
-array normalize_eos_ids(
-    const std::vector<std::int64_t>& values,
-    int vocab) {
-    std::vector<std::int32_t> result;
-    result.reserve(values.size());
-    for (const auto token : values) {
-        if (token < 0 || token >= vocab) {
-            throw std::invalid_argument(
-                "DeepSeek-V4 EOS token is out of range");
-        }
-        result.push_back(
-            static_cast<std::int32_t>(token));
-    }
-    return array(
-        result.begin(),
-        Shape{static_cast<int>(result.size())},
-        mlx::core::int32);
-}
-
-array last_token_logits(
-    const array& logits,
-    int vocab,
-    bool preserve_batch_axis = true) {
-    if (logits.ndim() != 3 ||
-        logits.shape(0) <= 0 ||
-        logits.shape(1) <= 0 ||
-        logits.shape(2) != vocab) {
-        throw std::runtime_error(
-            "DeepSeek-V4 logits must have "
-            "[batch,tokens,vocab] shape");
-    }
-    auto sliced = mlx::core::slice(
-        logits,
-        Shape{0, logits.shape(1) - 1, 0},
-        Shape{
-            logits.shape(0),
-            logits.shape(1),
-            vocab,
-        });
-    if (!preserve_batch_axis) {
-        return sliced;
-    }
-    return mlx::core::reshape(
-        std::move(sliced),
-        Shape{logits.shape(0), vocab});
-}
-
-bool contains_token(
-    const std::vector<std::int64_t>& values,
-    std::int64_t token) {
-    return std::find(
-        values.begin(),
-        values.end(),
-        token) != values.end();
-}
-
 } // namespace
 
 MlxDeepseekV4Layer MlxDeepseekV4Layer::load(
@@ -883,6 +827,18 @@ array MlxDeepseekV4Layer::forward(
         "layer.ffn_hc_post",
         output);
     return output;
+}
+
+void MlxDeepseekV4Layer::commit_speculative(
+    MlxDeepseekV4LayerState& state) const noexcept {
+    components_.attention.commit_speculative(state);
+}
+
+void MlxDeepseekV4Layer::rollback_speculative(
+    MlxDeepseekV4LayerState& state,
+    int accepted_tokens) const {
+    components_.attention.rollback_speculative(
+        state, accepted_tokens);
 }
 
 MlxDeepseekV4CausalLm
@@ -1297,6 +1253,45 @@ void MlxDeepseekV4CausalLm::materialize_state(
     arrays.reserve(11);
     append_state_arrays(state, arrays);
     detail::eval_with_timing(std::move(arrays));
+}
+
+void MlxDeepseekV4CausalLm::begin_speculative_target(
+    int confirmed_tokens,
+    int total_tokens) {
+    if (states_.size() != layers_.size() ||
+        confirmed_tokens <= 0 || total_tokens <= confirmed_tokens) {
+        throw std::runtime_error(
+            "invalid DeepSeek-V4 target cache transaction");
+    }
+    for (auto& state : states_) {
+        state.begin_speculative(confirmed_tokens, total_tokens);
+        // The target cache uses in-place ring writes. Resolve each compact
+        // checkpoint before verification can overwrite those physical rows.
+        materialize_state(state.speculative_checkpoint());
+    }
+}
+
+void MlxDeepseekV4CausalLm::commit_speculative_target() noexcept {
+    for (std::size_t index = 0; index < layers_.size(); ++index) {
+        layers_[index].commit_speculative(states_[index]);
+    }
+}
+
+void MlxDeepseekV4CausalLm::rollback_speculative_target(
+    int accepted_tokens,
+    int draft_tokens) {
+    if (draft_tokens <= 0 || accepted_tokens < 0 ||
+        accepted_tokens >= draft_tokens ||
+        draft_tokens > cache_position_) {
+        throw std::runtime_error(
+            "invalid DeepSeek-V4 target cache rollback");
+    }
+    for (std::size_t index = 0; index < layers_.size(); ++index) {
+        layers_[index].rollback_speculative(
+            states_[index], accepted_tokens);
+        materialize_state(states_[index]);
+    }
+    cache_position_ -= draft_tokens - accepted_tokens;
 }
 
 array MlxDeepseekV4CausalLm::head(
@@ -1741,7 +1736,7 @@ array MlxDeepseekV4CausalLm::prefill_impl(
                   std::move(outputs),
                   1);
     }
-    return last_token_logits(
+    return mlx_last_token_logits(
         *last,
         checked_int(
             config_.vocab,
@@ -2017,13 +2012,13 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     const auto& eos = eos_token_ids.has_value()
         ? *eos_token_ids
         : config_.eos_token_id;
-    (void)normalize_eos_ids(eos, vocab);
+    mlx_validate_token_set(eos, vocab);
     if (max_tokens == 0) {
+        last_mtp_stats_ = {dspark_.has_value(), false, 0, 0, 0};
         return 0;
     }
     const bool dspark_candidate =
-        dspark_.has_value() && sampling.enable_mtp && sampling.greedy() &&
-        !sampling.has_penalties() && !token_constraint &&
+        dspark_.has_value() && sampling.enable_mtp && !token_constraint &&
         max_tokens > 1;
 
     const int prompt_count =
@@ -2154,6 +2149,13 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
 
     const bool dspark_active =
         dspark_candidate && reused_tokens == 0 && stable_count == 0;
+    last_mtp_stats_ = {
+        dspark_.has_value(),
+        dspark_active,
+        0,
+        0,
+        0,
+    };
     std::optional<MlxDeepseekV4DSparkState> dspark_state;
     if (dspark_active) {
         dspark_state.emplace(
@@ -2212,7 +2214,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 dspark_->append_context(
                     target_hidden, *dspark_state, position);
                 cache_position_ += static_cast<int>(stop - start);
-                last = last_token_logits(chunk_logits, vocab);
+                last = mlx_last_token_logits(chunk_logits, vocab);
             }
             if (!last) {
                 throw std::runtime_error(
@@ -2331,155 +2333,139 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     MlxSampler sampler(sampling);
 
     if (dspark_active) {
-        if (!dspark_state.has_value()) {
+        if (!dspark_state) {
             throw std::runtime_error(
                 "DeepSeek-V4 DSpark state was not initialized");
         }
-        std::int32_t generated = 0;
-        const auto greedy_token = [&](const array& value) {
-            auto sampled = sample_greedy(value);
-            sampled.eval();
-            const auto token = sampled.data<std::int32_t>()[0];
-            if (token < 0 || token >= vocab) {
-                throw std::runtime_error(
-                    "DeepSeek-V4 DSpark sampler returned an invalid token");
-            }
-            return token;
-        };
-        const auto emit = [&](std::int32_t token) {
-            ++generated;
-            const bool delivered = !callback || callback(token);
-            return delivered && !contains_token(eos, token) &&
-                generated < max_tokens;
-        };
-        auto current_logits = logits;
-        while (generated < max_tokens) {
-            const auto anchor = greedy_token(current_logits);
-            if (!emit(anchor)) {
-                return generated;
-            }
 
-            const int remaining = max_tokens - generated;
-            const int cache_available = max_context_ - cache_position_;
-            const int width = std::min({
-                dspark_->block_size(),
-                remaining - 1,
-                cache_available - 2,
-            });
-            if (width <= 0) {
+        MlxMtpEngineCallbacks mtp_callbacks;
+        mtp_callbacks.target_cache_position = [this] {
+            return cache_position_;
+        };
+        mtp_callbacks.prepare_draft =
+            [&](const MlxMtpDraftContext& context,
+                const MlxMtpTokenSelector& select_token) {
+                if (!context.initial) {
+                    if (context.verified_hidden == nullptr) {
+                        throw std::runtime_error(
+                            "DeepSeek-V4 verified DSpark history is unavailable");
+                    }
+                    const int committed = context.accepted_drafts + 1;
+                    if (context.verified_hidden->ndim() != 3 ||
+                        context.verified_hidden->shape(0) != 1 ||
+                        context.verified_hidden->shape(1) < committed) {
+                        throw std::runtime_error(
+                            "DeepSeek-V4 verified DSpark history is malformed");
+                    }
+                    auto committed_hidden = mlx::core::slice(
+                        *context.verified_hidden,
+                        Shape{0, 0, 0},
+                        Shape{
+                            1,
+                            committed,
+                            context.verified_hidden->shape(2),
+                        });
+                    dspark_->append_context(
+                        committed_hidden,
+                        *dspark_state,
+                        context.target_cache_start);
+                }
+                if (context.requested_depth == 0) {
+                    return;
+                }
                 const array anchor_ids(
-                    {anchor}, Shape{1, 1}, mlx::core::int32);
-                array target_hidden(0.0f);
-                auto advanced = forward_chunk(
+                    {context.pending_token},
+                    Shape{1, 1},
+                    mlx::core::int32);
+                (void)dspark_->draft(
                     anchor_ids,
+                    *dspark_state,
+                    select_token,
+                    context.requested_depth);
+            };
+        mtp_callbacks.verify_target =
+            [&](std::int32_t pending_token,
+                const array& draft_tokens,
+                int draft_count) {
+                if (draft_count > 0) {
+                    begin_speculative_target(1, draft_count + 1);
+                }
+
+                std::vector<std::int32_t> speculative_ids;
+                speculative_ids.reserve(
+                    static_cast<std::size_t>(draft_count + 1));
+                speculative_ids.push_back(pending_token);
+                if (draft_count > 0) {
+                    auto resolved_drafts = draft_tokens;
+                    resolved_drafts.eval();
+                    const auto* values =
+                        resolved_drafts.data<std::int32_t>();
+                    speculative_ids.insert(
+                        speculative_ids.end(),
+                        values,
+                        values + draft_count);
+                }
+                const array verify_ids(
+                    speculative_ids.begin(),
+                    Shape{1, draft_count + 1},
+                    mlx::core::int32);
+                array target_hidden(0.0f);
+                auto verified_logits = forward_chunk(
+                    verify_ids,
                     cache_position_,
                     true,
                     std::nullopt,
                     nullptr,
                     &target_hidden);
-                dspark_->append_context(
-                    target_hidden,
-                    *dspark_state,
-                    cache_position_);
-                ++cache_position_;
-                current_logits = last_token_logits(advanced, vocab);
-                continue;
-            }
-
-            const array anchor_ids(
-                {anchor}, Shape{1, 1}, mlx::core::int32);
-            auto proposal = dspark_->draft_greedy(
-                anchor_ids, *dspark_state, width);
-            proposal.tokens.eval();
-            std::vector<std::int32_t> drafts(
-                proposal.tokens.data<std::int32_t>(),
-                proposal.tokens.data<std::int32_t>() + width);
-            for (const auto token : drafts) {
-                if (token < 0 || token >= vocab) {
-                    throw std::runtime_error(
-                        "DeepSeek-V4 DSpark produced an invalid draft token");
+                cache_position_ += draft_count + 1;
+                return MlxMtpTargetBatch{
+                    mlx::core::reshape(
+                        verified_logits,
+                        Shape{draft_count + 1, vocab}),
+                    std::move(target_hidden),
+                };
+            };
+        mtp_callbacks.resolve_target =
+            [&](int accepted_drafts, int draft_count) {
+                if (draft_count == 0) {
+                    return;
                 }
-            }
-
-            std::vector<MlxDeepseekV4LayerState> checkpoint;
-            checkpoint.reserve(states_.size());
-            for (const auto& state : states_) {
-                checkpoint.push_back(state.snapshot());
-                materialize_state(checkpoint.back());
-            }
-            const int checkpoint_position = cache_position_;
-            std::vector<std::int32_t> verify_values;
-            verify_values.reserve(static_cast<std::size_t>(width + 1));
-            verify_values.push_back(anchor);
-            verify_values.insert(
-                verify_values.end(), drafts.begin(), drafts.end());
-            const array verify_ids(
-                verify_values.begin(),
-                Shape{1, width + 1},
+                if (accepted_drafts == draft_count) {
+                    commit_speculative_target();
+                    return;
+                }
+                rollback_speculative_target(
+                    accepted_drafts, draft_count);
+            };
+        mtp_callbacks.plain_decode = [&](std::int32_t pending_token) {
+            const array token_ids(
+                {pending_token},
+                Shape{1, 1},
                 mlx::core::int32);
-            auto verified_logits = forward_chunk(
-                verify_ids,
-                checkpoint_position,
-                true);
-            cache_position_ += width + 1;
-            auto target_tokens = sample_greedy(
-                mlx::core::reshape(
-                    verified_logits,
-                    Shape{width + 1, vocab}));
-            target_tokens.eval();
-            std::vector<std::int32_t> targets(
-                target_tokens.data<std::int32_t>(),
-                target_tokens.data<std::int32_t>() + width + 1);
-            for (const auto token : targets) {
-                if (token < 0 || token >= vocab) {
-                    throw std::runtime_error(
-                        "DeepSeek-V4 DSpark verification returned an invalid token");
-                }
-            }
-            const auto verification = verify_greedy_mtp(drafts, targets);
-
-            for (std::size_t index = 0; index < states_.size(); ++index) {
-                states_[index].restore_snapshot(
-                    std::move(checkpoint[index]));
-                materialize_state(states_[index]);
-            }
-            cache_position_ = checkpoint_position;
-
-            std::vector<std::int32_t> committed{anchor};
-            for (std::size_t index = 0;
-                 index < verification.accepted_drafts;
-                 ++index) {
-                const auto token = drafts[index];
-                if (!emit(token)) {
-                    return generated;
-                }
-                committed.push_back(token);
-            }
-            if (!emit(verification.next_token)) {
-                return generated;
-            }
-            committed.push_back(verification.next_token);
-
-            const array committed_ids(
-                committed.begin(),
-                Shape{1, static_cast<int>(committed.size())},
-                mlx::core::int32);
-            array committed_hidden(0.0f);
-            auto replayed = forward_chunk(
-                committed_ids,
+            auto output = forward_chunk(
+                token_ids,
                 cache_position_,
-                true,
-                std::nullopt,
-                nullptr,
-                &committed_hidden);
-            dspark_->append_context(
-                committed_hidden,
-                *dspark_state,
-                cache_position_);
-            cache_position_ += static_cast<int>(committed.size());
-            current_logits = last_token_logits(replayed, vocab);
-        }
-        return generated;
+                true);
+            ++cache_position_;
+            return mlx_last_token_logits(output, vocab);
+        };
+
+        return run_mlx_mtp_generation(
+            MlxMtpEngineRequest{
+                vocab,
+                max_tokens,
+                max_context_,
+                dspark_->block_size(),
+                logits,
+                sampling,
+                sampling.has_penalties()
+                    ? std::optional<array>(counts)
+                    : std::nullopt,
+                std::span<const std::int64_t>(eos),
+                callback,
+            },
+            mtp_callbacks,
+            last_mtp_stats_);
     }
 
     std::int32_t generated = 0;
@@ -2595,7 +2581,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     token))) {
             break;
         }
-        if (contains_token(eos, token) ||
+        if (mlx_token_in_set(eos, token) ||
             generated == max_tokens) {
             report_components();
             break;
@@ -2605,7 +2591,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             cache_position_,
             true);
         ++cache_position_;
-        logits = last_token_logits(
+        logits = mlx_last_token_logits(
             decoded,
             vocab);
         report_components();

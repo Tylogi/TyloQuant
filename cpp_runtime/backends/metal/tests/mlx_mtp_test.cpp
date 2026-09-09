@@ -189,6 +189,84 @@ int main() {
                     "device stochastic MTP chain mismatch");
             }
         }
+        {
+            int target_position = 0;
+            int resolved_cycles = 0;
+            std::vector<std::int64_t> emitted;
+            mfq::metal::MlxMtpEngineCallbacks callbacks;
+            callbacks.target_cache_position = [&] {
+                return target_position;
+            };
+            callbacks.prepare_draft = [](
+                const mfq::metal::MlxMtpDraftContext& context,
+                const mfq::metal::MlxMtpTokenSelector& select_token) {
+                for (int position = 0;
+                     position < context.requested_depth;
+                     ++position) {
+                    (void)select_token(mlx::core::array(
+                        {10.0f, 0.0f, 0.0f},
+                        mlx::core::Shape{1, 3}));
+                }
+            };
+            callbacks.verify_target = [&] (
+                std::int32_t,
+                const mlx::core::array&,
+                int draft_count) {
+                target_position += draft_count + 1;
+                return mfq::metal::MlxMtpTargetBatch{
+                    mlx::core::broadcast_to(
+                        mlx::core::array(
+                            {10.0f, 0.0f, 0.0f},
+                            mlx::core::Shape{1, 3}),
+                        mlx::core::Shape{draft_count + 1, 3}),
+                    mlx::core::zeros(
+                        mlx::core::Shape{1, draft_count + 1, 1}),
+                };
+            };
+            callbacks.resolve_target = [&] (
+                int accepted,
+                int drafted) {
+                target_position -= drafted - accepted;
+                ++resolved_cycles;
+            };
+            callbacks.plain_decode = [&] (std::int32_t) {
+                ++target_position;
+                return mlx::core::array(
+                    {10.0f, 0.0f, 0.0f},
+                    mlx::core::Shape{1, 3});
+            };
+
+            mfq::metal::MlxSamplingParams sampling;
+            sampling.temperature = 0.0;
+            sampling.mtp_max_draft_tokens = 2;
+            mfq::metal::MlxMtpGenerationStats stats;
+            const auto generated = mfq::metal::run_mlx_mtp_generation(
+                mfq::metal::MlxMtpEngineRequest{
+                    3,
+                    5,
+                    32,
+                    2,
+                    mlx::core::array(
+                        {10.0f, 0.0f, 0.0f},
+                        mlx::core::Shape{1, 3}),
+                    sampling,
+                    std::nullopt,
+                    {},
+                    [&](std::int64_t token) {
+                        emitted.push_back(token);
+                        return true;
+                    },
+                },
+                callbacks,
+                stats);
+            if (generated != 5 || emitted != std::vector<std::int64_t>(5, 0) ||
+                target_position != 4 || resolved_cycles != 2 ||
+                !stats.available || !stats.used || stats.cycles != 2 ||
+                stats.drafted_tokens != 2 || stats.accepted_tokens != 2) {
+                throw std::runtime_error(
+                    "architecture-independent MTP engine lifecycle mismatch");
+            }
+        }
         std::cout << "MFQ generic MTP verification tests passed\n";
         return 0;
     } catch (const std::exception& error) {

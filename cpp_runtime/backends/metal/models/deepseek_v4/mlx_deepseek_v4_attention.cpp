@@ -1461,6 +1461,14 @@ MlxDeepseekV4LayerState::MlxDeepseekV4LayerState(
       main_(std::move(main)),
       indexer_(std::move(indexer)) {}
 
+struct MlxDeepseekV4LayerSpeculation {
+    MlxDeepseekV4LayerState checkpoint;
+    std::optional<array> attention_input;
+    int confirmed_tokens;
+    int total_tokens;
+    int start_position;
+};
+
 MlxDeepseekV4LayerState
 MlxDeepseekV4LayerState::snapshot() const {
     MlxDeepseekV4LayerState result(
@@ -1495,7 +1503,39 @@ void MlxDeepseekV4LayerState::restore_snapshot(
         indexer_->restore_snapshot(
             std::move(*snapshot.indexer_));
     }
+    speculative_.reset();
     position_ = snapshot.position_;
+}
+
+void MlxDeepseekV4LayerState::begin_speculative(
+    int confirmed_tokens,
+    int total_tokens) {
+    if (speculative_ || confirmed_tokens <= 0 ||
+        total_tokens <= confirmed_tokens) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4 speculative cache transaction");
+    }
+    speculative_ = std::make_shared<MlxDeepseekV4LayerSpeculation>(
+        MlxDeepseekV4LayerSpeculation{
+            snapshot(),
+            std::nullopt,
+            confirmed_tokens,
+            total_tokens,
+            position_,
+        });
+}
+
+const MlxDeepseekV4LayerState&
+MlxDeepseekV4LayerState::speculative_checkpoint() const {
+    if (!speculative_) {
+        throw std::runtime_error(
+            "DeepSeek-V4 speculative checkpoint is unavailable");
+    }
+    return speculative_->checkpoint;
+}
+
+bool MlxDeepseekV4LayerState::has_speculative() const noexcept {
+    return static_cast<bool>(speculative_);
 }
 
 array MlxDeepseekV4LayerState::local_positions() const {
@@ -2347,6 +2387,16 @@ array MlxDeepseekV4Attention::operator()(
     }
     const int batch = source.shape(0);
     const int tokens = source.shape(1);
+    if (state.speculative_) {
+        auto& transaction = *state.speculative_;
+        if (transaction.attention_input ||
+            transaction.start_position != pos0 ||
+            transaction.total_tokens != tokens) {
+            throw std::runtime_error(
+                "DeepSeek-V4 speculative attention transaction mismatch");
+        }
+        transaction.attention_input = source;
+    }
     if (visibility != nullptr &&
         (tokens == 1 || pos0 != 0 || visibility->max_image_tokens <= 0 ||
          visibility->left.shape() != Shape{batch, tokens} ||
@@ -2759,6 +2809,42 @@ array MlxDeepseekV4Attention::operator()(
         sine);
     state.position_ += tokens;
     return result;
+}
+
+void MlxDeepseekV4Attention::commit_speculative(
+    MlxDeepseekV4LayerState& state) const noexcept {
+    state.speculative_.reset();
+}
+
+void MlxDeepseekV4Attention::rollback_speculative(
+    MlxDeepseekV4LayerState& state,
+    int accepted_tokens) const {
+    auto transaction = std::move(state.speculative_);
+    state.speculative_.reset();
+    if (!transaction || !transaction->attention_input) {
+        throw std::runtime_error(
+            "DeepSeek-V4 speculative attention checkpoint is unavailable");
+    }
+    const int speculative_tokens =
+        transaction->total_tokens - transaction->confirmed_tokens;
+    if (accepted_tokens < 0 || accepted_tokens > speculative_tokens) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 speculative acceptance count is invalid");
+    }
+    const int keep = transaction->confirmed_tokens + accepted_tokens;
+    auto input = mlx::core::slice(
+        *transaction->attention_input,
+        Shape{0, 0, 0},
+        Shape{
+            transaction->attention_input->shape(0),
+            keep,
+            transaction->attention_input->shape(2),
+        });
+    const int start = transaction->start_position;
+    state.restore_snapshot(std::move(transaction->checkpoint));
+    // Only the architecture-specific compressed attention cache is rebuilt.
+    // Decoder blocks, routed experts, HC and the LM head are not replayed.
+    (void)(*this)(input, state, start, nullptr);
 }
 
 int MlxDeepseekV4Attention::ratio() const noexcept {

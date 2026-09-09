@@ -16,6 +16,12 @@ family or source origin:
 - `tests/` — backend-independent native tests;
 - `cmake/` — backend-specific build orchestration.
 
+The mandatory ownership and canonicalization rules are defined in the
+repository [development rules](../CONTRIBUTING.md). In particular, reusable
+state machines, cache lifecycle, sampling, dispatch, metrics, multimodal
+pipelines, and MTP orchestration must never live in a model-architecture
+directory.
+
 `CMakeLists.txt` is the single entry point. Existing executable target names
 (`mfq-decode`, `mfq-decode-metal`, and `mfq-perplexity`) and the established
 Metal build output directory remain unchanged. Integrated upstream-derived

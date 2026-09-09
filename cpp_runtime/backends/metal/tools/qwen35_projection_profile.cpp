@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -31,6 +32,8 @@ using mfq::metal::MlxLinear;
 
 using Projection = std::function<std::vector<array>(const array&)>;
 
+int g_profile_rows = 1;
+
 void require(bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -38,13 +41,16 @@ void require(bool condition, const std::string& message) {
 }
 
 array make_input(int width) {
-    std::vector<float> values(static_cast<std::size_t>(width));
-    for (int index = 0; index < width; ++index) {
+    std::vector<float> values(
+        static_cast<std::size_t>(g_profile_rows)
+            * static_cast<std::size_t>(width));
+    for (std::size_t index = 0; index < values.size(); ++index) {
         values[static_cast<std::size_t>(index)] =
-            static_cast<float>((index * 17 + 11) % 127 - 63) / 256.0f;
+            static_cast<float>((index * 17u + 11u) % 127u) / 256.0f
+            - 0.24609375f;
     }
     return mlx::core::astype(
-        array(values.begin(), Shape{1, 1, width}),
+        array(values.begin(), Shape{1, g_profile_rows, width}),
         mlx::core::float16);
 }
 
@@ -146,17 +152,19 @@ void profile_full_qkv(
         warmup,
         repetitions);
 
-    MlxGroupedLinear grouped(grouped_refs({&q, &k, &v}));
-    profile(
-        prefix + "_grouped",
-        width,
-        grouped.packed_nbytes(),
-        1,
-        [&](const array& input) {
-            return grouped(input);
-        },
-        warmup,
-        repetitions);
+    if (g_profile_rows <= MlxGroupedLinear::max_rows()) {
+        MlxGroupedLinear grouped(grouped_refs({&q, &k, &v}));
+        profile(
+            prefix + "_grouped",
+            width,
+            grouped.packed_nbytes(),
+            1,
+            [&](const array& input) {
+                return grouped(input);
+            },
+            warmup,
+            repetitions);
+    }
 }
 
 void profile_gate_up(
@@ -190,26 +198,29 @@ void profile_gate_up(
         warmup,
         repetitions);
 
-    MlxGroupedLinear grouped(grouped_refs({&gate, &up}));
-    profile(
-        prefix + "_grouped",
-        width,
-        grouped.packed_nbytes(),
-        2,
-        [&](const array& input) {
-            const auto values = grouped(input);
-            return std::vector<array>{
-                values.at(0) *
-                    mlx::core::sigmoid(values.at(0)) *
-                    values.at(1),
-            };
-        },
-        warmup,
-        repetitions);
+    if (g_profile_rows <= MlxGroupedLinear::max_rows()) {
+        MlxGroupedLinear grouped(grouped_refs({&gate, &up}));
+        profile(
+            prefix + "_grouped",
+            width,
+            grouped.packed_nbytes(),
+            2,
+            [&](const array& input) {
+                const auto values = grouped(input);
+                return std::vector<array>{
+                    values.at(0) *
+                        mlx::core::sigmoid(values.at(0)) *
+                        values.at(1),
+                };
+            },
+            warmup,
+            repetitions);
+    }
 
     const auto* gate_nint = gate.nint_weight_ref();
     const auto* up_nint = up.nint_weight_ref();
-    if (gate_nint != nullptr &&
+    if (g_profile_rows == 1 &&
+        gate_nint != nullptr &&
         up_nint != nullptr &&
         gate_nint->can_fuse_swiglu(*up_nint)) {
         const auto parity_input = make_input(width);
@@ -281,6 +292,114 @@ void profile_single(
         repetitions);
 }
 
+void compare_packed_and_transient(
+    const MfqContainer& model,
+    const std::string& label,
+    const std::string& name) {
+    auto linear = MlxLinear::load(model, name);
+    const auto input = make_input(linear.input_size());
+    ::setenv("MFQ_METAL_NINT_PREFILL_PACKED_MMQ", "1", 1);
+    auto packed = mlx::core::astype(linear(input), mlx::core::float32);
+    ::setenv("MFQ_METAL_NINT_PREFILL_PACKED_MMQ", "0", 1);
+    auto transient = mlx::core::astype(linear(input), mlx::core::float32);
+    ::unsetenv("MFQ_METAL_NINT_PREFILL_PACKED_MMQ");
+    mlx::core::eval(packed, transient);
+
+    const auto* expected = packed.data<float>();
+    const auto* actual = transient.data<float>();
+    double difference_squared = 0.0;
+    double reference_squared = 0.0;
+    float maximum_absolute = 0.0f;
+    for (std::size_t index = 0; index < packed.size(); ++index) {
+        const float difference = actual[index] - expected[index];
+        maximum_absolute = std::max(maximum_absolute, std::fabs(difference));
+        difference_squared += static_cast<double>(difference) * difference;
+        reference_squared +=
+            static_cast<double>(expected[index]) * expected[index];
+    }
+    std::cout
+        << label
+        << "\tmax_abs=" << maximum_absolute
+        << "\trel_l2="
+        << std::sqrt(
+               difference_squared /
+               std::max(reference_squared, 1.0e-30))
+        << '\n';
+}
+
+void profile_nint_breakdown(
+    const MfqContainer& model,
+    const std::string& label,
+    const std::string& name,
+    int warmup,
+    int repetitions) {
+    auto linear = MlxLinear::load(model, name);
+    const auto* weight = linear.nint_weight_ref();
+    require(weight != nullptr, label + " is not a dense NINT tensor");
+    auto decode_once = [&]() {
+        auto dense = weight->dequantize(mlx::core::float16);
+        dense.eval();
+    };
+    decode_once();
+    for (int index = 0; index < warmup; ++index) {
+        decode_once();
+    }
+    mlx::core::synchronize();
+    const auto decode_started = Clock::now();
+    for (int index = 0; index < repetitions; ++index) {
+        decode_once();
+    }
+    mlx::core::synchronize();
+    const double decode_ms =
+        elapsed_ms(decode_started) / static_cast<double>(repetitions);
+
+    auto dense = weight->dequantize(mlx::core::float16);
+    dense.eval();
+    profile(
+        label + "_f16_matmul",
+        linear.input_size(),
+        dense.nbytes(),
+        1,
+        [&](const array& input) {
+            return std::vector<array>{mlx::core::matmul(
+                input, mlx::core::transpose(dense))};
+        },
+        warmup,
+        repetitions);
+
+    ::setenv("MFQ_METAL_NINT_PREFILL_PACKED_MMQ", "1", 1);
+    profile(
+        label + "_packed_nax",
+        linear.input_size(),
+        packed_bytes(linear),
+        1,
+        [&](const array& input) {
+            return std::vector<array>{linear(input)};
+        },
+        warmup,
+        repetitions);
+    ::setenv("MFQ_METAL_NINT_PREFILL_PACKED_MMQ", "0", 1);
+    profile(
+        label + "_transient_f16",
+        linear.input_size(),
+        packed_bytes(linear),
+        2,
+        [&](const array& input) {
+            return std::vector<array>{linear(input)};
+        },
+        warmup,
+        repetitions);
+    ::unsetenv("MFQ_METAL_NINT_PREFILL_PACKED_MMQ");
+
+    std::cout
+        << label << "_decode_to_f16\t"
+        << packed_bytes(linear) << "\t1\t"
+        << std::fixed << std::setprecision(4) << decode_ms << "\t"
+        << std::setprecision(1)
+        << static_cast<double>(dense.nbytes()) / (decode_ms * 1.0e6)
+        << '\n';
+}
+
 void profile_linear_alpha_beta(
     const MfqContainer& model,
     int warmup,
@@ -294,6 +413,29 @@ void profile_linear_alpha_beta(
     const auto* alpha_weight = alpha.dense_weight_ref();
     const auto* beta_weight = beta.dense_weight_ref();
     if (alpha_weight == nullptr || beta_weight == nullptr) {
+        if (g_profile_rows > MlxGroupedLinear::max_rows()) {
+            profile(
+                "linear_alpha_prefill",
+                alpha.input_size(),
+                packed_bytes(alpha),
+                1,
+                [&](const array& input) {
+                    return std::vector<array>{alpha(input)};
+                },
+                warmup,
+                repetitions);
+            profile(
+                "linear_beta_prefill",
+                beta.input_size(),
+                packed_bytes(beta),
+                1,
+                [&](const array& input) {
+                    return std::vector<array>{beta(input)};
+                },
+                warmup,
+                repetitions);
+            return;
+        }
         MlxGroupedLinear grouped(grouped_refs({&alpha, &beta}));
         profile(
             "linear_alpha_beta_grouped",
@@ -340,13 +482,66 @@ int main(int argc, char** argv) {
             "MODEL.mfq [REPETITIONS]");
         const int repetitions =
             argc >= 3 ? std::stoi(argv[2]) : 40;
+        g_profile_rows = argc >= 4 ? std::stoi(argv[3]) : 1;
         require(repetitions > 0, "repetitions must be positive");
+        require(
+            g_profile_rows > 0 && g_profile_rows <= 131072,
+            "profile rows must be in [1, 131072]");
         constexpr int warmup = 4;
 
         MfqContainer model(argv[1]);
         mfq::metal::install_legacy_tensor_compatibility(model);
         std::cout
             << "case\tpacked_bytes\tdispatches\tms\tGB/s\n";
+        if (argc >= 5 && std::string(argv[4]) == "parity") {
+            const std::vector<std::pair<std::string, std::string>> cases{
+                {"linear_qkv_l0", "model.block.0.linear_attention.qkv.weight"},
+                {"linear_gate_l0", "model.block.0.linear_attention.gate.weight"},
+                {"linear_output_l0", "model.block.0.linear_attention.output.weight"},
+                {"full_query_l3", "model.block.3.attention.query.weight"},
+                {"full_query_l63", "model.block.63.attention.query.weight"},
+                {"ffn_gate_l0", "model.block.0.mlp.gate.weight"},
+                {"ffn_gate_l50", "model.block.50.mlp.gate.weight"},
+                {"ffn_down_l0", "model.block.0.mlp.down.weight"},
+                {"ffn_down_l8", "model.block.8.mlp.down.weight"},
+                {"ffn_down_l12", "model.block.12.mlp.down.weight"},
+                {"lm_head", "model.output.weight"},
+            };
+            for (const auto& [label, name] : cases) {
+                compare_packed_and_transient(model, label, name);
+            }
+            return 0;
+        }
+        if (argc >= 5 && std::string(argv[4]) == "breakdown") {
+            profile_nint_breakdown(
+                model,
+                "ffn_gate_nint4_l0",
+                "model.block.0.mlp.gate.weight",
+                warmup,
+                repetitions);
+            profile_nint_breakdown(
+                model,
+                "ffn_down_nint6_l0",
+                "model.block.0.mlp.down.weight",
+                warmup,
+                repetitions);
+            return 0;
+        }
+        if (argc >= 5 && std::string(argv[4]) == "ffn") {
+            profile_gate_up(
+                model,
+                0,
+                "ffn_swiglu_nint4_l0",
+                warmup,
+                repetitions);
+            profile_single(
+                model,
+                "ffn_down_nint6_l0",
+                "model.block.0.mlp.down.weight",
+                warmup,
+                repetitions);
+            return 0;
+        }
         profile_single(
             model,
             "linear_qkv_nint6_l0",

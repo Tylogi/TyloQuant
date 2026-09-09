@@ -832,6 +832,18 @@ int main() {
                             source_row * packed_row_size + index]);
                 }
             }
+
+            auto dequantized = astype(weight.dequantize(), float32);
+            dequantized.eval();
+            const auto* dense_values = dequantized.data<float>();
+            for (int output_row = 0; output_row < 2; ++output_row) {
+                for (int index = 0; index < input_size; ++index) {
+                    require_close(
+                        dense_values[output_row * input_size + index],
+                        fixture.quantized[
+                            output_row * packed_row_size + index]);
+                }
+            }
         }
         test_nint5_gs28_decode();
         test_nint3_gs24_decode();

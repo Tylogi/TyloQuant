@@ -437,6 +437,33 @@ int main() {
         require_close(rewritten.second.data<float>()[4], 15.0f);
         require_close(rewritten.second.data<float>()[5], 16.0f);
 
+        mfq::metal::MlxSequenceCache sequence_cache(8, 2, float32);
+        sequence_cache.reset(1, 1);
+        sequence_cache.append(
+            array({1.0f, 2.0f}, Shape{1, 1, 2}));
+        auto sequence = sequence_cache.append(
+            array(
+                {3.0f, 4.0f, 5.0f, 6.0f},
+                Shape{1, 2, 2}));
+        sequence.first.eval();
+        if (sequence.second != 1 || sequence_cache.position() != 3 ||
+            sequence.first.shape() != Shape{1, 3, 2}) {
+            throw std::runtime_error(
+                "sequence cache append/growth mismatch");
+        }
+        const float expected_sequence[] = {
+            1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f,
+        };
+        for (int index = 0; index < 6; ++index) {
+            require_close(
+                sequence.first.data<float>()[index],
+                expected_sequence[index]);
+        }
+        sequence_cache.clear();
+        if (sequence_cache.position() != 0) {
+            throw std::runtime_error("sequence cache clear mismatch");
+        }
+
         const array query(
             {0.0f, 0.0f, 0.0f, 0.0f},
             Shape{1, 1, 2, 2});

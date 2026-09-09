@@ -648,4 +648,92 @@ void MlxKvCache::restore_snapshot(MlxKvCacheSnapshot&& snapshot) {
     position_ = snapshot.position;
 }
 
+MlxSequenceCache::MlxSequenceCache(
+    int maximum_sequence,
+    int width,
+    mlx::core::Dtype dtype)
+    : maximum_sequence_(maximum_sequence),
+      width_(width),
+      dtype_(dtype) {
+    if (maximum_sequence_ <= 0 || width_ <= 0 ||
+        (dtype_ != mlx::core::float16 &&
+         dtype_ != mlx::core::bfloat16 &&
+         dtype_ != mlx::core::float32)) {
+        throw std::invalid_argument("invalid MLX sequence cache geometry");
+    }
+}
+
+void MlxSequenceCache::reset(
+    int batch,
+    int initial_capacity) {
+    if (batch <= 0 || initial_capacity <= 0) {
+        throw std::invalid_argument("invalid MLX sequence cache allocation");
+    }
+    batch_ = batch;
+    position_ = 0;
+    const int capacity = std::min(
+        maximum_sequence_, initial_capacity);
+    values_ = mlx::core::zeros(
+        Shape{batch_, capacity, width_}, dtype_);
+}
+
+std::pair<array, int> MlxSequenceCache::append(
+    const array& value) {
+    if (value.ndim() != 3 || value.shape(0) <= 0 ||
+        value.shape(1) <= 0 || value.shape(2) != width_) {
+        throw std::runtime_error("MLX sequence-cache append mismatch");
+    }
+    if (!values_ || batch_ != value.shape(0)) {
+        reset(value.shape(0), std::max(16, value.shape(1)));
+    }
+    const int start = position_;
+    const int end = start + value.shape(1);
+    ensure_capacity(end);
+    *values_ = mlx::core::slice_update(
+        *values_,
+        value.dtype() == dtype_
+            ? value
+            : mlx::core::astype(value, dtype_),
+        Shape{0, start, 0},
+        Shape{batch_, end, width_});
+    position_ = end;
+    return {
+        mlx::core::slice(
+            *values_,
+            Shape{0, 0, 0},
+            Shape{batch_, end, width_}),
+        start,
+    };
+}
+
+void MlxSequenceCache::clear() noexcept {
+    values_.reset();
+    batch_ = 0;
+    position_ = 0;
+}
+
+void MlxSequenceCache::ensure_capacity(int required) {
+    if (!values_) {
+        throw std::runtime_error("MLX sequence cache is not initialized");
+    }
+    if (required <= values_->shape(1)) {
+        return;
+    }
+    if (required > maximum_sequence_) {
+        throw std::runtime_error("MLX sequence cache exceeds context capacity");
+    }
+    int capacity = values_->shape(1);
+    while (capacity < required) {
+        capacity = std::min(maximum_sequence_, capacity * 2);
+    }
+    auto expanded = mlx::core::zeros(
+        Shape{batch_, capacity, width_}, dtype_);
+    expanded = mlx::core::slice_update(
+        expanded,
+        *values_,
+        Shape{0, 0, 0},
+        Shape{batch_, values_->shape(1), width_});
+    values_ = std::move(expanded);
+}
+
 } // namespace mfq::metal

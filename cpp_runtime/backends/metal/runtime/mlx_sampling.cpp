@@ -966,6 +966,43 @@ array run_hierarchical_top_k(
 
 } // namespace
 
+array mlx_last_token_logits(
+    const array& logits,
+    int vocab) {
+    if (vocab <= 0 || logits.ndim() != 3 ||
+        logits.shape(0) <= 0 || logits.shape(1) <= 0 ||
+        logits.shape(2) != vocab) {
+        throw std::runtime_error(
+            "generation logits must have [batch,tokens,vocab] shape");
+    }
+    return mlx::core::reshape(
+        mlx::core::slice(
+            logits,
+            Shape{0, logits.shape(1) - 1, 0},
+            Shape{logits.shape(0), logits.shape(1), vocab}),
+        Shape{logits.shape(0), vocab});
+}
+
+void mlx_validate_token_set(
+    std::span<const std::int64_t> token_ids,
+    int vocab) {
+    if (vocab <= 0) {
+        throw std::invalid_argument("vocabulary size must be positive");
+    }
+    for (const auto token : token_ids) {
+        if (token < 0 || token >= vocab) {
+            throw std::invalid_argument("token set contains an invalid ID");
+        }
+    }
+}
+
+bool mlx_token_in_set(
+    std::span<const std::int64_t> token_ids,
+    std::int64_t token) noexcept {
+    return std::find(token_ids.begin(), token_ids.end(), token) !=
+        token_ids.end();
+}
+
 array sample_greedy(const array& logits) {
     auto view = normalize_logits(logits);
     auto outputs = greedy_kernel()(

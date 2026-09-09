@@ -3922,15 +3922,6 @@ std::vector<Bound> parse_bounds(
     return result;
 }
 
-array last_logits(const array& logits, int vocab) {
-    return mlx::core::reshape(
-        mlx::core::slice(
-            logits,
-            Shape{0, logits.shape(1) - 1, 0},
-            Shape{1, logits.shape(1), vocab}),
-        Shape{1, vocab});
-}
-
 } // namespace
 
 namespace detail {
@@ -4623,7 +4614,7 @@ public:
             nullptr,
             nullptr,
             true);
-        auto logits = last_logits(
+        auto logits = mlx_last_token_logits(
             language.logits(hidden), language.config().vocab);
         return {std::move(logits), std::move(hidden)};
     }
@@ -5378,7 +5369,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
             if (fused_greedy) {
                 return implementation_->language.forward_greedy(ids, true);
             }
-            return last_logits(
+            return mlx_last_token_logits(
                 implementation_->language.forward(ids, true),
                 config.vocab);
         };
@@ -5491,7 +5482,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
         }
         logits = fused_greedy
             ? implementation_->language.forward_greedy(token_ids, true)
-            : last_logits(
+            : mlx_last_token_logits(
                   implementation_->language.forward(token_ids, true),
                   config.vocab);
         detail::profile_eval("minicpmo.logits", logits);
@@ -5574,7 +5565,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
                 true);
         result.logits =
             implementation_->language.logits(result.hidden_states);
-        auto value = last_logits(result.logits, config.vocab);
+        auto value = mlx_last_token_logits(result.logits, config.vocab);
         if (prefill_callback) detail::eval_with_timing(value);
         if (prefill_callback) {
             llm_prefill_ms = std::chrono::duration<double, std::milli>(
@@ -5669,7 +5660,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
         }
         logits = fused_greedy
             ? implementation_->language.forward_greedy(token_ids, true)
-            : last_logits(
+            : mlx_last_token_logits(
                   implementation_->language.forward(token_ids, true),
                   config.vocab);
         detail::profile_eval("minicpmo.logits", logits);

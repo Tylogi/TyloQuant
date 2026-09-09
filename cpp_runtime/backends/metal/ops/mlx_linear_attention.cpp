@@ -212,6 +212,140 @@ constexpr const char* kGatedDeltaNetSource = R"METAL(
     }
 )METAL";
 
+// Blocked-sequential layout adapted from oMLX's Apache-2.0 GDN prefill
+// kernel.  MFQ keeps the operation architecture-neutral here and adapts the
+// input layout, logarithmic decay convention, output scaling, grouped-head
+// mapping, and state orientation to the generic gated_delta_net contract.
+constexpr const char* kGatedDeltaNetBlockedSource = R"METAL(
+    constexpr uint TB = 16u;
+    constexpr uint DB = 32u;
+    constexpr uint SEGMENT = 16u;
+    constexpr uint SEGMENTS = uint(D) / SEGMENT;
+
+    uint tid = thread_index_in_threadgroup;
+    uint block = threadgroup_position_in_grid.x;
+    uint value_head = threadgroup_position_in_grid.y;
+    uint batch = threadgroup_position_in_grid.z;
+    uint value_row = tid / SEGMENTS;
+    uint segment = tid - value_row * SEGMENTS;
+    uint value_dimension = block * DB + value_row;
+    uint key_start = segment * SEGMENT;
+
+    uint query_head = TILED_HEADS != 0
+        ? value_head % uint(HQ)
+        : value_head / uint(HV / HQ);
+
+    threadgroup float key_tile[TB][uint(D) + 8u];
+    threadgroup float query_tile[TB][uint(D) + 8u];
+    threadgroup float value_tile[TB][DB + 8u];
+    threadgroup float decay_tile[TB];
+    threadgroup float beta_tile[TB];
+
+    uint query_base =
+        ((batch * uint(HQ) + query_head) * uint(TOKENS)) * uint(D);
+    uint value_base =
+        ((batch * uint(HV) + value_head) * uint(TOKENS)) * uint(D) +
+        block * DB;
+    uint gate_base =
+        (batch * uint(HV) + value_head) * uint(TOKENS);
+    uint state_base =
+        (batch * uint(HV) + value_head) * uint(D * D);
+
+    float4 state_fragment[4];
+    {
+        const device float4* source =
+            reinterpret_cast<const device float4*>(
+                state_in + state_base + value_dimension * uint(D) +
+                key_start);
+        for (uint item = 0u; item < 4u; ++item) {
+            state_fragment[item] = source[item];
+        }
+    }
+
+    const float output_scale = rsqrt(float(D));
+    for (uint token_start = 0u;
+         token_start < uint(TOKENS);
+         token_start += TB) {
+        uint tile_tokens = min(TB, uint(TOKENS) - token_start);
+
+        for (uint item = tid;
+             item < tile_tokens * uint(D);
+             item += 256u) {
+            uint row = item / uint(D);
+            uint dimension = item - row * uint(D);
+            uint source =
+                query_base + (token_start + row) * uint(D) + dimension;
+            key_tile[row][dimension] = k[source];
+            query_tile[row][dimension] = q[source];
+        }
+        for (uint item = tid;
+             item < tile_tokens * DB;
+             item += 256u) {
+            uint row = item / DB;
+            uint dimension = item - row * DB;
+            value_tile[row][dimension] =
+                v[value_base + (token_start + row) * uint(D) + dimension];
+        }
+        for (uint item = tid; item < tile_tokens; item += 256u) {
+            decay_tile[item] = exp(g[gate_base + token_start + item]);
+            beta_tile[item] = beta[gate_base + token_start + item];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint token = 0u; token < tile_tokens; ++token) {
+            const threadgroup float4* key_values =
+                reinterpret_cast<const threadgroup float4*>(
+                    &key_tile[token][key_start]);
+            const threadgroup float4* query_values =
+                reinterpret_cast<const threadgroup float4*>(
+                    &query_tile[token][key_start]);
+            float decay = decay_tile[token];
+
+            float4 projected = 0.0f;
+            float4 key_fragment[4];
+            for (uint item = 0u; item < 4u; ++item) {
+                key_fragment[item] = key_values[item];
+                state_fragment[item] *= decay;
+                projected += state_fragment[item] * key_fragment[item];
+            }
+            float projected_key =
+                projected.x + projected.y + projected.z + projected.w;
+            projected_key += simd_shuffle_down(projected_key, 4u);
+            projected_key += simd_shuffle_down(projected_key, 2u);
+            projected_key += simd_shuffle_down(projected_key, 1u);
+            uint row_first_lane = (tid & 31u) / SEGMENTS * SEGMENTS;
+            projected_key = simd_shuffle(projected_key, row_first_lane);
+
+            float delta =
+                (value_tile[token][value_row] - projected_key) *
+                beta_tile[token];
+            float4 result = 0.0f;
+            for (uint item = 0u; item < 4u; ++item) {
+                state_fragment[item] += key_fragment[item] * delta;
+                result += state_fragment[item] * query_values[item];
+            }
+            float output = result.x + result.y + result.z + result.w;
+            output += simd_shuffle_down(output, 4u);
+            output += simd_shuffle_down(output, 2u);
+            output += simd_shuffle_down(output, 1u);
+            if (segment == 0u) {
+                out[value_base +
+                    (token_start + token) * uint(D) + value_row] =
+                    output * output_scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    {
+        device float4* destination = reinterpret_cast<device float4*>(
+            state_out + state_base + value_dimension * uint(D) + key_start);
+        for (uint item = 0u; item < 4u; ++item) {
+            destination[item] = state_fragment[item];
+        }
+    }
+)METAL";
+
 constexpr const char* kSsmConvSiluSource = R"METAL(
     uint index = thread_position_in_grid.x;
     if (index >= uint(B * TOKENS * C)) {
@@ -424,6 +558,23 @@ const mlx::core::fast::CustomKernelFunction& gdn_kernel() {
     return kernel;
 }
 
+const mlx::core::fast::CustomKernelFunction& gdn_blocked_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_gated_delta_net_blocked_v1",
+            {"q", "k", "v", "g", "beta", "state_in"},
+            {"out", "state_out"},
+            kGatedDeltaNetBlockedSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
 mlx::core::fast::CustomKernelFunction make_ssm_conv_kernel() {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
@@ -614,6 +765,15 @@ bool cached_depthwise_conv_fast_path_enabled() noexcept {
     return enabled;
 }
 
+bool gdn_blocked_prefill_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* setting =
+            std::getenv("MFQ_METAL_GDN_BLOCKED_PREFILL");
+        return setting == nullptr || std::atoi(setting) != 0;
+    }();
+    return enabled;
+}
+
 std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
 gdn_templates(
     int batch,
@@ -714,6 +874,52 @@ MlxGatedDeltaNetResult gated_delta_net(
         return {
             mlx::core::zeros(v.shape(), mlx::core::float32),
             std::move(state_values),
+        };
+    }
+
+    // The blocked kernel stores each value row's key-vector contiguously in
+    // registers.  Convert the legacy [key,value] state orientation only at
+    // the operation boundary; callers and cache serialization retain the
+    // existing public contract.  The two tiny state transposes are amortized
+    // over a long prefill and avoid repeatedly streaming q/k/state per value
+    // column in the old kernel.
+    const bool use_blocked_prefill =
+        gdn_blocked_prefill_enabled() &&
+        !key_decay_attention && tokens >= 64 && dimension == 128;
+    if (use_blocked_prefill) {
+        auto blocked_state = transposed_state
+            ? state_values
+            : mlx::core::contiguous(mlx::core::transpose(
+                  state_values, {0, 1, 3, 2}));
+        const int value_blocks = dimension / 32;
+        auto outputs = gdn_blocked_kernel()(
+            {q, k, v, g, beta_values, blocked_state},
+            {v.shape(), state_shape},
+            {mlx::core::float32, mlx::core::float32},
+            {checked_int(
+                 static_cast<std::int64_t>(value_blocks) * 256,
+                 "blocked GDN grid"),
+             value_heads,
+             batch},
+            {256, 1, 1},
+            {
+                {"B", batch},
+                {"HQ", query_heads},
+                {"HV", value_heads},
+                {"TOKENS", tokens},
+                {"D", dimension},
+                {"TILED_HEADS", static_cast<int>(tiled_heads)},
+            },
+            std::nullopt,
+            false,
+            {});
+        auto next_state = transposed_state
+            ? std::move(outputs.at(1))
+            : mlx::core::contiguous(mlx::core::transpose(
+                  outputs.at(1), {0, 1, 3, 2}));
+        return {
+            std::move(outputs.at(0)),
+            std::move(next_state),
         };
     }
 

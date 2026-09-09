@@ -30,6 +30,8 @@ public:
     mlx::core::array swiglu(
         const MlxNintWeight& up,
         const mlx::core::array& input) const;
+    mlx::core::array dequantize(
+        mlx::core::Dtype dtype = mlx::core::float16) const;
     mlx::core::array embedding(
         const mlx::core::array& token_ids,
         mlx::core::Dtype dtype = mlx::core::float16) const;

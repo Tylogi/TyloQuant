@@ -254,6 +254,7 @@ NINT 在每个输出神经元的权重行内共享仿射元数据，并把节省
 
 ### 运行时与验证
 
+- [开发守则与架构边界](./CONTRIBUTING.md)
 - [运行时支持矩阵](./docs/runtime-support.md)
 - [运行时采样配置](./docs/runtime-sampling-profiles.md)
 - [原生 CUDA 运行时验证](./docs/cuda-native-runtime-validation.md)

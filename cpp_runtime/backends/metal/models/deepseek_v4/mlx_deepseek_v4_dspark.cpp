@@ -855,9 +855,10 @@ void MlxDeepseekV4DSpark::append_context(
     state.position_ += source.shape(1);
 }
 
-MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft_greedy(
+MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft(
     const array& anchor_ids,
     MlxDeepseekV4DSparkState& state,
+    const MlxMtpTokenSelector& select_token,
     int width) const {
     auto anchors = anchor_ids;
     if (anchors.dtype() != mlx::core::int32) {
@@ -921,7 +922,7 @@ MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft_greedy(
             impl_->head_components.markov_output(markov),
             mlx::core::float32);
         auto row = slice_axis(base_logits, 1, position, position + 1) + bias;
-        auto next = sample_greedy(row);
+        auto next = select_token(row);
         if (next.ndim() == 1) {
             next = mlx::core::reshape(next, Shape{state.batch(), 1});
         }
@@ -943,6 +944,19 @@ MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft_greedy(
         std::move(logit_values),
         std::move(confidence),
     };
+}
+
+MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft_greedy(
+    const array& anchor_ids,
+    MlxDeepseekV4DSparkState& state,
+    int width) const {
+    return draft(
+        anchor_ids,
+        state,
+        [](const array& logits) {
+            return sample_greedy(logits);
+        },
+        width);
 }
 
 int MlxDeepseekV4DSpark::block_size() const noexcept {

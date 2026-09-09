@@ -3087,7 +3087,8 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
     }
     if (experts <= 0 || experts > 1024) {
         throw std::invalid_argument(
-            "grouped MMQ block builder requires 1..1024 experts");
+            "grouped MMQ block builder requires 1..1024 experts; received " +
+            std::to_string(experts));
     }
     if (
         expert_order.dtype() != mlx::core::int32
@@ -7920,7 +7921,13 @@ array MlxNintMoeWeight::routed_swiglu_packed(
 }
 
 bool MlxNintMoeWeight::supports_grouped_mmq() const noexcept {
-    return impl_->projections == 1 && impl_->grouped_mmq;
+    // The block-list builder uses one Metal thread and one threadgroup-array
+    // entry per addressable expert. Large shared SSD arenas can expose more
+    // than the Metal 1024-thread limit even though a model routes to only a
+    // small subset. They must use the ordinary mapped routed kernel until the
+    // builder itself is made multi-threadgroup.
+    return impl_->projections == 1 && impl_->grouped_mmq &&
+        impl_->experts <= 1024;
 }
 
 bool MlxNintMoeWeight::prefers_mxfp4_smallm_nax(
@@ -8028,7 +8035,12 @@ array MlxNintMoeWeight::routed_matmul_sorted(
     float swiglu_limit,
     const MlxGroupedMmqPlan* plan,
     bool force_mxfp4_nax) const {
-    if (!supports_grouped_mmq()) {
+    const bool direct_mxfp4_nax =
+        force_mxfp4_nax &&
+        impl_->mxfp4_slot_ids.has_value() &&
+        impl_->projections == 1 &&
+        impl_->rotations.empty();
+    if (!supports_grouped_mmq() && !direct_mxfp4_nax) {
         throw std::invalid_argument(
             "weight does not support grouped MMQ");
     }
@@ -8589,8 +8601,7 @@ array MlxNintMoeWeight::routed_matmul_impl(
         sorted_routes
         && tokens >= 32
         && source.dtype() == mlx::core::float16
-        && impl_->projections == 1
-        && impl_->grouped_mmq
+        && supports_grouped_mmq()
     ) {
         const bool use_grouped_nax = nint_grouped_nax_enabled()
             && (impl_->grouped_nint4_group24

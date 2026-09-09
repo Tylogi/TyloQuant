@@ -1224,8 +1224,7 @@ void test_generation_greedy_seed_and_penalties() {
         const auto prompt = token_ids({0, 1, 1});
         mfq::metal::MlxSamplingParams sampling;
         auto counts =
-            mfq::metal::detail::
-                qwen35_generation_token_counts(
+            mfq::metal::mlx_generation_token_counts(
                     sampling,
                     prompt,
                     8);
@@ -1235,8 +1234,7 @@ void test_generation_greedy_seed_and_penalties() {
 
         sampling.presence_penalty = 0.2;
         counts =
-            mfq::metal::detail::
-                qwen35_generation_token_counts(
+            mfq::metal::mlx_generation_token_counts(
                     sampling,
                     prompt,
                     8);
@@ -1264,8 +1262,7 @@ void test_generation_greedy_seed_and_penalties() {
         sampling = {};
         sampling.frequency_penalty = 0.1;
         require(
-            mfq::metal::detail::
-                qwen35_generation_token_counts(
+            mfq::metal::mlx_generation_token_counts(
                     sampling,
                     prompt,
                     8)

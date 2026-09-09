@@ -146,4 +146,34 @@ private:
     int position_ = 0;
 };
 
+// Growable [batch,sequence,width] cache for non-attention recurrent/index
+// features. Model implementations provide only the feature producer; storage
+// growth and append semantics remain backend-wide.
+class MlxSequenceCache {
+public:
+    MlxSequenceCache(
+        int maximum_sequence,
+        int width,
+        mlx::core::Dtype dtype = mlx::core::float16);
+
+    void reset(int batch, int initial_capacity = 16);
+    std::pair<mlx::core::array, int> append(
+        const mlx::core::array& value);
+    void clear() noexcept;
+
+    int position() const noexcept {
+        return position_;
+    }
+
+private:
+    void ensure_capacity(int required);
+
+    int maximum_sequence_;
+    int width_;
+    mlx::core::Dtype dtype_;
+    int batch_ = 0;
+    int position_ = 0;
+    std::optional<mlx::core::array> values_;
+};
+
 } // namespace mfq::metal

@@ -3179,24 +3179,28 @@ inline void decode_dense_nint6_group24(
 // M5-family large-M path.  Unlike BlockMMA, NAX loads activation fragments
 // directly into cooperative registers, so the threadgroup memory budget is
 // spent only on one decoded weight tile and occupancy stays high.
-[[kernel]] void mfq_dense_nint_nax_f16_bm64_bn64_bk96(
-    const device uchar* q [[buffer(0)]],
-    const device uchar* sub_scale [[buffer(1)]],
-    const device uchar* sub_min [[buffer(2)]],
-    const device float* anchor_scale [[buffer(3)]],
-    const device float* anchor_min [[buffer(4)]],
-    const device half* x [[buffer(5)]],
-    device half* y [[buffer(6)]],
-    constant MfqDenseNintMmqParams& params [[buffer(7)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint thread_id [[thread_index_in_threadgroup]]) {
-    constexpr int BM = 64;
-    constexpr int BN = 64;
-    constexpr int BK = 96;
-    constexpr int BK_padded = 104;
-    constexpr int WM = 2;
-    constexpr int WN = 2;
+template <
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    int BITS = 0,
+    int GROUP_SIZE = 0>
+inline void mfq_dense_nint_nax_f16_impl(
+    const device uchar* q,
+    const device uchar* sub_scale,
+    const device uchar* sub_min,
+    const device float* anchor_scale,
+    const device float* anchor_min,
+    const device half* x,
+    device half* y,
+    constant MfqDenseNintMmqParams& params,
+    threadgroup half* Ws,
+    uint3 tid,
+    uint simd_group_id,
+    uint thread_id) {
+    constexpr int BK_padded = BK + 8;
     constexpr uint TGP_SIZE = uint(WM * WN * 32);
     constexpr short SM = BM / WM;
     constexpr short SN = BN / WN;
@@ -3217,21 +3221,30 @@ inline void decode_dense_nint6_group24(
     short simd_m = short(max(0, min(int(SM), int(valid_m) - int(tm))));
     short simd_n = short(max(0, min(int(SN), int(valid_n) - int(tn))));
 
-    threadgroup half Ws[BN * BK_padded];
     mlx::steel::NAXTile<float, TM, TN> output_tile;
     output_tile.clear();
 
     for (int k_base = 0; k_base < params.input_width; k_base += BK) {
-        for (uint item = thread_id;
-             item < uint(BN * BK_padded);
-             item += TGP_SIZE) {
-            Ws[item] = half(0.0f);
-        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Full tiles overwrite every weight consumed by NAX.  Clearing the
+        // complete scratch tile on every K step needlessly duplicated that
+        // traffic and inserted an extra barrier.  Only the final partial K
+        // tile needs explicit zeros for elements outside the logical width.
+        if (k_base + BK > params.input_width) {
+            for (uint item = thread_id;
+                 item < uint(BN * BK_padded);
+                 item += TGP_SIZE) {
+                Ws[item] = half(0.0f);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
 
-        bool group24 = (params.bits == 4 || params.bits == 6)
+        constexpr bool SPECIALIZED_GROUP24 =
+            (BITS == 4 || BITS == 6) && GROUP_SIZE == 24;
+        bool group24 = SPECIALIZED_GROUP24 || (
+            (params.bits == 4 || params.bits == 6)
             && params.group_size == 24
-            && params.q5_execution == 0;
+            && params.q5_execution == 0);
         if (group24) {
             constexpr uint GROUPS_PER_TILE = BK / 24;
             for (uint item = thread_id;
@@ -3245,7 +3258,29 @@ inline void decode_dense_nint6_group24(
                     threadgroup half* target =
                         Ws + output_row * uint(BK_padded)
                             + local_group * 24u;
-                    if (params.bits == 4) {
+                    if constexpr (BITS == 4) {
+                        decode_dense_nint4_group24(
+                            q,
+                            sub_scale,
+                            sub_min,
+                            anchor_scale,
+                            anchor_min,
+                            target,
+                            uint(output_base) + output_row,
+                            input_column / 24u,
+                            uint(params.groups));
+                    } else if constexpr (BITS == 6) {
+                        decode_dense_nint6_group24(
+                            q,
+                            sub_scale,
+                            sub_min,
+                            anchor_scale,
+                            anchor_min,
+                            target,
+                            uint(output_base) + output_row,
+                            input_column / 24u,
+                            uint(params.groups));
+                    } else if (params.bits == 4) {
                         decode_dense_nint4_group24(
                             q,
                             sub_scale,
@@ -3294,6 +3329,7 @@ inline void decode_dense_nint6_group24(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+#pragma clang loop unroll(disable)
         for (int kk = 0; kk < BK; kk += SK) {
             int input_column = k_base + kk;
             short valid_k = short(max(
@@ -3321,8 +3357,9 @@ inline void decode_dense_nint6_group24(
                 weight_tile,
                 metal::bool_constant<true>{});
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     device half* destination =
         y + (row_base + int(tm)) * params.output_width
@@ -3336,4 +3373,56 @@ inline void decode_dense_nint6_group24(
             short2(simd_n, simd_m));
     }
 }
+
+#define instantiate_mfq_dense_nint_nax(                                      \
+    name, bm, bn, bk, wm, wn)                                                \
+[[kernel]] void name(                                                        \
+    const device uchar* q [[buffer(0)]],                                     \
+    const device uchar* sub_scale [[buffer(1)]],                             \
+    const device uchar* sub_min [[buffer(2)]],                               \
+    const device float* anchor_scale [[buffer(3)]],                          \
+    const device float* anchor_min [[buffer(4)]],                            \
+    const device half* x [[buffer(5)]],                                      \
+    device half* y [[buffer(6)]],                                            \
+    constant MfqDenseNintMmqParams& params [[buffer(7)]],                    \
+    uint3 tid [[threadgroup_position_in_grid]],                              \
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],                   \
+    uint thread_id [[thread_index_in_threadgroup]]) {                        \
+    threadgroup half Ws[bn * (bk + 8)];                                      \
+    mfq_dense_nint_nax_f16_impl<bm, bn, bk, wm, wn>(                        \
+        q, sub_scale, sub_min, anchor_scale, anchor_min, x, y, params,       \
+        Ws, tid, simd_group_id, thread_id);                                  \
+}
+
+#define instantiate_mfq_dense_nint24_nax(                                    \
+    name, bits, bm, bn, bk, wm, wn)                                          \
+[[kernel]] void name(                                                        \
+    const device uchar* q [[buffer(0)]],                                     \
+    const device uchar* sub_scale [[buffer(1)]],                             \
+    const device uchar* sub_min [[buffer(2)]],                               \
+    const device float* anchor_scale [[buffer(3)]],                          \
+    const device float* anchor_min [[buffer(4)]],                            \
+    const device half* x [[buffer(5)]],                                      \
+    device half* y [[buffer(6)]],                                            \
+    constant MfqDenseNintMmqParams& params [[buffer(7)]],                    \
+    uint3 tid [[threadgroup_position_in_grid]],                              \
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],                   \
+    uint thread_id [[thread_index_in_threadgroup]]) {                        \
+    threadgroup half Ws[bn * (bk + 8)];                                      \
+    mfq_dense_nint_nax_f16_impl<bm, bn, bk, wm, wn, bits, 24>(              \
+        q, sub_scale, sub_min, anchor_scale, anchor_min, x, y, params,       \
+        Ws, tid, simd_group_id, thread_id);                                  \
+}
+
+instantiate_mfq_dense_nint_nax(
+    mfq_dense_nint_nax_f16_bm64_bn64_bk96,
+    64, 64, 96, 2, 2)
+instantiate_mfq_dense_nint24_nax(
+    mfq_dense_nint4_gs24_nax_f16_bm64_bn64_bk96,
+    4, 64, 64, 96, 2, 2)
+instantiate_mfq_dense_nint24_nax(
+    mfq_dense_nint6_gs24_nax_f16_bm64_bn64_bk96,
+    6, 64, 64, 96, 2, 2)
+#undef instantiate_mfq_dense_nint24_nax
+#undef instantiate_mfq_dense_nint_nax
 #endif

@@ -68,6 +68,143 @@ void require_bit_exact(
     }
 }
 
+void require_vector_close(
+    const float* actual,
+    const std::vector<float>& expected,
+    float tolerance,
+    const char* name) {
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        if (!std::isfinite(actual[index]) ||
+            std::fabs(actual[index] - expected[index]) > tolerance) {
+            throw std::runtime_error(
+                std::string(name) + " mismatch at " +
+                std::to_string(index) + ": actual=" +
+                std::to_string(actual[index]) + " expected=" +
+                std::to_string(expected[index]));
+        }
+    }
+}
+
+void test_blocked_gdn_prefill(bool tiled_heads) {
+    using namespace mlx::core;
+    constexpr int batch = 1;
+    constexpr int query_heads = 2;
+    constexpr int value_heads = 4;
+    constexpr int tokens = 67;
+    constexpr int dimension = 128;
+    const std::size_t query_size =
+        batch * query_heads * tokens * dimension;
+    const std::size_t value_size =
+        batch * value_heads * tokens * dimension;
+    const std::size_t gate_size = batch * value_heads * tokens;
+    const std::size_t state_size =
+        batch * value_heads * dimension * dimension;
+
+    std::vector<float> query(query_size);
+    std::vector<float> key(query_size);
+    std::vector<float> value(value_size);
+    std::vector<float> gate(gate_size);
+    std::vector<float> beta(gate_size);
+    std::vector<float> initial_state(state_size);
+    for (std::size_t index = 0; index < query_size; ++index) {
+        query[index] =
+            static_cast<float>(static_cast<int>((index * 13) % 29) - 14) *
+            0.0015f;
+        key[index] =
+            static_cast<float>(static_cast<int>((index * 17) % 31) - 15) *
+            0.0012f;
+    }
+    for (std::size_t index = 0; index < value_size; ++index) {
+        value[index] =
+            static_cast<float>(static_cast<int>((index * 19) % 37) - 18) *
+            0.002f;
+    }
+    for (std::size_t index = 0; index < gate_size; ++index) {
+        gate[index] = -0.015f - static_cast<float>(index % 7) * 0.004f;
+        beta[index] = 0.35f + static_cast<float>(index % 5) * 0.07f;
+    }
+    for (std::size_t index = 0; index < state_size; ++index) {
+        initial_state[index] =
+            static_cast<float>(static_cast<int>((index * 23) % 41) - 20) *
+            0.00003f;
+    }
+
+    std::vector<float> expected_output(value_size, 0.0f);
+    auto expected_state = initial_state;
+    const float output_scale = 1.0f / std::sqrt(float(dimension));
+    for (int value_head = 0; value_head < value_heads; ++value_head) {
+        const int query_head = tiled_heads
+            ? value_head % query_heads
+            : value_head / (value_heads / query_heads);
+        float* head_state = expected_state.data() +
+            value_head * dimension * dimension;
+        for (int token = 0; token < tokens; ++token) {
+            const float* query_row = query.data() +
+                (query_head * tokens + token) * dimension;
+            const float* key_row = key.data() +
+                (query_head * tokens + token) * dimension;
+            const float decay = std::exp(
+                gate[(value_head * tokens) + token]);
+            const float beta_value =
+                beta[(value_head * tokens) + token];
+            for (int value_dimension = 0;
+                 value_dimension < dimension;
+                 ++value_dimension) {
+                float projected_key = 0.0f;
+                for (int key_dimension = 0;
+                     key_dimension < dimension;
+                     ++key_dimension) {
+                    projected_key +=
+                        head_state[key_dimension * dimension +
+                                   value_dimension] *
+                        key_row[key_dimension];
+                }
+                const std::size_t output_index =
+                    (value_head * tokens + token) * dimension +
+                    value_dimension;
+                const float delta =
+                    (value[output_index] - decay * projected_key) *
+                    beta_value;
+                float output = 0.0f;
+                for (int key_dimension = 0;
+                     key_dimension < dimension;
+                     ++key_dimension) {
+                    float& state_value =
+                        head_state[key_dimension * dimension +
+                                   value_dimension];
+                    state_value = decay * state_value +
+                        key_row[key_dimension] * delta;
+                    output += state_value * query_row[key_dimension];
+                }
+                expected_output[output_index] = output * output_scale;
+            }
+        }
+    }
+
+    auto result = mfq::metal::gated_delta_net(
+        array(query.begin(), Shape{batch, query_heads, tokens, dimension}),
+        array(key.begin(), Shape{batch, query_heads, tokens, dimension}),
+        array(value.begin(), Shape{batch, value_heads, tokens, dimension}),
+        array(gate.begin(), Shape{batch, value_heads, tokens}),
+        array(beta.begin(), Shape{batch, value_heads, tokens}),
+        array(
+            initial_state.begin(),
+            Shape{batch, value_heads, dimension, dimension}),
+        false,
+        tiled_heads);
+    eval(result.output, result.state);
+    require_vector_close(
+        result.output.data<float>(),
+        expected_output,
+        3e-5f,
+        tiled_heads ? "blocked tiled GDN output" : "blocked GDN output");
+    require_vector_close(
+        result.state.data<float>(),
+        expected_state,
+        3e-5f,
+        tiled_heads ? "blocked tiled GDN state" : "blocked GDN state");
+}
+
 void test_cached_depthwise_dilated_decode() {
     using namespace mlx::core;
     constexpr int batch = 1;
@@ -139,6 +276,8 @@ int main() {
         using namespace mlx::core;
 
         test_cached_depthwise_dilated_decode();
+        test_blocked_gdn_prefill(false);
+        test_blocked_gdn_prefill(true);
 
         const array conv_input(
             {

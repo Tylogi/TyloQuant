@@ -3634,6 +3634,71 @@ void test_mxfp4_smallm_nax_policy() {
     }
 }
 
+void test_large_mxfp4_arena_avoids_single_group_builder() {
+    constexpr int experts = 1025;
+    constexpr int output = 1;
+    constexpr int input = 32;
+    std::vector<std::int32_t> slots(experts);
+    std::iota(slots.begin(), slots.end(), 0);
+    std::vector<std::uint8_t> packed(
+        static_cast<std::size_t>(experts) * output * input / 2,
+        0x22);
+    std::vector<std::uint8_t> scales(
+        static_cast<std::size_t>(experts) * output * input / 32,
+        127);
+    const auto weight = mfq::metal::MlxMoeWeight::from_mxfp4_slots(
+        experts,
+        output,
+        input,
+        slots,
+        mlx::core::array(
+            packed.begin(),
+            mlx::core::Shape{experts, output * input / 2}),
+        mlx::core::array(
+            scales.begin(),
+            mlx::core::Shape{experts, output * input / 32}));
+    require(
+        !weight.supports_grouped_mmq(),
+        "large SSD arena must not use a single-threadgroup block builder");
+    std::vector<float> input_values(32 * input, 0.0f);
+    std::vector<std::int32_t> expert_ids(32, 0);
+    const auto output_values = evaluated_floats(weight.routed_matmul(
+        mlx::core::astype(
+            mlx::core::array(
+                input_values.begin(),
+                mlx::core::Shape{32, input}),
+            mlx::core::float16),
+        mlx::core::array(
+            expert_ids.begin(),
+            mlx::core::Shape{32, 1})));
+    require(
+        output_values.size() == 32,
+        "large SSD arena mapped fallback output shape mismatch");
+
+    std::vector<float> small_input_values(4 * input, 0.0f);
+    std::vector<std::int32_t> small_expert_ids(4, 0);
+    std::vector<std::int32_t> small_order{0, 1, 2, 3};
+    const auto direct_values = evaluated_floats(
+        weight.routed_matmul_sorted(
+            mlx::core::array(
+                small_input_values.begin(),
+                mlx::core::Shape{4, input}),
+            mlx::core::array(
+                small_expert_ids.begin(),
+                mlx::core::Shape{4, 1}),
+            mlx::core::array(
+                small_order.begin(),
+                mlx::core::Shape{4}),
+            false,
+            false,
+            0.0f,
+            nullptr,
+            true));
+    require(
+        direct_values.size() == 4,
+        "large SSD arena direct MXFP4 output shape mismatch");
+}
+
 void test_vq_cohorts_and_ffn() {
     constexpr int tokens = 3;
     constexpr int routes = 3;
@@ -5436,6 +5501,7 @@ int main(int argc, char** argv) {
         test_swiglu_ffn();
         test_mxfp4_nintm_and_projection_offsets();
         test_mxfp4_smallm_nax_policy();
+        test_large_mxfp4_arena_avoids_single_group_builder();
         test_vq_cohorts_and_ffn();
         test_nepq_a_routed_and_fused_swiglu();
         test_grouped_mmq_prefill();

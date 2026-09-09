@@ -292,6 +292,7 @@ Kernel and model details: [runtime support matrix](./docs/runtime-support.md).
 
 ### Runtime and validation
 
+- [Development rules and architecture boundaries](./CONTRIBUTING.md)
 - [Runtime support matrix](./docs/runtime-support.md)
 - [Runtime sampling profiles](./docs/runtime-sampling-profiles.md)
 - [Native CUDA runtime validation](./docs/cuda-native-runtime-validation.md)

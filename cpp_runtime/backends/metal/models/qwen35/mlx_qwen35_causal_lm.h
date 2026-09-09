@@ -3,13 +3,12 @@
 #include "mfq/token_constraint.h"
 #include "mlx_qwen35_full_attention.h"
 #include "mlx_qwen35_linear_attention.h"
+#include "mlx_mtp.h"
 #include "mlx_multimodal.h"
-#include "mlx_sampling.h"
 #include "qwen35_model.h"
 
 #include <cstddef>
 #include <cstdint>
-#include <array>
 #include <functional>
 #include <optional>
 #include <string_view>
@@ -20,19 +19,6 @@
 #include <mlx/mlx.h>
 
 namespace mfq::metal {
-
-namespace detail {
-
-// Generation only needs a dense vocabulary-sized count vector when a
-// configured penalty consumes it. Returning nullopt for the common
-// no-penalty path also prevents an otherwise-unused per-token graph chain.
-std::optional<mlx::core::array>
-qwen35_generation_token_counts(
-    const MlxSamplingParams& sampling,
-    const mlx::core::array& prompt_ids,
-    int vocab);
-
-} // namespace detail
 
 using MlxQwen35Layer = std::variant<
     MlxQwen35FullAttentionBlock,
@@ -50,20 +36,7 @@ struct MlxQwen35TextSessionState {
     std::size_t bytes = 0;
 };
 
-struct MlxMtpGenerationStats {
-    bool available = false;
-    bool used = false;
-    std::uint64_t cycles = 0;
-    std::uint64_t drafted_tokens = 0;
-    std::uint64_t accepted_tokens = 0;
-    std::array<std::uint64_t, 6> depth_cycles{};
-    std::array<std::uint64_t, 5> position_drafted{};
-    std::array<std::uint64_t, 5> position_accepted{};
-    std::array<double, 6> measured_depth_ms{};
-    int selected_depth = 0;
-};
-
-using MlxTokenCallback = std::function<bool(std::int64_t)>;
+using MlxTokenCallback = MlxGenerationTokenCallback;
 
 class MlxQwen35MtpModule {
 public:
@@ -269,7 +242,8 @@ private:
         const mlx::core::array& embeddings,
         const mlx::core::array* positions,
         bool use_cache,
-        int speculative_confirmed = 0);
+        int speculative_confirmed = 0,
+        bool full_logits = true);
     std::pair<mlx::core::array, mlx::core::array>
     forward_with_hidden(
         const mlx::core::array& token_ids,

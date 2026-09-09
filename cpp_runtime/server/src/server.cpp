@@ -3171,15 +3171,14 @@ int run_mfq_server(
                                  std::to_string(tokenizer->vocab_size()) + " model=" +
                                  std::to_string(config.vocab_size));
     }
-    if (tokenizer->chat_template().empty()) {
-        throw std::runtime_error(
-            "MFQ server requires tokenizer.chat_template");
-    }
-    common_chat_templates_ptr chat_templates =
-        common_chat_templates_init(tokenizer->context(), "");
-    if (!chat_templates) {
-        throw std::runtime_error(
-            "cannot initialize tokenizer.chat_template");
+    common_chat_templates_ptr chat_templates = nullptr;
+    if (!tokenizer->chat_template().empty()) {
+        chat_templates = common_chat_templates_init(
+            tokenizer->context(), "");
+        if (!chat_templates) {
+            throw std::runtime_error(
+                "cannot initialize tokenizer.chat_template");
+        }
     }
     const MfqSamplingParams sampling_defaults =
         default_sampling_params(config);
@@ -3977,6 +3976,13 @@ int run_mfq_server(
             return;
         }
         try {
+            if (chat && !chat_templates) {
+                throw ApiError(
+                    400,
+                    "unsupported_parameter",
+                    "the tokenizer has no chat template; use /v1/completions with a preformatted prompt",
+                    "messages");
+            }
             const json body = parse_body(req);
             RequestWork work = parse_work(
                 body, chat, *tokenizer, chat_templates.get(),

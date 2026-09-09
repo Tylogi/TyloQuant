@@ -888,7 +888,7 @@ MlxDeepseekV4DSpark make_dspark(
             static_cast<float>(config.rope_theta)));
 }
 
-MlxDeepseekV4CausalLm make_dspark_model() {
+MlxDeepseekV4CausalLm make_dspark_model(bool attach_dspark = true) {
     auto config = test_config(false, {0, 0, 0});
     config.n_mtp_layers = 1;
     config.dspark_block_size = 2;
@@ -903,7 +903,10 @@ MlxDeepseekV4CausalLm make_dspark_model() {
     }
     auto embedding = make_embedding();
     auto output = make_output(true);
-    auto dspark = make_dspark(config, embedding, output);
+    std::optional<MlxDeepseekV4DSpark> dspark;
+    if (attach_dspark) {
+        dspark.emplace(make_dspark(config, embedding, output));
+    }
     return MlxDeepseekV4CausalLm(
         config,
         std::move(embedding),
@@ -1440,7 +1443,7 @@ void test_generation_eos_and_callback() {
     }
 }
 
-void test_dspark_generation_verification_and_replay() {
+void test_dspark_generation_uses_common_mtp_engine() {
     auto model = make_dspark_model();
     require(model.supports_mtp(), "DeepSeek-V4 DSpark was not attached");
     mfq::metal::MlxSamplingParams sampling;
@@ -1459,11 +1462,70 @@ void test_dspark_generation_verification_and_replay() {
         count == 6 &&
             emitted == std::vector<std::int64_t>({0, 0, 0, 0, 0, 0}),
         "DeepSeek-V4 DSpark verification output mismatch");
-    // The final token is delivered without an unnecessary trailing decode;
-    // the preceding verified/replayed tokens must remain on one timeline.
+    const auto& stats = model.last_mtp_stats();
     require(
-        model.cache_position() >= 5 && model.cache_position() <= 8,
-        "DeepSeek-V4 DSpark replay cache position mismatch");
+        model.cache_position() == 7 && stats.available && stats.used &&
+            stats.cycles > 0 && stats.drafted_tokens > 0,
+        "DeepSeek-V4 DSpark target transaction/statistics mismatch");
+
+    mfq::metal::MlxSamplingParams penalized = sampling;
+    penalized.presence_penalty = 0.2;
+    penalized.frequency_penalty = 0.1;
+    penalized.repetition_penalty = 1.15;
+    auto baseline = make_dspark_model(false);
+    auto speculative = make_dspark_model();
+    std::vector<std::int64_t> expected;
+    std::vector<std::int64_t> actual;
+    (void)baseline.generate(
+        {1, 2},
+        penalized,
+        6,
+        [&](std::int64_t token) {
+            expected.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    (void)speculative.generate(
+        {1, 2},
+        penalized,
+        6,
+        [&](std::int64_t token) {
+            actual.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    require(
+        actual == expected && speculative.last_mtp_stats().used,
+        "DeepSeek-V4 DSpark penalties bypassed the common MTP engine");
+
+    mfq::metal::MlxSamplingParams stochastic;
+    stochastic.temperature = 0.8;
+    stochastic.top_k = 4;
+    stochastic.top_p = 0.9;
+    stochastic.seed = 1729;
+    auto sampled_first = make_dspark_model();
+    auto sampled_second = make_dspark_model();
+    std::vector<std::int64_t> first;
+    std::vector<std::int64_t> second;
+    for (auto pair : {
+             std::pair{&sampled_first, &first},
+             std::pair{&sampled_second, &second},
+         }) {
+        (void)pair.first->generate(
+            {1, 2},
+            stochastic,
+            6,
+            [&](std::int64_t token) {
+                pair.second->push_back(token);
+                return true;
+            },
+            std::vector<std::int64_t>{});
+    }
+    require(
+        first == second && first.size() == 6 &&
+            sampled_first.last_mtp_stats().used &&
+            sampled_second.last_mtp_stats().used,
+        "DeepSeek-V4 DSpark stochastic MTP is not deterministic");
 }
 
 void test_generation_stable_prefix_cache() {
@@ -1995,7 +2057,7 @@ int main() {
         test_layer_schedule_and_manual_reference();
         test_prefill_decode_and_chunking();
         test_generation_eos_and_callback();
-        test_dspark_generation_verification_and_replay();
+        test_dspark_generation_uses_common_mtp_engine();
         test_generation_stable_prefix_cache();
         test_text_session_snapshot_restore();
         test_mfq_container_load();

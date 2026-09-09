@@ -139,91 +139,6 @@ MlxNintMoeWeight moe_weight(
     return MlxNintMoeWeight::from_blob(mapped.view());
 }
 
-array last_token_logits(const array& logits, int vocab) {
-    if (logits.ndim() != 3 || logits.shape(0) != 1 ||
-        logits.shape(1) <= 0 || logits.shape(2) != vocab) {
-        throw std::runtime_error("Qwen4 logits must have [1,T,V] shape");
-    }
-    return mlx::core::reshape(
-        mlx::core::slice(
-            logits,
-            Shape{0, logits.shape(1) - 1, 0},
-            Shape{1, logits.shape(1), vocab}),
-        Shape{1, vocab});
-}
-
-class SequenceCache {
-public:
-    SequenceCache(int maximum, int width)
-        : maximum_(maximum), width_(width) {}
-
-    void reset(int batch, int initial_capacity = 16) {
-        batch_ = batch;
-        position_ = 0;
-        const int capacity = std::min(
-            maximum_, std::max(1, initial_capacity));
-        values_ = mlx::core::zeros(
-            Shape{batch_, capacity, width_}, mlx::core::float16);
-    }
-
-    std::pair<array, int> append(const array& value) {
-        if (value.ndim() != 3 || value.shape(0) <= 0 ||
-            value.shape(2) != width_) {
-            throw std::runtime_error("Qwen4 sequence-cache append mismatch");
-        }
-        if (!values_ || batch_ != value.shape(0)) {
-            reset(value.shape(0), std::max(16, value.shape(1)));
-        }
-        const int start = position_;
-        const int end = start + value.shape(1);
-        ensure(end);
-        *values_ = mlx::core::slice_update(
-            *values_,
-            value.dtype() == mlx::core::float16
-                ? value : mlx::core::astype(value, mlx::core::float16),
-            Shape{0, start, 0},
-            Shape{batch_, end, width_});
-        position_ = end;
-        return {
-            mlx::core::slice(
-                *values_, Shape{0, 0, 0}, Shape{batch_, end, width_}),
-            start,
-        };
-    }
-
-    void clear() noexcept {
-        values_.reset();
-        batch_ = 0;
-        position_ = 0;
-    }
-
-    int position() const noexcept { return position_; }
-
-private:
-    void ensure(int required) {
-        if (!values_) throw std::runtime_error("Qwen4 cache is not initialized");
-        if (required <= values_->shape(1)) return;
-        if (required > maximum_) {
-            throw std::runtime_error("Qwen4 cache exceeds context capacity");
-        }
-        int capacity = values_->shape(1);
-        while (capacity < required) {
-            capacity = std::min(maximum_, capacity * 2);
-        }
-        auto expanded = mlx::core::zeros(
-            Shape{batch_, capacity, width_}, values_->dtype());
-        expanded = mlx::core::slice_update(
-            expanded, *values_,
-            Shape{0, 0, 0}, Shape{batch_, values_->shape(1), width_});
-        values_ = std::move(expanded);
-    }
-
-    int maximum_;
-    int width_;
-    int batch_ = 0;
-    int position_ = 0;
-    std::optional<array> values_;
-};
 
 class GatedResidual {
 public:
@@ -1410,7 +1325,7 @@ private:
     MlxRmsNorm index_query_norm_;
     MlxRmsNorm index_key_norm_;
     std::unique_ptr<MlxKvCache> cache_;
-    SequenceCache index_cache_;
+    MlxSequenceCache index_cache_;
     int batch_ = 0;
 };
 
@@ -1893,7 +1808,7 @@ std::int32_t MlxQwen4CausalLm::generate(
             profile_prefill ? &component_profile : nullptr);
         detail::ScopedMlxEvaluationTiming timing(
             prefill_callback ? &prefill_ms : nullptr);
-        auto value = last_token_logits(
+        auto value = mlx_last_token_logits(
             impl_->forward(prompt_ids, true, true), vocab);
         if (profile_prefill) {
             detail::profile_eval("qwen4.output", value);
@@ -1978,7 +1893,7 @@ std::int32_t MlxQwen4CausalLm::generate(
         ++generated;
         if (callback && !callback(token)) break;
         if (generated == limit) break;
-        logits = last_token_logits(forward(token_ids, true), vocab);
+        logits = mlx_last_token_logits(forward(token_ids, true), vocab);
     }
     return generated;
 }

@@ -3,6 +3,7 @@
 #include "mlx_sampling.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -459,6 +460,462 @@ std::optional<int> MlxMtpDepthController::most_stale() const {
     }
     consider(0);
     return result;
+}
+
+namespace {
+
+struct PreparedMtpDraft {
+    int depth;
+    array tokens;
+    std::optional<array> compact_indices;
+    std::optional<array> compact_probabilities;
+    std::vector<std::vector<float>> host_probabilities;
+};
+
+array mtp_sampling_row(
+    const array& logits,
+    int vocab,
+    const char* source) {
+    if (logits.ndim() == 2 && logits.shape() == Shape{1, vocab}) {
+        return logits;
+    }
+    if (logits.ndim() == 3 &&
+        logits.shape() == Shape{1, 1, vocab}) {
+        return mlx::core::reshape(logits, Shape{1, vocab});
+    }
+    throw std::runtime_error(
+        std::string("MTP ") + source +
+        " logits must have [1,vocab] or [1,1,vocab] shape");
+}
+
+PreparedMtpDraft prepare_mtp_draft(
+    const MlxMtpDraftContext& context,
+    const MlxMtpEngineRequest& request,
+    const MlxMtpEngineCallbacks& callbacks,
+    MlxSampler& sampler,
+    const std::optional<array>& committed_counts,
+    bool compact_stochastic,
+    const MlxSamplingParams& draft_sampling) {
+    const int requested = context.requested_depth;
+    if (requested < 0 || requested > 5) {
+        throw std::runtime_error("MTP requested draft depth is invalid");
+    }
+
+    std::vector<array> tokens;
+    std::vector<array> compact_indices;
+    std::vector<array> compact_probabilities;
+    std::vector<std::vector<float>> host_probabilities;
+    tokens.reserve(static_cast<std::size_t>(requested));
+    compact_indices.reserve(static_cast<std::size_t>(requested));
+    compact_probabilities.reserve(static_cast<std::size_t>(requested));
+    host_probabilities.reserve(static_cast<std::size_t>(requested));
+    auto prospective_counts = committed_counts;
+
+    const MlxMtpTokenSelector select_token = [&](const array& raw_logits) {
+        if (static_cast<int>(tokens.size()) >= requested) {
+            throw std::runtime_error(
+                "MTP predictor selected more tokens than requested");
+        }
+        auto logits = mtp_sampling_row(
+            raw_logits, request.vocab, "predictor");
+        if (prospective_counts) {
+            logits = sampler.apply_penalties(logits, *prospective_counts);
+        }
+
+        array token = mlx::core::zeros(Shape{1}, mlx::core::int32);
+        if (request.sampling.greedy()) {
+            token = sample_greedy(logits);
+        } else if (compact_stochastic) {
+            const array random(
+                {static_cast<float>(sampler.next_uniform())},
+                Shape{1},
+                mlx::core::float32);
+            auto distribution = sample_top_k_distribution(
+                logits,
+                random,
+                draft_sampling.temperature,
+                draft_sampling.top_k,
+                draft_sampling.top_p);
+            token = std::move(distribution.sampled);
+            compact_indices.push_back(std::move(distribution.indices));
+            compact_probabilities.push_back(
+                std::move(distribution.probabilities));
+        } else {
+            auto probabilities = host_sampling_distribution(
+                logits, draft_sampling);
+            const auto host_token = sample_host_distribution(
+                probabilities, sampler.next_uniform());
+            token = array(
+                {host_token}, Shape{1}, mlx::core::int32);
+            host_probabilities.push_back(std::move(probabilities));
+        }
+        token = mlx::core::reshape(token, Shape{1});
+        tokens.push_back(token);
+        if (prospective_counts) {
+            prospective_counts = sample_token_counts_add(
+                *prospective_counts, token);
+        }
+        return token;
+    };
+
+    callbacks.prepare_draft(context, select_token);
+    if (static_cast<int>(tokens.size()) != requested) {
+        throw std::runtime_error(
+            "MTP predictor did not produce the requested draft depth");
+    }
+
+    auto token_values = tokens.empty()
+        ? mlx::core::zeros(Shape{0}, mlx::core::int32)
+        : mlx::core::concatenate(tokens, 0);
+    std::optional<array> indices;
+    std::optional<array> probabilities;
+    std::vector<array> pending{token_values};
+    if (!compact_indices.empty()) {
+        indices = mlx::core::concatenate(compact_indices, 0);
+        probabilities = mlx::core::concatenate(
+            compact_probabilities, 0);
+        pending.push_back(*indices);
+        pending.push_back(*probabilities);
+    }
+    mlx::core::async_eval(std::move(pending));
+    return {
+        requested,
+        std::move(token_values),
+        std::move(indices),
+        std::move(probabilities),
+        std::move(host_probabilities),
+    };
+}
+
+} // namespace
+
+std::optional<array> mlx_generation_token_counts(
+    const MlxSamplingParams& sampling,
+    const array& prompt_ids,
+    int vocab) {
+    if (vocab <= 0) {
+        throw std::invalid_argument(
+            "generation vocabulary size must be positive");
+    }
+    if (!sampling.has_penalties()) {
+        return std::nullopt;
+    }
+    return sample_token_counts_add(
+        mlx::core::zeros(Shape{vocab}, mlx::core::int32),
+        prompt_ids);
+}
+
+std::int32_t run_mlx_mtp_generation(
+    MlxMtpEngineRequest request,
+    const MlxMtpEngineCallbacks& callbacks,
+    MlxMtpGenerationStats& stats) {
+    if (request.vocab <= 0 || request.generation_limit <= 0 ||
+        request.maximum_context <= 0 ||
+        request.predictor_maximum_depth <= 0 ||
+        request.predictor_maximum_depth > 5 ||
+        !callbacks.target_cache_position || !callbacks.prepare_draft ||
+        !callbacks.verify_target || !callbacks.resolve_target ||
+        !callbacks.plain_decode) {
+        throw std::invalid_argument("invalid MTP engine configuration");
+    }
+    mlx_validate_token_set(request.eos_token_ids, request.vocab);
+
+    stats = {};
+    stats.available = true;
+    stats.used = true;
+    MlxSampler sampler(request.sampling);
+    auto counts = std::move(request.token_counts);
+
+    const auto sample_token = [&](const array& raw_logits) {
+        const auto logits = mtp_sampling_row(
+            raw_logits, request.vocab, "target");
+        auto sampled = counts
+            ? sampler.sample(logits, *counts)
+            : sampler.sample(logits);
+        sampled.eval();
+        const auto token = sampled.data<std::int32_t>()[0];
+        if (token < 0 || token >= request.vocab) {
+            throw std::runtime_error(
+                "MTP target sampler returned an out-of-range token");
+        }
+        return token;
+    };
+
+    std::int32_t generated = 0;
+    const auto emit = [&](std::int32_t token) {
+        if (counts) {
+            const array token_id(
+                {token}, Shape{1, 1}, mlx::core::int32);
+            counts = sample_token_counts_add(*counts, token_id);
+        }
+        ++generated;
+        const bool delivered = !request.callback || request.callback(token);
+        return delivered &&
+            !mlx_token_in_set(request.eos_token_ids, token) &&
+            generated < request.generation_limit;
+    };
+
+    const bool compact_stochastic =
+        !request.sampling.greedy() && request.sampling.top_k > 0 &&
+        request.sampling.top_k <= 64;
+    MlxSamplingParams draft_sampling = request.sampling;
+    if (compact_stochastic) {
+        // The proposal may be sharper than the target distribution because
+        // exact p/q verification preserves the target sampler.
+        draft_sampling.temperature = 0.6;
+        draft_sampling.top_p = 0.95;
+    }
+    const int maximum_depth =
+        (!request.sampling.greedy() && !compact_stochastic)
+        ? 1
+        : std::min(
+              request.predictor_maximum_depth,
+              std::clamp(request.sampling.mtp_max_draft_tokens, 1, 5));
+    MlxMtpDepthController depth_controller(maximum_depth);
+
+    auto pending = sample_token(request.initial_logits);
+    if (!emit(pending)) {
+        return generated;
+    }
+
+    const auto bounded_depth = [&](int desired) {
+        const int context_depth = std::max(
+            0,
+            request.maximum_context - callbacks.target_cache_position() - 1);
+        const int output_depth = std::max(
+            0, request.generation_limit - generated - 1);
+        return std::min({desired, context_depth, output_depth});
+    };
+    MlxMtpDraftContext initial_context{
+        true,
+        pending,
+        bounded_depth(depth_controller.depth()),
+        callbacks.target_cache_position(),
+        0,
+        nullptr,
+        {},
+    };
+    auto draft = prepare_mtp_draft(
+        initial_context,
+        request,
+        callbacks,
+        sampler,
+        counts,
+        compact_stochastic,
+        draft_sampling);
+
+    const auto finish_without_mtp = [&](std::int32_t last_token) {
+        while (generated < request.generation_limit) {
+            const auto next = sample_token(callbacks.plain_decode(last_token));
+            if (!emit(next)) {
+                break;
+            }
+            last_token = next;
+        }
+        return generated;
+    };
+
+    while (generated < request.generation_limit) {
+        const auto cycle_started = std::chrono::steady_clock::now();
+        const int cycle_cache_start = callbacks.target_cache_position();
+        const int draft_count = draft.depth;
+        auto target = callbacks.verify_target(
+            pending, draft.tokens, draft_count);
+        if (target.logits.ndim() != 2 ||
+            target.logits.shape() != Shape{draft_count + 1, request.vocab}) {
+            throw std::runtime_error(
+                "MTP target adapter returned incompatible logits");
+        }
+
+        ++stats.cycles;
+        stats.drafted_tokens += static_cast<std::uint64_t>(draft_count);
+        ++stats.depth_cycles.at(static_cast<std::size_t>(draft_count));
+        for (int position = 0; position < draft_count; ++position) {
+            ++stats.position_drafted.at(static_cast<std::size_t>(position));
+        }
+
+        std::vector<array> adjusted_rows;
+        adjusted_rows.reserve(static_cast<std::size_t>(draft_count + 1));
+        auto row_counts = counts;
+        for (int row = 0; row <= draft_count; ++row) {
+            auto logits_row = mlx::core::slice(
+                target.logits,
+                Shape{row, 0},
+                Shape{row + 1, request.vocab});
+            adjusted_rows.push_back(
+                row_counts
+                    ? sampler.apply_penalties(logits_row, *row_counts)
+                    : logits_row);
+            if (row < draft_count && row_counts) {
+                auto token = mlx::core::slice(
+                    draft.tokens, Shape{row}, Shape{row + 1});
+                row_counts = sample_token_counts_add(*row_counts, token);
+            }
+        }
+        auto target_rows = mlx::core::concatenate(adjusted_rows, 0);
+
+        MlxMtpVerification verification;
+        std::vector<std::int32_t> draft_ids;
+        draft_ids.reserve(static_cast<std::size_t>(draft_count));
+        if (draft_count == 0) {
+            auto sampled = sampler.sample(mtp_sampling_row(
+                target_rows, request.vocab, "adjusted target"));
+            sampled.eval();
+            const auto next = sampled.data<std::int32_t>()[0];
+            if (next < 0 || next >= request.vocab) {
+                throw std::runtime_error(
+                    "MTP target sampler returned an out-of-range token");
+            }
+            verification = {0, next, true};
+        } else if (request.sampling.greedy()) {
+            auto target_tokens = sample_greedy(target_rows);
+            auto compact = mlx::core::concatenate(
+                {
+                    mlx::core::reshape(draft.tokens, Shape{draft_count}),
+                    mlx::core::reshape(
+                        target_tokens, Shape{draft_count + 1}),
+                },
+                0);
+            compact.eval();
+            const auto* resolved = compact.data<std::int32_t>();
+            draft_ids.assign(resolved, resolved + draft_count);
+            verification = verify_greedy_mtp(
+                std::span<const std::int32_t>(resolved, draft_count),
+                std::span<const std::int32_t>(
+                    resolved + draft_count, draft_count + 1));
+        } else if (draft.compact_indices &&
+                   draft.compact_probabilities && compact_stochastic) {
+            auto target_distribution = sample_top_k_distribution(
+                target_rows,
+                mlx::core::zeros(
+                    Shape{draft_count + 1}, mlx::core::float32),
+                request.sampling.temperature,
+                request.sampling.top_k,
+                request.sampling.top_p);
+            std::vector<float> random_values;
+            random_values.reserve(static_cast<std::size_t>(draft_count + 1));
+            for (int index = 0; index <= draft_count; ++index) {
+                random_values.push_back(
+                    static_cast<float>(sampler.next_uniform()));
+            }
+            const array random(
+                random_values.begin(),
+                Shape{draft_count + 1},
+                mlx::core::float32);
+            auto compact = verify_stochastic_mtp_top_k_chain_device(
+                *draft.compact_indices,
+                *draft.compact_probabilities,
+                target_distribution.indices,
+                target_distribution.probabilities,
+                draft.tokens,
+                random,
+                draft_count,
+                request.sampling.top_k);
+            compact.eval();
+            const auto* resolved = compact.data<std::int32_t>();
+            draft_ids.assign(resolved + 2, resolved + 2 + draft_count);
+            verification = {
+                static_cast<std::size_t>(resolved[0]),
+                resolved[1],
+                resolved[0] == draft_count,
+            };
+        } else {
+            if (draft_count != 1 ||
+                draft.host_probabilities.size() != 1) {
+                throw std::runtime_error(
+                    "host MTP verification requires exactly one draft");
+            }
+            draft.tokens.eval();
+            const auto draft_id = draft.tokens.data<std::int32_t>()[0];
+            draft_ids.push_back(draft_id);
+            verification = verify_stochastic_mtp(
+                draft_id,
+                draft.host_probabilities.front(),
+                host_sampling_distribution(
+                    mlx::core::slice(
+                        target_rows,
+                        Shape{0, 0},
+                        Shape{1, request.vocab}),
+                    request.sampling),
+                host_sampling_distribution(
+                    mlx::core::slice(
+                        target_rows,
+                        Shape{1, 0},
+                        Shape{2, request.vocab}),
+                    request.sampling),
+                sampler.next_uniform(),
+                sampler.next_uniform());
+        }
+
+        const int accepted = static_cast<int>(verification.accepted_drafts);
+        if (accepted < 0 || accepted > draft_count ||
+            verification.next_token < 0 ||
+            verification.next_token >= request.vocab) {
+            throw std::runtime_error("MTP verification returned invalid data");
+        }
+        stats.accepted_tokens += static_cast<std::uint64_t>(accepted);
+        for (int position = 0; position < accepted; ++position) {
+            ++stats.position_accepted.at(static_cast<std::size_t>(position));
+        }
+
+        int emitted_accepted = 0;
+        bool continue_generation = true;
+        for (int index = 0; index < accepted; ++index) {
+            ++emitted_accepted;
+            if (!emit(draft_ids.at(static_cast<std::size_t>(index)))) {
+                continue_generation = false;
+                break;
+            }
+        }
+        callbacks.resolve_target(emitted_accepted, draft_count);
+        if (!continue_generation) {
+            return generated;
+        }
+        if (!emit(verification.next_token)) {
+            return generated;
+        }
+
+        const double cycle_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - cycle_started).count();
+        depth_controller.observe(draft_count, accepted, cycle_ms);
+        stats.selected_depth = depth_controller.depth();
+        for (int depth = 0; depth <= depth_controller.maximum_depth(); ++depth) {
+            const auto measured = depth_controller.measured_cycle_ms(depth);
+            if (measured) {
+                stats.measured_depth_ms.at(
+                    static_cast<std::size_t>(depth)) = *measured;
+            }
+        }
+
+        pending = verification.next_token;
+        if (depth_controller.should_exit()) {
+            return finish_without_mtp(pending);
+        }
+
+        std::vector<std::int32_t> next_ids;
+        next_ids.reserve(static_cast<std::size_t>(accepted + 1));
+        next_ids.insert(
+            next_ids.end(), draft_ids.begin(), draft_ids.begin() + accepted);
+        next_ids.push_back(pending);
+        MlxMtpDraftContext next_context{
+            false,
+            pending,
+            bounded_depth(depth_controller.depth()),
+            cycle_cache_start,
+            accepted,
+            &target.hidden,
+            std::span<const std::int32_t>(next_ids),
+        };
+        draft = prepare_mtp_draft(
+            next_context,
+            request,
+            callbacks,
+            sampler,
+            counts,
+            compact_stochastic,
+            draft_sampling);
+    }
+    return generated;
 }
 
 MlxMtpVerification verify_greedy_mtp(

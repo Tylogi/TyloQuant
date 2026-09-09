@@ -77,6 +77,27 @@ bool dense_nint_nax_enabled() noexcept {
     return is_m5;
 }
 
+std::int64_t dense_nint_dequant_prefill_threshold() noexcept {
+    const char* setting =
+        std::getenv("MFQ_METAL_NINT_PREFILL_DEQUANT_THRESHOLD");
+    if (setting == nullptr || setting[0] == '\0') {
+        return 2048;
+    }
+    char* end = nullptr;
+    const long long value = std::strtoll(setting, &end, 10);
+    return end != setting && *end == '\0' && value >= 0
+        ? static_cast<std::int64_t>(value)
+        : 2048;
+}
+
+bool dense_nint_use_packed_prefill(std::int64_t rows) noexcept {
+    const char* setting =
+        std::getenv("MFQ_METAL_NINT_PREFILL_PACKED_MMQ");
+    return setting != nullptr
+        ? std::strcmp(setting, "0") != 0
+        : rows < dense_nint_dequant_prefill_threshold();
+}
+
 class DenseNintMmqPrimitive final : public mlx::core::UnaryPrimitive {
 public:
     DenseNintMmqPrimitive(
@@ -101,7 +122,7 @@ public:
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
             config_.use_nax
-                ? "mfq_dense_nint_nax_v1"
+                ? "mfq_dense_nint_nax_v4"
                 : "mfq_dense_nint_mmq_v6",
             options,
             [use_nax = config_.use_nax] {
@@ -143,15 +164,27 @@ public:
             .q5_execution = config_.q5_execution,
         };
         encoder.set_bytes(parameters, 7);
+        const char* nax_kernel =
+            "mfq_dense_nint_nax_f16_bm64_bn64_bk96";
+        if (config_.group_size == 24 && config_.q5_execution == 0) {
+            if (config_.bits == 4) {
+                nax_kernel =
+                    "mfq_dense_nint4_gs24_nax_f16_bm64_bn64_bk96";
+            } else if (config_.bits == 6) {
+                nax_kernel =
+                    "mfq_dense_nint6_gs24_nax_f16_bm64_bn64_bk96";
+            }
+        }
         auto* kernel = device.get_kernel(
             config_.use_nax
-                ? "mfq_dense_nint_nax_f16_bm64_bn64_bk96"
+                ? nax_kernel
                 : "mfq_dense_nint_mmq_f16_bm128_bn64_bk48",
             library);
         encoder.set_compute_pipeline_state(kernel);
         encoder.dispatch_threadgroups(
             MTL::Size(
-                (config_.output_width + 63) / 64,
+                (config_.output_width +
+                    63) / 64,
                 config_.use_nax
                     ? (config_.rows + 63) / 64
                     : (config_.rows + 127) / 128,
@@ -2170,6 +2203,29 @@ constexpr const char* kNintEmbedding = R"METAL(
     y[output_index] = T(scale * float(quantized) - minimum);
 )METAL";
 
+constexpr const char* kNintDequantize = R"METAL(
+    uint output_index = thread_position_in_grid.x;
+    if (output_index >= uint(OUT) * uint(K)) {
+        return;
+    }
+
+    uint output = output_index / uint(K);
+    uint input_index = output_index - output * uint(K);
+    uint group = input_index / uint(GS);
+    uint element = input_index - group * uint(GS);
+    uint metadata_index = output * uint(NG) + group;
+    uint quantized_index = metadata_index * uint(GS) + element;
+    uint quantized = mfq_nint_read_value(
+        q_packed,
+        quantized_index,
+        uint(BITS),
+        uint(GS),
+        uint(Q5_EXEC));
+    float scale = neuron_scale[output] * float(sub_scale[metadata_index]);
+    float minimum = neuron_min[output] * float(sub_min[metadata_index]);
+    y[output_index] = T(scale * float(quantized) - minimum);
+)METAL";
+
 class BlobCursor {
 public:
     explicit BlobCursor(std::span<const std::uint8_t> blob)
@@ -3105,6 +3161,31 @@ const mlx::core::fast::CustomKernelFunction& nint_embedding_kernel() {
     return kernel;
 }
 
+mlx::core::fast::CustomKernelFunction make_nint_dequantize_kernel() {
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    return mlx::core::fast::metal_kernel(
+        "mfq_cpp_nint_dequantize",
+        {
+            "q_packed",
+            "sub_scale",
+            "sub_min",
+            "neuron_scale",
+            "neuron_min",
+        },
+        {"y"},
+        kNintDequantize,
+        kNintHeader,
+        true,
+        false,
+        options);
+}
+
+const mlx::core::fast::CustomKernelFunction& nint_dequantize_kernel() {
+    static const auto kernel = make_nint_dequantize_kernel();
+    return kernel;
+}
+
 std::int32_t checked_shape(std::int64_t value, const char* name) {
     if (value <= 0 ||
         value > std::numeric_limits<std::int32_t>::max()) {
@@ -3392,10 +3473,13 @@ array MlxNintWeight::matmul_impl(
             input_size_,
         });
     if (rows >= 64 && source.dtype() == mlx::core::float16) {
-        const auto* packed_setting =
-            std::getenv("MFQ_METAL_NINT_PREFILL_PACKED_MMQ");
-        const bool packed_enabled = packed_setting == nullptr
-            || std::strcmp(packed_setting, "0") != 0;
+        // A packed tile is decoded once per M tile.  At long prefill lengths
+        // that repeated work dominates the NAX multiply.  Decode the matrix
+        // once into a transient FP16 allocation beyond the measured
+        // crossover; MLX releases/reuses it after the matmul, so this never
+        // becomes a resident decoded copy of the model.  An explicit legacy
+        // environment setting continues to force either route.
+        const bool packed_enabled = dense_nint_use_packed_prefill(rows);
         auto result = packed_enabled
             ? dense_nint_mmq(
                   q_packed_,
@@ -3416,9 +3500,7 @@ array MlxNintWeight::matmul_impl(
                   })
             : mlx::core::matmul(
                   source,
-                  mlx::core::transpose(embedding(
-                      mlx::core::arange(output_size_, mlx::core::int32),
-                      mlx::core::float16)));
+                  mlx::core::transpose(dequantize(mlx::core::float16)));
         result = mlx::core::reshape(
             std::move(result),
             std::move(output_shape));
@@ -3741,6 +3823,51 @@ array MlxNintWeight::swiglu(
     return mlx::core::reshape(
         outputs.front(),
         std::move(output_shape));
+}
+
+array MlxNintWeight::dequantize(Dtype dtype) const {
+    if (dtype != mlx::core::float16 &&
+        dtype != mlx::core::float32) {
+        throw std::runtime_error(
+            "NINT dequantization output must be float16 or float32");
+    }
+    const auto element_count =
+        static_cast<std::uint64_t>(output_size_) *
+        static_cast<std::uint64_t>(input_size_);
+    if (element_count > static_cast<std::uint64_t>(
+                            std::numeric_limits<int>::max())) {
+        throw std::runtime_error(
+            "NINT dequantization grid exceeds MLX limits");
+    }
+    const int grid = static_cast<int>(element_count);
+    const int threadgroup = std::min(256, std::max(1, grid));
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
+        templates{
+            {"T", dtype},
+            {"BITS", bits_},
+            {"GS", group_size_},
+            {"NG", groups_},
+            {"K", input_size_},
+            {"OUT", output_size_},
+            {"Q5_EXEC", static_cast<int>(q5_execution_layout_)},
+        };
+    auto outputs = nint_dequantize_kernel()(
+        {
+            q_packed_,
+            sub_scale_,
+            sub_min_,
+            neuron_scale_,
+            neuron_min_,
+        },
+        {Shape{output_size_, input_size_}},
+        {dtype},
+        {grid, 1, 1},
+        {threadgroup, 1, 1},
+        std::move(templates),
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
 }
 
 array MlxNintWeight::embedding(

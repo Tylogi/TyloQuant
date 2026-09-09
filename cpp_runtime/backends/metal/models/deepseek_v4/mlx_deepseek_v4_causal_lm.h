@@ -7,7 +7,7 @@
 #include "mlx_deepseek_v4_hc.h"
 #include "mlx_deepseek_v4_moe.h"
 #include "mlx_deepseek_v4_vision.h"
-#include "mlx_sampling.h"
+#include "mlx_mtp.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
 
@@ -111,6 +111,12 @@ public:
         return forward(hidden, token_ids, state, pos0);
     }
 
+    void commit_speculative(
+        MlxDeepseekV4LayerState& state) const noexcept;
+    void rollback_speculative(
+        MlxDeepseekV4LayerState& state,
+        int accepted_tokens) const;
+
     const DeepseekV4Config& config() const noexcept {
         return config_;
     }
@@ -152,8 +158,7 @@ private:
     MlxRmsNorm ffn_norm_;
 };
 
-using MlxDeepseekV4TokenCallback =
-    std::function<bool(std::int64_t)>;
+using MlxDeepseekV4TokenCallback = MlxGenerationTokenCallback;
 
 struct MlxDeepseekV4TextSessionState {
     std::vector<std::int64_t> tokens;
@@ -312,6 +317,9 @@ public:
     bool supports_mtp() const noexcept {
         return dspark_.has_value();
     }
+    const MlxMtpGenerationStats& last_mtp_stats() const noexcept {
+        return last_mtp_stats_;
+    }
 
 private:
     void validate_components() const;
@@ -338,6 +346,13 @@ private:
     void append_state_arrays(
         const MlxDeepseekV4LayerState& state,
         std::vector<mlx::core::array>& arrays) const;
+    void begin_speculative_target(
+        int confirmed_tokens,
+        int total_tokens);
+    void commit_speculative_target() noexcept;
+    void rollback_speculative_target(
+        int accepted_tokens,
+        int draft_tokens);
     std::int32_t generate_impl(
         const std::vector<std::int64_t>& prompt,
         const std::vector<MlxDeepseekV4ImageInput>* images,
@@ -364,6 +379,7 @@ private:
         ssd_expert_cache_;
     std::optional<MlxDeepseekV4Vision> vision_;
     std::optional<MlxDeepseekV4DSpark> dspark_;
+    MlxMtpGenerationStats last_mtp_stats_;
     int max_context_;
     mlx::core::Dtype activation_dtype_;
     std::vector<MlxDeepseekV4LayerState> states_;

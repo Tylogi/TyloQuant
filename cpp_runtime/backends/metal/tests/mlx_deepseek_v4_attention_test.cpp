@@ -1,6 +1,7 @@
 #include "mlx_deepseek_v4_attention.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -92,7 +93,11 @@ void require_close(
     for (std::size_t index = 0;
          index < actual.size();
          ++index) {
+        if (actual[index] == expected[index]) {
+            continue;
+        }
         if (!std::isfinite(actual[index]) ||
+            !std::isfinite(expected[index]) ||
             std::fabs(actual[index] - expected[index]) >
                 tolerance) {
             throw std::runtime_error(
@@ -433,6 +438,149 @@ array input_tokens(
             static_cast<int>(first_feature.size()),
             4,
         });
+}
+
+void materialize_state(const MlxDeepseekV4LayerState& state) {
+    std::vector<array> values{state.local_state()};
+    const auto append_pool = [&](const MlxDeepseekV4PoolState& pool) {
+        values.push_back(pool.pool());
+        values.push_back(pool.state_kv());
+        values.push_back(pool.state_gate());
+        if (pool.prev_kv()) values.push_back(*pool.prev_kv());
+        if (pool.prev_gate()) values.push_back(*pool.prev_gate());
+        if (pool.pool_prefix_backup()) {
+            values.push_back(*pool.pool_prefix_backup());
+        }
+    };
+    if (state.main()) append_pool(*state.main());
+    if (state.indexer()) append_pool(*state.indexer());
+    for (auto value : values) value.eval();
+}
+
+void require_pool_state_close(
+    const MlxDeepseekV4PoolState& actual,
+    const MlxDeepseekV4PoolState& expected,
+    const std::string& label) {
+    require(
+        actual.pool_len() == expected.pool_len() &&
+            actual.remainder() == expected.remainder(),
+        label + " metadata mismatch");
+    require_close(
+        evaluated_float(actual.state_kv()),
+        evaluated_float(expected.state_kv()),
+        2e-4f,
+        label + " KV tail");
+    require_close(
+        evaluated_float(actual.state_gate()),
+        evaluated_float(expected.state_gate()),
+        2e-4f,
+        label + " gate tail");
+    if (actual.pool_len() > 0) {
+        const auto live = [](const MlxDeepseekV4PoolState& pool) {
+            return mlx::core::slice(
+                pool.pool(),
+                Shape{0, 0, 0},
+                Shape{
+                    pool.batch(),
+                    pool.pool_len(),
+                    pool.head_dim(),
+                });
+        };
+        require_close(
+            evaluated_float(live(actual)),
+            evaluated_float(live(expected)),
+            2e-4f,
+            label + " live pool");
+    }
+    require(
+        static_cast<bool>(actual.prev_kv()) ==
+                static_cast<bool>(expected.prev_kv()) &&
+            static_cast<bool>(actual.prev_gate()) ==
+                static_cast<bool>(expected.prev_gate()),
+        label + " overlap state mismatch");
+    if (actual.prev_kv()) {
+        require_close(
+            evaluated_float(*actual.prev_kv()),
+            evaluated_float(*expected.prev_kv()),
+            2e-4f,
+            label + " previous KV");
+        require_close(
+            evaluated_float(*actual.prev_gate()),
+            evaluated_float(*expected.prev_gate()),
+            2e-4f,
+            label + " previous gate");
+    }
+}
+
+void require_layer_state_close(
+    const MlxDeepseekV4LayerState& actual,
+    const MlxDeepseekV4LayerState& expected,
+    const std::string& label) {
+    require(actual.position() == expected.position(), label + " position");
+    require_close(
+        evaluated_float(actual.local_state()),
+        evaluated_float(expected.local_state()),
+        2e-4f,
+        label + " local ring");
+    require(
+        static_cast<bool>(actual.main()) ==
+                static_cast<bool>(expected.main()) &&
+            static_cast<bool>(actual.indexer()) ==
+                static_cast<bool>(expected.indexer()),
+        label + " topology mismatch");
+    if (actual.main()) {
+        require_pool_state_close(
+            *actual.main(), *expected.main(), label + " main");
+    }
+    if (actual.indexer()) {
+        require_pool_state_close(
+            *actual.indexer(), *expected.indexer(), label + " indexer");
+    }
+}
+
+void test_speculative_cache_transaction() {
+    const auto config = test_config();
+    for (const auto [layer, ratio, context] : {
+             std::array<int, 3>{1, 4, 8},
+             std::array<int, 3>{2, 128, 128},
+         }) {
+        auto expected_operation = attention(config, layer, ratio, context);
+        auto actual_operation = attention(config, layer, ratio, context);
+        auto expected = MlxDeepseekV4LayerState::allocate(
+            config, ratio, 1, context);
+        auto actual = MlxDeepseekV4LayerState::allocate(
+            config, ratio, 1, context);
+        expected_operation(input_tokens({0.2f, 0.4f}), expected, 0).eval();
+        actual_operation(input_tokens({0.2f, 0.4f}), actual, 0).eval();
+        materialize_state(expected);
+        materialize_state(actual);
+
+        actual.begin_speculative(1, 3);
+        materialize_state(actual.speculative_checkpoint());
+        actual_operation(
+            input_tokens({0.6f, 0.8f, 1.0f}), actual, 2).eval();
+        materialize_state(actual);
+        actual_operation.rollback_speculative(actual, 1);
+        materialize_state(actual);
+
+        expected_operation(
+            input_tokens({0.6f, 0.8f}), expected, 2).eval();
+        materialize_state(expected);
+        require_layer_state_close(
+            actual,
+            expected,
+            "speculative compressed-cache rollback");
+
+        auto expected_next = expected_operation(
+            input_tokens({1.2f}), expected, 4);
+        auto actual_next = actual_operation(
+            input_tokens({1.2f}), actual, 4);
+        require_close(
+            evaluated_float(actual_next),
+            evaluated_float(expected_next),
+            3e-4f,
+            "post-rollback attention output");
+    }
 }
 
 float normalized_kv(
@@ -1165,6 +1313,7 @@ int main() {
         test_prefill_mma_cpu_reference();
         test_ratio_four_continuity();
         test_ratio_128_forward();
+        test_speculative_cache_transaction();
         test_attention_copy_move_lifetime_stress();
         test_container_load_and_rejections();
         std::cout

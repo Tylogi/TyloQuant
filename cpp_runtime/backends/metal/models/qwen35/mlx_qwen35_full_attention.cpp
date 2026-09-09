@@ -1,4 +1,5 @@
 #include "mlx_qwen35_full_attention.h"
+#include "mlx_eval_timing.h"
 
 #include <cmath>
 #include <limits>
@@ -545,6 +546,11 @@ array MlxQwen35FullAttentionBlock::forward_impl(
     auto query_full = std::move(projected.at(0));
     auto key_full = std::move(projected.at(1));
     auto value_full = std::move(projected.at(2));
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            "qwen35.full_attention.qkv",
+            {query_full, key_full, value_full});
+    }
 
     array query_raw = query_full;
     std::optional<array> query_gate;
@@ -642,6 +648,7 @@ array MlxQwen35FullAttentionBlock::forward_impl(
         key_cache,
         value_cache,
         true);
+    detail::profile_eval("qwen35.full_attention.sdpa", attended);
     attended = mlx::core::reshape(
         mlx::core::transpose(attended, {0, 2, 1, 3}),
         Shape{batch, tokens, attention_size});
@@ -653,7 +660,9 @@ array MlxQwen35FullAttentionBlock::forward_impl(
     }
 
     auto residual = input + output_(attended);
+    detail::profile_eval("qwen35.full_attention.output", residual);
     residual = residual + ffn_(ffn_norm_(residual));
+    detail::profile_eval("qwen35.ffn", residual);
     return residual;
 }
 

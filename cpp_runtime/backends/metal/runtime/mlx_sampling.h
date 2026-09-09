@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <random>
+#include <span>
 #include <vector>
 
 #include <mlx/mlx.h>
@@ -36,6 +37,21 @@ struct MlxTopKDistribution {
     mlx::core::array indices;
     mlx::core::array probabilities;
 };
+
+// Select the final time step from [batch,tokens,vocab] logits and return
+// [batch,vocab]. Generation adapters must not carry private copies of this
+// shape policy.
+mlx::core::array mlx_last_token_logits(
+    const mlx::core::array& logits,
+    int vocab);
+
+void mlx_validate_token_set(
+    std::span<const std::int64_t> token_ids,
+    int vocab);
+
+bool mlx_token_in_set(
+    std::span<const std::int64_t> token_ids,
+    std::int64_t token) noexcept;
 
 mlx::core::array sample_greedy(const mlx::core::array& logits);
 

@@ -1,6 +1,7 @@
 #include "mlx_qwen35_linear_attention.h"
 
 #include "mlx_detached_copy.h"
+#include "mlx_eval_timing.h"
 
 #include <cmath>
 #include <limits>
@@ -601,6 +602,11 @@ array MlxQwen35LinearAttentionBlock::forward(
                     mlx::core::float32)),
             Shape{batch, tokens, value_heads});
     }
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            "qwen35.linear_attention.projections",
+            {qk, value_input, z, alpha, beta});
+    }
 
     const auto gate_input =
         alpha +
@@ -651,6 +657,12 @@ array MlxQwen35LinearAttentionBlock::forward(
         dimension,
         convolution_bias_,
         static_cast<float>(config_.rms_norm_eps));
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            "qwen35.linear_attention.conv",
+            {convolved.query, convolved.key, convolved.value,
+             convolved.state});
+    }
     auto recurrent = gated_delta_net(
         convolved.query,
         convolved.key,
@@ -660,6 +672,11 @@ array MlxQwen35LinearAttentionBlock::forward(
         use_cache ? recurrent_state_ : std::nullopt,
         false,
         gguf_layout_);
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            "qwen35.linear_attention.recurrent",
+            {recurrent.output, recurrent.state});
+    }
 
     if (use_cache) {
         convolution_state_ = convolved.state;
@@ -683,7 +700,9 @@ array MlxQwen35LinearAttentionBlock::forward(
         mlx::core::astype(
             gated_value,
             activation_dtype));
+    detail::profile_eval("qwen35.linear_attention.output", residual);
     residual = residual + ffn_(ffn_norm_(residual));
+    detail::profile_eval("qwen35.ffn", residual);
     return residual;
 }
 

@@ -156,6 +156,8 @@ private:
     int remainder_ = 0;
 };
 
+struct MlxDeepseekV4LayerSpeculation;
+
 class MlxDeepseekV4LayerState {
 public:
     static MlxDeepseekV4LayerState allocate(
@@ -187,6 +189,14 @@ public:
     MlxDeepseekV4LayerState snapshot() const;
     void restore_snapshot(MlxDeepseekV4LayerState snapshot);
 
+    // Open a target-cache transaction before a speculative verify. The
+    // attention adapter records its already-normalized input while the
+    // target graph runs; rollback then rebuilds only attention cache state,
+    // never the complete decoder/MoE graph.
+    void begin_speculative(int confirmed_tokens, int total_tokens);
+    const MlxDeepseekV4LayerState& speculative_checkpoint() const;
+    bool has_speculative() const noexcept;
+
 private:
     friend class MlxDeepseekV4Attention;
 
@@ -198,6 +208,7 @@ private:
     mlx::core::array local_;
     std::optional<MlxDeepseekV4PoolState> main_;
     std::optional<MlxDeepseekV4PoolState> indexer_;
+    std::shared_ptr<MlxDeepseekV4LayerSpeculation> speculative_;
     int position_ = 0;
 };
 
@@ -292,6 +303,12 @@ public:
         MlxDeepseekV4LayerState& state,
         int pos0,
         const MlxDeepseekV4ImageVisibility* visibility) const;
+
+    void commit_speculative(
+        MlxDeepseekV4LayerState& state) const noexcept;
+    void rollback_speculative(
+        MlxDeepseekV4LayerState& state,
+        int accepted_tokens) const;
 
     int ratio() const noexcept;
     int layer() const noexcept;

@@ -132,22 +132,6 @@ void print_graph_stats(const GraphStats& stats) {
     }
 }
 
-array last_token_logits(const array& logits, int vocab) {
-    if (logits.ndim() != 3 ||
-        logits.shape(0) != 1 ||
-        logits.shape(1) <= 0 ||
-        logits.shape(2) != vocab) {
-        throw std::runtime_error(
-            "profile logits must have [1,tokens,vocab] shape");
-    }
-    return mlx::core::reshape(
-        mlx::core::slice(
-            logits,
-            Shape{0, logits.shape(1) - 1, 0},
-            Shape{1, logits.shape(1), vocab}),
-        Shape{1, vocab});
-}
-
 std::int32_t evaluated_token(array sampled) {
     sampled.eval();
     return sampled.data<std::int32_t>()[0];
@@ -171,7 +155,7 @@ std::int32_t prefill(
     model.reset_cache(1);
     return evaluated_token(
         sampler.sample(
-            last_token_logits(
+            mfq::metal::mlx_last_token_logits(
                 model.forward(ids, true),
                 vocab)));
 }
@@ -199,7 +183,7 @@ void run_decode_steps(
             mlx::core::int32);
         auto logits = model.forward(ids, true);
         auto sampled = sampler.sample(
-            last_token_logits(logits, vocab));
+            mfq::metal::mlx_last_token_logits(logits, vocab));
         if (timings != nullptr) {
             timings->build_ms +=
                 milliseconds_since(build_start);
