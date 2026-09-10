@@ -148,14 +148,21 @@ def _all_family_container() -> NintMoeTensor:
     )
 
 
-def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path):
-    executable = (
-        Path(__file__).resolve().parents[1]
-        / "build"
-        / "cpp_runtime"
-        / "mfq-decode.exe"
+@pytest.mark.parametrize("tokens", (3, 13))
+def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path, tokens: int):
+    root = Path(__file__).resolve().parents[1]
+    executable = next(
+        (
+            candidate
+            for candidate in (
+                root / "build" / "cpp_runtime" / "mfq-decode.exe",
+                root / "build" / "cuda-local" / "mfq-decode.exe",
+            )
+            if candidate.exists()
+        ),
+        None,
     )
-    if not executable.exists():
+    if executable is None:
         pytest.skip("C++ runtime is not built")
 
     tensor_name = "all.families"
@@ -169,7 +176,6 @@ def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path):
     _, stored_tensors = io.load(model_path)
     tensor = stored_tensors[tensor_name]
 
-    tokens = 3
     routes = 8
     count = tokens * tensor.neuron_len
     sequence = torch.arange(count, device="cuda", dtype=torch.float32)
@@ -201,20 +207,23 @@ def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path):
         path_parts.append(str(Path(cuda_root) / "bin"))
     path_parts.append(env.get("PATH", ""))
     env["PATH"] = os.pathsep.join(path_parts)
+    if tokens > 8:
+        env["MFQ_MOE_PREFILL_MMA_MIN_TOKENS"] = "9"
+    command = [
+        str(executable),
+        "--mfq",
+        str(model_path),
+        "--check-nintm-tensor",
+        tensor_name,
+        "--check-nintm-tokens",
+        str(tokens),
+        "--check-nintm-routes",
+        str(routes),
+        "--check-nintm-reps",
+        "2",
+    ]
     completed = subprocess.run(
-        [
-            str(executable),
-            "--mfq",
-            str(model_path),
-            "--check-nintm-tensor",
-            tensor_name,
-            "--check-nintm-tokens",
-            str(tokens),
-            "--check-nintm-routes",
-            str(routes),
-            "--check-nintm-reps",
-            "2",
-        ],
+        command,
         check=True,
         capture_output=True,
         env=env,
@@ -227,6 +236,28 @@ def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path):
         if value.startswith("nintm_tensor_check ")
     )
     fields = dict(part.split("=", 1) for part in line.split()[1:])
+    if tokens > 8:
+        legacy_env = env.copy()
+        legacy_env["MFQ_DISABLE_MOE_NVQ_HETERO"] = "1"
+        legacy = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            env=legacy_env,
+            text=True,
+            timeout=60,
+        )
+        legacy_line = next(
+            value
+            for value in legacy.stdout.splitlines()
+            if value.startswith("nintm_tensor_check ")
+        )
+        legacy_fields = dict(
+            part.split("=", 1) for part in legacy_line.split()[1:]
+        )
+        assert fields["values"] == legacy_fields["values"]
+        assert fields["checksum"] == legacy_fields["checksum"]
+        assert fields["sqsum"] == legacy_fields["sqsum"]
     actual = torch.as_tensor(
         [float(value) for value in fields["values"].split(",")],
         dtype=torch.float32,
@@ -234,23 +265,27 @@ def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path):
     assert fields["mixed"] == "1"
     expected = expected[: actual.numel()]
     diagnostics = []
-    for token in range(tokens):
-        for route_index in range(routes):
-            offset = (token * routes + route_index) * tensor.out_per_expert
-            got = actual[offset : offset + tensor.out_per_expert]
-            ref = expected[offset : offset + tensor.out_per_expert]
-            max_abs = float((got - ref).abs().max())
-            if max_abs > 2e-5:
-                expert = int(ids[token, route_index])
-                diagnostics.append(
-                    (
-                        token,
-                        route_index,
-                        expert,
-                        tensor.expert_profiles[expert],
-                        max_abs,
-                        float((got - ref).norm() / ref.norm().clamp_min(1e-30)),
-                    )
+    shown_pairs = actual.numel() // tensor.out_per_expert
+    for pair in range(shown_pairs):
+        token, route_index = divmod(pair, routes)
+        offset = pair * tensor.out_per_expert
+        got = actual[offset : offset + tensor.out_per_expert]
+        ref = expected[offset : offset + tensor.out_per_expert]
+        max_abs = float((got - ref).abs().max())
+        relative = float((got - ref).norm() / ref.norm().clamp_min(1e-30))
+        if (tokens <= 8 and max_abs > 2e-5) or (
+            tokens > 8 and relative >= 0.02
+        ):
+            expert = int(ids[token, route_index])
+            diagnostics.append(
+                (
+                    token,
+                    route_index,
+                    expert,
+                    tensor.expert_profiles[expert],
+                    max_abs,
+                    relative,
                 )
+            )
     diagnostics.sort(key=lambda value: value[4], reverse=True)
     assert not diagnostics, diagnostics[:10]

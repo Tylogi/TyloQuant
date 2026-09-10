@@ -339,6 +339,14 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
     int64_t sub_bits, int64_t format, int64_t sign_mode,
     mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
     mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor weight_sizes,
+    mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor expert_pool,
+    mfq_tensor_backend::Tensor expert_local, mfq_tensor_backend::Tensor x,
+    int64_t n_experts, int64_t out_per_expert, int64_t neuron_len,
+    mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor ids_dst,
+    mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts);
 mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
     mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor table_pool, mfq_tensor_backend::Tensor bank_ids,
@@ -6646,6 +6654,15 @@ struct MixedMoeActivationKeyHash {
     }
 };
 
+struct MixedNvqDispatch {
+    mfq_tensor_backend::Tensor weight_ptrs;
+    mfq_tensor_backend::Tensor weight_sizes;
+    mfq_tensor_backend::Tensor pool_params;
+    mfq_tensor_backend::Tensor expert_pool;
+    mfq_tensor_backend::Tensor expert_local;
+    int pool_count = 0;
+};
+
 struct MixedMoeRuntime {
     int n_experts = 0;
     int out_per_expert = 0;
@@ -6653,6 +6670,7 @@ struct MixedMoeRuntime {
     bool partial_experts = false;
     std::vector<MixedMoePool> pools;
     std::shared_ptr<NintMoeWeight> nint_dispatch;
+    std::shared_ptr<MixedNvqDispatch> nvq_dispatch;
     MoeActivationWorkspace & activation_workspace(
             mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
             MixedMoeTransformKey transform) const {
@@ -6755,6 +6773,8 @@ struct MixedMoeRuntime {
         const bool use_nint_decode =
             !use_f16_mma && !use_kl_mmq && nint_dispatch &&
             nint_dispatch->hetero_supported;
+        const bool use_nvq_prefill =
+            use_f16_mma && !use_kl_mmq && nvq_dispatch;
         if (input_prequantized && use_kl_mmq) {
             throw std::runtime_error(
                 "mixed prequantized activation reuse is unavailable in KLD MMQ mode");
@@ -6780,6 +6800,17 @@ struct MixedMoeRuntime {
             output = input_prequantized
                 ? nint_dispatch->forward_prequantized(x, route)
                 : nint_dispatch->forward(x, route);
+        }
+        if (use_nvq_prefill) {
+            nvq_moe_grouped_matmul_hetero_f16_cuda(
+                nvq_dispatch->weight_ptrs,
+                nvq_dispatch->weight_sizes,
+                nvq_dispatch->pool_params,
+                nvq_dispatch->expert_pool,
+                nvq_dispatch->expert_local,
+                x, n_experts, out_per_expert, neuron_len, output,
+                route.ids_dst, route.expert_bounds,
+                route.tile_bounds, route.tile_experts);
         }
 
         mfq_tensor_backend::Tensor shared_nint_qx;
@@ -6807,6 +6838,9 @@ struct MixedMoeRuntime {
         for (const auto & pool : pools) {
             if (pool.family == MixedMoeFamily::Nint &&
                     (use_nint_prefill || use_nint_decode)) {
+                continue;
+            }
+            if (pool.family == MixedMoeFamily::Nvq && use_nvq_prefill) {
                 continue;
             }
             int gs = 24;
@@ -7155,6 +7189,126 @@ static void initialize_mixed_nint_dispatch(
         std::make_shared<NintMoeWeight>(std::move(dispatch));
 }
 
+static void initialize_mixed_nvq_dispatch(
+        MixedMoeRuntime & runtime) {
+    runtime.nvq_dispatch.reset();
+    const char * disabled =
+        std::getenv("MFQ_DISABLE_MOE_NVQ_HETERO");
+    if (disabled != nullptr && std::atoi(disabled) != 0) return;
+
+    int nvq_pools = 0;
+    for (const auto & pool : runtime.pools) {
+        if (pool.family == MixedMoeFamily::Nvq) ++nvq_pools;
+    }
+    if (nvq_pools < 2) return;
+
+    std::vector<int64_t> weight_ptrs;
+    std::vector<int64_t> weight_sizes;
+    std::vector<int32_t> pool_params;
+    std::vector<int32_t> expert_pool(
+        static_cast<size_t>(runtime.n_experts), -1);
+    std::vector<int32_t> expert_local(
+        static_cast<size_t>(runtime.n_experts), -1);
+    weight_ptrs.reserve(static_cast<size_t>(nvq_pools) * 5);
+    weight_sizes.reserve(static_cast<size_t>(nvq_pools) * 3);
+    pool_params.reserve(static_cast<size_t>(nvq_pools) * 7);
+
+    mfq_tensor_backend::Device target = mfq_tensor_backend::Device(
+        mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
+    int dispatch_pool = 0;
+    for (const auto & pool : runtime.pools) {
+        if (pool.family != MixedMoeFamily::Nvq) continue;
+        const auto & weight = pool.nvq;
+        if (weight.gs != 24 || weight.ng <= 0 ||
+                weight.ng > std::numeric_limits<int32_t>::max() ||
+                weight.sub_bits < 1 || weight.sub_bits > 8 ||
+                weight.kernel_format < 1 || weight.kernel_format > 17 ||
+                weight.sign_mode < 0 || weight.sign_mode > 1) {
+            return;
+        }
+        if (dispatch_pool == 0) target = weight.indices_packed.device();
+        if (weight.indices_packed.device() != target ||
+                weight.aux_packed.device() != target ||
+                weight.sub_scale_packed.device() != target ||
+                weight.neuron_scale.device() != target ||
+                weight.codebook.device() != target) {
+            return;
+        }
+        weight_ptrs.push_back(static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(
+                weight.indices_packed.data_ptr<uint8_t>())));
+        weight_ptrs.push_back(static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(
+                weight.aux_packed.data_ptr<uint8_t>())));
+        weight_ptrs.push_back(static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(
+                weight.sub_scale_packed.data_ptr<uint8_t>())));
+        weight_ptrs.push_back(static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(
+                weight.neuron_scale.data_ptr<float>())));
+        weight_ptrs.push_back(static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(
+                weight.codebook.data_ptr<int8_t>())));
+        weight_sizes.push_back(weight.indices_packed.numel());
+        weight_sizes.push_back(weight.aux_packed.numel());
+        weight_sizes.push_back(weight.sub_scale_packed.numel());
+        const int format = static_cast<int>(weight.kernel_format);
+        const bool d4 =
+            format == 3 || format == 10 || format == 11 ||
+            format == 12 || format == 15 || format == 17;
+        const int nvec =
+            (runtime.neuron_len + (d4 ? 3 : 7)) / (d4 ? 4 : 8);
+        const int nsign = (runtime.neuron_len + 7) / 8;
+        pool_params.push_back(pool.local_experts);
+        pool_params.push_back(static_cast<int32_t>(weight.ng));
+        pool_params.push_back(nvec);
+        pool_params.push_back(nsign);
+        pool_params.push_back(static_cast<int32_t>(weight.sub_bits));
+        pool_params.push_back(static_cast<int32_t>(weight.sign_mode));
+        pool_params.push_back(format);
+
+        auto local_host = pool.expert_local
+            .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt32)
+            .contiguous();
+        const int32_t * local = local_host.data_ptr<int32_t>();
+        for (int expert = 0; expert < runtime.n_experts; ++expert) {
+            if (local[expert] < 0) continue;
+            if (local[expert] >= pool.local_experts ||
+                    expert_pool[static_cast<size_t>(expert)] >= 0) {
+                throw std::runtime_error(
+                    "mixed NVQ prefill has invalid expert ownership");
+            }
+            expert_pool[static_cast<size_t>(expert)] = dispatch_pool;
+            expert_local[static_cast<size_t>(expert)] = local[expert];
+        }
+        ++dispatch_pool;
+    }
+
+    auto dispatch = std::make_shared<MixedNvqDispatch>();
+    dispatch->pool_count = dispatch_pool;
+    dispatch->weight_ptrs = mfq_tensor_backend::from_blob(
+        weight_ptrs.data(), {dispatch_pool, 5},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+        .clone().to(target).contiguous();
+    dispatch->weight_sizes = mfq_tensor_backend::from_blob(
+        weight_sizes.data(), {dispatch_pool, 3},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+        .clone().to(target).contiguous();
+    dispatch->pool_params = mfq_tensor_backend::from_blob(
+        pool_params.data(), {dispatch_pool, 7},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone().to(target).contiguous();
+    dispatch->expert_pool = mfq_tensor_backend::from_blob(
+        expert_pool.data(), {runtime.n_experts},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone().to(target).contiguous();
+    dispatch->expert_local = mfq_tensor_backend::from_blob(
+        expert_local.data(), {runtime.n_experts},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone().to(target).contiguous();
+    runtime.nvq_dispatch = std::move(dispatch);
+}
+
 static int64_t tensor_storage_bytes(const mfq_tensor_backend::Tensor & value) {
     return value.defined()
         ? value.numel() * (int64_t)value.element_size()
@@ -7168,6 +7322,13 @@ static int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
         bytes += tensor_storage_bytes(runtime.nint_dispatch->pool_params);
         bytes += tensor_storage_bytes(runtime.nint_dispatch->expert_pool);
         bytes += tensor_storage_bytes(runtime.nint_dispatch->expert_local);
+    }
+    if (runtime.nvq_dispatch) {
+        bytes += tensor_storage_bytes(runtime.nvq_dispatch->weight_ptrs);
+        bytes += tensor_storage_bytes(runtime.nvq_dispatch->weight_sizes);
+        bytes += tensor_storage_bytes(runtime.nvq_dispatch->pool_params);
+        bytes += tensor_storage_bytes(runtime.nvq_dispatch->expert_pool);
+        bytes += tensor_storage_bytes(runtime.nvq_dispatch->expert_local);
     }
     for (const auto & pool : runtime.pools) {
         bytes += tensor_storage_bytes(pool.expert_local);
@@ -7295,7 +7456,10 @@ static std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
         }
         runtime->pools.push_back(std::move(pool));
     }
-    if (cuda) initialize_mixed_nint_dispatch(*runtime);
+    if (cuda) {
+        initialize_mixed_nint_dispatch(*runtime);
+        initialize_mixed_nvq_dispatch(*runtime);
+    }
     return runtime;
 }
 
@@ -7450,6 +7614,7 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
             "expert-parallel MoE shard has no owned experts");
     }
     initialize_mixed_nint_dispatch(*runtime);
+    initialize_mixed_nvq_dispatch(*runtime);
     return wrap_mixed_moe_runtime(runtime);
 }
 
@@ -7619,6 +7784,7 @@ static NintMoeWeight stage_cpu_mixed_moe(
         runtime->pools.push_back(std::move(pool));
     }
     initialize_mixed_nint_dispatch(*runtime);
+    initialize_mixed_nvq_dispatch(*runtime);
     return wrap_mixed_moe_runtime(runtime);
 }
 
