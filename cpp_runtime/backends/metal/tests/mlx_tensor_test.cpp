@@ -338,6 +338,59 @@ void test_dense_small_m() {
     }
 }
 
+void test_dense_small_output_m_matches_decode() {
+    using namespace mlx::core;
+    constexpr int width = 4096;
+    constexpr int output = 24;
+    std::vector<float> weight_values(
+        static_cast<std::size_t>(width) * output);
+    for (std::size_t index = 0; index < weight_values.size(); ++index) {
+        weight_values[index] = static_cast<float>(
+            static_cast<int>((index * 29 + 7) % 47) - 23) / 256.0f;
+    }
+    for (const auto dtype : {float16, bfloat16, float32}) {
+        auto weight = astype(
+            array(weight_values.begin(), Shape{output, width}),
+            dtype);
+        const mfq::metal::MlxLinear linear(weight);
+        for (int rows = 2; rows <= 6; ++rows) {
+            std::vector<float> input_values(
+                static_cast<std::size_t>(rows) * width);
+            for (std::size_t index = 0; index < input_values.size(); ++index) {
+                input_values[index] = static_cast<float>(
+                    static_cast<int>((index * 31 + 11) % 53) - 26) /
+                    128.0f;
+            }
+            auto input = astype(
+                array(input_values.begin(), Shape{1, rows, width}),
+                dtype);
+            auto actual = contiguous(linear(input));
+            std::vector<array> serial;
+            serial.reserve(static_cast<std::size_t>(rows));
+            for (int row = 0; row < rows; ++row) {
+                serial.push_back(linear(slice(
+                    input,
+                    Shape{0, row, 0},
+                    Shape{1, row + 1, width})));
+            }
+            auto reference = contiguous(concatenate(serial, 1));
+            eval(actual, reference);
+            require(
+                actual.shape() == reference.shape(),
+                "dense small-output decode shape mismatch");
+            require(
+                actual.nbytes() == reference.nbytes(),
+                "dense small-output decode dtype mismatch");
+            require(
+                std::memcmp(
+                    actual.data<std::uint8_t>(),
+                    reference.data<std::uint8_t>(),
+                    actual.nbytes()) == 0,
+                "dense small-output batch differs from decode");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -387,6 +440,7 @@ int main() {
         require_close(bf16_values[2], 4.0f);
 
         test_dense_small_m();
+        test_dense_small_output_m_matches_decode();
 
         const array grouped_weight(
             {

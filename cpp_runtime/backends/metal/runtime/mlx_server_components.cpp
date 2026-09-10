@@ -608,12 +608,15 @@ MlxServerComponentCallbacks make_mlx_server_components(
                     std::move(permutation),
                 });
             }
-            std::function<void(std::size_t, double)> report_prefill;
+            MlxDeepseekV4PrefillCallback report_prefill;
             if (on_prefill) {
                 report_prefill = [on_prefill](
-                    std::size_t tokens, double model_ms) {
+                    std::size_t tokens,
+                    double llm_ms,
+                    double multimodal_ms,
+                    double model_ms) {
                     on_prefill(MfqPrefillTiming{
-                        tokens, model_ms, 0.0, model_ms});
+                        tokens, llm_ms, multimodal_ms, model_ms});
                 };
             }
             return runtime_holder->value().generate_multimodal(

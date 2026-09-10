@@ -24,6 +24,12 @@
 
 namespace mfq::metal {
 
+using MlxDeepseekV4PrefillCallback = std::function<void(
+    std::size_t prompt_tokens,
+    double llm_ms,
+    double multimodal_ms,
+    double model_ms)>;
+
 struct MlxDeepseekV4LayerComponents {
     MlxDeepseekV4Attention attention;
     MlxDeepseekV4Moe moe;
@@ -97,6 +103,15 @@ public:
         int pos0,
         MlxDeepseekV4SsdPrefetchedLayer* prefetched,
         const MlxDeepseekV4ImageVisibility* visibility) const;
+
+    mlx::core::array forward(
+        const mlx::core::array& hidden,
+        const mlx::core::array& token_ids,
+        MlxDeepseekV4LayerState& state,
+        int pos0,
+        MlxDeepseekV4SsdPrefetchedLayer* prefetched,
+        const MlxDeepseekV4ImageVisibility* visibility,
+        std::vector<mlx::core::array>* debug_stages) const;
 
     std::optional<MlxDeepseekV4SsdPrefetchedLayer>
     prefetch_routed(std::size_t rows) const {
@@ -272,7 +287,7 @@ public:
         const MlxDeepseekV4TokenCallback& callback = {},
         const std::optional<std::vector<std::int64_t>>&
             eos_token_ids = std::nullopt,
-        const std::function<void(std::size_t, double)>&
+        const MlxDeepseekV4PrefillCallback&
             prefill_callback = {},
         const MfqTokenConstraintPtr& token_constraint = {});
 
@@ -333,7 +348,9 @@ private:
         const std::optional<mlx::core::array>& input_embeddings =
             std::nullopt,
         const MlxDeepseekV4ImageVisibility* visibility = nullptr,
-        mlx::core::array* dspark_hidden = nullptr);
+        mlx::core::array* dspark_hidden = nullptr,
+        std::vector<mlx::core::array>* debug_layer_hiddens = nullptr,
+        std::vector<mlx::core::array>* debug_layer0_stages = nullptr);
     mlx::core::array prefill_impl(
         const mlx::core::array& token_ids,
         int chunk_size,
@@ -341,8 +358,8 @@ private:
         bool reset);
     mlx::core::array head(
         const mlx::core::array& hidden) const;
-    void materialize_state(
-        const MlxDeepseekV4LayerState& state) const;
+    void materialize_states(
+        const std::vector<MlxDeepseekV4LayerState>& states) const;
     void append_state_arrays(
         const MlxDeepseekV4LayerState& state,
         std::vector<mlx::core::array>& arrays) const;
@@ -361,7 +378,7 @@ private:
         const MlxDeepseekV4TokenCallback& callback,
         const std::optional<std::vector<std::int64_t>>& eos_token_ids,
         int chunk_size,
-        const std::function<void(std::size_t, double)>& prefill_callback,
+        const MlxDeepseekV4PrefillCallback& prefill_callback,
         std::optional<std::size_t> stable_prefix_tokens,
         const MfqTokenConstraintPtr& token_constraint);
 

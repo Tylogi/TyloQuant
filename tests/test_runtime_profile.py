@@ -25,6 +25,10 @@ def test_architecture_registry_is_partial() -> None:
     assert profile["duplex"]["system_prompt"] == "Streaming Omni Conversation."
     assert "max_tokens" not in profile["chat"]
 
+    deepseek = architecture_profile("deepseek_v4_vision")
+    assert deepseek is not None
+    assert deepseek["chat"]["mtp_max_draft_tokens"] == 4
+
 
 def test_exact_model_registry_matches_repository_identity() -> None:
     profile = model_profile("Tylogi/MiniCPM-o-4_5-MFQ")

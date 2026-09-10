@@ -763,6 +763,7 @@ static MfqRuntimeProfile architecture_runtime_profile(
         result.chat.top_p = 0.8;
         result.chat.repetition_penalty = 1.05;
         result.chat.presence_penalty = 0.0;
+        result.chat.mtp_max_draft_tokens = 4;
         result.source = "architecture-registry:deepseek_v4";
     }
     return result;

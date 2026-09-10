@@ -78,6 +78,7 @@ _ARCHITECTURE_REGISTRY: dict[str, dict[str, Any]] = {
             "top_p": 0.8,
             "repetition_penalty": 1.05,
             "presence_penalty": 0.0,
+            "mtp_max_draft_tokens": 4,
         },
         source="architecture-registry:deepseek_v4",
     ),

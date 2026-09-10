@@ -317,6 +317,13 @@ public:
         int pos0,
         const MlxDeepseekV4ImageVisibility* visibility) const;
 
+    mlx::core::array operator()(
+        const mlx::core::array& input,
+        MlxDeepseekV4LayerState& state,
+        int pos0,
+        const MlxDeepseekV4ImageVisibility* visibility,
+        std::vector<mlx::core::array>* debug_stages) const;
+
     void commit_speculative(
         MlxDeepseekV4LayerState& state) const noexcept;
     void rollback_speculative(
