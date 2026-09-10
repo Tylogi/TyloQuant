@@ -76,6 +76,14 @@ def test_cuda_kl_rejects_context_larger_than_model_capacity() -> None:
 
 
 def test_unified_cuda_extension_can_include_runtime_headers() -> None:
-    assert "_REPOSITORY_ROOT" in UNIFIED_CUDA_EXT
-    assert "_CUDA_RUNTIME_INCLUDE" in UNIFIED_CUDA_EXT
-    assert "extra_include_paths=[_REPOSITORY_ROOT, _CUDA_RUNTIME_INCLUDE]" in UNIFIED_CUDA_EXT
+    for include in (
+        "_REPOSITORY_ROOT",
+        "_CUDA_RUNTIME_INCLUDE",
+        "_GGML_INCLUDE",
+        "_GGML_SOURCE_INCLUDE",
+        "_GGML_CUDA_INCLUDE",
+    ):
+        assert include in UNIFIED_CUDA_EXT
+    assert "extra_include_paths=[" in UNIFIED_CUDA_EXT
+    assert '"--extended-lambda"' in UNIFIED_CUDA_EXT
+    assert '"-U__CUDA_NO_HALF_CONVERSIONS__"' in UNIFIED_CUDA_EXT

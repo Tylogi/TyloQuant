@@ -4,9 +4,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
-#include <deque>
 #include <exception>
 #include <fstream>
+#include <list>
 #include <limits>
 #include <mutex>
 #include <thread>
@@ -316,18 +316,77 @@ void NintMxfp4ExpertStore::read_range_into(
     }
 }
 
+struct NintMxfp4ReadState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::size_t remaining = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t calls = 0;
+    std::uint64_t file_opens = 0;
+    std::chrono::steady_clock::time_point started;
+    std::chrono::steady_clock::time_point completed;
+    std::exception_ptr error;
+};
+
+NintMxfp4ReadTicket::NintMxfp4ReadTicket(
+    std::shared_ptr<NintMxfp4ReadState> state)
+    : state_(std::move(state)) {}
+
+NintMxfp4ReadTicket::NintMxfp4ReadTicket(
+    NintMxfp4ReadTicket&&) noexcept = default;
+
+NintMxfp4ReadTicket& NintMxfp4ReadTicket::operator=(
+    NintMxfp4ReadTicket&& other) noexcept {
+    if (this == &other) return *this;
+    if (state_) {
+        try {
+            (void)wait();
+        } catch (...) {
+        }
+    }
+    state_ = std::move(other.state_);
+    return *this;
+}
+
+NintMxfp4ReadTicket::~NintMxfp4ReadTicket() {
+    if (!state_) return;
+    try {
+        (void)wait();
+    } catch (...) {
+    }
+}
+
+bool NintMxfp4ReadTicket::valid() const noexcept {
+    return static_cast<bool>(state_);
+}
+
+NintMxfp4ReadBatchStats NintMxfp4ReadTicket::wait() {
+    if (!state_) {
+        throw std::runtime_error("exact-range read ticket is empty");
+    }
+    auto state = std::move(state_);
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->condition.wait(lock, [&state] {
+        return state->remaining == 0;
+    });
+    NintMxfp4ReadBatchStats result;
+    result.bytes = state->bytes;
+    result.calls = state->calls;
+    result.file_opens = state->file_opens;
+    result.wall_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            state->completed - state->started).count());
+    const auto error = state->error;
+    lock.unlock();
+    if (error) std::rethrow_exception(error);
+    return result;
+}
+
 struct NintMxfp4ReadPool::Impl {
-    struct Batch {
-        std::mutex mutex;
-        std::condition_variable condition;
-        std::size_t remaining = 0;
-        std::uint64_t file_opens = 0;
-        std::exception_ptr error;
-    };
 
     struct Task {
         NintMxfp4ReadRequest request;
-        std::shared_ptr<Batch> batch;
+        std::shared_ptr<NintMxfp4ReadState> batch;
     };
 
     explicit Impl(std::size_t requested_workers)
@@ -448,6 +507,10 @@ struct NintMxfp4ReadPool::Impl {
                     std::terminate();
                 }
                 --task.batch->remaining;
+                if (task.batch->remaining == 0) {
+                    task.batch->completed =
+                        std::chrono::steady_clock::now();
+                }
             }
             task.batch->condition.notify_one();
         }
@@ -456,7 +519,7 @@ struct NintMxfp4ReadPool::Impl {
     const std::size_t worker_count;
     std::mutex mutex;
     std::condition_variable condition;
-    std::deque<Task> tasks;
+    std::list<Task> tasks;
     std::vector<std::thread> threads;
     bool stopping = false;
 };
@@ -470,43 +533,43 @@ std::size_t NintMxfp4ReadPool::workers() const noexcept {
     return impl_->worker_count;
 }
 
-NintMxfp4ReadBatchStats NintMxfp4ReadPool::read(
+NintMxfp4ReadTicket NintMxfp4ReadPool::submit(
     std::span<const NintMxfp4ReadRequest> requests) {
-    NintMxfp4ReadBatchStats result;
-    if (requests.empty()) return result;
+    auto batch = std::make_shared<NintMxfp4ReadState>();
+    batch->started = std::chrono::steady_clock::now();
     for (const auto& request : requests) {
         if (request.store == nullptr || request.part == nullptr ||
             request.destination.size() != request.part->nbytes ||
             request.part->nbytes >
-                std::numeric_limits<std::uint64_t>::max() - result.bytes) {
+                std::numeric_limits<std::uint64_t>::max() - batch->bytes) {
             throw std::invalid_argument("invalid exact-range read batch");
         }
-        result.bytes += request.part->nbytes;
+        batch->bytes += request.part->nbytes;
     }
-    result.calls = requests.size();
-    const auto started = std::chrono::steady_clock::now();
-    auto batch = std::make_shared<Impl::Batch>();
+    batch->calls = requests.size();
     batch->remaining = requests.size();
+    if (requests.empty()) {
+        batch->completed = batch->started;
+        return NintMxfp4ReadTicket(std::move(batch));
+    }
+    std::list<Impl::Task> tasks;
+    for (const auto& request : requests) {
+        tasks.push_back({request, batch});
+    }
     {
         std::lock_guard<std::mutex> guard(impl_->mutex);
         if (impl_->stopping) {
             throw std::runtime_error("exact-range read pool is stopping");
         }
-        for (const auto& request : requests) {
-            impl_->tasks.push_back({request, batch});
-        }
+        impl_->tasks.splice(impl_->tasks.end(), tasks);
     }
     impl_->condition.notify_all();
-    std::unique_lock<std::mutex> lock(batch->mutex);
-    batch->condition.wait(lock, [&batch] {
-        return batch->remaining == 0;
-    });
-    result.file_opens = batch->file_opens;
-    if (batch->error) std::rethrow_exception(batch->error);
-    result.wall_nanoseconds = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - started).count());
-    return result;
+    return NintMxfp4ReadTicket(std::move(batch));
+}
+
+NintMxfp4ReadBatchStats NintMxfp4ReadPool::read(
+    std::span<const NintMxfp4ReadRequest> requests) {
+    return submit(requests).wait();
 }
 
 } // namespace mfq::cuda

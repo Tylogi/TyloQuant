@@ -7943,6 +7943,15 @@ struct MoePinnedStage {
     bool pending = false;
 };
 
+struct MoePendingRangeRead {
+    mfq_tensor_backend::Tensor host;
+    std::vector<MoeCacheTransfer> transfers;
+    std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> held_slots;
+    std::vector<MoeCacheNewLease> new_leases;
+    mfq::cuda::NintMxfp4ReadTicket ticket;
+    bool replaced_occupied = false;
+};
+
 struct MoeCacheStats {
     int64_t demand_hits = 0;
     int64_t demand_misses = 0;
@@ -7962,6 +7971,8 @@ struct MoeCacheStats {
     int64_t range_read_calls = 0;
     int64_t range_file_opens = 0;
     int64_t range_read_nanoseconds = 0;
+    int64_t range_overlap_batches = 0;
+    int64_t range_overlap_wait_nanoseconds = 0;
 };
 
 class MoeExpertCache : public std::enable_shared_from_this<MoeExpertCache> {
@@ -8007,6 +8018,10 @@ public:
         }
         range_read_pool_ =
             std::make_unique<mfq::cuda::NintMxfp4ReadPool>(range_workers);
+        const char * disable_overlap =
+            std::getenv("MFQ_DISABLE_MOE_SSD_OVERLAP");
+        range_overlap_enabled_ =
+            disable_overlap == nullptr || std::atoi(disable_overlap) == 0;
     }
 
     ~MoeExpertCache() {
@@ -8220,6 +8235,11 @@ public:
         const std::vector<MoeCachedSource *> & sources,
         const std::vector<int32_t> & experts);
 
+    bool prepare_bundle_deferred(
+        const std::vector<MoeCachedSource *> & ready_sources,
+        MoeCachedSource & deferred_source,
+        const std::vector<int32_t> & experts);
+
     void prewarm();
 
     void begin_route_experts(
@@ -8371,6 +8391,11 @@ public:
                << " range_read_ms="
                << static_cast<double>(stats_.range_read_nanoseconds) /
                     1.0e6
+               << " range_overlap_batches="
+               << stats_.range_overlap_batches
+               << " range_overlap_wait_ms="
+               << static_cast<double>(
+                    stats_.range_overlap_wait_nanoseconds) / 1.0e6
                << "\n";
     }
 
@@ -8390,6 +8415,22 @@ private:
         const std::vector<MoeCacheNewLease> & new_leases,
         const std::vector<
             std::pair<mfq::MoeCacheSlotBook *, int>> & held_slots) noexcept;
+
+    bool begin_deferred_range_read(
+        MoeCachedSource & source,
+        const std::vector<int32_t> & experts);
+
+    void finish_deferred_range_read(MoeCachedSource & source);
+
+    void record_range_read(
+        const mfq::cuda::NintMxfp4ReadBatchStats & range_stats) {
+        stats_.range_read_bytes += static_cast<int64_t>(range_stats.bytes);
+        stats_.range_read_calls += static_cast<int64_t>(range_stats.calls);
+        stats_.range_file_opens +=
+            static_cast<int64_t>(range_stats.file_opens);
+        stats_.range_read_nanoseconds +=
+            static_cast<int64_t>(range_stats.wall_nanoseconds);
+    }
 
     MoePinnedStage & acquire_stage(
             int64_t required_bytes,
@@ -8483,12 +8524,7 @@ private:
         auto finish_range_reads = [this, &range_requests]() {
             if (range_requests.empty()) return;
             const auto range_stats = range_read_pool_->read(range_requests);
-            stats_.range_read_bytes += static_cast<int64_t>(range_stats.bytes);
-            stats_.range_read_calls += static_cast<int64_t>(range_stats.calls);
-            stats_.range_file_opens +=
-                static_cast<int64_t>(range_stats.file_opens);
-            stats_.range_read_nanoseconds +=
-                static_cast<int64_t>(range_stats.wall_nanoseconds);
+            record_range_read(range_stats);
             range_requests.clear();
         };
         int64_t staged_payload_bytes = 0;
@@ -8734,6 +8770,9 @@ private:
     std::vector<RegisteredHostField> registered_host_fields_;
     std::unordered_map<void *, const uint8_t *> mapped_host_lookup_;
     std::unique_ptr<mfq::cuda::NintMxfp4ReadPool> range_read_pool_;
+    std::unordered_map<int, std::unique_ptr<MoePendingRangeRead>>
+        pending_range_reads_;
+    bool range_overlap_enabled_ = true;
 };
 
 struct MoeCachedCohort {
@@ -9289,6 +9328,25 @@ public:
                 return false;
             }
             raw_sources.push_back(source.get());
+        }
+        if (raw_sources.size() == 3 &&
+                raw_sources[0]->projection_role_ == "gate" &&
+                raw_sources[1]->projection_role_ == "up" &&
+                raw_sources[2]->projection_role_ == "down" &&
+                raw_sources[2]->range_store_) {
+            return first.cache_->prepare_bundle_deferred(
+                {raw_sources[0], raw_sources[1]},
+                *raw_sources[2],
+                first.route_experts(route));
+        }
+        if (raw_sources.size() == 2 &&
+                raw_sources[0]->projection_role_ == "gate_up" &&
+                raw_sources[1]->projection_role_ == "down" &&
+                raw_sources[1]->range_store_) {
+            return first.cache_->prepare_bundle_deferred(
+                {raw_sources[0]},
+                *raw_sources[1],
+                first.route_experts(route));
         }
         return first.cache_->prepare_bundle(
             raw_sources, first.route_experts(route));
@@ -9888,6 +9946,151 @@ void MoeExpertCache::rollback_preparation(
     }
 }
 
+bool MoeExpertCache::begin_deferred_range_read(
+        MoeCachedSource & source,
+        const std::vector<int32_t> & experts) {
+    if (!range_overlap_enabled_ || prewarming_ || !source.range_store_ ||
+            experts.empty()) {
+        return false;
+    }
+    finish_deferred_range_read(source);
+
+    std::unordered_map<
+        MoeGpuArena *,
+        std::unordered_set<mfq::MoeCacheKey, mfq::MoeCacheKeyHash>>
+        arena_demands;
+    for (int expert : experts) {
+        if (expert < 0 || expert >= source.n_experts()) return false;
+        const int cohort_index = source.expert_to_cohort_.at(
+            static_cast<size_t>(expert));
+        auto & cohort = source.cohorts_.at(
+            static_cast<size_t>(cohort_index));
+        arena_demands[cohort.arena].insert(
+            {source.id_, cohort_index, expert});
+    }
+    for (const auto & item : arena_demands) {
+        if (item.second.size() >
+                static_cast<size_t>(item.first->book->capacity())) {
+            return false;
+        }
+    }
+
+    auto pending = std::make_unique<MoePendingRangeRead>();
+    for (const auto & item : arena_demands) {
+        auto * book = item.first->book.get();
+        for (const auto & key : item.second) {
+            const int slot = book->slot_for(key);
+            if (slot >= 0 && !book->inflight(slot)) {
+                book->mark_inflight(slot);
+                pending->held_slots.emplace_back(book, slot);
+            }
+        }
+    }
+
+    try {
+        append_source_transfers(
+            source,
+            experts,
+            true,
+            pending->transfers,
+            pending->replaced_occupied,
+            &pending->held_slots,
+            &pending->new_leases);
+
+        int64_t range_bytes = 0;
+        size_t range_count = 0;
+        for (const auto & transfer : pending->transfers) {
+            if (transfer.range_store == nullptr) continue;
+            range_bytes = (range_bytes + 15) & ~int64_t{15};
+            if (transfer.nbytes >
+                    std::numeric_limits<int64_t>::max() - range_bytes) {
+                throw std::overflow_error(
+                    "deferred MoE range byte count overflows int64");
+            }
+            range_bytes += transfer.nbytes;
+            ++range_count;
+        }
+        if (range_count == 0) {
+            submit_transfers(
+                pending->transfers,
+                pending->replaced_occupied,
+                false);
+            for (const auto & held : pending->held_slots) {
+                held.first->clear_inflight(held.second);
+            }
+            return true;
+        }
+
+        pending->host = mfq_tensor_backend::empty(
+            {range_bytes},
+            mfq_tensor_backend::TensorOptions()
+                .device(mfq_tensor_backend::kCPU)
+                .dtype(mfq_tensor_backend::kUInt8)
+                .pinned_memory(true));
+        auto * staging = pending->host.data_ptr<uint8_t>();
+        std::vector<mfq::cuda::NintMxfp4ReadRequest> requests;
+        requests.reserve(range_count);
+        int64_t offset = 0;
+        for (auto & transfer : pending->transfers) {
+            if (transfer.range_store == nullptr) continue;
+            offset = (offset + 15) & ~int64_t{15};
+            requests.push_back({
+                transfer.range_store,
+                transfer.range_part,
+                std::span<uint8_t>(
+                    staging + offset,
+                    static_cast<size_t>(transfer.nbytes)),
+            });
+            transfer.source = staging + offset;
+            transfer.range_store = nullptr;
+            transfer.range_part = nullptr;
+            offset += transfer.nbytes;
+        }
+        pending->ticket = range_read_pool_->submit(requests);
+        const auto inserted = pending_range_reads_.try_emplace(
+            source.id_, std::move(pending));
+        if (!inserted.second) {
+            throw std::runtime_error(
+                "MoE source already has a deferred range read");
+        }
+        ++stats_.range_overlap_batches;
+        return true;
+    } catch (...) {
+        if (pending) {
+            rollback_preparation(
+                pending->new_leases, pending->held_slots);
+        }
+        throw;
+    }
+}
+
+void MoeExpertCache::finish_deferred_range_read(
+        MoeCachedSource & source) {
+    const auto found = pending_range_reads_.find(source.id_);
+    if (found == pending_range_reads_.end()) return;
+    auto pending = std::move(found->second);
+    pending_range_reads_.erase(found);
+    try {
+        const auto wait_begin = std::chrono::steady_clock::now();
+        const auto range_stats = pending->ticket.wait();
+        stats_.range_overlap_wait_nanoseconds +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_begin).count();
+        record_range_read(range_stats);
+        submit_transfers(
+            pending->transfers,
+            pending->replaced_occupied,
+            true);
+    } catch (...) {
+        rollback_preparation(
+            pending->new_leases, pending->held_slots);
+        throw;
+    }
+    for (const auto & held : pending->held_slots) {
+        held.first->clear_inflight(held.second);
+    }
+}
+
 bool MoeExpertCache::prepare(
         MoeCachedSource & source,
         const std::vector<int32_t> & experts,
@@ -9896,6 +10099,7 @@ bool MoeExpertCache::prepare(
         throw std::runtime_error(
             "MoE cache must be finalized before inference");
     }
+    finish_deferred_range_read(source);
     if (experts.empty()) return false;
 
     std::unordered_map<
@@ -9957,6 +10161,11 @@ bool MoeExpertCache::prepare_bundle(
         throw std::runtime_error(
             "MoE cache must be finalized before inference");
     }
+    for (auto * source : sources) {
+        if (source != nullptr && source->cache_ == this) {
+            finish_deferred_range_read(*source);
+        }
+    }
     if (sources.empty() || experts.empty()) return false;
 
     std::unordered_map<
@@ -10012,6 +10221,19 @@ bool MoeExpertCache::prepare_bundle(
         held.first->clear_inflight(held.second);
     }
     return true;
+}
+
+bool MoeExpertCache::prepare_bundle_deferred(
+        const std::vector<MoeCachedSource *> & ready_sources,
+        MoeCachedSource & deferred_source,
+        const std::vector<int32_t> & experts) {
+    if (!range_overlap_enabled_ || !deferred_source.range_store_) {
+        auto sources = ready_sources;
+        sources.push_back(&deferred_source);
+        return prepare_bundle(sources, experts);
+    }
+    if (!prepare_bundle(ready_sources, experts)) return false;
+    return begin_deferred_range_read(deferred_source, experts);
 }
 
 static NintMoeWeight wrap_cached_moe_source(
@@ -10084,6 +10306,17 @@ static bool prefetch_cached_moe_projection_bundle(
     return MoeCachedSource::prefetch_bundle(
         {gate.cached_source, up.cached_source, down.cached_source},
         route);
+}
+
+static bool prefetch_cached_moe_projection_bundle(
+        const NintMoeWeight & gate_up,
+        const NintMoeWeight & down,
+        const MoeRoutePlan & route) {
+    if (!gate_up.cached_source || !down.cached_source) {
+        return false;
+    }
+    return MoeCachedSource::prefetch_bundle(
+        {gate_up.cached_source, down.cached_source}, route);
 }
 
 static NintMoeWeight load_nint_moe_gpu(
@@ -15438,17 +15671,44 @@ struct FFN {
                     std::getenv("MFQ_MOE_DELAYED_ROUTE_READBACK");
                 return value == nullptr || std::atoi(value) != 0;
             }();
+            static const bool disable_projection_bundle = [] {
+                const char * value = std::getenv(
+                    "MFQ_DISABLE_MOE_PROJECTION_BUNDLE_PREFETCH");
+                return value != nullptr && std::atoi(value) != 0;
+            }();
+            auto prefetch_projection_bundle = [&]() {
+                if (disable_projection_bundle || cpu_moe_down) {
+                    return false;
+                }
+                if (moe_split_gate_up) {
+                    if (cpu_moe_gate || cpu_moe_up) return false;
+                    return prefetch_cached_moe_projection_bundle(
+                        moe_gate, moe_up, moe_down, route);
+                }
+                if (cpu_moe_gate_up) return false;
+                return prefetch_cached_moe_projection_bundle(
+                    moe_gate_up, moe_down, route);
+            };
+            bool projection_bundle_prefetched = false;
             if (moe_split_gate_up) {
                 if (delayed_route_readback) {
                     moe_gate.prefetch_begin(route);
                 } else {
-                    moe_gate.prefetch(route);
+                    projection_bundle_prefetched =
+                        prefetch_projection_bundle();
+                    if (!projection_bundle_prefetched) {
+                        moe_gate.prefetch(route);
+                    }
                 }
             } else {
                 if (delayed_route_readback) {
                     moe_gate_up.prefetch_begin(route);
                 } else {
-                    moe_gate_up.prefetch(route);
+                    projection_bundle_prefetched =
+                        prefetch_projection_bundle();
+                    if (!projection_bundle_prefetched) {
+                        moe_gate_up.prefetch(route);
+                    }
                 }
             }
             auto shared_output = g_profiler.measure(
@@ -15464,25 +15724,15 @@ struct FFN {
                         .contiguous();
                 });
             }
-            bool projection_bundle_prefetched = false;
             if (delayed_route_readback) {
-                if (moe_split_gate_up) {
-                    static const bool disable_projection_bundle = [] {
-                        const char * value = std::getenv(
-                            "MFQ_DISABLE_MOE_PROJECTION_BUNDLE_PREFETCH");
-                        return value != nullptr && std::atoi(value) != 0;
-                    }();
-                    if (!disable_projection_bundle &&
-                            !cpu_moe_gate && !cpu_moe_up && !cpu_moe_down) {
-                        projection_bundle_prefetched =
-                            prefetch_cached_moe_projection_bundle(
-                                moe_gate, moe_up, moe_down, route);
-                    }
-                    if (!projection_bundle_prefetched) {
+                projection_bundle_prefetched =
+                    prefetch_projection_bundle();
+                if (!projection_bundle_prefetched) {
+                    if (moe_split_gate_up) {
                         moe_gate.prefetch(route);
+                    } else {
+                        moe_gate_up.prefetch(route);
                     }
-                } else {
-                    moe_gate_up.prefetch(route);
                 }
             }
             std::optional<NintMoeWeight> staged_gate_up;
@@ -17649,6 +17899,9 @@ struct FullBlock : Block {
             auto route = g_profiler.measure("gemma.route_map", [&]() {
                 return build_moe_route_plan(selected.at(0), gemma_moe_gate_up.n_experts);
             });
+            const bool projection_bundle_prefetched =
+                prefetch_cached_moe_projection_bundle(
+                    gemma_moe_gate_up, gemma_moe_down, route);
             mfq_tensor_backend::Tensor down_pair;
             const bool tracing_layer =
                 g_gemma_stage_trace != nullptr && layer == g_gemma_trace_layer;
@@ -17657,7 +17910,9 @@ struct FullBlock : Block {
                 auto moe_hidden = g_profiler.measure("gemma.moe_gate_up_geglu", [&]() {
                     return gemma_moe_gate_up.forward_glu_output(moe_input, route, true);
                 });
-                gemma_moe_down.prefetch(route);
+                if (!projection_bundle_prefetched) {
+                    gemma_moe_down.prefetch(route);
+                }
                 down_pair = g_profiler.measure("gemma.moe_down", [&]() {
                     return gemma_moe_down.forward(moe_hidden, route);
                 });
@@ -17665,7 +17920,9 @@ struct FullBlock : Block {
                 auto gate_up_pair = g_profiler.measure("gemma.moe_gate_up", [&]() {
                     return gemma_moe_gate_up.forward(moe_input, route);
                 });
-                gemma_moe_down.prefetch(route);
+                if (!projection_bundle_prefetched) {
+                    gemma_moe_down.prefetch(route);
+                }
                 trace_gemma_stage(layer, "moe_gate_up", gate_up_pair);
                 if (tracing_layer || gate_up_pair.size(0) > 4 ||
                     !gemma_moe_down.hetero_supported) {
@@ -26887,9 +27144,12 @@ static int run_gemma_moe_check(
                           packed.sub_min, packed.neuron_scale,
                           packed.neuron_min, packed.neuron_len,
                           packed.gs, packed.bits);
+            } else if (pool.dtype == "MXFP4") {
+                local_flat = dequant_mxfp4_cpu(pool.mxfp4)
+                    .to(mfq_tensor_backend::kCUDA).contiguous();
             } else {
                 throw std::runtime_error(
-                    "Gemma dense MoE reference requires NINT cohorts");
+                    "Gemma dense MoE reference requires NINT or MXFP4 cohorts");
             }
             auto local = local_flat.reshape({
                 static_cast<int64_t>(pool.expert_ids.size()),
@@ -26980,28 +27240,44 @@ static int run_gemma_moe_check(
             mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
         auto forward_materialized = [&]() {
             auto route = build_moe_route_plan(ids, experts);
+            const bool projection_bundle_prefetched =
+                prefetch_cached_moe_projection_bundle(
+                    gate_up, down, route);
             auto gate_pair = gate_up.forward(x, route);
             auto hidden = moe_geglu_split_cuda(gate_pair);
+            if (!projection_bundle_prefetched) down.prefetch(route);
             auto down_pair = down.forward(hidden, route);
             return moe_weighted_reduce_cuda(down_pair, weights);
         };
         auto forward_gate_glu = [&]() {
             auto route = build_moe_route_plan(ids, experts);
+            const bool projection_bundle_prefetched =
+                prefetch_cached_moe_projection_bundle(
+                    gate_up, down, route);
             auto hidden = gate_up.forward_glu_output(x, route, true);
+            if (!projection_bundle_prefetched) down.prefetch(route);
             auto down_pair = down.forward(hidden, route);
             return moe_weighted_reduce_cuda(down_pair, weights);
         };
+        const bool gate_glu_supported =
+            tokens <= 4 && gate_up.hetero_supported;
         auto forward = [&]() {
-            return tokens <= 4 ? forward_gate_glu() : forward_materialized();
+            return gate_glu_supported
+                ? forward_gate_glu()
+                : forward_materialized();
         };
         auto fused_check = forward();
         auto materialized_check = forward_materialized();
-        auto gate_glu_check = tokens <= 4 ? forward_gate_glu() : fused_check;
+        auto gate_glu_check = gate_glu_supported
+            ? forward_gate_glu()
+            : fused_check;
         mfq_cuda_synchronize();
         auto fused_diff = (fused_check - materialized_check).abs().to(mfq_tensor_backend::kFloat32);
         auto fused_time = time_ms(forward, reps);
         auto materialized_time = time_ms(forward_materialized, reps);
-        auto gate_glu_time = tokens <= 4 ? time_ms(forward_gate_glu, reps) : fused_time;
+        auto gate_glu_time = gate_glu_supported
+            ? time_ms(forward_gate_glu, reps)
+            : fused_time;
         auto gate_glu_diff = (gate_glu_check - materialized_check).abs().to(mfq_tensor_backend::kFloat32);
         std::cout << std::fixed << std::setprecision(6)
                   << "gemma_moe_geglu_quant_fusion"
@@ -27011,6 +27287,7 @@ static int run_gemma_moe_check(
                   << " fused_ms=" << fused_time.first
                   << " materialized_ms=" << materialized_time.first
                   << " speedup=" << materialized_time.first / fused_time.first
+                  << " gate_glu_supported=" << (gate_glu_supported ? 1 : 0)
                   << " gate_glu_equal=" << (gate_glu_check.equal(materialized_check) ? 1 : 0)
                   << " gate_glu_max_abs=" << gate_glu_diff.max().item<float>()
                   << " gate_glu_ms=" << gate_glu_time.first << "\n";

@@ -178,7 +178,10 @@ void test_parallel_read_batch() {
         });
     }
     mfq::cuda::NintMxfp4ReadPool pool(3);
-    const auto stats = pool.read(requests);
+    auto ticket = pool.submit(requests);
+    require(ticket.valid(), "asynchronous read ticket is empty");
+    const auto stats = ticket.wait();
+    require(!ticket.valid(), "completed read ticket remained valid");
     require(pool.workers() == 3, "parallel worker count was lost");
     require(stats.calls == 6, "parallel range-call accounting is wrong");
     require(stats.bytes == 102, "parallel range-byte accounting is wrong");
@@ -197,6 +200,24 @@ void test_parallel_read_batch() {
     const auto second = serial.read(requests);
     require(first.file_opens == 1, "serial worker did not open its source once");
     require(second.file_opens == 0, "serial worker did not reuse its file handle");
+
+    std::array<std::uint8_t, 32> destructor_values{};
+    const std::array<mfq::cuda::NintMxfp4ReadRequest, 1>
+        destructor_requests{{
+            {
+                &store,
+                &store.part(
+                    2,
+                    mfq::cuda::NintMxfp4ExpertStore::values),
+                destructor_values,
+            },
+        }};
+    {
+        auto abandoned = serial.submit(destructor_requests);
+        require(abandoned.valid(), "abandoned read ticket is empty");
+    }
+    require(destructor_values.front() == 34,
+            "read ticket destructor did not preserve destination lifetime");
 }
 
 void test_concurrent_read_batches() {

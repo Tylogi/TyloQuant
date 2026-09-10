@@ -89,6 +89,30 @@ struct NintMxfp4ReadBatchStats {
     std::uint64_t wall_nanoseconds = 0;
 };
 
+struct NintMxfp4ReadState;
+
+class NintMxfp4ReadTicket {
+public:
+    NintMxfp4ReadTicket() = default;
+    NintMxfp4ReadTicket(NintMxfp4ReadTicket&&) noexcept;
+    NintMxfp4ReadTicket& operator=(NintMxfp4ReadTicket&&) noexcept;
+    ~NintMxfp4ReadTicket();
+
+    NintMxfp4ReadTicket(const NintMxfp4ReadTicket&) = delete;
+    NintMxfp4ReadTicket& operator=(const NintMxfp4ReadTicket&) = delete;
+
+    bool valid() const noexcept;
+    NintMxfp4ReadBatchStats wait();
+
+private:
+    explicit NintMxfp4ReadTicket(
+        std::shared_ptr<NintMxfp4ReadState> state);
+
+    std::shared_ptr<NintMxfp4ReadState> state_;
+
+    friend class NintMxfp4ReadPool;
+};
+
 class NintMxfp4ReadPool {
 public:
     explicit NintMxfp4ReadPool(std::size_t workers);
@@ -98,6 +122,8 @@ public:
     NintMxfp4ReadPool& operator=(const NintMxfp4ReadPool&) = delete;
 
     std::size_t workers() const noexcept;
+    NintMxfp4ReadTicket submit(
+        std::span<const NintMxfp4ReadRequest> requests);
     NintMxfp4ReadBatchStats read(
         std::span<const NintMxfp4ReadRequest> requests);
 
