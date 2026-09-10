@@ -1022,24 +1022,60 @@ void test_sparse_attention_path(int queries) {
         sinks[head] =
             -0.5f + static_cast<float>(head) / 64.0f;
     }
+    auto query_array = float_array(
+        query,
+        Shape{1, heads, queries, dimension});
+    auto cache_array = float_array(
+        cache,
+        Shape{1, max_seq, dimension});
+    auto index_array = int_array(
+        indices,
+        Shape{1, queries, selected});
+    auto mask_array = float_array(
+        mask,
+        Shape{1, queries, selected});
+    auto sink_array = float_array(sinks, Shape{heads});
     auto output = mfq::metal::attention_dsv4_sparse(
-        float_array(
-            query,
-            Shape{1, heads, queries, dimension}),
-        float_array(
-            cache,
-            Shape{1, max_seq, dimension}),
-        int_array(
-            indices,
-            Shape{1, queries, selected}),
-        float_array(
-            mask,
-            Shape{1, queries, selected}),
-        float_array(sinks, Shape{heads}));
+        query_array,
+        cache_array,
+        index_array,
+        mask_array,
+        sink_array);
     require(
         output.shape() ==
             Shape{1, queries, heads, dimension},
         "sparse attention output shape mismatch");
+    const auto actual = evaluated_float(output);
+    if (queries >= 2 && queries <= 6) {
+        std::vector<array> serial_rows;
+        serial_rows.reserve(static_cast<std::size_t>(queries));
+        for (int query_index = 0;
+             query_index < queries;
+             ++query_index) {
+            serial_rows.push_back(
+                mfq::metal::attention_dsv4_sparse(
+                    mlx::core::slice(
+                        query_array,
+                        Shape{0, 0, query_index, 0},
+                        Shape{1, heads, query_index + 1, dimension}),
+                    cache_array,
+                    mlx::core::slice(
+                        index_array,
+                        Shape{0, query_index, 0},
+                        Shape{1, query_index + 1, selected}),
+                    mlx::core::slice(
+                        mask_array,
+                        Shape{0, query_index, 0},
+                        Shape{1, query_index + 1, selected}),
+                    sink_array));
+        }
+        require_close(
+            actual,
+            evaluated_float(mlx::core::concatenate(serial_rows, 1)),
+            0.0f,
+            "sparse attention decode consistency M=" +
+                std::to_string(queries));
+    }
     const auto expected = sparse_reference(
         queries,
         query,
@@ -1049,7 +1085,7 @@ void test_sparse_attention_path(int queries) {
         sinks,
         scale);
     require_close(
-        evaluated_float(std::move(output)),
+        actual,
         expected,
         queries >= 32 ? 4e-3f : 7e-4f,
         "sparse attention M=" +
@@ -1133,8 +1169,127 @@ void test_direct_decode_attention_path() {
     require_close(
         evaluated_float(std::move(direct)),
         evaluated_float(std::move(legacy)),
-        1e-6f,
+        0.0f,
         "direct sparse decode attention");
+
+    auto empty_topk = mlx::core::zeros(
+        Shape{1, 1, 0},
+        mlx::core::int32);
+    auto local_plan = mfq::metal::dsv4_build_decode_plan(
+        empty_topk,
+        int_array({seq_len}, Shape{1}),
+        0,
+        1,
+        window);
+    auto selected_local = mfq::metal::attention_dsv4_sparse(
+        float_array(query, Shape{1, heads, 1, dimension}),
+        local_array,
+        local_plan.first,
+        local_plan.second,
+        sink_array);
+    auto direct_local = mfq::metal::attention_dsv4_sparse_decode(
+        float_array(query, Shape{1, heads, 1, dimension}),
+        local_array,
+        std::nullopt,
+        0,
+        empty_topk,
+        sink_array,
+        seq_len,
+        1,
+        window);
+    require_close(
+        evaluated_float(std::move(direct_local)),
+        evaluated_float(std::move(selected_local)),
+        0.0f,
+        "direct local decode attention");
+}
+
+void test_short_prefill_plan_matches_circular_decode() {
+    constexpr int heads = 64;
+    constexpr int dimension = 512;
+    constexpr int window = 4096;
+    constexpr int history = 13;
+    constexpr int queries = 5;
+    std::vector<float> query(
+        static_cast<std::size_t>(heads) * queries * dimension);
+    for (std::size_t index = 0; index < query.size(); ++index) {
+        query[index] = static_cast<float>(
+            static_cast<int>((index * 17 + 3) % 61) - 30) / 64.0f;
+    }
+    std::vector<float> cache(
+        static_cast<std::size_t>(window) * dimension,
+        0.0f);
+    for (int row = 0; row < history + queries; ++row) {
+        for (int feature = 0; feature < dimension; ++feature) {
+            cache[static_cast<std::size_t>(row) * dimension + feature] =
+                static_cast<float>(
+                    ((row * 19 + feature * 7) % 47) - 23) / 48.0f;
+        }
+    }
+    std::vector<float> sinks(heads);
+    for (int head = 0; head < heads; ++head) {
+        sinks[head] = -0.5f + static_cast<float>(head) / 97.0f;
+    }
+    auto query_array = float_array(
+        query,
+        Shape{1, heads, queries, dimension});
+    auto full_cache = mlx::core::astype(
+        float_array(cache, Shape{1, window, dimension}),
+        mlx::core::float16);
+    auto visible_cache = mlx::core::slice(
+        full_cache,
+        Shape{0, 0, 0},
+        Shape{1, history + queries, dimension});
+    auto empty_topk = mlx::core::zeros(
+        Shape{1, queries, 0},
+        mlx::core::int32);
+    auto plan = mfq::metal::dsv4_build_prefill_plan(
+        empty_topk,
+        history,
+        history,
+        0,
+        1,
+        window);
+    require(
+        plan.first.shape() == Shape{1, queries, 32},
+        "short verifier plan retained the full local window");
+    auto batched = mfq::metal::attention_dsv4_sparse(
+        query_array,
+        visible_cache,
+        plan.first,
+        plan.second,
+        float_array(sinks, Shape{heads}));
+    std::vector<array> serial;
+    serial.reserve(queries);
+    for (int row = 0; row < queries; ++row) {
+        auto serial_topk = mlx::core::zeros(
+            Shape{1, 1, 0},
+            mlx::core::int32);
+        auto serial_plan = mfq::metal::dsv4_build_prefill_plan(
+            serial_topk,
+            history + row,
+            history + row,
+            0,
+            1,
+            window);
+        serial.push_back(mfq::metal::attention_dsv4_sparse(
+            mlx::core::slice(
+                query_array,
+                Shape{0, 0, row, 0},
+                Shape{1, heads, row + 1, dimension}),
+            mlx::core::slice(
+                full_cache,
+                Shape{0, 0, 0},
+                Shape{1, history + row + 1, dimension}),
+            serial_plan.first,
+            serial_plan.second,
+            float_array(sinks, Shape{heads})));
+    }
+    require_close(
+        evaluated_float(std::move(batched)),
+        evaluated_float(mlx::core::concatenate(serial, 1)),
+        0.0f,
+        "short verifier attention decode consistency");
 }
 
 void test_direct_pool_attention_path(int queries) {
@@ -1352,6 +1507,39 @@ void test_invalid_inputs() {
         "invalid prefill window");
     require_invalid(
         [] {
+            (void)mfq::metal::dsv4_build_prefill_plan_visible(
+                mlx::core::zeros(
+                    Shape{1, 1, 0},
+                    mlx::core::int32),
+                mlx::core::zeros(
+                    Shape{1, 1},
+                    mlx::core::int32),
+                mlx::core::zeros(
+                    Shape{1, 1},
+                    mlx::core::int32),
+                0,
+                std::numeric_limits<int>::max(),
+                0,
+                1,
+                1,
+                1);
+        },
+        "visible prefill local-width overflow");
+    require_invalid(
+        [] {
+            (void)mfq::metal::dsv4_build_prefill_plan(
+                mlx::core::zeros(
+                    Shape{1, 1, 0},
+                    mlx::core::int32),
+                std::numeric_limits<int>::max(),
+                0,
+                0,
+                1,
+                1);
+        },
+        "prefill query-position overflow");
+    require_invalid(
+        [] {
             (void)mfq::metal::attention_dsv4_sparse(
                 mlx::core::zeros(
                     Shape{1, 64, 1, 512},
@@ -1387,12 +1575,16 @@ int main() {
         test_sparse_plans();
         test_sparse_attention_path(1);
         test_sparse_attention_path(2);
+        test_sparse_attention_path(3);
+        test_sparse_attention_path(4);
+        test_sparse_attention_path(5);
         test_sparse_attention_path(6);
         test_sparse_attention_path(32);
         test_direct_decode_attention_path();
         test_direct_pool_attention_path(2);
         test_direct_pool_attention_path(6);
         test_direct_pool_attention_path(32);
+        test_short_prefill_plan_matches_circular_decode();
         test_invalid_inputs();
         std::cout
             << "MFQ C++ DeepSeek-V4 sparse Metal tests passed\n";

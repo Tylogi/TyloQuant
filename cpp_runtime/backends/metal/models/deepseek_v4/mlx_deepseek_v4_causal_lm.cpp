@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -999,14 +1000,16 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
                 "predictor.stage." + std::to_string(stage));
         }
     }
-    auto expert_cache =
-        std::make_shared<MlxDeepseekV4SsdExpertCache>(
+    std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache;
+    if (expert_cache_bytes > 0) {
+        expert_cache = std::make_shared<MlxDeepseekV4SsdExpertCache>(
             model_root,
             std::move(expert_prefixes),
             expert_cache_bytes,
             io_workers,
             prefill_overlap,
             static_cast<std::size_t>(config.n_experts));
+    }
     auto rope_base = deepseek_v4_yarn_tables(
         checked_int(config.qk_rope_head_dim, "rotary dimension"),
         context,
@@ -1247,11 +1250,13 @@ void MlxDeepseekV4CausalLm::append_state_arrays(
     }
 }
 
-void MlxDeepseekV4CausalLm::materialize_state(
-    const MlxDeepseekV4LayerState& state) const {
+void MlxDeepseekV4CausalLm::materialize_states(
+    const std::vector<MlxDeepseekV4LayerState>& states) const {
     std::vector<array> arrays;
-    arrays.reserve(11);
-    append_state_arrays(state, arrays);
+    arrays.reserve(states.size() * 8);
+    for (const auto& state : states) {
+        append_state_arrays(state, arrays);
+    }
     detail::eval_with_timing(std::move(arrays));
 }
 
@@ -1416,6 +1421,11 @@ array MlxDeepseekV4CausalLm::forward_chunk(
         "model.embedding_broadcast",
         hidden_values);
     const bool bounded_prefill = tokens > 1;
+    const bool compact_resident_speculation =
+        bounded_prefill && tokens <= 6 && dspark_hidden != nullptr &&
+        visibility == nullptr && !expert_offload_ && !ssd_expert_cache_;
+    const bool materialize_each_layer =
+        bounded_prefill && !compact_resident_speculation;
     std::array<
         std::optional<MlxDeepseekV4SsdPrefetchedLayer>,
         2> routed_pipeline;
@@ -1538,7 +1548,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                 prefetched,
                 visibility);
             capture_target(index);
-            if (bounded_prefill) {
+            if (materialize_each_layer) {
                 // Hidden and cache branches share the layer projections.
                 std::vector<array> layer_outputs{hidden_values};
                 layer_outputs.reserve(12);
@@ -1591,11 +1601,10 @@ array MlxDeepseekV4CausalLm::forward_chunk(
     detail::profile_eval(
         "model.lm_head_cast",
         logits);
-    if (!bounded_prefill) {
-        // Decode owns one token and a bounded cache update per layer.  Keep
-        // the complete 43-layer graph lazy, then materialize logits and every
-        // updated cache array together.  Evaluating hidden/state after every
-        // layer fragmented one token into roughly 86 Metal synchronizations.
+    if (!materialize_each_layer) {
+        // Decode and compact resident verification own bounded cache updates
+        // per layer. Keep the graph lazy, then materialize logits and every
+        // updated cache array together instead of synchronizing per layer.
         std::vector<array> outputs{logits};
         const auto append_pool =
             [&outputs](const MlxDeepseekV4PoolState& pool) {
@@ -1878,10 +1887,12 @@ MlxDeepseekV4CausalLm::capture_text_session_state(
     state.layers.reserve(states_.size());
     for (const auto& layer : states_) {
         auto snapshot = layer.snapshot();
-        materialize_state(snapshot);
         state.bytes += deepseek_v4_layer_snapshot_nbytes(snapshot);
         state.layers.push_back(std::move(snapshot));
     }
+    // Submit all detached cache copies together rather than synchronizing
+    // once for every decoder layer.
+    materialize_states(state.layers);
     return state;
 }
 
@@ -1903,8 +1914,8 @@ void MlxDeepseekV4CausalLm::restore_text_session_state(
             // saved session immutable while the restored runtime advances.
             states_[index].restore_snapshot(
                 state.layers[index].snapshot());
-            materialize_state(states_[index]);
         }
+        materialize_states(states_);
         cache_position_ = state.cache_position;
         cache_batch_ = state.cache_batch;
         stable_cache_tokens_ = state.tokens;
@@ -1926,6 +1937,16 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         prefill_callback,
     std::optional<std::size_t> stable_prefix_tokens,
     const MfqTokenConstraintPtr& token_constraint) {
+    MlxDeepseekV4PrefillCallback report_prefill;
+    if (prefill_callback) {
+        report_prefill = [prefill_callback](
+            std::size_t tokens,
+            double llm_ms,
+            double,
+            double) {
+            prefill_callback(tokens, llm_ms);
+        };
+    }
     return generate_impl(
         prompt,
         nullptr,
@@ -1934,7 +1955,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         callback,
         eos_token_ids,
         chunk_size,
-        prefill_callback,
+        report_prefill,
         stable_prefix_tokens,
         token_constraint);
 }
@@ -1946,7 +1967,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_multimodal(
     std::int32_t max_tokens,
     const MlxDeepseekV4TokenCallback& callback,
     const std::optional<std::vector<std::int64_t>>& eos_token_ids,
-    const std::function<void(std::size_t, double)>& prefill_callback,
+    const MlxDeepseekV4PrefillCallback& prefill_callback,
     const MfqTokenConstraintPtr& token_constraint) {
     return generate_impl(
         prompt,
@@ -1969,7 +1990,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     const MlxDeepseekV4TokenCallback& callback,
     const std::optional<std::vector<std::int64_t>>& eos_token_ids,
     int chunk_size,
-    const std::function<void(std::size_t, double)>& prefill_callback,
+    const MlxDeepseekV4PrefillCallback& prefill_callback,
     std::optional<std::size_t> stable_prefix_tokens,
     const MfqTokenConstraintPtr& token_constraint) {
     if (prompt.empty()) {
@@ -2076,9 +2097,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         // State allocation/zeroing is request setup. Keep it in TTFT while
         // materializing it before the model-evaluation prefill metric starts.
         reset_cache(1);
-        for (const auto& state : states_) {
-            materialize_state(state);
-        }
+        materialize_states(states_);
     }
 
     struct StableCacheRestore {
@@ -2174,7 +2193,8 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
 
     const std::size_t evaluated_prompt_tokens =
         prompt.size() - reused_tokens;
-    double prefill_evaluation_ms = 0.0;
+    double llm_prefill_evaluation_ms = 0.0;
+    double multimodal_prefill_evaluation_ms = 0.0;
     const bool profile_prefill =
         detail::component_profile_requested();
     detail::ComponentProfile prefill_component_profile;
@@ -2187,7 +2207,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 : nullptr);
         detail::ScopedMlxEvaluationTiming timing(
             prefill_callback
-                ? &prefill_evaluation_ms
+                ? &llm_prefill_evaluation_ms
                 : nullptr);
         const auto prefill_range = [&](std::size_t begin, std::size_t end) {
             if (!dspark_active) {
@@ -2236,12 +2256,16 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         std::optional<array> stable_logits;
         array value = [&]() {
             if (multimodal) {
-                reset_cache(1);
-                for (const auto& state : states_) {
-                    materialize_state(state);
-                }
                 auto embeddings = vision_->embed_prompt(
                     prompt, *images, embedding_, activation_dtype_);
+                if (prefill_callback) {
+                    // MLX is lazy: materialize the vision tower and aligner
+                    // before the language model consumes their output so the
+                    // server reports both costs in the correct buckets.
+                    detail::ScopedMlxEvaluationTiming multimodal_timing(
+                        &multimodal_prefill_evaluation_ms);
+                    detail::eval_with_timing(embeddings);
+                }
                 auto visibility = deepseek_v4_image_visibility(
                     prompt,
                     config_.vocab,
@@ -2264,6 +2288,19 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 return output;
             }
             if (!retain_stable_prefix) {
+                // Preserve the server's stable-prefix evaluation boundary
+                // while rebuilding DSpark state from scratch. Shape-dependent
+                // kernels must see the same prompt segmentation with MTP on
+                // and off or their tiny rounding differences can alter tokens.
+                if (dspark_active && requested_stable_count > 0 &&
+                    requested_stable_count < prompt.size()) {
+                    auto prefix_logits = prefill_range(
+                        0, requested_stable_count);
+                    detail::eval_with_timing(prefix_logits);
+                    materialize_states(states_);
+                    return prefill_range(
+                        requested_stable_count, prompt.size());
+                }
                 return prefill_range(0, prompt.size());
             }
             if (reused_tokens < stable_count) {
@@ -2271,16 +2308,12 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     reused_tokens,
                     stable_count);
             }
-            for (const auto& state : states_) {
-                materialize_state(state);
-            }
+            materialize_states(states_);
             stable_restore.capture(prompt, stable_count);
             // Materialize every copy before evaluating the suffix. Otherwise
             // the lazy copy graph would still read arrays after the suffix or
             // decode kernels had modified them in place.
-            for (const auto& state : stable_restore.states()) {
-                materialize_state(state);
-            }
+            materialize_states(stable_restore.states());
             if (stable_count < prompt.size()) {
                 return prefill_range(
                     stable_count,
@@ -2297,6 +2330,19 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             // eval calls accumulate above; this final eval adds only the
             // remaining output-head graph.
             detail::eval_with_timing(value);
+        }
+        if (dspark_active) {
+            // DSpark prompt K/V construction belongs to prefill. Submit the
+            // lazy rings here so it is not charged to the first draft cycle
+            // or interpreted as decode work by the adaptive scheduler.
+            std::vector<array> rings;
+            rings.reserve(dspark_state->stages());
+            for (std::size_t stage = 0;
+                 stage < dspark_state->stages();
+                 ++stage) {
+                rings.push_back(dspark_state->ring(stage));
+            }
+            detail::eval_with_timing(std::move(rings));
         }
         return value;
     }();
@@ -2338,7 +2384,10 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     if (prefill_callback) {
         prefill_callback(
             evaluated_prompt_tokens,
-            prefill_evaluation_ms);
+            llm_prefill_evaluation_ms,
+            multimodal_prefill_evaluation_ms,
+            llm_prefill_evaluation_ms +
+                multimodal_prefill_evaluation_ms);
     }
     MlxSampler sampler(sampling);
 

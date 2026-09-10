@@ -1078,21 +1078,28 @@ constexpr const char* kPrefillPlanSource = R"MFQ_METAL(
     uint slot = linear % uint(SELECTED);
     uint row = linear / uint(SELECTED);
     uint query = row % uint(M);
-    uint raw_length = uint(LOCAL_HISTORY + M);
+    uint query_offset = uint(plan_params[0]);
+    uint local_history = uint(plan_params[1]);
+    uint local_width = uint(plan_params[2]);
+    uint pool_len = uint(plan_params[3]);
+    uint ratio = uint(plan_params[4]);
+    uint window = uint(plan_params[5]);
+    uint raw_length = local_history + uint(M);
     int index = 0;
     bool valid = false;
-    if (slot < uint(WINDOW)) {
-        uint local_end = uint(LOCAL_HISTORY) + query + 1u;
-        uint local_count = min(uint(WINDOW), local_end);
+    if (slot < local_width) {
+        uint local_end = local_history + query + 1u;
+        uint local_count = min(window, local_end);
         if (slot < local_count) {
             index = int(local_end - local_count + slot);
             valid = true;
         }
-    } else if (slot < uint(WINDOW + TOPK_COUNT)) {
-        int pooled = topk[row * uint(TOPK_COUNT) + slot - uint(WINDOW)];
+    } else if (slot < local_width + uint(TOPK_COUNT)) {
+        int pooled = topk[
+            row * uint(TOPK_COUNT) + slot - local_width];
         uint visible = min(
-            uint(POOL_LEN),
-            (uint(QUERY_OFFSET) + query + 1u) / uint(RATIO)
+            pool_len,
+            (query_offset + query + 1u) / ratio
         );
         if (pooled >= 0 && uint(pooled) < visible) {
             index = int(raw_length) + pooled;
@@ -1111,28 +1118,34 @@ constexpr const char* kVisiblePrefillPlanSource = R"MFQ_METAL(
     uint slot = linear % uint(SELECTED);
     uint row = linear / uint(SELECTED);
     uint query = row % uint(M);
-    uint raw_length = uint(LOCAL_HISTORY + M);
+    int query_offset = plan_params[0];
+    int local_history = plan_params[1];
+    int local_width = plan_params[2];
+    int pool_len = plan_params[3];
+    int ratio = plan_params[4];
+    int window = plan_params[5];
+    uint raw_length = uint(local_history + int(M));
     int index = 0;
     bool valid = false;
-    if (slot < uint(LOCAL_WIDTH)) {
-        int absolute_query = QUERY_OFFSET + int(query);
-        int base = QUERY_OFFSET - LOCAL_HISTORY;
+    if (slot < uint(local_width)) {
+        int absolute_query = query_offset + int(query);
+        int base = query_offset - local_history;
         int left_count = max(left[row], 0);
         int right_count = max(right[row], 0);
-        int left_add = max(left_count - (WINDOW - 1), 0);
-        int start = max(base, absolute_query - (WINDOW - 1) - left_add);
-        int end = min(QUERY_OFFSET + M - 1, absolute_query + right_count);
+        int left_add = max(left_count - (window - 1), 0);
+        int start = max(base, absolute_query - (window - 1) - left_add);
+        int end = min(query_offset + int(M) - 1, absolute_query + right_count);
         int count = max(end - start + 1, 0);
         if (int(slot) < count) {
             index = start - base + int(slot);
             valid = true;
         }
-    } else if (slot < uint(LOCAL_WIDTH + TOPK_COUNT)) {
+    } else if (slot < uint(local_width + int(TOPK_COUNT))) {
         int pooled = topk[
-            row * uint(TOPK_COUNT) + slot - uint(LOCAL_WIDTH)];
+            row * uint(TOPK_COUNT) + slot - uint(local_width)];
         uint visible = min(
-            uint(POOL_LEN),
-            (uint(QUERY_OFFSET) + query + 1u) / uint(RATIO)
+            uint(pool_len),
+            uint(query_offset + int(query) + 1) / uint(ratio)
         );
         if (pooled >= 0 && uint(pooled) < visible) {
             index = int(raw_length) + pooled;
@@ -1479,8 +1492,14 @@ constexpr const char* kSparseAttentionDecodeSource = R"MFQ_METAL(
         bool valid = isfinite(mask_value)
             && cache_row >= 0
             && cache_row < int(MAX_SEQ);
-        uint safe_row = valid ? uint(cache_row) : 0u;
-        uint cache_base = (batch * uint(MAX_SEQ) + safe_row) * DIM;
+        // Circular M=1 has no iteration corresponding to selected-plan
+        // alignment padding. Skip those slots so verifier rows execute the
+        // identical online-softmax instruction sequence.
+        if (!valid) {
+            continue;
+        }
+        uint cache_base =
+            (batch * uint(MAX_SEQ) + uint(cache_row)) * DIM;
 
         float dot = 0.0f;
         for (uint item = 0u; item < VALUES_PER_LANE; ++item) {
@@ -1488,21 +1507,19 @@ constexpr const char* kSparseAttentionDecodeSource = R"MFQ_METAL(
             dot += q[query_base + dimension]
                 * float(kv[cache_base + dimension]);
         }
-        float score = simd_sum(dot);
-        score = valid ? score * params[0] + mask_value : -INFINITY;
+        float score = simd_sum(dot) * params[0];
+        if (mask_value != 0.0f) {
+            score += mask_value;
+        }
         float new_maximum = max(maximum, score);
         float old_scale = metal::fast::exp(maximum - new_maximum);
-        float new_scale = valid
-            ? metal::fast::exp(score - new_maximum)
-            : 0.0f;
+        float new_scale = metal::fast::exp(score - new_maximum);
         denominator = denominator * old_scale + new_scale;
         maximum = new_maximum;
 
         for (uint item = 0u; item < VALUES_PER_LANE; ++item) {
             uint dimension = lane + item * 32u;
-            float value = valid
-                ? float(kv[cache_base + dimension])
-                : 0.0f;
+            float value = float(kv[cache_base + dimension]);
             accumulators[item] =
                 accumulators[item] * old_scale + value * new_scale;
         }

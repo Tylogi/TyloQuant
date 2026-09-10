@@ -2,12 +2,15 @@
 
 #include "mlx_eval_timing.h"
 #include "mlx_moe_ops.h"
+#include "mlx_ssd_expert_arena.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <future>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -21,6 +24,45 @@ namespace {
 
 using mlx::core::Shape;
 using mlx::core::array;
+
+MlxDeepseekV4SsdExpertWeights load_resident_hf_experts(
+    const MlxHfTensorStore& model,
+    const DeepseekV4Config& config,
+    const std::string& prefix) {
+    const auto count = static_cast<std::size_t>(config.n_experts);
+    DeepseekV4NativeExpertStore store(
+        model.checkpoint().root(),
+        std::vector<std::string>{prefix},
+        count);
+    MlxDeepseekV4SsdExpertArena arena(count);
+    std::vector<DeepseekV4NativeExpertDestination> destinations;
+    destinations.reserve(count);
+    for (std::size_t expert = 0; expert < count; ++expert) {
+        destinations.push_back(arena.destination(expert));
+    }
+    const auto workers = std::min<std::size_t>(8, count);
+    std::vector<std::future<void>> reads;
+    reads.reserve(workers);
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+        reads.push_back(std::async(std::launch::async, [&, worker] {
+            for (std::size_t expert = worker;
+                 expert < count;
+                 expert += workers) {
+                store.load_scatter(0, expert, destinations[expert]);
+            }
+        }));
+    }
+    for (auto& read : reads) {
+        read.get();
+    }
+    std::cout
+        << "Resident HF experts: " << prefix
+        << " experts=" << count
+        << " bytes=" << arena.nbytes()
+        << std::endl;
+    // The returned MLX arrays retain the four arena bank allocations.
+    return arena.slot_weights();
+}
 
 double current_thread_cpu_seconds() noexcept {
     timespec value{};
@@ -603,17 +645,24 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
     std::size_t expert_cache_layer,
     const std::optional<array>& available) {
     config.validate();
-    if (prefix.empty() || !expert_cache) {
+    if (prefix.empty()) {
         throw std::invalid_argument(
-            "DeepSeek-V4 named HF MoE requires a prefix and SSD cache");
+            "DeepSeek-V4 named HF MoE requires a prefix");
     }
     const auto name = [&prefix](std::string_view suffix) {
         return prefix + "." + std::string(suffix);
     };
     std::optional<array> visual_bias;
     const auto visual_name = name("mlp.router.vision_bias");
-    if (model.checkpoint().tensors().contains(visual_name)) {
+    if (config.has_vision()) {
         visual_bias = model.load_dense(visual_name);
+    }
+    std::optional<MlxRoutedLinear> resident_gate_up;
+    std::optional<MlxRoutedLinear> resident_down;
+    if (!expert_cache) {
+        auto weights = load_resident_hf_experts(model, config, prefix);
+        resident_gate_up.emplace(std::move(weights.gate_up));
+        resident_down.emplace(std::move(weights.down));
     }
     return MlxDeepseekV4Moe(
         config,
@@ -621,10 +670,10 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
         model.load_linear(name("mlp.shared_expert.gate.weight")),
         model.load_linear(name("mlp.shared_expert.up.weight")),
         model.load_linear(name("mlp.shared_expert.down.weight")),
+        std::move(resident_gate_up),
         std::nullopt,
         std::nullopt,
-        std::nullopt,
-        std::nullopt,
+        std::move(resident_down),
         nullptr,
         std::move(expert_cache),
         expert_cache_layer,
@@ -650,10 +699,6 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
         throw std::out_of_range(
             "DeepSeek-V4 HF MoE layer index is out of range");
     }
-    if (!expert_cache) {
-        throw std::invalid_argument(
-            "DeepSeek-V4 HF MoE requires an SSD expert cache");
-    }
     const auto name = [layer](std::string_view suffix) {
         return DeepseekV4TensorNames::layer(layer, suffix);
     };
@@ -668,16 +713,26 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
     if (config.has_vision()) {
         visual_router_bias = model.load_dense(name("mlp.router.vision_bias"));
     }
+    std::optional<MlxRoutedLinear> resident_gate_up;
+    std::optional<MlxRoutedLinear> resident_down;
+    if (!expert_cache) {
+        auto weights = load_resident_hf_experts(
+            model,
+            config,
+            "model.block." + std::to_string(layer));
+        resident_gate_up.emplace(std::move(weights.gate_up));
+        resident_down.emplace(std::move(weights.down));
+    }
     return MlxDeepseekV4Moe(
         config,
         model.load_linear(name("mlp.router.weight")),
         model.load_linear(name("mlp.shared_expert.gate.weight")),
         model.load_linear(name("mlp.shared_expert.up.weight")),
         model.load_linear(name("mlp.shared_expert.down.weight")),
+        std::move(resident_gate_up),
         std::nullopt,
         std::nullopt,
-        std::nullopt,
-        std::nullopt,
+        std::move(resident_down),
         nullptr,
         std::move(expert_cache),
         layer,
@@ -1053,13 +1108,17 @@ MlxDeepseekV4Moe::project_shared(
     if (
         grouped_shared_gate_up_.has_value()
         && fused_shared_swiglu_
-        && grouped_shared_gate_up_
-            ->supports_single_row_swiglu(input)
+        && (grouped_shared_gate_up_->supports_single_row_swiglu(input)
+            || grouped_shared_gate_up_->supports_small_m_swiglu(input))
     ) {
-        auto shared_hidden =
-            grouped_shared_gate_up_->single_row_swiglu(
-                input,
-                swiglu_limit);
+        auto shared_hidden = grouped_shared_gate_up_
+                ->supports_single_row_swiglu(input)
+            ? grouped_shared_gate_up_->single_row_swiglu(
+                  input,
+                  swiglu_limit)
+            : grouped_shared_gate_up_->small_m_swiglu(
+                  input,
+                  swiglu_limit);
         if (project_router) {
             return {
                 router_(input),

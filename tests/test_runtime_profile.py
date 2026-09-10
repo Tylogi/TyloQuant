@@ -25,6 +25,10 @@ def test_architecture_registry_is_partial() -> None:
     assert profile["duplex"]["system_prompt"] == "Streaming Omni Conversation."
     assert "max_tokens" not in profile["chat"]
 
+    deepseek = architecture_profile("deepseek_v4_vision")
+    assert deepseek is not None
+    assert deepseek["chat"]["mtp_max_draft_tokens"] == 5
+
 
 def test_exact_model_registry_matches_repository_identity() -> None:
     profile = model_profile("Tylogi/MiniCPM-o-4_5-MFQ")
@@ -84,6 +88,8 @@ def test_invalid_profile_fails_closed() -> None:
         validate_runtime_profile({"version": 2, "chat": {"top_p": 0.8}})
     with pytest.raises(ValueError, match="boolean"):
         validate_runtime_profile({"chat": {"enable_thinking": 0}})
+    with pytest.raises(ValueError, match="mtp_max_draft_tokens"):
+        validate_runtime_profile({"chat": {"mtp_max_draft_tokens": 6}})
 
 
 def test_metadata_key_is_versioned() -> None:

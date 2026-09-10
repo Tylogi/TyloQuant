@@ -2223,18 +2223,16 @@ std::string make_direct_small_m_blockwise_source(
                 "        constexpr uint MX_BLOCKS = uint(K) / MX_BLOCK;\n"
                 "        for (uint block = k_lane; block < MX_BLOCKS;"
                 " block += K_LANES) {\n"
-                "            uint column_base = block * MX_BLOCK;\n";
+                "            uint column_base = block * MX_BLOCK;\n"
+                "            float mx_accumulators[ROWS];\n"
+                "            for (uint row = 0u; row < uint(ROWS); ++row) {\n"
+                "                mx_accumulators[row] = 0.0f;\n"
+                "            }\n";
             if (layout.bits == 4) {
                 source +=
-                    "            float scale = mfq_grouped_mx_e8m0("
-                    "mx_scales_" + suffix
-                    + "[output * MX_BLOCKS + block]);\n"
                     "            uint value_base = output * (uint(K) / 2u);\n";
             } else {
                 source +=
-                    "            float scale = mfq_grouped_mx_e8m0("
-                    "mx_scales_" + suffix
-                    + "[(output / 128u) * MX_BLOCKS + block]);\n"
                     "            uint value_base = output * uint(K);\n";
             }
             source +=
@@ -2246,7 +2244,7 @@ std::string make_direct_small_m_blockwise_source(
                     "                uint packed = uint(*(device const ushort*)("
                     "mx_values_" + suffix
                     + " + value_base + (column >> 1u)));\n"
-                    "                float4 weights = scale * float4(\n"
+                    "                float4 weights = float4(\n"
                     "                    mfq_grouped_mx_fp4(uchar(packed & 15u)),\n"
                     "                    mfq_grouped_mx_fp4(uchar((packed >> 4u) & 15u)),\n"
                     "                    mfq_grouped_mx_fp4(uchar((packed >> 8u) & 15u)),\n"
@@ -2256,7 +2254,7 @@ std::string make_direct_small_m_blockwise_source(
                     "                uchar4 codes = as_type<uchar4>("
                     "*(device const uint*)(mx_values_" + suffix
                     + " + value_base + column));\n"
-                    "                float4 weights = scale * float4(\n"
+                    "                float4 weights = float4(\n"
                     "                    mfq_grouped_mx_fp8(codes.x),\n"
                     "                    mfq_grouped_mx_fp8(codes.y),\n"
                     "                    mfq_grouped_mx_fp8(codes.z),\n"
@@ -2266,9 +2264,35 @@ std::string make_direct_small_m_blockwise_source(
                 "                for (uint row = 0u; row < uint(ROWS); ++row) {\n"
                 "                    half4 activation = *(device const half4*)(\n"
                 "                        x + row * uint(K) + column);\n"
-                "                    accumulators[row] += dot(\n"
-                "                        float4(activation), weights);\n"
+                "                    mx_accumulators[row] = fma(\n"
+                "                        float(activation.x), weights.x,\n"
+                "                        mx_accumulators[row]);\n"
+                "                    mx_accumulators[row] = fma(\n"
+                "                        float(activation.y), weights.y,\n"
+                "                        mx_accumulators[row]);\n"
+                "                    mx_accumulators[row] = fma(\n"
+                "                        float(activation.z), weights.z,\n"
+                "                        mx_accumulators[row]);\n"
+                "                    mx_accumulators[row] = fma(\n"
+                "                        float(activation.w), weights.w,\n"
+                "                        mx_accumulators[row]);\n"
                 "                }\n"
+                "            }\n"
+                "            float scale = mfq_grouped_mx_e8m0(";
+            if (layout.bits == 4) {
+                source +=
+                    "mx_scales_" + suffix
+                    + "[output * MX_BLOCKS + block]);\n";
+            } else {
+                source +=
+                    "mx_scales_" + suffix
+                    + "[(output / 128u) * MX_BLOCKS + block]);\n";
+            }
+            source +=
+                "            for (uint row = 0u; row < uint(ROWS); ++row) {\n"
+                "                accumulators[row] = fma(\n"
+                "                    scale, mx_accumulators[row],\n"
+                "                    accumulators[row]);\n"
                 "            }\n"
                 "        }\n";
         } else {
@@ -3892,7 +3916,10 @@ constexpr const char* kSingleRowMxfp8PairSwiglu = R"METAL(
     device const uchar* values = projection == 0u
         ? mx_values_0
         : mx_values_1;
-    float accumulator = 0.0f;
+    float accumulators[M];
+    for (uint row = 0u; row < uint(M); ++row) {
+        accumulators[row] = 0.0f;
+    }
 
     // Gate and Up occupy separate SIMD half-groups. Both halves visit the
     // same 128-column block at once: the 16 lanes in each half read one
@@ -3901,10 +3928,6 @@ constexpr const char* kSingleRowMxfp8PairSwiglu = R"METAL(
     for (uint block = 0u; block < BLOCKS; ++block) {
         uint column_base = block * BLOCK;
         uint column = column_base + k_lane * 8u;
-        activation4_t activation0 =
-            *(device const activation4_t*)(x + column);
-        activation4_t activation1 =
-            *(device const activation4_t*)(x + column + 4u);
         uchar4 code0 = *(device const uchar4*)(
             values + value_base + column);
         uchar4 code1 = *(device const uchar4*)(
@@ -3919,37 +3942,49 @@ constexpr const char* kSingleRowMxfp8PairSwiglu = R"METAL(
             float(fp8_lut[uint(code1.y)]),
             float(fp8_lut[uint(code1.z)]),
             float(fp8_lut[uint(code1.w)]));
-        float block_dot =
-            dot(float4(activation0), weight0)
-            + dot(float4(activation1), weight1);
         uchar scale = projection == 0u
             ? mx_scales_0[scale_base + block]
             : mx_scales_1[scale_base + block];
-        accumulator = fma(
-            mfq_grouped_mx_e8m0(scale),
-            block_dot,
-            accumulator);
+        float block_scale = mfq_grouped_mx_e8m0(scale);
+        for (uint row = 0u; row < uint(M); ++row) {
+            uint input_base = row * uint(K);
+            activation4_t activation0 =
+                *(device const activation4_t*)(x + input_base + column);
+            activation4_t activation1 = *(device const activation4_t*)(
+                x + input_base + column + 4u);
+            float block_dot =
+                dot(float4(activation0), weight0)
+                + dot(float4(activation1), weight1);
+            accumulators[row] = fma(
+                block_scale,
+                block_dot,
+                accumulators[row]);
+        }
     }
 
     // Each 16-lane half is an independent reduction tree. Only lanes 0 and
     // 16 are consumed, so shuffle-down traffic from inactive upper nodes
     // cannot cross-contaminate the two projection sums.
-    accumulator += simd_shuffle_down(accumulator, 8);
-    accumulator += simd_shuffle_down(accumulator, 4);
-    accumulator += simd_shuffle_down(accumulator, 2);
-    accumulator += simd_shuffle_down(accumulator, 1);
-    float gate = simd_shuffle(accumulator, 0u);
-    float up = simd_shuffle(accumulator, 16u);
-    if (lane == 0u && output_index < uint(OUT)) {
-        // Match the unfused MXFP8 GEMV activation-dtype boundary.
-        gate = float(activation_t(gate));
-        up = float(activation_t(up));
-        if (params[0] > 0.0f) {
-            gate = min(gate, params[0]);
-            up = clamp(up, -params[0], params[0]);
+    for (uint row = 0u; row < uint(M); ++row) {
+        float accumulator = accumulators[row];
+        accumulator += simd_shuffle_down(accumulator, 8);
+        accumulator += simd_shuffle_down(accumulator, 4);
+        accumulator += simd_shuffle_down(accumulator, 2);
+        accumulator += simd_shuffle_down(accumulator, 1);
+        float gate = simd_shuffle(accumulator, 0u);
+        float up = simd_shuffle(accumulator, 16u);
+        if (lane == 0u && output_index < uint(OUT)) {
+            // Match the unfused MXFP8 GEMV activation-dtype boundary.
+            gate = float(activation_t(gate));
+            up = float(activation_t(up));
+            if (params[0] > 0.0f) {
+                gate = min(gate, params[0]);
+                up = clamp(up, -params[0], params[0]);
+            }
+            float activated = gate / (1.0f + exp(-gate));
+            y[row * uint(OUT) + output_index] =
+                activation_t(activated * up);
         }
-        float activated = gate / (1.0f + exp(-gate));
-        y[output_index] = activation_t(activated * up);
     }
 )METAL";
 
@@ -4765,6 +4800,25 @@ bool MlxGroupedLinear::supports_single_row_swiglu(
             impl_->input_size);
 }
 
+bool MlxGroupedLinear::supports_small_m_swiglu(
+    const array& input) const noexcept {
+    if (!impl_->has_single_row_mxfp8_fast_path()
+        || impl_->direct_layouts.size() != 2
+        || impl_->direct_layouts[0].family != kFamilyMx
+        || impl_->direct_layouts[0].bits != 8
+        || impl_->direct_layouts[1].family != kFamilyMx
+        || impl_->direct_layouts[1].bits != 8
+        || input.ndim() == 0
+        || input.shape(-1) != impl_->input_size
+        || (input.dtype() != mlx::core::float16
+            && input.dtype() != mlx::core::bfloat16)) {
+        return false;
+    }
+    const auto rows = input.size() /
+        static_cast<std::size_t>(impl_->input_size);
+    return rows >= 2 && rows <= 6;
+}
+
 array MlxGroupedLinear::single_row_swiglu(
     const array& input,
     float limit) const {
@@ -4816,6 +4870,7 @@ array MlxGroupedLinear::single_row_swiglu(
             {
                 {"K", impl_->input_size},
                 {"OUT", impl_->output_sizes[0]},
+                {"M", 1},
             },
             std::nullopt,
             false,
@@ -4872,6 +4927,53 @@ array MlxGroupedLinear::single_row_swiglu(
         },
         {64, 1, 1},
         std::move(templates),
+        std::nullopt,
+        false,
+        {}).front();
+    return mlx::core::reshape(
+        std::move(result),
+        std::move(output_shape));
+}
+
+array MlxGroupedLinear::small_m_swiglu(
+    const array& input,
+    float limit) const {
+    if (!supports_small_m_swiglu(input)) {
+        throw MlxGroupedLinearUnsupported(
+            "grouped MXFP8 SwiGLU requires two through six FP16/BF16 rows");
+    }
+    if (!std::isfinite(limit) || limit < 0.0f) {
+        throw std::invalid_argument(
+            "grouped SwiGLU limit must be finite and non-negative");
+    }
+    const int rows = checked_int(
+        input.size() / static_cast<std::size_t>(impl_->input_size),
+        "MXFP8 SwiGLU row count");
+    Shape output_shape(
+        input.shape().begin(),
+        input.shape().end() - 1);
+    output_shape.push_back(impl_->output_sizes[0]);
+    auto source = mlx::core::contiguous(mlx::core::reshape(
+        input,
+        Shape{rows, impl_->input_size}));
+    const array params({limit}, mlx::core::float32);
+    auto inputs = impl_->direct_weight_inputs;
+    inputs.push_back(source);
+    inputs.push_back(params);
+    const auto workgroups =
+        (static_cast<std::size_t>(impl_->output_sizes[0]) + 3) / 4;
+    const auto grid = workgroups * 128;
+    auto result = single_row_mxfp8_pair_swiglu_kernel(source.dtype())(
+        inputs,
+        {Shape{rows, impl_->output_sizes[0]}},
+        {source.dtype()},
+        {checked_int(grid, "MXFP8 SwiGLU Metal grid"), 1, 1},
+        {128, 1, 1},
+        {
+            {"K", impl_->input_size},
+            {"OUT", impl_->output_sizes[0]},
+            {"M", rows},
+        },
         std::nullopt,
         false,
         {}).front();

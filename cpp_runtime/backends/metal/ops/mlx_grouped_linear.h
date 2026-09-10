@@ -63,6 +63,14 @@ public:
     mlx::core::array single_row_swiglu(
         const mlx::core::array& input,
         float limit) const;
+
+    // MXFP8 verifier counterpart to single_row_swiglu. It retains the same
+    // two 16-lane reduction trees for each of M=2..6 independent rows.
+    bool supports_small_m_swiglu(
+        const mlx::core::array& input) const noexcept;
+    mlx::core::array small_m_swiglu(
+        const mlx::core::array& input,
+        float limit) const;
     std::vector<mlx::core::array> operator()(
         const mlx::core::array& input) const {
         return matmul(input);

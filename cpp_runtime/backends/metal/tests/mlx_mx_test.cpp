@@ -61,6 +61,58 @@ std::vector<std::uint8_t> make_block_scaled_mxfp8_blob() {
     return blob;
 }
 
+std::vector<std::uint8_t> make_patterned_mxfp8_blob(
+    int outputs,
+    int inputs,
+    int salt) {
+    auto blob = make_blob(8, outputs, inputs);
+    constexpr std::size_t header_bytes = 4 + 1 + 1 + 2 + 8 * 6;
+    const std::size_t value_bytes =
+        static_cast<std::size_t>(outputs) * inputs;
+    for (std::size_t index = 0; index < value_bytes; ++index) {
+        // Finite positive and negative E4M3 codes with varied mantissas.
+        const auto magnitude = static_cast<std::uint8_t>(
+            1 + (index * 17 + static_cast<std::size_t>(salt)) % 119);
+        blob[header_bytes + index] = static_cast<std::uint8_t>(
+            magnitude | (((index + salt) & 7u) == 0u ? 0x80u : 0u));
+    }
+    const std::size_t scale_offset = header_bytes + value_bytes;
+    const std::size_t scale_bytes =
+        static_cast<std::size_t>((outputs + 127) / 128) *
+        static_cast<std::size_t>(inputs / 128);
+    for (std::size_t index = 0; index < scale_bytes; ++index) {
+        blob[scale_offset + index] = static_cast<std::uint8_t>(
+            123 + (index * 5 + static_cast<std::size_t>(salt)) % 7);
+    }
+    return blob;
+}
+
+std::vector<std::uint8_t> make_patterned_mxfp4_blob(
+    int outputs,
+    int inputs,
+    int salt) {
+    auto blob = make_blob(4, outputs, inputs);
+    constexpr std::size_t header_bytes = 4 + 1 + 1 + 2 + 8 * 6;
+    const std::size_t value_bytes =
+        static_cast<std::size_t>(outputs) * inputs / 2;
+    for (std::size_t index = 0; index < value_bytes; ++index) {
+        const auto low = static_cast<std::uint8_t>(
+            (index * 7 + static_cast<std::size_t>(salt)) % 16);
+        const auto high = static_cast<std::uint8_t>(
+            (index * 11 + static_cast<std::size_t>(salt) + 3) % 16);
+        blob[header_bytes + index] = static_cast<std::uint8_t>(
+            low | (high << 4u));
+    }
+    const std::size_t scale_offset = header_bytes + value_bytes;
+    const std::size_t scale_bytes =
+        static_cast<std::size_t>(outputs) * inputs / 32;
+    for (std::size_t index = 0; index < scale_bytes; ++index) {
+        blob[scale_offset + index] = static_cast<std::uint8_t>(
+            123 + (index * 5 + static_cast<std::size_t>(salt)) % 7);
+    }
+    return blob;
+}
+
 std::vector<std::uint8_t> make_q8_blob(int outputs, int inputs) {
     const int groups = inputs / 32;
     std::vector<std::uint8_t> blob{'N', 'I', '8', '0'};
@@ -163,6 +215,53 @@ void test_native_mxfp8_scale_expansion() {
             output.data<float>()[127] == 320.0f &&
             output.data<float>()[128] == 640.0f,
         "native MXFP8 scale expansion value mismatch");
+}
+
+void test_mxfp8_small_m_matches_decode() {
+    using namespace mlx::core;
+    constexpr int inputs = 512;
+    for (const int outputs : {512, 1024, 2048}) {
+        const auto weight = mfq::metal::MlxMxWeight::from_blob(
+            "MXFP8", make_patterned_mxfp8_blob(outputs, inputs, 3));
+        for (const auto dtype : {float16, bfloat16}) {
+            for (int rows = 2; rows <= 6; ++rows) {
+                std::vector<float> values(
+                    static_cast<std::size_t>(rows) * inputs);
+                for (int row = 0; row < rows; ++row) {
+                    for (int column = 0; column < inputs; ++column) {
+                        values[static_cast<std::size_t>(row) * inputs + column] =
+                            static_cast<float>(
+                                ((column * 7 + row * 13) % 31) - 15) /
+                            128.0f;
+                    }
+                }
+                auto input = astype(
+                    array(values.begin(), Shape{rows, inputs}),
+                    dtype);
+                auto actual = contiguous(weight.matmul(input));
+                std::vector<array> reference_rows;
+                reference_rows.reserve(static_cast<std::size_t>(rows));
+                for (int row = 0; row < rows; ++row) {
+                    reference_rows.push_back(weight.matmul(slice(
+                        input,
+                        Shape{row, 0},
+                        Shape{row + 1, inputs})));
+                }
+                auto reference = contiguous(concatenate(reference_rows, 0));
+                eval(actual, reference);
+                require(
+                    actual.shape() == reference.shape(),
+                    "MXFP8 exact small-M shape mismatch");
+                const auto* actual_bits = actual.data<std::uint16_t>();
+                const auto* reference_bits = reference.data<std::uint16_t>();
+                for (std::size_t index = 0; index < actual.size(); ++index) {
+                    require(
+                        actual_bits[index] == reference_bits[index],
+                        "MXFP8 exact small-M differs from serial decode");
+                }
+            }
+        }
+    }
 }
 
 void test_grouped_mxfp8() {
@@ -338,6 +437,62 @@ void test_grouped_mxfp8_swiglu() {
     }
 }
 
+void test_grouped_mxfp8_swiglu_small_m_matches_decode() {
+    using namespace mlx::core;
+    constexpr int inputs = 512;
+    constexpr int outputs = 64;
+    const auto gate = mfq::metal::MlxMxWeight::from_blob(
+        "MXFP8", make_patterned_mxfp8_blob(outputs, inputs, 23));
+    const auto up = mfq::metal::MlxMxWeight::from_blob(
+        "MXFP8", make_patterned_mxfp8_blob(outputs, inputs, 31));
+    const mfq::metal::MlxGroupedLinear grouped({&gate, &up});
+    for (const auto dtype : {float16, bfloat16}) {
+        for (int rows = 2; rows <= 6; ++rows) {
+            std::vector<float> values(
+                static_cast<std::size_t>(rows) * inputs);
+            for (int row = 0; row < rows; ++row) {
+                for (int column = 0; column < inputs; ++column) {
+                    values[static_cast<std::size_t>(row) * inputs + column] =
+                        static_cast<float>(
+                            ((column * 17 + row * 29) % 43) - 21) /
+                        96.0f;
+                }
+            }
+            auto input = astype(
+                array(values.begin(), Shape{1, rows, inputs}),
+                dtype);
+            require(
+                grouped.supports_small_m_swiglu(input),
+                "grouped MXFP8 small-M SwiGLU was not selected");
+            auto actual = contiguous(
+                grouped.small_m_swiglu(input, 1.75f));
+            std::vector<array> serial;
+            serial.reserve(static_cast<std::size_t>(rows));
+            for (int row = 0; row < rows; ++row) {
+                serial.push_back(grouped.single_row_swiglu(
+                    slice(
+                        input,
+                        Shape{0, row, 0},
+                        Shape{1, row + 1, inputs}),
+                    1.75f));
+            }
+            auto reference = contiguous(concatenate(serial, 1));
+            eval(actual, reference);
+            require(
+                actual.shape() == reference.shape(),
+                "grouped MXFP8 small-M SwiGLU shape mismatch");
+            const auto* actual_bytes = actual.data<std::uint8_t>();
+            const auto* reference_bytes = reference.data<std::uint8_t>();
+            require(
+                std::memcmp(
+                    actual_bytes,
+                    reference_bytes,
+                    actual.nbytes()) == 0,
+                "grouped MXFP8 small-M SwiGLU differs from decode");
+        }
+    }
+}
+
 void test_grouped_mxfp8_q8() {
     using namespace mlx::core;
     constexpr int inputs = 128;
@@ -420,6 +575,95 @@ void test_grouped_mxfp8_inverse_rope() {
     }
 }
 
+void test_grouped_mxfp8_inverse_rope_small_m_matches_decode() {
+    using namespace mlx::core;
+    constexpr int groups = 2;
+    constexpr int inputs = 512;
+    constexpr int outputs = 16;
+    constexpr int head_dimension = 128;
+    constexpr int rotary_dimension = 64;
+    const auto weight = mfq::metal::MlxMxWeight::from_blob(
+        "MXFP8", make_patterned_mxfp8_blob(outputs, inputs, 19));
+    for (int rows = 2; rows <= 6; ++rows) {
+        std::vector<float> values(
+            static_cast<std::size_t>(rows) * groups * inputs);
+        for (int row = 0; row < rows; ++row) {
+            for (int group = 0; group < groups; ++group) {
+                for (int column = 0; column < inputs; ++column) {
+                    const auto index =
+                        (static_cast<std::size_t>(row) * groups + group) *
+                            inputs + column;
+                    values[index] = static_cast<float>(
+                        ((column * 13 + group * 17 + row * 23) % 41) - 20)
+                        / 64.0f;
+                }
+            }
+        }
+        std::vector<float> cosine_values(
+            static_cast<std::size_t>(rows) * rotary_dimension / 2);
+        std::vector<float> sine_values(cosine_values.size());
+        for (int row = 0; row < rows; ++row) {
+            for (int pair = 0; pair < rotary_dimension / 2; ++pair) {
+                const float angle =
+                    static_cast<float>((row + 1) * (pair + 1)) / 137.0f;
+                const auto index = static_cast<std::size_t>(row) *
+                    (rotary_dimension / 2) + pair;
+                cosine_values[index] = std::cos(angle);
+                sine_values[index] = std::sin(angle);
+            }
+        }
+        auto input = astype(
+            array(values.begin(), Shape{1, rows, groups, inputs}),
+            float16);
+        const array cosine(
+            cosine_values.begin(),
+            Shape{rows, rotary_dimension / 2});
+        const array sine(
+            sine_values.begin(),
+            Shape{rows, rotary_dimension / 2});
+        auto actual = contiguous(
+            weight.grouped_row_matmul_inverse_rope(
+                input,
+                groups,
+                cosine,
+                sine,
+                head_dimension,
+                rotary_dimension));
+        std::vector<array> serial;
+        serial.reserve(static_cast<std::size_t>(rows));
+        for (int row = 0; row < rows; ++row) {
+            serial.push_back(weight.grouped_row_matmul_inverse_rope(
+                slice(
+                    input,
+                    Shape{0, row, 0, 0},
+                    Shape{1, row + 1, groups, inputs}),
+                groups,
+                slice(
+                    cosine,
+                    Shape{row, 0},
+                    Shape{row + 1, rotary_dimension / 2}),
+                slice(
+                    sine,
+                    Shape{row, 0},
+                    Shape{row + 1, rotary_dimension / 2}),
+                head_dimension,
+                rotary_dimension));
+        }
+        auto reference = contiguous(concatenate(serial, 1));
+        eval(actual, reference);
+        require(
+            actual.shape() == reference.shape(),
+            "MXFP8 inverse-RoPE small-M shape mismatch");
+        const auto* actual_bits = actual.data<std::uint16_t>();
+        const auto* reference_bits = reference.data<std::uint16_t>();
+        for (std::size_t index = 0; index < actual.size(); ++index) {
+            require(
+                actual_bits[index] == reference_bits[index],
+                "MXFP8 inverse-RoPE small-M differs from decode");
+        }
+    }
+}
+
 void test_grouped_row_mxfp8_prefill() {
     using namespace mlx::core;
     constexpr int groups = 2;
@@ -476,6 +720,139 @@ void test_grouped_row_mxfp8_prefill() {
     }
 }
 
+void test_grouped_row_mxfp8_verify() {
+    using namespace mlx::core;
+    constexpr int groups = 2;
+    constexpr int outputs_per_group = 8;
+    constexpr int inputs = 256;
+    const auto weight = mfq::metal::MlxMxWeight::from_blob(
+        "MXFP8",
+        make_blob(
+            8,
+            groups * outputs_per_group,
+            inputs));
+    for (int tokens = 2; tokens <= 6; ++tokens) {
+        std::vector<float> values(
+            static_cast<std::size_t>(tokens) * groups * inputs);
+        for (int token = 0; token < tokens; ++token) {
+            for (int group = 0; group < groups; ++group) {
+                const float value =
+                    static_cast<float>(1 + token * groups + group) /
+                    static_cast<float>(inputs);
+                std::fill_n(
+                    values.begin() +
+                        (static_cast<std::size_t>(token) * groups + group) *
+                            inputs,
+                    inputs,
+                    value);
+            }
+        }
+        auto output = contiguous(astype(
+            weight.grouped_row_matmul(
+                astype(
+                    array(
+                        values.begin(),
+                        Shape{1, tokens, groups, inputs}),
+                    float16),
+                groups),
+            float32));
+        eval(output);
+        require(
+            output.shape() ==
+                Shape{1, tokens, groups, outputs_per_group},
+            "MXFP8 verify grouped-row shape mismatch");
+        for (int token = 0; token < tokens; ++token) {
+            for (int group = 0; group < groups; ++group) {
+                const float expected =
+                    static_cast<float>(1 + token * groups + group);
+                for (int out = 0; out < outputs_per_group; ++out) {
+                    const auto index =
+                        ((static_cast<std::size_t>(token) * groups + group) *
+                            outputs_per_group) + out;
+                    require(
+                        std::fabs(output.data<float>()[index] - expected) <
+                            2e-3f,
+                        "MXFP8 verify grouped-row value mismatch");
+                }
+            }
+        }
+    }
+}
+
+void test_grouped_mx_small_m_matches_decode(const std::string& dtype) {
+    using namespace mlx::core;
+    // Match the released V4F attention input width.  At 512 columns the
+    // final FP16 store can hide reduction-order differences which become
+    // visible after 4096 products.
+    constexpr int inputs = 4096;
+    const auto patterned = [&dtype](int outputs, int salt) {
+        return dtype == "MXFP4"
+            ? make_patterned_mxfp4_blob(outputs, inputs, salt)
+            : make_patterned_mxfp8_blob(outputs, inputs, salt);
+    };
+    auto first = mfq::metal::MlxMxWeight::from_blob(
+        dtype, patterned(1024, 3));
+    auto second = mfq::metal::MlxMxWeight::from_blob(
+        dtype, patterned(512, 7));
+    auto third = mfq::metal::MlxMxWeight::from_blob(
+        dtype, patterned(64, 11));
+    const mfq::metal::MlxGroupedLinear grouped({
+        &first,
+        &second,
+        &third,
+    });
+    for (int rows = 2; rows <= 6; ++rows) {
+        std::vector<float> values(
+            static_cast<std::size_t>(rows) * inputs);
+        for (int row = 0; row < rows; ++row) {
+            for (int column = 0; column < inputs; ++column) {
+                values[static_cast<std::size_t>(row) * inputs + column] =
+                    static_cast<float>(((column * 11 + row * 17) % 37) - 18)
+                    / 128.0f;
+            }
+        }
+        auto input = astype(
+            array(values.begin(), Shape{rows, inputs}),
+            float16);
+        auto actual = grouped(input);
+        std::vector<std::vector<array>> serial(3);
+        for (int row = 0; row < rows; ++row) {
+            auto result = grouped(slice(
+                input,
+                Shape{row, 0},
+                Shape{row + 1, inputs}));
+            for (std::size_t projection = 0;
+                 projection < result.size();
+                 ++projection) {
+                serial[projection].push_back(
+                    std::move(result[projection]));
+            }
+        }
+        for (std::size_t projection = 0;
+             projection < actual.size();
+             ++projection) {
+            actual[projection] = contiguous(actual[projection]);
+            auto reference = contiguous(concatenate(
+                serial[projection], 0));
+            eval(actual[projection], reference);
+            require(
+                actual[projection].shape() == reference.shape(),
+                dtype + " grouped exact small-M shape mismatch");
+            const auto* actual_bits =
+                actual[projection].data<std::uint16_t>();
+            const auto* reference_bits =
+                reference.data<std::uint16_t>();
+            for (std::size_t index = 0;
+                 index < actual[projection].size();
+                 ++index) {
+                require(
+                    actual_bits[index] == reference_bits[index],
+                    dtype + " grouped small-M differs from decode");
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -494,15 +871,21 @@ int main() {
         test_matmul("MXFP8", 128, 7);
         test_matmul("MXFP8", 128, 64);
         test_native_mxfp8_scale_expansion();
+        test_mxfp8_small_m_matches_decode();
         test_embedding("MXFP4", 96);
         test_embedding("MXFP8", 128);
         test_grouped_mxfp8();
         test_grouped_mx_small_m("MXFP4");
         test_grouped_mx_small_m("MXFP8");
         test_grouped_mxfp8_swiglu();
+        test_grouped_mxfp8_swiglu_small_m_matches_decode();
         test_grouped_mxfp8_q8();
         test_grouped_mxfp8_inverse_rope();
+        test_grouped_mxfp8_inverse_rope_small_m_matches_decode();
         test_grouped_row_mxfp8_prefill();
+        test_grouped_row_mxfp8_verify();
+        test_grouped_mx_small_m_matches_decode("MXFP4");
+        test_grouped_mx_small_m_matches_decode("MXFP8");
         std::cout << "MFQ MXFP4/MXFP8 Metal GEMV/MMQ/GEMM/grouped/embedding passed\n";
         return 0;
     } catch (const std::exception& error) {

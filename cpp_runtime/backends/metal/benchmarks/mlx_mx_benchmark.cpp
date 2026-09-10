@@ -240,6 +240,65 @@ void benchmark_grouped_synthetic(
         << std::setprecision(6) << checksum << '\t' << maximum << '\n';
 }
 
+void benchmark_diagonal_synthetic(
+    int rows,
+    int output_per_group,
+    int input_size,
+    int groups,
+    int repetitions) {
+    require(
+        rows >= 2 && rows <= 6 &&
+            output_per_group > 0 && output_per_group % 8 == 0 &&
+            input_size > 0 && input_size % 256 == 0 &&
+            groups > 0,
+        "invalid synthetic diagonal MXFP8 geometry");
+    auto weight = MlxMxWeight::from_blob(
+        "MXFP8",
+        make_synthetic_mx_blob(
+            8,
+            output_per_group * groups,
+            input_size));
+    auto flat = make_input(input_size, rows * groups);
+    auto source = mlx::core::reshape(
+        std::move(flat),
+        Shape{1, rows, groups, input_size});
+    const auto execute = [&] {
+        return weight.grouped_row_matmul(source, groups);
+    };
+    auto result = execute();
+    mlx::core::eval(result);
+    for (int index = 0; index < 4; ++index) {
+        result = execute();
+        mlx::core::eval(result);
+    }
+    mlx::core::synchronize();
+    const auto started = Clock::now();
+    for (int index = 0; index < repetitions; ++index) {
+        result = execute();
+        mlx::core::eval(result);
+    }
+    mlx::core::synchronize();
+    const double mean_ms = milliseconds_since(started) / repetitions;
+    auto checked = mlx::core::contiguous(
+        mlx::core::astype(result, mlx::core::float32));
+    mlx::core::eval(checked);
+    double checksum = 0.0;
+    for (std::size_t index = 0; index < checked.size(); ++index) {
+        require(
+            std::isfinite(checked.data<float>()[index]),
+            "diagonal MXFP8 benchmark produced a non-finite value");
+        checksum += checked.data<float>()[index];
+    }
+    std::cout
+        << "MXFP8\tsynthetic_diagonal\t"
+        << rows << 'x' << groups << 'x' << input_size << 'x'
+        << output_per_group << '\t' << weight.packed_nbytes() << '\t'
+        << std::fixed << std::setprecision(3) << mean_ms << '\t'
+        << std::setprecision(1)
+        << static_cast<double>(weight.packed_nbytes()) / (mean_ms * 1.0e6)
+        << '\t' << std::setprecision(6) << checksum << "\t0\n";
+}
+
 array fallback_grouped(
     const MlxMxWeight& weight,
     const array& input,
@@ -306,6 +365,24 @@ void benchmark_grouped(
 
 int main(int argc, char** argv) {
     try {
+        if (argc >= 2 && std::string(argv[1]) == "--synthetic-diagonal") {
+            require(
+                argc == 7,
+                "usage: mfq-metal-mx-benchmark --synthetic-diagonal "
+                "REPETITIONS ROWS OUTPUT_PER_GROUP INPUT GROUPS");
+            const int repetitions = std::stoi(argv[2]);
+            require(repetitions > 0, "repetitions must be positive");
+            std::cout
+                << "dtype\ttensor\tshape\tpacked_bytes\tms\tGB/s\t"
+                   "checksum\tmax_abs\n";
+            benchmark_diagonal_synthetic(
+                std::stoi(argv[3]),
+                std::stoi(argv[4]),
+                std::stoi(argv[5]),
+                std::stoi(argv[6]),
+                repetitions);
+            return 0;
+        }
         if (argc >= 2 && std::string(argv[1]) == "--synthetic-grouped") {
             require(
                 argc == 8,

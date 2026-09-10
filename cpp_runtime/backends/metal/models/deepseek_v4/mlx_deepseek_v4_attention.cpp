@@ -1507,10 +1507,14 @@ MlxDeepseekV4LayerState::MlxDeepseekV4LayerState(
 
 struct MlxDeepseekV4LayerSpeculation {
     MlxDeepseekV4LayerState checkpoint;
-    std::optional<array> attention_input;
     int confirmed_tokens;
     int total_tokens;
     int start_position;
+    std::optional<array> local_kv;
+    std::optional<array> main_kv;
+    std::optional<array> main_gate;
+    std::optional<array> index_kv;
+    std::optional<array> index_gate;
 };
 
 MlxDeepseekV4LayerState
@@ -1624,10 +1628,14 @@ void MlxDeepseekV4LayerState::begin_speculative(
     speculative_ = std::make_shared<MlxDeepseekV4LayerSpeculation>(
         MlxDeepseekV4LayerSpeculation{
             std::move(checkpoint),
-            std::nullopt,
             confirmed_tokens,
             total_tokens,
             position_,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
         });
 }
 
@@ -2152,7 +2160,7 @@ struct MlxDeepseekV4Attention::Impl {
                       sine,
                       head_dim,
                       rotary)
-            : components.wo_a.mx_weight_ref() && tokens == 1
+            : components.wo_a.mx_weight_ref() && tokens <= 6
             ? components.wo_a.mx_weight_ref()
                   ->grouped_row_matmul_inverse_rope(
                       grouped,
@@ -2493,15 +2501,16 @@ array MlxDeepseekV4Attention::operator()(
     }
     const int batch = source.shape(0);
     const int tokens = source.shape(1);
+    MlxDeepseekV4LayerSpeculation* speculation = nullptr;
     if (state.speculative_) {
         auto& transaction = *state.speculative_;
-        if (transaction.attention_input ||
+        if (transaction.local_kv ||
             transaction.start_position != pos0 ||
             transaction.total_tokens != tokens) {
             throw std::runtime_error(
                 "DeepSeek-V4 speculative attention transaction mismatch");
         }
-        transaction.attention_input = source;
+        speculation = &transaction;
     }
     if (visibility != nullptr &&
         (tokens == 1 || pos0 != 0 || visibility->max_image_tokens <= 0 ||
@@ -2582,6 +2591,9 @@ array MlxDeepseekV4Attention::operator()(
     // the RoPE channels verbatim and use this same fake-quantized KV for both
     // prefill and incremental cache writes.
     kv = deepseek_v4_kv_fp8_sim_prefix(kv, rotary);
+    if (speculation != nullptr) {
+        speculation->local_kv = kv;
+    }
     if (detail::component_profile_active()) {
         detail::profile_eval(
             profile_component("q_rms_rope"),
@@ -2607,6 +2619,14 @@ array MlxDeepseekV4Attention::operator()(
             index_kv = projected.at(output++);
             index_gate = projected.at(output++);
             index_weights = projected.at(output++);
+        }
+        if (speculation != nullptr) {
+            speculation->main_kv = main_kv;
+            speculation->main_gate = main_gate;
+            if (impl_->ratio == 4) {
+                speculation->index_kv = index_kv;
+                speculation->index_gate = index_gate;
+            }
         }
         const bool batch_prefill =
             tokens > 1 &&
@@ -2826,6 +2846,7 @@ array MlxDeepseekV4Attention::operator()(
             1);
         const bool use_direct_pool =
             config.fast_attention() &&
+            speculation == nullptr &&
             visibility == nullptr &&
             state.main_.has_value() &&
             pool_len > 0 &&
@@ -2954,7 +2975,7 @@ void MlxDeepseekV4Attention::rollback_speculative(
     int accepted_tokens) const {
     auto transaction = std::move(state.speculative_);
     state.speculative_.reset();
-    if (!transaction || !transaction->attention_input) {
+    if (!transaction || !transaction->local_kv) {
         throw std::runtime_error(
             "DeepSeek-V4 speculative attention checkpoint is unavailable");
     }
@@ -2965,22 +2986,86 @@ void MlxDeepseekV4Attention::rollback_speculative(
             "DeepSeek-V4 speculative acceptance count is invalid");
     }
     const int keep = transaction->confirmed_tokens + accepted_tokens;
-    auto input = mlx::core::slice(
-        *transaction->attention_input,
-        Shape{0, 0, 0},
-        Shape{
-            transaction->attention_input->shape(0),
-            keep,
-            transaction->attention_input->shape(2),
-        });
     const int start = transaction->start_position;
     state.restore_speculative_snapshot(
         std::move(transaction->checkpoint),
         start,
         transaction->total_tokens);
-    // Only the architecture-specific compressed attention cache is rebuilt.
-    // Decoder blocks, routed experts, HC and the LM head are not replayed.
-    (void)(*this)(input, state, start, nullptr);
+    if (transaction->local_kv->ndim() != 3 ||
+        transaction->local_kv->shape(0) != state.batch() ||
+        transaction->local_kv->shape(1) < keep) {
+        throw std::runtime_error(
+            "DeepSeek-V4 speculative KV capture is malformed");
+    }
+
+    // The verifier has already computed every cache projection. Restore the
+    // checkpoint and commit the accepted prefix from those values directly;
+    // replaying attention across all target layers makes partial acceptance
+    // dominate otherwise profitable MTP cycles.
+    const int batch = state.batch();
+    const int window = state.local_.shape(1);
+    auto local_values = slice_axis(
+        *transaction->local_kv, 1, 0, keep);
+    auto local_positions = mlx::core::remainder(
+        mlx::core::arange(
+            start,
+            start + keep,
+            1,
+            mlx::core::int32),
+        array(window, mlx::core::int32));
+    auto local_indices = mlx::core::broadcast_to(
+        mlx::core::reshape(local_positions, Shape{1, keep}),
+        Shape{batch, keep});
+    state.local_ = dsv4_cache_write_inplace(
+        state.local_,
+        mlx::core::astype(local_values, state.local_.dtype()),
+        local_indices);
+
+    if (impl_->ratio != 0) {
+        if (!state.main_ || !transaction->main_kv ||
+            !transaction->main_gate ||
+            transaction->main_kv->shape(1) < keep ||
+            transaction->main_gate->shape(1) < keep ||
+            (impl_->ratio == 4 &&
+             (!state.indexer_ || !transaction->index_kv ||
+              !transaction->index_gate ||
+              transaction->index_kv->shape(1) < keep ||
+              transaction->index_gate->shape(1) < keep))) {
+            throw std::runtime_error(
+                "DeepSeek-V4 speculative compressor capture is malformed");
+        }
+        for (int token = 0; token < keep; ++token) {
+            const int length = start + token + 1;
+            state.main_->update(
+                slice_axis(*transaction->main_kv, 1, token, token + 1),
+                slice_axis(*transaction->main_gate, 1, token, token + 1),
+                *impl_->components.main_ape,
+                *impl_->components.main_norm,
+                length,
+                impl_->pool_rope->first,
+                impl_->pool_rope->second,
+                0,
+                static_cast<float>(impl_->config.rms_eps));
+            if (impl_->ratio == 4) {
+                state.indexer_->update(
+                    slice_axis(*transaction->index_kv, 1, token, token + 1),
+                    slice_axis(*transaction->index_gate, 1, token, token + 1),
+                    *impl_->components.index_ape,
+                    *impl_->components.index_norm,
+                    length,
+                    impl_->pool_rope->first,
+                    impl_->pool_rope->second,
+                    impl_->config.fast_indexer() ? 2 : 0,
+                    static_cast<float>(impl_->config.rms_eps));
+            }
+        }
+        if (state.indexer_ &&
+            state.indexer_->pool_len() != state.main_->pool_len()) {
+            throw std::runtime_error(
+                "DeepSeek-V4 speculative pool lengths diverged");
+        }
+    }
+    state.position_ = start + keep;
 }
 
 int MlxDeepseekV4Attention::ratio() const noexcept {

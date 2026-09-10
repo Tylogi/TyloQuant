@@ -569,7 +569,7 @@ array mlx_sparse_selected_mla_attention(
         .selected = indices.shape(2),
         .scale = selected_scale,
     };
-    if (params.queries == 1) {
+    if (params.queries < 32) {
         const array scale_parameter({selected_scale}, mlx::core::float32);
         const Shape output_shape{
             params.batch,
@@ -583,10 +583,20 @@ array mlx_sparse_selected_mla_attention(
             {"MAX_SEQ", params.keys},
             {"SELECTED", params.selected},
         };
-        const int grid = checked_grid_product(
-            {params.batch, 16, 128},
-            "selected-token sparse MLA decode grid");
-        auto outputs = sparse_selected_mla_decode_kernel()(
+        // Speculative verification must preserve the M=1 reduction order.
+        // Even a small short-prefill rounding difference can change a greedy
+        // target token and make MTP diverge from ordinary decode.
+        const bool decode_consistent = params.queries <= 6;
+        const int grid = decode_consistent
+            ? checked_grid_product(
+                {params.batch, params.queries, 16, 128},
+                "selected-token sparse MLA decode grid")
+            : checked_grid_product(
+                {params.batch, params.queries, kHeads, 256},
+                "selected-token sparse MLA short-query grid");
+        auto outputs = (decode_consistent
+            ? sparse_selected_mla_decode_kernel()
+            : sparse_selected_mla_short_kernel())(
                 {
                     selected_query,
                     selected_cache,
@@ -598,7 +608,7 @@ array mlx_sparse_selected_mla_attention(
                 {output_shape},
                 {mlx::core::float32},
                 {grid, 1, 1},
-                {128, 1, 1},
+                {decode_consistent ? 128 : 256, 1, 1},
                 templates,
                 std::nullopt,
                 false,
