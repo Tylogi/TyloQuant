@@ -3318,20 +3318,44 @@ void test_swiglu_ffn() {
                 - 8)
             / 256.0f;
     }
+    const auto input_array = mlx::core::array(
+        input.begin(),
+        mlx::core::Shape{tokens, hidden});
+    const auto ids_array = mlx::core::array(
+        ids.begin(),
+        mlx::core::Shape{tokens, routes});
+    const auto activated_actual = evaluated_floats(
+        ffn.gate_up_weight().routed_swiglu(
+            input_array,
+            ids_array));
+    const std::vector<float> single_input(
+        input.begin(),
+        input.begin() + hidden);
+    const std::vector<std::int32_t> single_ids(
+        ids.begin(),
+        ids.begin() + routes);
+    const auto single_activated_actual = evaluated_floats(
+        ffn.gate_up_weight().routed_swiglu(
+            mlx::core::array(
+                single_input.begin(),
+                mlx::core::Shape{1, hidden}),
+            mlx::core::array(
+                single_ids.begin(),
+                mlx::core::Shape{1, routes})));
+    for (
+        std::size_t index = 0;
+        index < single_activated_actual.size();
+        ++index
+    ) {
+        require_close(
+            single_activated_actual[index],
+            activated_actual[index],
+            3e-3f);
+    }
     const auto actual = evaluated_floats(
         ffn.forward(
-            mlx::core::array(
-                input.begin(),
-                mlx::core::Shape{
-                    tokens,
-                    hidden,
-                }),
-            mlx::core::array(
-                ids.begin(),
-                mlx::core::Shape{
-                    tokens,
-                    routes,
-                }),
+            input_array,
+            ids_array,
             mlx::core::array(
                 route_weights.begin(),
                 mlx::core::Shape{
@@ -3373,6 +3397,13 @@ void test_swiglu_ffn() {
                         + std::exp(-gate_value)
                     )
                     * up_value;
+                require_close(
+                    activated_actual[
+                        (token * routes + route)
+                            * intermediate
+                        + column],
+                    activated[column],
+                    3e-3f);
             }
             const auto weight_offset =
                 static_cast<std::size_t>(expert)
