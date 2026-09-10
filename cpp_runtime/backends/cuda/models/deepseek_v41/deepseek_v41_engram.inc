@@ -314,6 +314,34 @@ public:
         context_.assign(
             static_cast<std::size_t>(batch * (max_ngram_size_ - 1)),
             pad_id_);
+        speculative_context_.reset();
+        speculative_position_ = -1;
+    }
+
+    void begin_speculative() {
+        if (batch_ <= 0 || position_ <= 0 || context_.empty() ||
+            speculative_context_.has_value()) {
+            throw std::runtime_error(
+                "invalid DeepSeek-V4.1 Engram speculative checkpoint");
+        }
+        speculative_position_ = position_;
+        speculative_context_ = context_;
+    }
+
+    void commit_speculative() noexcept {
+        speculative_context_.reset();
+        speculative_position_ = -1;
+    }
+
+    void rollback_speculative() {
+        if (!speculative_context_.has_value() || speculative_position_ < 0) {
+            throw std::runtime_error(
+                "DeepSeek-V4.1 Engram speculative checkpoint is unavailable");
+        }
+        context_ = std::move(*speculative_context_);
+        position_ = speculative_position_;
+        speculative_context_.reset();
+        speculative_position_ = -1;
     }
 
     EngramHashBatch forward(
@@ -480,6 +508,19 @@ public:
         MFQ_RUNTIME_CHECK(
             chunked == expected,
             "DeepSeek-V4.1 Engram chunked hash contract failed");
+
+        auto speculative_state = make_state();
+        (void)speculative_state.forward(
+            all_ids.narrow(1, 0, 2), 0);
+        speculative_state.begin_speculative();
+        const auto speculative = speculative_state.forward(
+            all_ids.narrow(1, 2, 2), 2);
+        speculative_state.rollback_speculative();
+        const auto replayed = speculative_state.forward(
+            all_ids.narrow(1, 2, 2), 2);
+        MFQ_RUNTIME_CHECK(
+            speculative.values == replayed.values,
+            "DeepSeek-V4.1 Engram speculative rollback failed");
         MFQ_RUNTIME_CHECK(
             engram_detail::decode_e4m3(0x00) == 0.0f &&
                 engram_detail::decode_e4m3(0x38) == 1.0f &&
@@ -526,6 +567,8 @@ private:
     int batch_ = 0;
     std::int64_t position_ = 0;
     std::vector<std::int64_t> context_;
+    std::optional<std::vector<std::int64_t>> speculative_context_;
+    std::int64_t speculative_position_ = -1;
 };
 
 class EngramTable {

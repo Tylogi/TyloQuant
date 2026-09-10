@@ -1,8 +1,21 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
+#include <stdexcept>
+
 struct CudaMtpStep {
     mfq_tensor_backend::Tensor sample_hidden;
     mfq_tensor_backend::Tensor chain_hidden;
+};
+
+using CudaMtpTokenSelector = std::function<std::int32_t(
+    mfq_tensor_backend::Tensor)>;
+
+struct CudaMtpBlockDraft {
+    mfq_tensor_backend::Tensor tokens;
+    mfq_tensor_backend::Tensor logits;
+    mfq_tensor_backend::Tensor confidence;
 };
 
 // Generation sees one predictor contract. Model-specific modules own their
@@ -29,6 +42,22 @@ struct CudaMtpModule {
     virtual bool preserve_output_dtype() const noexcept = 0;
     virtual int maximum_draft_depth() const noexcept {
         return mfq::cuda::mtp::kMaximumDraftDepth;
+    }
+    virtual bool blockwise_drafting() const noexcept { return false; }
+    virtual bool split_target_verification() const noexcept { return false; }
+    virtual void append_target_context(
+        mfq_tensor_backend::Tensor,
+        std::int64_t) {
+        throw std::runtime_error(
+            "this CUDA MTP predictor has no target-context adapter");
+    }
+    virtual CudaMtpBlockDraft draft_block(
+        Model&,
+        mfq_tensor_backend::Tensor,
+        const CudaMtpTokenSelector&,
+        int) {
+        throw std::runtime_error(
+            "this CUDA MTP predictor has no block-draft adapter");
     }
 
     mfq::cuda::mtp::GenerationStats last_stats;

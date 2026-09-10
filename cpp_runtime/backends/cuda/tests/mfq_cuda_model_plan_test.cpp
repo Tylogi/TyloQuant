@@ -121,8 +121,16 @@ int main() {
             "DeepSeek-V4.1 text adapter was not selected");
         require(
             deepseek_v41_plan.vision == MfqCudaVisionAdapter::none &&
-                deepseek_v41_plan.predictor == MfqCudaPredictorAdapter::none,
-            "unfinished DeepSeek-V4.1 optional adapters were advertised");
+                deepseek_v41_plan.predictor ==
+                    MfqCudaPredictorAdapter::deepseek_v41_dspark,
+            "DeepSeek-V4.1 optional component selection mismatch");
+        const auto deepseek_v41_state = mfq_cuda_component_state(
+            deepseek_v41, deepseek_v41_plan, false, true);
+        require(
+            deepseek_v41_state.mtp_supported &&
+                deepseek_v41_state.mtp_enabled &&
+                !deepseek_v41_state.vision_supported,
+            "DeepSeek-V4.1 DSpark availability state mismatch");
 
         std::cout << "MFQ CUDA model plan tests passed\n";
         return 0;

@@ -7,6 +7,8 @@ namespace mfq::cuda::deepseek_v41_runtime {
 using Tensor = mfq_tensor_backend::Tensor;
 using CommonConfig = mfq::models::deepseek_v41::Config;
 
+static void run_dspark_self_check();
+
 struct SharedState {
     Tensor compressed_kv;
     Tensor index_k;
@@ -16,12 +18,71 @@ struct SharedState {
     Tensor attention_meta;
     std::unique_ptr<EngramHashState> engram_hash;
     EngramHashBatch engram_hashes;
+    std::vector<Tensor> dspark_target_hiddens;
+    bool capture_dspark_targets = false;
     std::int64_t compressed_length = 0;
     std::int64_t ratio = 0;
     std::int64_t cache_position = -1;
     std::int64_t batch = 0;
     std::int64_t tokens = 0;
     std::int64_t next_layer = 0;
+
+    void begin_forward(bool capture, std::size_t target_count) {
+        capture_dspark_targets = capture;
+        dspark_target_hiddens.clear();
+        if (capture) dspark_target_hiddens.resize(target_count);
+    }
+
+    void capture_dspark_target(
+        std::int64_t layer,
+        const CommonConfig& config,
+        const Tensor& hidden) {
+        if (!capture_dspark_targets) return;
+        const auto found = std::find(
+            config.dspark_target_layer_ids.begin(),
+            config.dspark_target_layer_ids.end(),
+            layer);
+        if (found == config.dspark_target_layer_ids.end()) return;
+        const auto slot = static_cast<std::size_t>(std::distance(
+            config.dspark_target_layer_ids.begin(), found));
+        MFQ_RUNTIME_CHECK(
+            slot < dspark_target_hiddens.size() && hidden.dim() == 4 &&
+                hidden.size(2) == config.hc_mult &&
+                hidden.size(3) == config.hidden,
+            "DeepSeek-V4.1 DSpark target geometry mismatch");
+        dspark_target_hiddens[slot] = hidden.mean(2).contiguous();
+    }
+
+    Tensor dspark_target_hidden() const {
+        MFQ_RUNTIME_CHECK(
+            capture_dspark_targets && !dspark_target_hiddens.empty() &&
+                std::all_of(
+                    dspark_target_hiddens.begin(),
+                    dspark_target_hiddens.end(),
+                    [](const Tensor& value) { return value.defined(); }),
+            "DeepSeek-V4.1 DSpark target layers were not fully captured");
+        return dspark_target_hiddens.size() == 1
+            ? dspark_target_hiddens.front()
+            : mfq_tensor_backend::cat(dspark_target_hiddens, -1).contiguous();
+    }
+
+    void begin_speculative() {
+        MFQ_RUNTIME_CHECK(
+            engram_hash,
+            "DeepSeek-V4.1 Engram state is unavailable");
+        engram_hash->begin_speculative();
+    }
+
+    void commit_speculative() noexcept {
+        if (engram_hash) engram_hash->commit_speculative();
+    }
+
+    void rollback_speculative() {
+        MFQ_RUNTIME_CHECK(
+            engram_hash,
+            "DeepSeek-V4.1 Engram state is unavailable");
+        engram_hash->rollback_speculative();
+    }
 
     void reset_session(std::int64_t current_batch) {
         compressed_kv = {};
@@ -30,6 +91,8 @@ struct SharedState {
         candidate_blocks = {};
         previous_pre = {};
         engram_hashes = {};
+        dspark_target_hiddens.clear();
+        capture_dspark_targets = false;
         compressed_length = 0;
         ratio = 0;
         cache_position = -1;
@@ -339,6 +402,14 @@ struct Block final : ::Block {
     FFN mlp;
     Dsv4RopeTable rope;
     std::unique_ptr<Engram> engram;
+    Tensor speculative_local_slots;
+    Tensor speculative_slot_ids;
+    Tensor speculative_partial_kv;
+    Tensor speculative_partial_score;
+    std::int64_t speculative_position = -1;
+    std::int64_t speculative_compressed_length = 0;
+    std::int64_t speculative_partial_length = 0;
+    bool speculative_pending = false;
 
     bool kv_source() const noexcept {
         return config.is_kv_source(layer);
@@ -377,7 +448,68 @@ struct Block final : ::Block {
         state.position = 0;
         state.compressed_length = 0;
         state.partial_length = 0;
+        speculative_local_slots = {};
+        speculative_slot_ids = {};
+        speculative_partial_kv = {};
+        speculative_partial_score = {};
+        speculative_position = -1;
+        speculative_pending = false;
         if (layer == 0) shared->reset_session(batch);
+    }
+
+    bool supports_speculation() const noexcept override { return true; }
+
+    void begin_speculative(std::int64_t draft_tokens) override {
+        MFQ_RUNTIME_CHECK(
+            !speculative_pending && draft_tokens > 0 &&
+                draft_tokens <= config.sliding_window &&
+                state.local_kv.defined(),
+            "invalid DeepSeek-V4.1 speculative checkpoint");
+        speculative_position = state.position;
+        speculative_compressed_length = state.compressed_length;
+        speculative_partial_length = state.partial_length;
+        speculative_slot_ids = mfq_tensor_backend::arange(
+            state.position,
+            state.position + draft_tokens,
+            state.local_kv.options().dtype(mfq_tensor_backend::kInt64))
+            .remainder(static_cast<double>(config.sliding_window))
+            .to(mfq_tensor_backend::kInt64)
+            .contiguous();
+        speculative_local_slots = state.local_kv
+            .index_select(1, speculative_slot_ids)
+            .clone();
+        if (state.partial_kv.defined()) {
+            speculative_partial_kv = state.partial_kv.clone();
+            speculative_partial_score = state.partial_score.clone();
+        }
+        speculative_pending = true;
+    }
+
+    void commit_speculative() override {
+        speculative_pending = false;
+        speculative_local_slots = {};
+        speculative_slot_ids = {};
+        speculative_partial_kv = {};
+        speculative_partial_score = {};
+        speculative_position = -1;
+    }
+
+    void rollback_speculative(std::int64_t position) override {
+        MFQ_RUNTIME_CHECK(
+            speculative_pending && position == speculative_position &&
+                speculative_local_slots.defined() &&
+                speculative_slot_ids.defined(),
+            "DeepSeek-V4.1 speculative checkpoint is unavailable");
+        state.local_kv.index_copy_(
+            1, speculative_slot_ids, speculative_local_slots);
+        if (speculative_partial_kv.defined()) {
+            state.partial_kv.copy_(speculative_partial_kv);
+            state.partial_score.copy_(speculative_partial_score);
+        }
+        state.position = speculative_position;
+        state.compressed_length = speculative_compressed_length;
+        state.partial_length = speculative_partial_length;
+        commit_speculative();
     }
 
     void set_token_ids(const Tensor& ids) override {
@@ -839,6 +971,8 @@ struct Block final : ::Block {
             });
         }
 
+        shared->capture_dspark_target(layer, config, hidden);
+
         auto attention_residual = hidden;
         auto attention_mix = collapse(
             attention_residual,
@@ -886,11 +1020,13 @@ struct Block final : ::Block {
     }
 };
 
-static FFN load_moe(
+static FFN load_moe_at(
     const MfqFile& model,
     const ::Config& runtime,
-    std::int64_t layer) {
-    const auto prefix = "model.block." + std::to_string(layer) + ".mlp.";
+    const std::string& prefix,
+    std::int64_t layer,
+    std::int64_t top_k,
+    bool cacheable) {
     FFN result;
     result.is_moe = true;
     const bool split_gate = model.has_record(prefix + "experts.gate.weight");
@@ -903,18 +1039,18 @@ static FFN load_moe(
     result.moe_split_gate_up = split_gate;
     if (split_gate) {
         result.moe_gate = load_nint_moe_gpu(
-            model, prefix + "experts.gate.weight", true,
+            model, prefix + "experts.gate.weight", cacheable,
             static_cast<int>(layer), "gate");
         result.moe_up = load_nint_moe_gpu(
-            model, prefix + "experts.up.weight", true,
+            model, prefix + "experts.up.weight", cacheable,
             static_cast<int>(layer), "up");
     } else {
         result.moe_gate_up = load_nint_moe_gpu(
-            model, prefix + "experts.gate_up.weight", true,
+            model, prefix + "experts.gate_up.weight", cacheable,
             static_cast<int>(layer), "gate_up");
     }
     result.moe_down = load_nint_moe_gpu(
-        model, prefix + "experts.down.weight", true,
+        model, prefix + "experts.down.weight", cacheable,
         static_cast<int>(layer), "down");
     result.moe_router = load_dense_gpu(model, prefix + "router.weight")
         .to(mfq_tensor_backend::kFloat32)
@@ -922,7 +1058,7 @@ static FFN load_moe(
     result.moe_router_bias = load_dense_gpu(model, prefix + "router.bias")
         .to(mfq_tensor_backend::kFloat32)
         .contiguous();
-    result.moe_top_k = static_cast<int>(runtime.num_experts_per_tok);
+    result.moe_top_k = static_cast<int>(top_k);
     result.moe_use_sqrt_softplus = true;
     result.moe_normalize = runtime.norm_topk_prob;
     result.moe_delayed_softmax = false;
@@ -942,6 +1078,19 @@ static FFN load_moe(
     result.shared->swiglu_limit = runtime.swiglu_limit;
     prepare_ffn_workspaces(*result.shared);
     return result;
+}
+
+static FFN load_moe(
+    const MfqFile& model,
+    const ::Config& runtime,
+    std::int64_t layer) {
+    return load_moe_at(
+        model,
+        runtime,
+        "model.block." + std::to_string(layer) + ".mlp.",
+        layer,
+        runtime.num_experts_per_tok,
+        true);
 }
 
 static std::unique_ptr<::Block> load_block(
@@ -1098,6 +1247,7 @@ static std::unique_ptr<::Block> load_block(
 
 static int run_self_check() {
     EngramHashState::self_check();
+    run_dspark_self_check();
     auto options = mfq_tensor_backend::TensorOptions()
         .device(mfq_tensor_backend::kCUDA)
         .dtype(mfq_tensor_backend::kInt32);

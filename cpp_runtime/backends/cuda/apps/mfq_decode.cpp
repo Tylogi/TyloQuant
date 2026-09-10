@@ -15778,6 +15778,7 @@ struct Block {
     virtual void reset(int64_t B) = 0;
     virtual void set_token_ids(const mfq_tensor_backend::Tensor &) {}
     virtual bool supports_speculation() const noexcept { return false; }
+    virtual void begin_speculative(int64_t) {}
     virtual void commit_speculative() {}
     virtual void rollback_speculative(int64_t) {}
     virtual mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
@@ -19772,6 +19773,7 @@ struct Model {
     int64_t cache_pos = 0;
     int64_t speculative_start = -1;
     int64_t speculative_confirmed = 0;
+    bool speculative_suffix_forward = false;
     std::unique_ptr<flash_runtime::Gr> qwen4_final_mixer;
     mfq_tensor_backend::Tensor qwen4_positions;
     int64_t qwen4_batch=0;
@@ -19784,11 +19786,54 @@ struct Model {
                 [](const auto& block) {return block->supports_speculation();});
     }
 
+    bool supports_deepseek_v41_speculation() const {
+        return c.is_deepseek_v41() && !blocks.empty() &&
+            std::all_of(
+                blocks.begin(), blocks.end(),
+                [](const auto& block) {
+                    return block->supports_speculation();
+                });
+    }
+
+    void begin_speculative_suffix(int64_t draft_tokens) {
+        MFQ_RUNTIME_CHECK(
+            supports_deepseek_v41_speculation() &&
+                speculative_start < 0 && draft_tokens > 0 &&
+                cache_pos + draft_tokens <= c.max_position_embeddings &&
+                deepseek_v41_state,
+            "invalid DeepSeek-V4.1 speculative suffix");
+        speculative_start = cache_pos;
+        speculative_confirmed = 0;
+        deepseek_v41_state->begin_speculative();
+        std::size_t begun = 0;
+        try {
+            for (auto& block : blocks) {
+                MfqCudaGuard guard(block->cuda_device);
+                block->begin_speculative(draft_tokens);
+                ++begun;
+            }
+        } catch (...) {
+            for (std::size_t index = 0; index < begun; ++index) {
+                try { blocks[index]->commit_speculative(); } catch (...) {}
+            }
+            try { deepseek_v41_state->rollback_speculative(); } catch (...) {}
+            speculative_start = -1;
+            speculative_confirmed = 0;
+            throw;
+        }
+    }
+
     void commit_speculative() {
         MFQ_RUNTIME_CHECK(speculative_start >= 0, "no speculative transaction to commit");
         for (auto& block : blocks) {
             MfqCudaGuard guard(block->cuda_device);
             block->commit_speculative();
+        }
+        if (c.is_deepseek_v41()) {
+            MFQ_RUNTIME_CHECK(
+                deepseek_v41_state,
+                "DeepSeek-V4.1 speculative state is unavailable");
+            deepseek_v41_state->commit_speculative();
         }
         speculative_start = -1;
         speculative_confirmed = 0;
@@ -19799,6 +19844,12 @@ struct Model {
         for (auto& block : blocks) {
             MfqCudaGuard guard(block->cuda_device);
             block->rollback_speculative(speculative_start+speculative_confirmed);
+        }
+        if (c.is_deepseek_v41()) {
+            MFQ_RUNTIME_CHECK(
+                deepseek_v41_state,
+                "DeepSeek-V4.1 speculative state is unavailable");
+            deepseek_v41_state->rollback_speculative();
         }
         // Full-attention KV slots beyond this logical length are overwritten
         // by the next pass; no history-sized cache copy is needed.
@@ -19821,6 +19872,7 @@ struct Model {
         qwen4_positions={};qwen4_batch=B;
         speculative_start = -1;
         speculative_confirmed = 0;
+        speculative_suffix_forward = false;
         for (auto & b : blocks) {
             MfqCudaGuard guard(b->cuda_device);
             b->reset(B);
@@ -20130,6 +20182,26 @@ struct Model {
             mfq_nullopt, false, cache_positions_override, raw_hidden, confirmed_prefix);
     }
 
+    mfq_tensor_backend::Tensor hidden_forward_speculative_suffix(
+            mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor* raw_hidden = nullptr) {
+        MFQ_RUNTIME_CHECK(
+            speculative_start >= 0 && speculative_confirmed == 0 &&
+                !speculative_suffix_forward,
+            "DeepSeek-V4.1 speculative suffix is not active");
+        speculative_suffix_forward = true;
+        try {
+            auto result = hidden_forward(
+                std::move(ids), mfq_nullopt, mfq_nullopt,
+                nullptr, mfq_nullopt, raw_hidden);
+            speculative_suffix_forward = false;
+            return result;
+        } catch (...) {
+            speculative_suffix_forward = false;
+            throw;
+        }
+    }
+
     mfq_tensor_backend::Tensor hidden_forward_inputs(
             mfq_tensor_backend::Tensor ids,
             mfq_tensor_backend::Tensor input_embeddings,
@@ -20168,7 +20240,7 @@ struct Model {
                 !cache_positions_override.has_value() && !attention_mask.has_value(),
                 "Qwen4 requires unpadded causal cache positions");
         }
-        MFQ_RUNTIME_CHECK(speculative_start < 0,
+        MFQ_RUNTIME_CHECK(speculative_start < 0 || speculative_suffix_forward,
             "commit or roll back the pending speculative pass before forwarding");
         MFQ_RUNTIME_CHECK(confirmed_prefix >= 0 &&
             (confirmed_prefix == 0 || (confirmed_prefix < T && B == 1 && cache_pos > 0 &&
@@ -20259,6 +20331,14 @@ struct Model {
                 .expand({B, T, c.hc_mult, c.hidden_size})
                 .contiguous();
         }
+        if (c.is_deepseek_v41()) {
+            MFQ_RUNTIME_CHECK(
+                deepseek_v41_state && c.deepseek_v41.has_value(),
+                "DeepSeek-V4.1 target capture state is unavailable");
+            deepseek_v41_state->begin_forward(
+                raw_hidden != nullptr,
+                c.deepseek_v41->dspark_target_layer_ids.size());
+        }
         if (c.is_qwen4()) x=x.to(mfq_tensor_backend::kFloat16).repeat({1,1,c.hc_mult});
         if (block_trace != nullptr) block_trace->push_back(x.to(mfq_tensor_backend::kFloat32).clone());
         for (auto & b : blocks) {
@@ -20322,7 +20402,11 @@ struct Model {
         }
         x = tensor_to_cuda_device(x, primary);
         auto finalized=finalize_hidden(x, B, T);
-        if (raw_hidden != nullptr) *raw_hidden = c.is_glm5_next()?finalized:x;
+        if (raw_hidden != nullptr) {
+            *raw_hidden = c.is_deepseek_v41()
+                ? deepseek_v41_state->dspark_target_hidden()
+                : (c.is_glm5_next() ? finalized : x);
+        }
         return finalized;
     }
 
@@ -20665,6 +20749,7 @@ static Model load_model(const std::string & mfq_path, const std::string & config
 #include "minicpmo45_runtime.inc"
 
 #include "../runtime/mtp.h"
+#include "deepseek_v41/deepseek_v41_dspark.inc"
 #include "qwen35/mtp.h"
 #include "flash_next/flash_next_mtp.h"
 #include "../runtime/server_components.h"
@@ -22520,6 +22605,10 @@ static int32_t generate_mtp_tokens(
         if (on_prefill) on_prefill(MfqPrefillTiming{prompt.size(), prefill_ms, 0., prefill_ms});
         if (!emit(pending) || generated == limit) return generated;
 
+        if (mtp.blockwise_drafting()) {
+            mtp.append_target_context(raw, 0);
+        }
+
         if (mtp.teacher_forced_prompt_prime() && prompt.size() > 1) {
             constexpr int64_t chunk_size = 512;
             const int64_t pairs = raw.size(1) - 1;
@@ -22558,7 +22647,8 @@ static int32_t generate_mtp_tokens(
         };
         auto prepare_draft = [&](Tensor hidden_rows,
                                  const std::vector<int32_t>& next_ids,
-                                 int requested_depth) {
+                                 int requested_depth,
+                                 bool initial) {
             MFQ_RUNTIME_CHECK(
                 hidden_rows.dim() == 3 && hidden_rows.size(0) == 1 &&
                     hidden_rows.size(1) == static_cast<int64_t>(next_ids.size()) &&
@@ -22566,22 +22656,12 @@ static int32_t generate_mtp_tokens(
                     requested_depth <= maximum_depth,
                 "CUDA MTP committed history is incompatible");
             mtp.trim_cache_to(predictor_history_position);
-            std::vector<int64_t> shifted(next_ids.begin(), next_ids.end());
-            auto head = mtp.step(model, hidden_rows, ids_for(std::move(shifted)));
-            predictor_history_position += static_cast<int64_t>(next_ids.size());
-            MFQ_RUNTIME_CHECK(
-                mtp.cache_position() == predictor_history_position,
-                "CUDA MTP predictor cache did not advance");
-            auto sample_hidden = head.sample_hidden.narrow(
-                1, head.sample_hidden.size(1) - 1, 1);
-            auto chain_hidden = head.chain_hidden.narrow(
-                1, head.chain_hidden.size(1) - 1, 1);
             auto prospective_counts = penalties ? counts.clone() : Tensor{};
             DraftChain result;
             result.tokens.reserve(static_cast<size_t>(requested_depth));
             result.probabilities.reserve(static_cast<size_t>(requested_depth));
-            for (int position = 0; position < requested_depth; ++position) {
-                auto draft_logits = logits_for(sample_hidden).reshape({1, -1});
+            auto select_draft = [&](Tensor draft_logits) {
+                draft_logits = draft_logits.reshape({1, -1});
                 int32_t token = -1;
                 if (greedy) {
                     token = sample_normal(draft_logits, prospective_counts);
@@ -22596,6 +22676,47 @@ static int32_t generate_mtp_tokens(
                     sample_token_counts_add_cuda(
                         prospective_counts, ids_for({token}));
                 }
+                return token;
+            };
+            if (mtp.blockwise_drafting()) {
+                if (!initial) {
+                    mtp.append_target_context(
+                        hidden_rows, predictor_history_position);
+                    predictor_history_position +=
+                        static_cast<int64_t>(next_ids.size());
+                }
+                MFQ_RUNTIME_CHECK(
+                    mtp.cache_position() == predictor_history_position,
+                    "CUDA block predictor cache did not advance");
+                if (requested_depth > 0) {
+                    auto block = mtp.draft_block(
+                        model,
+                        ids_for({next_ids.back()}),
+                        select_draft,
+                        requested_depth);
+                    MFQ_RUNTIME_CHECK(
+                        block.tokens.numel() == requested_depth &&
+                            block.logits.size(1) == requested_depth &&
+                            block.confidence.numel() == requested_depth &&
+                            result.tokens.size() ==
+                                static_cast<size_t>(requested_depth),
+                        "CUDA block predictor returned an incomplete draft");
+                }
+                return result;
+            }
+            std::vector<int64_t> shifted(next_ids.begin(), next_ids.end());
+            auto head = mtp.step(model, hidden_rows, ids_for(std::move(shifted)));
+            predictor_history_position += static_cast<int64_t>(next_ids.size());
+            MFQ_RUNTIME_CHECK(
+                mtp.cache_position() == predictor_history_position,
+                "CUDA MTP predictor cache did not advance");
+            auto sample_hidden = head.sample_hidden.narrow(
+                1, head.sample_hidden.size(1) - 1, 1);
+            auto chain_hidden = head.chain_hidden.narrow(
+                1, head.chain_hidden.size(1) - 1, 1);
+            for (int position = 0; position < requested_depth; ++position) {
+                auto draft_logits = logits_for(sample_hidden).reshape({1, -1});
+                const int32_t token = select_draft(draft_logits);
                 if (position + 1 < requested_depth) {
                     auto next = mtp.step(
                         model, chain_hidden, ids_for({token}));
@@ -22607,7 +22728,8 @@ static int32_t generate_mtp_tokens(
         };
 
         auto draft = prepare_draft(
-            initial_hidden, {pending}, bounded_depth(depth_controller.depth()));
+            initial_hidden, {pending},
+            bounded_depth(depth_controller.depth()), true);
         while (generated < limit) {
             const auto cycle_started = Clock::now();
             const int draft_count = static_cast<int>(draft.tokens.size());
@@ -22615,10 +22737,33 @@ static int32_t generate_mtp_tokens(
             std::vector<int64_t> verify_ids{pending};
             verify_ids.insert(
                 verify_ids.end(), draft.tokens.begin(), draft.tokens.end());
-            auto verified = model.hidden_forward(
-                ids_for(std::move(verify_ids)), mfq_nullopt, mfq_nullopt,
-                nullptr, mfq_nullopt, &verified_raw,
-                draft_count > 0 ? 1 : 0);
+            Tensor verified;
+            if (mtp.split_target_verification()) {
+                Tensor pending_raw;
+                auto pending_hidden = model.hidden_forward(
+                    ids_for({pending}), mfq_nullopt, mfq_nullopt,
+                    nullptr, mfq_nullopt, &pending_raw);
+                if (draft_count > 0) {
+                    model.begin_speculative_suffix(draft_count);
+                    std::vector<int64_t> draft_ids(
+                        draft.tokens.begin(), draft.tokens.end());
+                    Tensor draft_raw;
+                    auto draft_hidden = model.hidden_forward_speculative_suffix(
+                        ids_for(std::move(draft_ids)), &draft_raw);
+                    verified = mfq_tensor_backend::cat(
+                        {pending_hidden, draft_hidden}, 1).contiguous();
+                    verified_raw = mfq_tensor_backend::cat(
+                        {pending_raw, draft_raw}, 1).contiguous();
+                } else {
+                    verified = std::move(pending_hidden);
+                    verified_raw = std::move(pending_raw);
+                }
+            } else {
+                verified = model.hidden_forward(
+                    ids_for(std::move(verify_ids)), mfq_nullopt, mfq_nullopt,
+                    nullptr, mfq_nullopt, &verified_raw,
+                    draft_count > 0 ? 1 : 0);
+            }
             auto targets = logits_for(verified).reshape(
                 {draft_count + 1, model.c.vocab_size});
 
@@ -22750,7 +22895,8 @@ static int32_t generate_mtp_tokens(
             draft = prepare_draft(
                 verified_raw.narrow(1, 0, accepted + 1),
                 next_ids,
-                bounded_depth(depth_controller.depth()));
+                bounded_depth(depth_controller.depth()),
+                false);
         }
         return generated;
     };
