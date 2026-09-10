@@ -168,6 +168,8 @@ namespace mfq::metal {
 namespace {
 
 constexpr double kDepthAcceptanceAlpha = 0.08;
+constexpr double kDepthAcceptancePrior = 0.6;
+constexpr std::uint64_t kDepthAcceptanceBootstrapTrials = 16;
 constexpr double kDepthTimeTauMs = 400.0;
 constexpr double kDepthProbePeriodMs = 1000.0;
 constexpr double kDepthExplorePeriodMs = 5000.0;
@@ -179,7 +181,13 @@ constexpr double kDepthSpikeDamp = 0.25;
 constexpr double kDepthMarginalMs = 7.0;
 constexpr double kDepthHysteresis = 1.03;
 constexpr double kDepthExitMargin = 1.15;
-constexpr int kDepthExitStreak = 16;
+// oMLX can afford a long losing streak because its standard decoder later
+// schedules MTP re-entry probes. The native C++ engine hands the remainder of
+// this request to plain decode with no re-entry path, so lingering for 16
+// cycles consumes most short generations.
+constexpr int kDepthExitStreak = 3;
+constexpr int kDepthRealizedWindow = 3;
+constexpr double kDepthRealizedMargin = 1.03;
 
 } // namespace
 
@@ -189,29 +197,20 @@ MlxMtpDepthController::MlxMtpDepthController(
       current_depth_(maximum_depth_),
       acceptance_(
           static_cast<std::size_t>(maximum_depth_),
-          0.6),
-      warmup_accepts_(
-          static_cast<std::size_t>(maximum_depth_),
-          0),
-      warmup_trials_(
-          static_cast<std::size_t>(maximum_depth_),
-          0),
+          kDepthAcceptancePrior),
+      acceptance_hits_(static_cast<std::size_t>(maximum_depth_)),
+      acceptance_trials_(static_cast<std::size_t>(maximum_depth_)),
       cycle_ms_(
           static_cast<std::size_t>(maximum_depth_ + 1)),
       cycle_age_ms_(
           static_cast<std::size_t>(maximum_depth_ + 1)) {
     // A maximum-width verify observes every conditional acceptance position.
-    // Pair that with a plain-decode baseline and interpolate the intermediate
-    // widths; periodic probes refine any non-linearity later. This avoids
-    // forcing every request through all 1..N widths before useful decoding.
-    // Probe the maximum twice so update_time() drops one-time Metal graph and
-    // fused-attention compilation via its warmup minimum.
+    // Repeat it once so update_time() drops one-time graph compilation, then
+    // compare against a stable plain-decode baseline. Intermediate widths are
+    // interpolated and periodically probed after warmup.
     warmup_.insert(
         warmup_.end(),
         {maximum_depth_, maximum_depth_});
-    // Depth-one predictors still need a measured plain-decode reference.
-    // Without it the controller can never discover that a valid but costly
-    // one-token predictor loses to the target model alone.
     warmup_.insert(warmup_.end(), {0, 0, 0});
 }
 
@@ -227,15 +226,17 @@ void MlxMtpDepthController::observe(
         const double hit = position < accepted_drafts ? 1.0 : 0.0;
         const auto index = static_cast<std::size_t>(position);
         auto& estimate = acceptance_[index];
-        if (!warmup_.empty()) {
-            warmup_accepts_[index] += hit > 0.0 ? 1 : 0;
-            ++warmup_trials_[index];
-            // Every depth is explicitly probed during warmup. Use those
-            // observations directly; carrying the conservative 0.6 prior
-            // through only one sample per deep position can incorrectly pin
-            // a demonstrably profitable high-acceptance workload at M=1.
-            estimate = static_cast<double>(warmup_accepts_[index]) /
-                static_cast<double>(warmup_trials_[index]);
+        auto& trials = acceptance_trials_.at(index);
+        auto& hits = acceptance_hits_.at(index);
+        ++trials;
+        hits += static_cast<std::uint64_t>(hit);
+        if (trials <= kDepthAcceptanceBootstrapTrials) {
+            // A controller is created for each request. Bootstrap from the
+            // observed conditional rate with one prior sample, then switch to
+            // oMLX's slow EMA once the estimate is established.
+            estimate = (kDepthAcceptancePrior +
+                        static_cast<double>(hits)) /
+                (1.0 + static_cast<double>(trials));
         } else {
             estimate = (1.0 - kDepthAcceptanceAlpha) * estimate +
                 kDepthAcceptanceAlpha * hit;
@@ -248,6 +249,12 @@ void MlxMtpDepthController::observe(
     cycle_ms = std::max(0.0, cycle_ms);
     if (time_sample) {
         update_time(used_depth, cycle_ms);
+        if (used_depth > 0) {
+            ++realized_window_cycles_;
+            realized_window_tokens_ +=
+                static_cast<std::uint64_t>(accepted_drafts + 1);
+            realized_window_ms_ += cycle_ms;
+        }
     }
     for (std::size_t depth = 0; depth < cycle_age_ms_.size(); ++depth) {
         if (cycle_age_ms_[depth]) {
@@ -259,6 +266,24 @@ void MlxMtpDepthController::observe(
     }
     milliseconds_since_probe_ += cycle_ms;
     milliseconds_since_explore_ += cycle_ms;
+
+    const auto resolve_realized_window = [&] {
+        if (realized_window_cycles_ < kDepthRealizedWindow ||
+            !cycle_ms_.front() || realized_window_ms_ <= 0.0) {
+            return;
+        }
+        const double measured_tokens_per_ms =
+            static_cast<double>(realized_window_tokens_) /
+            realized_window_ms_;
+        const double baseline_tokens_per_ms =
+            1.0 / std::max(1.0e-6, *cycle_ms_.front());
+        realized_speculation_losing_ =
+            measured_tokens_per_ms <
+                baseline_tokens_per_ms * kDepthRealizedMargin;
+        realized_window_cycles_ = 0;
+        realized_window_tokens_ = 0;
+        realized_window_ms_ = 0.0;
+    };
 
     if (speculation_losing()) {
         ++exit_streak_;
@@ -272,10 +297,13 @@ void MlxMtpDepthController::observe(
             current_depth_ = warmup_.front();
             return;
         }
+        resolve_realized_window();
         current_depth_ = best_depth();
         milliseconds_since_probe_ = 0.0;
         return;
     }
+
+    resolve_realized_window();
 
     if (probe_left_ > 0) {
         --probe_left_;
@@ -312,7 +340,8 @@ void MlxMtpDepthController::observe(
 }
 
 bool MlxMtpDepthController::should_exit() const noexcept {
-    return exit_streak_ >= kDepthExitStreak;
+    return realized_speculation_losing_ ||
+        exit_streak_ >= kDepthExitStreak;
 }
 
 double MlxMtpDepthController::conditional_acceptance(

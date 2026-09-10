@@ -2798,7 +2798,10 @@ array MlxDeepseekV4Attention::operator()(
     std::optional<std::pair<array, array>> plan;
     std::optional<array> direct_decode;
     std::optional<array> direct_multi;
-    if (tokens == 1) {
+    // DSpark verifier rows use selected sparse attention. Keep ordinary
+    // one-token target decoding on that same arithmetic path; mixing it with
+    // the circular decode kernel can change final FP16 bits and greedy tokens.
+    if (tokens == 1 && !config.has_dspark()) {
         const int slot = pos0 % window;
         auto local_index = mlx::core::full(
             Shape{batch, 1},
@@ -2883,6 +2886,8 @@ array MlxDeepseekV4Attention::operator()(
             1);
         const bool use_direct_pool =
             config.fast_attention() &&
+            tokens > 1 &&
+            speculation == nullptr &&
             visibility == nullptr &&
             state.main_.has_value() &&
             pool_len > 0 &&
