@@ -146,6 +146,33 @@ def test_expert_imatrix_selects_weights_by_flattened_row(tmp_path: Path):
     )
 
 
+def test_aaq_imatrix_selects_one_importance_vector_per_weight_row(tmp_path: Path):
+    values = np.arange(1, 13, dtype=np.float32).reshape(4, 3)
+    matrix = ImportanceMatrix(
+        path=tmp_path / "unused.npz",
+        entries={
+            "blk.0.ffn_gate.weight": ImportanceEntry(
+                values=values,
+                counts=np.full(4, 10, dtype=np.int64),
+            )
+        },
+        datasets=(),
+        chunk_count=0,
+        chunk_size=0,
+        legacy=False,
+    )
+
+    name, selected = matrix.for_rows(
+        ("blk.0.ffn_gate.weight",),
+        (4, 3),
+        (4, 3),
+        np.asarray([3, 1]),
+    )
+
+    assert name == "blk.0.ffn_gate.weight"
+    np.testing.assert_array_equal(selected, values[[3, 1]])
+
+
 def test_gguf_imatrix_requires_llama_metadata(tmp_path: Path):
     _load_gguf_reader()
     from gguf import GGUFWriter  # type: ignore

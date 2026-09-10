@@ -481,6 +481,7 @@ class Qwen35LayerwiseBackend:
         layer: nn.Module,
         layer_index: int,
         hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from transformers.masking_utils import create_causal_mask
 
@@ -490,20 +491,20 @@ class Qwen35LayerwiseBackend:
         rope_positions = text_positions.unsqueeze(0).expand(3, -1, -1)
         position_embeddings = self.rotary(hidden_states, rope_positions)
         if self.config.layer_types[layer_index] == "full_attention":
-            attention_mask = create_causal_mask(
+            layer_attention_mask = create_causal_mask(
                 config=self.config,
                 inputs_embeds=hidden_states,
-                attention_mask=None,
+                attention_mask=attention_mask,
                 cache_position=None,
                 past_key_values=None,
                 position_ids=text_positions,
             )
         else:
-            attention_mask = None
+            layer_attention_mask = attention_mask
         output = layer(
             hidden_states,
             position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
+            attention_mask=layer_attention_mask,
             position_ids=text_positions,
             past_key_values=None,
             use_cache=False,
@@ -516,16 +517,28 @@ class Qwen35LayerwiseBackend:
         layer: nn.Module,
         layer_index: int,
         hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self._forward_layer(layer, layer_index, hidden_states)
+        return self._forward_layer(
+            layer,
+            layer_index,
+            hidden_states,
+            attention_mask=attention_mask,
+        )
 
     def forward_layer_with_grad(
         self,
         layer: nn.Module,
         layer_index: int,
         hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self._forward_layer(layer, layer_index, hidden_states)
+        return self._forward_layer(
+            layer,
+            layer_index,
+            hidden_states,
+            attention_mask=attention_mask,
+        )
 
 
 __all__ = ["Qwen35LayerwiseBackend"]

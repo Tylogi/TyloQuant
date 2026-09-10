@@ -119,6 +119,7 @@ class Gemma4LayerwiseBackend:
         layer: nn.Module,
         layer_index: int,
         hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from transformers.masking_utils import (
             create_causal_mask,
@@ -138,10 +139,10 @@ class Gemma4LayerwiseBackend:
             if layer_type == "full_attention"
             else create_sliding_window_causal_mask
         )
-        attention_mask = mask_fn(
+        layer_attention_mask = mask_fn(
             config=self.config,
             inputs_embeds=hidden_states,
-            attention_mask=None,
+            attention_mask=attention_mask,
             past_key_values=None,
             position_ids=position_ids,
         )
@@ -149,7 +150,7 @@ class Gemma4LayerwiseBackend:
             hidden_states,
             shared_kv_states={},
             position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
+            attention_mask=layer_attention_mask,
             position_ids=position_ids,
             past_key_values=None,
             use_cache=False,

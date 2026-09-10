@@ -200,6 +200,7 @@ def _calibrate_imatrix(args: argparse.Namespace) -> int:
             work_dir=args.work_dir or None,
             keep_hidden=args.keep_hidden,
             accumulation_dtype=accumulation_dtype,
+            objective=getattr(args, "objective", "aaq"),
         )
     return 0
 
@@ -803,6 +804,12 @@ def _add_calibration_parsers(sub: argparse._SubParsersAction) -> None:
         help="override accelerator device; defaults to cuda:0 or mps",
     )
     imatrix.add_argument("--attention", choices=("sdpa", "eager"), default="sdpa")
+    imatrix.add_argument(
+        "--objective",
+        choices=("aaq", "linear"),
+        default="aaq",
+        help="AAQ uses nonlinear activation energy for gate projections",
+    )
     imatrix.add_argument("--window-length", type=int, default=16_384)
     imatrix.add_argument("--batch-size", type=int, default=1)
     imatrix.add_argument(
