@@ -46,7 +46,7 @@ def mx_dequantize(weight: dict[str, object]) -> torch.Tensor:
     raise ValueError(f"unsupported MX dtype: {dtype}")
 
 
-def mx_matmul(weight: dict[str, object], x: torch.Tensor) -> torch.Tensor:
+def _mx_matmul_forward(weight: dict[str, object], x: torch.Tensor) -> torch.Tensor:
     """Apply a packed MX projection without keeping a dense weight copy."""
 
     shape = tuple(int(value) for value in weight["shape"])
@@ -71,6 +71,43 @@ def mx_matmul(weight: dict[str, object], x: torch.Tensor) -> torch.Tensor:
     return output.reshape(*original[:-1], shape[0])
 
 
+def mx_backward_input(
+    weight: dict[str, object],
+    output_gradient: torch.Tensor,
+) -> torch.Tensor:
+    """Compute ``dX = dY @ W`` directly from packed MX storage."""
+
+    gradient = output_gradient.reshape(-1, output_gradient.shape[-1]).contiguous()
+    return ext().mx_backward_input_cuda(
+        weight["values"],
+        weight["scales"],
+        gradient,
+        str(weight["dtype"]) == MXFP4_DTYPE,
+    )
+
+
+class _MxMatmulAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: dict[str, object]) -> torch.Tensor:
+        ctx.weight = weight
+        ctx.input_shape = tuple(x.shape)
+        ctx.input_dtype = x.dtype
+        return _mx_matmul_forward(weight, x)
+
+    @staticmethod
+    def backward(ctx, output_gradient: torch.Tensor):
+        gradient = mx_backward_input(ctx.weight, output_gradient)
+        return gradient.reshape(ctx.input_shape).to(ctx.input_dtype), None
+
+
+def mx_matmul(weight: dict[str, object], x: torch.Tensor) -> torch.Tensor:
+    """Apply a packed MX projection with a direct packed input gradient."""
+
+    if not torch.is_grad_enabled() or not x.requires_grad:
+        return _mx_matmul_forward(weight, x)
+    return _MxMatmulAutograd.apply(x, weight)
+
+
 def mx_embedding(
     weight: dict[str, object],
     token_ids: torch.Tensor,
@@ -89,4 +126,10 @@ def mx_embedding(
     raise ValueError(f"unsupported MX dtype: {dtype}")
 
 
-__all__ = ["mx_dequantize", "mx_embedding", "mx_matmul", "to_gpu_mx"]
+__all__ = [
+    "mx_backward_input",
+    "mx_dequantize",
+    "mx_embedding",
+    "mx_matmul",
+    "to_gpu_mx",
+]

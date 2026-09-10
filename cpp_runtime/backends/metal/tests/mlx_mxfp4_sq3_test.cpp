@@ -294,6 +294,38 @@ void test_fp32_multirow_contract() {
   }
 }
 
+void test_backward_input() {
+  using namespace mlx::core;
+  const auto fixture = make_fixture(19, 96);
+  const auto weight = mfq::metal::MlxMxfp4Sq3Weight::from_blob(fixture.blob);
+  constexpr int rows = 6;
+  std::vector<float> values(static_cast<std::size_t>(rows) * fixture.rows);
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    values[index] =
+        static_cast<float>(static_cast<int>(index % 31) - 15) / 128.0f;
+  }
+  auto gradient = array(values.begin(), Shape{2, 3, fixture.rows});
+  for (const auto dtype : {float16, float32}) {
+    auto source = astype(gradient, dtype);
+    auto actual = contiguous(astype(weight.backward_input(source), float32));
+    auto expected = contiguous(astype(matmul(
+        reshape(source, Shape{rows, fixture.rows}),
+        weight.dequantize(dtype)), float32));
+    eval(actual, expected);
+    require(actual.shape() == Shape{2, 3, fixture.columns},
+            "SQ3 backward-input shape mismatch");
+    float maximum_difference = 0.0f;
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+      maximum_difference = std::max(
+          maximum_difference,
+          std::fabs(actual.data<float>()[index] - expected.data<float>()[index]));
+    }
+    require(maximum_difference < 8e-3f,
+            "SQ3 backward-input mismatch: max_abs=" +
+                std::to_string(maximum_difference));
+  }
+}
+
 void test_blob_validation() {
   auto fixture = make_fixture(3, 64);
   const auto require_rejected = [](const std::vector<std::uint8_t> &blob,
@@ -332,6 +364,7 @@ int main() {
     test_fused_gemv();
     test_multirow_buckets();
     test_fp32_multirow_contract();
+    test_backward_input();
     test_blob_validation();
     std::cout << "MFQ native-MXFP4 SQ3 Metal dequant/GEMV/MMQ passed\n";
     return 0;

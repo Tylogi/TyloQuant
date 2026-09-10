@@ -682,6 +682,48 @@ def nvq_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
     return y.reshape(*original[:-1], int(g["out"]))
 
 
+_nvq_matmul_forward = nvq_matmul
+
+
+def nvq_backward_input(g: dict, output_gradient: torch.Tensor) -> torch.Tensor:
+    """Compute ``dX = dY @ W`` directly from packed NVQ/NPQ storage."""
+
+    gradient = output_gradient.reshape(-1, output_gradient.shape[-1]).contiguous()
+    return ext().nvq_backward_input_cuda(
+        *_kernel_args(g),
+        gradient,
+        int(g["neuron_len"]),
+        int(g["gs"]),
+        int(g["sub_bits"]),
+        int(g["format"]),
+        int(g["sign_mode"]),
+    )
+
+
+class _NvqMatmulAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, g: dict) -> torch.Tensor:
+        ctx.g = g
+        ctx.input_shape = tuple(x.shape)
+        ctx.input_width = int(x.shape[-1])
+        ctx.input_dtype = x.dtype
+        return _nvq_matmul_forward(g, x)
+
+    @staticmethod
+    def backward(ctx, output_gradient: torch.Tensor):
+        gradient = nvq_backward_input(ctx.g, output_gradient)
+        gradient = gradient[:, : ctx.input_width]
+        return gradient.reshape(ctx.input_shape).to(ctx.input_dtype), None
+
+
+def nvq_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
+    """Compute a packed NVQ/NPQ projection with a packed input gradient."""
+
+    if not torch.is_grad_enabled() or not x.requires_grad:
+        return _nvq_matmul_forward(g, x)
+    return _NvqMatmulAutograd.apply(x, g)
+
+
 def nvq_grouped_matmul_pool(
     g: dict,
     x: torch.Tensor,

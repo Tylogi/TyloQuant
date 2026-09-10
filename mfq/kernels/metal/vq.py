@@ -626,6 +626,87 @@ _VQ_MATMUL_SOURCE = r"""
     }
 """
 
+_VQ_BACKWARD_INPUT_SOURCE = r"""
+    uint lane = thread_index_in_simdgroup;
+    uint column = threadgroup_position_in_grid.x;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || first_row >= uint(M)) {
+        return;
+    }
+
+    float accumulators[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators[local_row] = 0.0f;
+    }
+    for (uint output = lane; output < uint(OUT); output += 32u) {
+        float weight = mfq_vq_decode_weight(
+            indices_packed,
+            state_packed,
+            aux_packed,
+            anchors,
+            codebooks,
+            scale_lut,
+            state_to_codebank,
+            bank_ids,
+            parameters,
+            output,
+            column,
+            uint(GS),
+            uint(NG),
+            uint(VECTOR_SIZE),
+            uint(NVEC),
+            uint(INDEX_BITS),
+            uint(STATE_BITS),
+            uint(STATES),
+            uint(ENTRIES),
+            uint(CODE_BANKS),
+            uint(AUX_MODE),
+            uint(CODE_BANK_MODE),
+            uint(HAS_TABLE_BANKS),
+            uint(GROUPS_PER_SUPER),
+            uint(NSUPER),
+            uint(NSIGN));
+        if (HAS_RESIDUAL != 0) {
+            uint vector = column >> 3u;
+            uint component = column & 7u;
+            uint block = vector / uint(RESIDUAL_BLOCK_VECTORS);
+            uint position_in_block = vector - block * uint(RESIDUAL_BLOCK_VECTORS);
+            uint record_index = output * uint(RESIDUAL_BLOCKS) + block;
+            short records[2] = {
+                residual_first[record_index],
+                residual_second[record_index],
+            };
+            for (uint stream = 0u; stream < 2u; ++stream) {
+                int record = int(records[stream]);
+                if (record < 0) {
+                    continue;
+                }
+                uint position = uint(record) & ((1u << uint(POSITION_BITS)) - 1u);
+                uint dictionary_id = uint(record) >> uint(POSITION_BITS);
+                if (position == position_in_block && dictionary_id < 1024u) {
+                    weight += float(residual_codebook[dictionary_id * 8u + component]);
+                }
+            }
+        }
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = first_row + local_row;
+            if (row < uint(M)) {
+                accumulators[local_row] = fma(
+                    float(x[row * uint(OUT) + output]),
+                    weight,
+                    accumulators[local_row]);
+            }
+        }
+    }
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        uint row = first_row + local_row;
+        float total = simd_sum(accumulators[local_row]);
+        if (lane == 0u && row < uint(M)) {
+            y[row * uint(K) + column] = T(total);
+        }
+    }
+"""
+
 _VQ_DEQUANT_SOURCE = r"""
     uint linear = thread_position_in_grid.x;
     if (linear >= uint(OUT) * uint(K)) {
@@ -1088,6 +1169,46 @@ _HADAMARD_SOURCE = r"""
     }
 """
 
+_INVERSE_HADAMARD_SOURCE = r"""
+    uint row = thread_position_in_grid.x / 256u;
+    uint lane = thread_index_in_threadgroup;
+    if (row >= uint(M)) {
+        return;
+    }
+
+    threadgroup float values[BLOCK];
+    for (uint local_block = 0u; local_block < uint(K) / uint(BLOCK); ++local_block) {
+        uint column_base = local_block * uint(BLOCK);
+        for (uint index = lane; index < uint(BLOCK); index += 256u) {
+            uint column = column_base + index;
+            values[index] = float(x[row * uint(K) + column]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = 1u; stride < uint(BLOCK); stride <<= 1u) {
+            for (uint pair = lane; pair < uint(BLOCK) / 2u; pair += 256u) {
+                uint pair_block = pair / stride;
+                uint within = pair - pair_block * stride;
+                uint first = pair_block * (stride << 1u) + within;
+                uint second = first + stride;
+                float a = values[first];
+                float b = values[second];
+                values[first] = a + b;
+                values[second] = a - b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float inverse = rsqrt(float(BLOCK));
+        for (uint index = lane; index < uint(BLOCK); index += 256u) {
+            uint column = column_base + index;
+            y[row * uint(K) + column] = T(
+                values[index] * inverse * float(signs[column]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"""
+
 
 def _vq_kernel(name: str, source: str):
     return mx.fast.metal_kernel(
@@ -1119,6 +1240,28 @@ _VQ_GEMM_KERNEL = _vq_kernel("mfq_vq_gemm", _VQ_MATMUL_SOURCE)
 _VQ_GEMM_MATRIX_KERNEL = _vq_kernel(
     "mfq_vq_gemm_matrix",
     _VQ_GEMM_MATRIX_SOURCE,
+)
+_VQ_BACKWARD_INPUT_KERNEL = mx.fast.metal_kernel(
+    name="mfq_vq_packed_backward_input",
+    input_names=[
+        "indices_packed",
+        "state_packed",
+        "aux_packed",
+        "anchors",
+        "codebooks",
+        "scale_lut",
+        "state_to_codebank",
+        "bank_ids",
+        "parameters",
+        "residual_codebook",
+        "residual_first",
+        "residual_second",
+        "x",
+    ],
+    output_names=["y"],
+    header=_BITSTREAM_HEADER,
+    source=_VQ_BACKWARD_INPUT_SOURCE,
+    compile_options={"math_mode": "fast"},
 )
 _VQ_DEQUANT_KERNEL = mx.fast.metal_kernel(
     name="mfq_vq_dequant",
@@ -1191,6 +1334,13 @@ _HADAMARD_KERNEL = mx.fast.metal_kernel(
     input_names=["x", "signs"],
     output_names=["y"],
     source=_HADAMARD_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
+_INVERSE_HADAMARD_KERNEL = mx.fast.metal_kernel(
+    name="mfq_inverse_signed_hadamard",
+    input_names=["x", "signs"],
+    output_names=["y"],
+    source=_INVERSE_HADAMARD_SOURCE,
     compile_options={"math_mode": "fast"},
 )
 
@@ -1741,6 +1891,43 @@ def signed_hadamard(
     )[0]
 
 
+def inverse_signed_hadamard(
+    x: mx.array | np.ndarray,
+    signs: mx.array | np.ndarray,
+    block: int,
+) -> mx.array:
+    """Apply the adjoint ``D @ H`` of :func:`signed_hadamard`."""
+
+    source = _floating(x)
+    if source.ndim != 2:
+        raise ValueError("inverse signed Hadamard input must be rank-2 [M,K]")
+    rows, width = (int(value) for value in source.shape)
+    block = int(block)
+    if block <= 0 or block & (block - 1) or width % block:
+        raise ValueError("Hadamard block must be a power of two dividing K")
+    if block > 8192:
+        raise ValueError("Hadamard block exceeds Metal threadgroup memory")
+    diagonal = signs if isinstance(signs, mx.array) else mx.array(signs)
+    if diagonal.ndim != 1 or int(diagonal.size) != width:
+        raise ValueError(f"Hadamard sign diagonal must have shape ({width},)")
+    diagonal = mx.contiguous(diagonal.astype(mx.int8))
+    if rows == 0:
+        return mx.zeros(source.shape, dtype=source.dtype)
+    return _INVERSE_HADAMARD_KERNEL(
+        inputs=[source, diagonal],
+        template=[
+            ("T", source.dtype),
+            ("M", rows),
+            ("K", width),
+            ("BLOCK", block),
+        ],
+        grid=(rows * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[source.shape],
+        output_dtypes=[source.dtype],
+    )[0]
+
+
 def _prepare_input(
     weight: MetalVqWeight,
     x: mx.array | np.ndarray,
@@ -1938,15 +2125,12 @@ def vq_gemm(weight: MetalVqWeight, x: mx.array | np.ndarray) -> mx.array:
     return _matmul(weight, x, path="gemm")
 
 
-def vq_matmul(
+def _vq_matmul_impl(
     weight: MetalVqWeight,
-    x: mx.array | np.ndarray,
+    source: mx.array,
     *,
     dequantize_threshold: int | None = 64,
 ) -> mx.array:
-    """Dispatch VQ matmul across packed and temporary-dense paths."""
-
-    source = x if isinstance(x, mx.array) else mx.array(x)
     if source.ndim < 1:
         raise ValueError("Metal VQ matmul input must have at least one dimension")
     rows = (
@@ -1963,8 +2147,111 @@ def vq_matmul(
     if rows == 1:
         return vq_gemv(weight, source)
     if rows <= 16:
-        return vq_mmq(weight, source)
-    return vq_gemm(weight, source)
+        return _matmul(weight, source, path="mmq")
+    return _matmul(weight, source, path="gemm")
+
+
+def vq_backward_input(
+    weight: MetalVqWeight,
+    output_gradient: mx.array | np.ndarray,
+) -> mx.array:
+    """Compute ``dX = dY @ W`` from packed NVQ/NPQ/NEPQ storage."""
+
+    gradient = _floating(output_gradient)
+    trailing = len(weight.output_shape)
+    if gradient.ndim < trailing or tuple(
+        int(value) for value in gradient.shape[-trailing:]
+    ) != weight.output_shape:
+        raise ValueError(
+            f"VQ output-gradient suffix must be {weight.output_shape}, got "
+            f"{tuple(int(value) for value in gradient.shape)}"
+        )
+    prefix = tuple(int(value) for value in gradient.shape[:-trailing])
+    rows = int(gradient.size) // weight.out
+    if rows == 0:
+        return mx.zeros((*prefix, weight.neuron_len), dtype=gradient.dtype)
+    gradient = mx.contiguous(gradient.reshape((rows, weight.out)))
+    tile_rows = min(rows, 4)
+    result = _VQ_BACKWARD_INPUT_KERNEL(
+        inputs=[
+            weight.indices_packed,
+            weight.state_packed,
+            weight.aux_packed,
+            weight.anchors,
+            weight.codebooks,
+            weight.scale_lut,
+            weight.state_to_codebank,
+            weight.bank_ids,
+            weight.parameters,
+            weight.residual_codebook,
+            weight.residual_first,
+            weight.residual_second,
+            gradient,
+        ],
+        template=[
+            ("T", gradient.dtype),
+            ("M", rows),
+            ("TILE_M", tile_rows),
+            ("OUT", weight.out),
+            ("K", weight.neuron_len),
+            ("GS", weight.groupsize),
+            ("NG", weight.groups),
+            ("VECTOR_SIZE", weight.vector_size),
+            ("NVEC", weight.vectors),
+            ("INDEX_BITS", weight.index_bits),
+            ("STATE_BITS", weight.state_bits),
+            ("STATES", weight.states),
+            ("ENTRIES", weight.entries),
+            ("CODE_BANKS", weight.code_banks),
+            ("AUX_MODE", weight.aux_mode),
+            ("CODE_BANK_MODE", weight.code_bank_mode),
+            ("HAS_TABLE_BANKS", int(weight.table_banks > 1)),
+            ("GROUPS_PER_SUPER", weight.groups_per_super),
+            ("NSUPER", weight.supergroups),
+            ("NSIGN", math.ceil(weight.neuron_len / 8)),
+            ("HAS_RESIDUAL", int(_has_sparse_residual(weight))),
+            ("RESIDUAL_BLOCKS", max(1, weight.residual_blocks_per_row)),
+            ("POSITION_BITS", max(1, weight.residual_position_bits)),
+            ("RESIDUAL_BLOCK_VECTORS", max(1, weight.residual_block_vectors)),
+        ],
+        grid=(weight.neuron_len * 32, (rows + tile_rows - 1) // tile_rows, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(rows, weight.neuron_len)],
+        output_dtypes=[gradient.dtype],
+    )[0]
+    if weight.rotation_block:
+        result = inverse_signed_hadamard(
+            result,
+            weight.rotation_signs,
+            weight.rotation_block,
+        )
+    return result.reshape((*prefix, weight.neuron_len))
+
+
+def vq_matmul(
+    weight: MetalVqWeight,
+    x: mx.array | np.ndarray,
+    *,
+    dequantize_threshold: int | None = 64,
+) -> mx.array:
+    """Dispatch VQ matmul with a direct packed custom VJP."""
+
+    source = x if isinstance(x, mx.array) else mx.array(x)
+
+    @mx.custom_function
+    def operation(value: mx.array) -> mx.array:
+        return _vq_matmul_impl(
+            weight,
+            value,
+            dequantize_threshold=dequantize_threshold,
+        )
+
+    @operation.vjp
+    def operation_vjp(primals, cotangent, output):
+        del primals, output
+        return vq_backward_input(weight, cotangent)
+
+    return operation(source)
 
 
 def vq_dequantize(
@@ -2196,7 +2483,9 @@ def vq_swiglu(
 __all__ = [
     "MetalVqWeight",
     "VqTensor",
+    "inverse_signed_hadamard",
     "signed_hadamard",
+    "vq_backward_input",
     "vq_dequantize",
     "vq_dequantize_matmul",
     "vq_embedding",

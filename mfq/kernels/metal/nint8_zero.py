@@ -49,6 +49,40 @@ _MATMUL_SOURCE = r"""
     }
 """
 
+_BACKWARD_INPUT_SOURCE = r"""
+    uint lane = thread_index_in_simdgroup;
+    uint column = threadgroup_position_in_grid.x;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || first_row >= uint(M)) {
+        return;
+    }
+    uint group = column >> 5u;
+    float accumulators[TILE_M];
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        accumulators[local] = 0.0f;
+    }
+    for (uint output = lane; output < uint(OUT); output += 32u) {
+        float weight = float(scales[output * uint(NG) + group])
+            * float(q[output * uint(K) + column]);
+        for (uint local = 0u; local < uint(TILE_M); ++local) {
+            uint row = first_row + local;
+            if (row < uint(M)) {
+                accumulators[local] = fma(
+                    float(x[row * uint(OUT) + output]),
+                    weight,
+                    accumulators[local]);
+            }
+        }
+    }
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        uint row = first_row + local;
+        float total = simd_sum(accumulators[local]);
+        if (lane == 0u && row < uint(M)) {
+            y[row * uint(K) + column] = T(total);
+        }
+    }
+"""
+
 _GEMV_SOURCE = r"""
     uint lane = thread_index_in_simdgroup;
     uint output = thread_position_in_grid.x >> 5;
@@ -277,6 +311,13 @@ _MATMUL_KERNEL = mx.fast.metal_kernel(
     input_names=["q", "scales", "x"],
     output_names=["y"],
     source=_MATMUL_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
+_BACKWARD_INPUT_KERNEL = mx.fast.metal_kernel(
+    name="mfq_nint8_zero_packed_backward_input",
+    input_names=["q", "scales", "x"],
+    output_names=["y"],
+    source=_BACKWARD_INPUT_SOURCE,
     compile_options={"math_mode": "fast"},
 )
 
@@ -512,15 +553,12 @@ def nint8_zero_dequantize(
     )[0]
 
 
-def nint8_zero_matmul(
+def _nint8_zero_matmul_impl(
     weight: MetalNint8ZeroWeight,
-    x: mx.array | np.ndarray,
+    source: mx.array,
     *,
     dequantize_threshold: int | None = 64,
 ) -> mx.array:
-    """Dispatch Q8_0 matmul across packed and temporary-dense paths."""
-
-    source = x if isinstance(x, mx.array) else mx.array(x)
     rows = int(np.prod(tuple(int(value) for value in source.shape[:-1]))) if source.ndim > 1 else 1
     if (
         dequantize_threshold is not None
@@ -531,6 +569,70 @@ def nint8_zero_matmul(
         dense = nint8_zero_dequantize(weight, dtype=mx.float16)
         return (prepared @ dense.T).reshape((*prefix, weight.out))
     return nint8_zero_packed_matmul(weight, source)
+
+
+def nint8_zero_backward_input(
+    weight: MetalNint8ZeroWeight,
+    output_gradient: mx.array | np.ndarray,
+) -> mx.array:
+    """Compute ``dX = dY @ W`` directly from packed GGML Q8_0 storage."""
+
+    gradient = output_gradient if isinstance(output_gradient, mx.array) else mx.array(output_gradient)
+    if gradient.ndim < 1 or int(gradient.shape[-1]) != weight.out:
+        raise ValueError(
+            f"NINT8-0 output-gradient width must be {weight.out}, got "
+            f"{gradient.shape if gradient.ndim else ()}"
+        )
+    if gradient.dtype not in (mx.float16, mx.float32):
+        gradient = gradient.astype(mx.float16)
+    prefix = tuple(int(value) for value in gradient.shape[:-1])
+    rows = int(gradient.size) // weight.out
+    if rows == 0:
+        return mx.zeros((*prefix, weight.neuron_len), dtype=gradient.dtype)
+    gradient = mx.contiguous(gradient.reshape((rows, weight.out)))
+    tile_rows = min(rows, 4)
+    result = _BACKWARD_INPUT_KERNEL(
+        inputs=[weight.q, weight.scales, gradient],
+        template=[
+            ("T", gradient.dtype),
+            ("OUT", weight.out),
+            ("K", weight.neuron_len),
+            ("NG", weight.groups),
+            ("M", rows),
+            ("TILE_M", tile_rows),
+        ],
+        grid=(weight.neuron_len * 32, (rows + tile_rows - 1) // tile_rows, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(rows, weight.neuron_len)],
+        output_dtypes=[gradient.dtype],
+    )[0]
+    return result.reshape((*prefix, weight.neuron_len))
+
+
+def nint8_zero_matmul(
+    weight: MetalNint8ZeroWeight,
+    x: mx.array | np.ndarray,
+    *,
+    dequantize_threshold: int | None = 64,
+) -> mx.array:
+    """Dispatch Q8_0 matmul with a direct packed custom VJP."""
+
+    source = x if isinstance(x, mx.array) else mx.array(x)
+
+    @mx.custom_function
+    def operation(value: mx.array) -> mx.array:
+        return _nint8_zero_matmul_impl(
+            weight,
+            value,
+            dequantize_threshold=dequantize_threshold,
+        )
+
+    @operation.vjp
+    def operation_vjp(primals, cotangent, output):
+        del primals, output
+        return nint8_zero_backward_input(weight, cotangent)
+
+    return operation(source)
 
 
 def nint8_zero_embedding(
@@ -566,6 +668,7 @@ def nint8_zero_embedding(
 
 __all__ = [
     "MetalNint8ZeroWeight",
+    "nint8_zero_backward_input",
     "nint8_zero_dequantize",
     "nint8_zero_embedding",
     "nint8_zero_gemm",

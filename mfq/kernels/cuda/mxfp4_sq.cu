@@ -134,6 +134,40 @@ __global__ void sq_mmq(const std::uint8_t* blob, const T* x, T* y,
     }
 }
 
+template<int BITS, typename T>
+__global__ void sq_backward_input(
+        const std::uint8_t* blob,
+        const T* output_gradient,
+        T* input_gradient,
+        mfq::sq::Layout q,
+        int rows) {
+    const auto* symbols = blob + q.symbols;
+    const std::size_t total = std::size_t(rows) * q.width;
+    for (std::size_t logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         logical < total;
+         logical += std::size_t(gridDim.x) * blockDim.x) {
+        const int row = int(logical / q.width);
+        const int column = int(logical - std::size_t(row) * q.width);
+        const int block = column / 32;
+        float accumulator = 0.0f;
+        for (int output = 0; output < q.outputs; ++output) {
+            const auto block_index = std::size_t(output) * (q.width / 32) + block;
+            const auto state = std::size_t(output) * 8 +
+                block_tag<BITS>(symbols, blob + q.selectors, block_index);
+            const auto exponent = q.base + read_bits<2>(blob + q.scales, state);
+            const auto palette = read_bits<5>(blob + q.palettes, state);
+            const auto symbol = read_bits<BITS>(
+                symbols, std::size_t(output) * q.width + column);
+            accumulator = fmaf(
+                as_float(output_gradient[
+                    std::size_t(row) * q.outputs + output]),
+                decode_value<BITS>(palette, symbol, exponent),
+                accumulator);
+        }
+        input_gradient[logical] = from_float<T>(accumulator);
+    }
+}
+
 mfq::sq::Layout validate(const mfq_tensor_backend::Tensor& blob,
         std::int64_t bits, std::int64_t outputs, std::int64_t width, std::int64_t base) {
     const auto q = mfq::sq::layout(bits, outputs, width, base);
@@ -219,4 +253,55 @@ mfq_tensor_backend::Tensor mxfp4_sq_matmul_cuda(
     }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
+}
+
+mfq_tensor_backend::Tensor mxfp4_sq_backward_input_cuda(
+        mfq_tensor_backend::Tensor blob,
+        mfq_tensor_backend::Tensor output_gradient,
+        std::int64_t bits,
+        std::int64_t outputs,
+        std::int64_t width,
+        std::int64_t base) {
+    const auto q = validate(blob, bits, outputs, width, base);
+    MFQ_RUNTIME_CHECK(
+        output_gradient.is_cuda() &&
+        output_gradient.get_device() == blob.get_device() &&
+        output_gradient.dim() == 2 && output_gradient.is_contiguous() &&
+        output_gradient.size(1) == outputs &&
+        (output_gradient.scalar_type() == mfq_tensor_backend::kFloat16 ||
+         output_gradient.scalar_type() == mfq_tensor_backend::kFloat32),
+        "MXFP4-SQ backward requires contiguous CUDA FP16/FP32 [M,N]");
+    const MfqCudaGuard guard(blob.device());
+    auto result = mfq_tensor_backend::empty(
+        {output_gradient.size(0), width}, output_gradient.options());
+    const auto count = output_gradient.size(0) * width;
+    if (!count) return result;
+    constexpr int threads = 256;
+    const int blocks = int(std::min<std::int64_t>(
+        (count + threads - 1) / threads, 65535));
+    const auto stream = mfq_current_cuda_stream();
+    const auto* data = blob.data_ptr<std::uint8_t>();
+    const int rows = int(output_gradient.size(0));
+    if (output_gradient.scalar_type() == mfq_tensor_backend::kFloat32) {
+        if (bits == 2) {
+            sq_backward_input<2><<<blocks, threads, 0, stream>>>(
+                data, output_gradient.data_ptr<float>(), result.data_ptr<float>(), q, rows);
+        } else {
+            sq_backward_input<3><<<blocks, threads, 0, stream>>>(
+                data, output_gradient.data_ptr<float>(), result.data_ptr<float>(), q, rows);
+        }
+    } else {
+        const auto* source = reinterpret_cast<const __half*>(
+            output_gradient.data_ptr<mfq_half>());
+        auto* destination = reinterpret_cast<__half*>(result.data_ptr<mfq_half>());
+        if (bits == 2) {
+            sq_backward_input<2><<<blocks, threads, 0, stream>>>(
+                data, source, destination, q, rows);
+        } else {
+            sq_backward_input<3><<<blocks, threads, 0, stream>>>(
+                data, source, destination, q, rows);
+        }
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
 }

@@ -34,6 +34,8 @@ public:
   mlx::core::array
   dequantize(mlx::core::Dtype dtype = mlx::core::float16) const;
   mlx::core::array matmul(const mlx::core::array &input) const;
+  mlx::core::array
+  backward_input(const mlx::core::array &output_gradient) const;
 
   int input_size() const noexcept { return input_size_; }
   int output_size() const noexcept { return output_size_; }

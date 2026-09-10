@@ -129,6 +129,51 @@ _NINT_MATMUL_SOURCE = r"""
     }
 """
 
+_NINT_BACKWARD_INPUT_SOURCE = r"""
+    uint lane = thread_index_in_simdgroup;
+    uint column = threadgroup_position_in_grid.x;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || first_row >= uint(M)) {
+        return;
+    }
+
+    float accumulators[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators[local_row] = 0.0f;
+    }
+    uint group = column / uint(GS);
+    uint element = column - group * uint(GS);
+    for (uint output = lane; output < uint(OUT); output += 32u) {
+        uint metadata_index = output * uint(NG) + group;
+        uint quantized = mfq_nint_read_value(
+            q_packed,
+            metadata_index * uint(GS) + element,
+            uint(BITS),
+            uint(GS),
+            uint(Q5_EXEC));
+        float scale = neuron_scale[output] * float(sub_scale[metadata_index]);
+        float minimum = neuron_min[output] * float(sub_min[metadata_index]);
+        float weight = scale * float(quantized) - minimum;
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = first_row + local_row;
+            if (row < uint(M)) {
+                accumulators[local_row] = fma(
+                    float(x[row * uint(OUT) + output]),
+                    weight,
+                    accumulators[local_row]);
+            }
+        }
+    }
+
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        uint row = first_row + local_row;
+        float total = simd_sum(accumulators[local_row]);
+        if (lane == 0u && row < uint(M)) {
+            y[row * uint(K) + column] = T(total);
+        }
+    }
+"""
+
 
 _NINT4_MATMUL_SOURCE = r"""
     uint lane = thread_index_in_simdgroup;
@@ -1609,6 +1654,10 @@ _NINT_GEMM_MATRIX_KERNEL = _nint_kernel(
     "mfq_nint_packed_gemm_matrix",
     _NINT_GEMM_MATRIX_SOURCE,
 )
+_NINT_BACKWARD_INPUT_KERNEL = _nint_kernel(
+    "mfq_nint_packed_backward_input",
+    _NINT_BACKWARD_INPUT_SOURCE,
+)
 _NINT_SWIGLU_KERNEL = _nint_pair_kernel(
     "mfq_nint_packed_swiglu",
     _NINT_SWIGLU_SOURCE,
@@ -2193,6 +2242,85 @@ def nint_gemm(weight: MetalNintWeight, x: mx.array | np.ndarray) -> mx.array:
     return _nint_matmul_path(weight, x, path="gemm")
 
 
+def nint_backward_input(
+    weight: MetalNintWeight,
+    output_gradient: mx.array | np.ndarray,
+) -> mx.array:
+    """Compute ``dX = dY @ W`` directly from a packed NINT matrix."""
+
+    gradient = output_gradient if isinstance(output_gradient, mx.array) else mx.array(output_gradient)
+    if gradient.ndim < 1 or int(gradient.shape[-1]) != weight.out:
+        raise ValueError(
+            f"NINT output-gradient width must be {weight.out}, got "
+            f"{gradient.shape if gradient.ndim else ()}"
+        )
+    if gradient.dtype not in (mx.float16, mx.float32):
+        gradient = gradient.astype(mx.float16)
+    prefix = tuple(int(value) for value in gradient.shape[:-1])
+    rows = int(gradient.size) // weight.out
+    if rows == 0:
+        return mx.zeros((*prefix, weight.neuron_len), dtype=gradient.dtype)
+    gradient = mx.contiguous(gradient.reshape((rows, weight.out)))
+    tile_rows = min(rows, 4)
+    result = _NINT_BACKWARD_INPUT_KERNEL(
+        inputs=[
+            weight.q_packed,
+            weight.sub_scale,
+            weight.sub_min,
+            weight.neuron_scale,
+            weight.neuron_min,
+            gradient,
+        ],
+        template=[
+            ("T", gradient.dtype),
+            ("BITS", weight.bits),
+            ("GS", weight.groupsize),
+            ("NG", weight.groups),
+            ("K", weight.neuron_len),
+            ("OUT", weight.out),
+            ("M", rows),
+            ("TILE_M", tile_rows),
+            ("Q5_EXEC", int(weight.q5_exec)),
+            ("BM_TILE", 32),
+        ],
+        grid=(weight.neuron_len * 32, (rows + tile_rows - 1) // tile_rows, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(rows, weight.neuron_len)],
+        output_dtypes=[gradient.dtype],
+    )[0]
+    return result.reshape((*prefix, weight.neuron_len))
+
+
+def _nint_matmul_with_vjp(
+    weight: MetalNintWeight,
+    source: mx.array,
+    *,
+    dequantize_threshold: int | None,
+) -> mx.array:
+    @mx.custom_function
+    def operation(value: mx.array) -> mx.array:
+        width = int(value.shape[-1])
+        rows = int(value.size) // width
+        if (
+            dequantize_threshold is not None
+            and rows >= int(dequantize_threshold)
+            and value.dtype == mx.float16
+        ):
+            return nint_dequantize_matmul(weight, value)
+        if rows == 1:
+            return _nint_matmul_path(weight, value, path="gemv")
+        if rows <= 16:
+            return _nint_matmul_path(weight, value, path="mmq")
+        return _nint_matmul_path(weight, value, path="gemm")
+
+    @operation.vjp
+    def operation_vjp(primals, cotangent, output):
+        del primals, output
+        return nint_backward_input(weight, cotangent)
+
+    return operation(source)
+
+
 def nint_matmul(
     weight: MetalNintWeight,
     x: mx.array | np.ndarray,
@@ -2204,19 +2332,11 @@ def nint_matmul(
     source = x if isinstance(x, mx.array) else mx.array(x)
     if source.ndim < 1:
         raise ValueError("NINT matmul input must have at least one dimension")
-    width = int(source.shape[-1])
-    rows = int(source.size) // width
-    if (
-        dequantize_threshold is not None
-        and rows >= int(dequantize_threshold)
-        and source.dtype == mx.float16
-    ):
-        return nint_dequantize_matmul(weight, source)
-    if rows == 1:
-        return nint_gemv(weight, source)
-    if rows <= 16:
-        return nint_mmq(weight, source)
-    return nint_gemm(weight, source)
+    return _nint_matmul_with_vjp(
+        weight,
+        source,
+        dequantize_threshold=dequantize_threshold,
+    )
 
 
 def nint_dequantize(
@@ -2367,6 +2487,7 @@ def nint_embedding(
 
 __all__ = [
     "MetalNintWeight",
+    "nint_backward_input",
     "nint_dequantize",
     "nint_dequantize_matmul",
     "nint_embedding",

@@ -98,6 +98,37 @@ _MATMUL_SOURCE = r"""
     }
 """
 
+_BACKWARD_INPUT_SOURCE = r"""
+    uint lane = thread_index_in_simdgroup;
+    uint column = threadgroup_position_in_grid.x;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || first_row >= uint(M)) {
+        return;
+    }
+    float accum[TILE_M];
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        accum[local] = 0.0f;
+    }
+    for (uint output = lane; output < uint(OUT); output += 32u) {
+        float weight = mfq_mx_weight(
+            values, scales, output, column, uint(MX_BITS), uint(K));
+        for (uint local = 0u; local < uint(TILE_M); ++local) {
+            uint row = first_row + local;
+            if (row < uint(M)) {
+                accum[local] = fma(
+                    float(x[row * uint(OUT) + output]), weight, accum[local]);
+            }
+        }
+    }
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        uint row = first_row + local;
+        float total = simd_sum(accum[local]);
+        if (lane == 0u && row < uint(M)) {
+            y[row * uint(K) + column] = T(total);
+        }
+    }
+"""
+
 _GEMV_SOURCE = r"""
     constexpr uint OUTPUTS_PER_SIMD = 4u;
     constexpr uint SIMD_GROUPS = 2u;
@@ -157,6 +188,15 @@ _MATMUL_KERNEL = mx.fast.metal_kernel(
     input_names=["values", "scales", "x"],
     output_names=["y"],
     source=_MATMUL_SOURCE,
+    header=_MX_HEADER,
+    ensure_row_contiguous=True,
+    compile_options={"math_mode": "fast"},
+)
+_BACKWARD_INPUT_KERNEL = mx.fast.metal_kernel(
+    name="mfq_mx_packed_backward_input",
+    input_names=["values", "scales", "x"],
+    output_names=["y"],
+    source=_BACKWARD_INPUT_SOURCE,
     header=_MX_HEADER,
     ensure_row_contiguous=True,
     compile_options={"math_mode": "fast"},
@@ -263,10 +303,7 @@ def mx_dequantize(
     )[0]
 
 
-def mx_matmul(weight: MetalMxWeight, x: mx.array | np.ndarray) -> mx.array:
-    """Run packed GEMV/MMQ, or dequantize once for a large-M dense GEMM."""
-
-    source = _source_array(x)
+def _mx_matmul_impl(weight: MetalMxWeight, source: mx.array) -> mx.array:
     if source.ndim == 0 or int(source.shape[-1]) != weight.in_features:
         raise ValueError(
             f"MX input width {source.shape if source.ndim else ()} does not match "
@@ -292,6 +329,52 @@ def mx_matmul(weight: MetalMxWeight, x: mx.array | np.ndarray) -> mx.array:
         output_dtypes=[source.dtype],
     )[0]
     return result.reshape(output_shape)
+
+
+def mx_backward_input(
+    weight: MetalMxWeight,
+    output_gradient: mx.array | np.ndarray,
+) -> mx.array:
+    """Compute ``dX = dY @ W`` directly from packed MXFP4/MXFP8 storage."""
+
+    gradient = _source_array(output_gradient)
+    if gradient.ndim == 0 or int(gradient.shape[-1]) != weight.out:
+        raise ValueError(
+            f"MX output-gradient width must be {weight.out}, got "
+            f"{gradient.shape if gradient.ndim else ()}"
+        )
+    prefix = tuple(int(value) for value in gradient.shape[:-1])
+    rows = int(gradient.size) // weight.out
+    if rows == 0:
+        return mx.zeros((*prefix, weight.in_features), dtype=gradient.dtype)
+    gradient = mx.contiguous(gradient.reshape((rows, weight.out)))
+    tile_rows = min(rows, 4)
+    result = _BACKWARD_INPUT_KERNEL(
+        inputs=[weight.values, weight.scales, gradient],
+        template=_templates(weight, gradient.dtype, rows=rows, tile_rows=tile_rows),
+        grid=(weight.in_features * 32, (rows + tile_rows - 1) // tile_rows, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(rows, weight.in_features)],
+        output_dtypes=[gradient.dtype],
+    )[0]
+    return result.reshape((*prefix, weight.in_features))
+
+
+def mx_matmul(weight: MetalMxWeight, x: mx.array | np.ndarray) -> mx.array:
+    """Run MX matmul with a direct packed custom VJP for its input."""
+
+    source = _source_array(x)
+
+    @mx.custom_function
+    def operation(value: mx.array) -> mx.array:
+        return _mx_matmul_impl(weight, value)
+
+    @operation.vjp
+    def operation_vjp(primals, cotangent, output):
+        del primals, output
+        return mx_backward_input(weight, cotangent)
+
+    return operation(source)
 
 
 def mx_embedding(
@@ -324,6 +407,7 @@ def mx_embedding(
 
 __all__ = [
     "MetalMxWeight",
+    "mx_backward_input",
     "mx_dequantize",
     "mx_embedding",
     "mx_matmul",

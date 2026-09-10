@@ -6352,6 +6352,320 @@ mfq_tensor_backend::Tensor nvq_dequant_cuda(
     return output;
 }
 
+namespace {
+
+template <typename T>
+__device__ __forceinline__ float nvq_backward_to_float(T value) {
+    return static_cast<float>(value);
+}
+
+template <>
+__device__ __forceinline__ float nvq_backward_to_float(__half value) {
+    return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float nvq_backward_to_float(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T nvq_backward_from_float(float value) {
+    return static_cast<T>(value);
+}
+
+template <>
+__device__ __forceinline__ __half nvq_backward_from_float(float value) {
+    return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 nvq_backward_from_float(float value) {
+    return __float2bfloat16_rn(value);
+}
+
+template <int FORMAT, typename T>
+__global__ void nvq_backward_input_kernel(
+        const uint8_t * indices,
+        int64_t indices_nbytes,
+        const uint8_t * aux,
+        int64_t aux_nbytes,
+        const uint8_t * sub_scale,
+        int64_t sub_scale_nbytes,
+        const float * neuron_scale,
+        const int8_t * codebook,
+        const T * output_gradient,
+        T * input_gradient,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int sub_bits,
+        int sign_mode) {
+    const int64_t total = static_cast<int64_t>(M) * K;
+    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         logical < total;
+         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(logical / K);
+        const int column = static_cast<int>(logical - static_cast<int64_t>(row) * K);
+        const int group = column / kGroupSize;
+        const int chunk = (column - group * kGroupSize) / 4;
+        const int component = column & 3;
+        float accumulator = 0.0f;
+        for (int output = 0; output < N; ++output) {
+            const int64_t state_index = static_cast<int64_t>(output) * ng + group;
+            const uint32_t state = load_packed_bits(
+                sub_scale, state_index * sub_bits, sub_bits, sub_scale_nbytes);
+            const int packed = decode_chunk4<FORMAT>(
+                indices, indices_nbytes, aux, aux_nbytes, codebook,
+                output, group, chunk, nvec, nsign, ng, sign_mode, state);
+            const int value = static_cast<int>(static_cast<int8_t>(
+                (packed >> (8 * component)) & 0xff));
+            const float weight =
+                format_scale<FORMAT>(neuron_scale[output], state, codebook) *
+                static_cast<float>(value);
+            accumulator = fmaf(
+                nvq_backward_to_float(
+                    output_gradient[static_cast<int64_t>(row) * N + output]),
+                weight,
+                accumulator);
+        }
+        input_gradient[logical] = nvq_backward_from_float<T>(accumulator);
+    }
+}
+
+template <int FORMAT, typename T>
+__global__ void nepq_backward_input_kernel(
+        const uint8_t * indices,
+        int64_t indices_nbytes,
+        const uint8_t * aux,
+        int64_t aux_nbytes,
+        const uint8_t * state_stream,
+        int64_t state_nbytes,
+        const float * neuron_scale,
+        const int8_t * table_pool,
+        const uint8_t * bank_ids,
+        const T * output_gradient,
+        T * input_gradient,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int nsuper,
+        int table_stride,
+        int state_bits) {
+    const int64_t total = static_cast<int64_t>(M) * K;
+    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         logical < total;
+         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(logical / K);
+        const int column = static_cast<int>(logical - static_cast<int64_t>(row) * K);
+        const int group = column / kGroupSize;
+        const int chunk = (column - group * kGroupSize) / 4;
+        const int component = column & 3;
+        float accumulator = 0.0f;
+        for (int output = 0; output < N; ++output) {
+            const int64_t state_index = static_cast<int64_t>(output) * ng + group;
+            const uint32_t state = load_packed_bits(
+                state_stream, state_index * state_bits, state_bits, state_nbytes);
+            const int8_t * table = nepq_active_table(
+                table_pool, bank_ids, output, group, nsuper, table_stride);
+            const int packed = decode_nepq_chunk4<FORMAT>(
+                indices, indices_nbytes, aux, aux_nbytes, table,
+                output, group, chunk, nvec, nsign, ng, 0, state);
+            const int value = static_cast<int>(static_cast<int8_t>(
+                (packed >> (8 * component)) & 0xff));
+            const float weight =
+                format_scale<FORMAT>(neuron_scale[output], state, table) *
+                static_cast<float>(value);
+            accumulator = fmaf(
+                nvq_backward_to_float(
+                    output_gradient[static_cast<int64_t>(row) * N + output]),
+                weight,
+                accumulator);
+        }
+        input_gradient[logical] = nvq_backward_from_float<T>(accumulator);
+    }
+}
+
+template <typename T, typename Launch>
+void launch_backward_by_dtype(
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & result,
+        Launch && launch) {
+    if constexpr (std::is_same_v<T, __half>) {
+        launch(
+            reinterpret_cast<const T *>(output_gradient.data_ptr<mfq_half>()),
+            reinterpret_cast<T *>(result.data_ptr<mfq_half>()));
+    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        launch(
+            reinterpret_cast<const T *>(output_gradient.data_ptr<mfq_bfloat16>()),
+            reinterpret_cast<T *>(result.data_ptr<mfq_bfloat16>()));
+    } else {
+        launch(output_gradient.data_ptr<T>(), result.data_ptr<T>());
+    }
+}
+
+}  // namespace
+
+mfq_tensor_backend::Tensor nvq_backward_input_cuda(
+        mfq_tensor_backend::Tensor indices,
+        mfq_tensor_backend::Tensor aux,
+        mfq_tensor_backend::Tensor sub_scale,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor codebook,
+        mfq_tensor_backend::Tensor output_gradient,
+        int64_t neuron_len,
+        int64_t gs,
+        int64_t sub_bits,
+        int64_t format,
+        int64_t sign_mode) {
+    check_common(indices, aux, sub_scale, neuron_scale, codebook,
+                 neuron_len, gs, sub_bits, format, sign_mode);
+    MFQ_RUNTIME_CHECK(
+        output_gradient.is_cuda() && output_gradient.is_contiguous() &&
+        output_gradient.dim() == 2 &&
+        output_gradient.size(1) == neuron_scale.numel(),
+        "NVQ backward output gradient geometry mismatch");
+    MFQ_RUNTIME_CHECK(
+        indices.device() == output_gradient.device() &&
+        aux.device() == output_gradient.device() &&
+        sub_scale.device() == output_gradient.device() &&
+        neuron_scale.device() == output_gradient.device() &&
+        codebook.device() == output_gradient.device(),
+        "NVQ backward tensors must share one CUDA device");
+    const auto dtype = output_gradient.scalar_type();
+    MFQ_RUNTIME_CHECK(
+        dtype == mfq_tensor_backend::kFloat16 ||
+        dtype == mfq_tensor_backend::kFloat32 ||
+        dtype == mfq_tensor_backend::kBFloat16,
+        "NVQ backward output gradient must be fp16, bf16, or fp32");
+    const int M = static_cast<int>(output_gradient.size(0));
+    const int N = static_cast<int>(neuron_scale.numel());
+    const int K = static_cast<int>(neuron_len);
+    const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
+    const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
+        (is_d4_format(format) ? 4 : 8);
+    const int nsign = (K + 7) / 8;
+    auto result = mfq_tensor_backend::empty({M, K}, output_gradient.options());
+    constexpr int threads = 256;
+    const int64_t total = static_cast<int64_t>(M) * K;
+    if (total == 0) {
+        return result;
+    }
+    MfqCudaGuard guard(output_gradient.device());
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (total + threads - 1) / threads, 65535));
+    const cudaStream_t stream = mfq_current_cuda_stream();
+#define NVQ_BACKWARD_LAUNCH(TYPE)                                                \
+    launch_by_format(static_cast<int>(format), [&](auto tag) {                   \
+        constexpr int F = decltype(tag)::value;                                  \
+        launch_backward_by_dtype<TYPE>(output_gradient, result, [&](             \
+                const TYPE * source, TYPE * destination) {                       \
+            nvq_backward_input_kernel<F, TYPE><<<blocks, threads, 0, stream>>>(  \
+                indices.data_ptr<uint8_t>(), indices.numel(),                    \
+                aux.data_ptr<uint8_t>(), aux.numel(),                            \
+                sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),                \
+                neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),     \
+                source, destination, M, N, K, ng, nvec, nsign,                   \
+                static_cast<int>(sub_bits), static_cast<int>(sign_mode));        \
+        });                                                                      \
+    })
+    if (dtype == mfq_tensor_backend::kFloat16) {
+        NVQ_BACKWARD_LAUNCH(__half);
+    } else if (dtype == mfq_tensor_backend::kBFloat16) {
+        NVQ_BACKWARD_LAUNCH(__nv_bfloat16);
+    } else {
+        NVQ_BACKWARD_LAUNCH(float);
+    }
+#undef NVQ_BACKWARD_LAUNCH
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
+}
+
+mfq_tensor_backend::Tensor nepq_backward_input_cuda(
+        mfq_tensor_backend::Tensor indices,
+        mfq_tensor_backend::Tensor aux,
+        mfq_tensor_backend::Tensor state_stream,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor table_pool,
+        mfq_tensor_backend::Tensor bank_ids,
+        mfq_tensor_backend::Tensor output_gradient,
+        int64_t neuron_len,
+        int64_t state_bits,
+        int64_t format) {
+    check_nepq_common(
+        indices, aux, state_stream, neuron_scale, table_pool, bank_ids,
+        neuron_len, state_bits, format);
+    MFQ_RUNTIME_CHECK(
+        output_gradient.is_cuda() && output_gradient.is_contiguous() &&
+        output_gradient.dim() == 2 &&
+        output_gradient.size(1) == neuron_scale.numel(),
+        "NEPQ backward output gradient geometry mismatch");
+    MFQ_RUNTIME_CHECK(
+        indices.device() == output_gradient.device() &&
+        aux.device() == output_gradient.device() &&
+        state_stream.device() == output_gradient.device() &&
+        neuron_scale.device() == output_gradient.device() &&
+        table_pool.device() == output_gradient.device() &&
+        bank_ids.device() == output_gradient.device(),
+        "NEPQ backward tensors must share one CUDA device");
+    const auto dtype = output_gradient.scalar_type();
+    MFQ_RUNTIME_CHECK(
+        dtype == mfq_tensor_backend::kFloat16 ||
+        dtype == mfq_tensor_backend::kFloat32 ||
+        dtype == mfq_tensor_backend::kBFloat16,
+        "NEPQ backward output gradient must be fp16, bf16, or fp32");
+    const int M = static_cast<int>(output_gradient.size(0));
+    const int N = static_cast<int>(neuron_scale.numel());
+    const int K = static_cast<int>(neuron_len);
+    const int ng = (K + kGroupSize - 1) / kGroupSize;
+    const int nvec = K / 8;
+    const int nsign = (K + 7) / 8;
+    const int nsuper = (ng + kNepqGroupsPerSupergroup - 1) /
+        kNepqGroupsPerSupergroup;
+    const int table_stride = static_cast<int>(table_pool.size(1));
+    auto result = mfq_tensor_backend::empty({M, K}, output_gradient.options());
+    constexpr int threads = 256;
+    const int64_t total = static_cast<int64_t>(M) * K;
+    if (total == 0) {
+        return result;
+    }
+    MfqCudaGuard guard(output_gradient.device());
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (total + threads - 1) / threads, 65535));
+    const cudaStream_t stream = mfq_current_cuda_stream();
+#define NEPQ_BACKWARD_LAUNCH(TYPE)                                               \
+    launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {              \
+        constexpr int F = decltype(tag)::value;                                  \
+        launch_backward_by_dtype<TYPE>(output_gradient, result, [&](             \
+                const TYPE * source, TYPE * destination) {                       \
+            nepq_backward_input_kernel<F, TYPE><<<blocks, threads, 0, stream>>>( \
+                indices.data_ptr<uint8_t>(), indices.numel(),                    \
+                aux.data_ptr<uint8_t>(), aux.numel(),                            \
+                state_stream.data_ptr<uint8_t>(), state_stream.numel(),          \
+                neuron_scale.data_ptr<float>(), table_pool.data_ptr<int8_t>(),   \
+                bank_ids.data_ptr<uint8_t>(), source, destination,               \
+                M, N, K, ng, nvec, nsign, nsuper, table_stride,                 \
+                static_cast<int>(state_bits));                                  \
+        });                                                                      \
+    })
+    if (dtype == mfq_tensor_backend::kFloat16) {
+        NEPQ_BACKWARD_LAUNCH(__half);
+    } else if (dtype == mfq_tensor_backend::kBFloat16) {
+        NEPQ_BACKWARD_LAUNCH(__nv_bfloat16);
+    } else {
+        NEPQ_BACKWARD_LAUNCH(float);
+    }
+#undef NEPQ_BACKWARD_LAUNCH
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
+}
+
 mfq_tensor_backend::Tensor nvq_gemm_f16_cuda(
     mfq_tensor_backend::Tensor indices,
     mfq_tensor_backend::Tensor aux,

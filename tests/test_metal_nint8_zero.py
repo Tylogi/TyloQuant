@@ -19,6 +19,7 @@ from mfq.formats.nint8_zero import (  # noqa: E402
 )
 from mfq.kernels.metal.nint8_zero import (  # noqa: E402
     MetalNint8ZeroWeight,
+    nint8_zero_backward_input,
     nint8_zero_dequantize,
     nint8_zero_embedding,
     nint8_zero_gemm,
@@ -133,6 +134,34 @@ def test_nint8_zero_fp16_gemm_partial_tiles():
     actual = _array(nint8_zero_gemm(MetalNint8ZeroWeight.from_tensor(tensor), source))
     expected = source.astype(np.float32) @ decoded.T
     np.testing.assert_allclose(actual, expected, rtol=4e-3, atol=4e-3)
+
+
+def test_nint8_zero_packed_backward_and_custom_vjp():
+    tensor, decoded = _tensor()
+    packed = MetalNint8ZeroWeight.from_tensor(tensor)
+    gradient = np.random.default_rng(490).normal(
+        0.0, 0.1, size=(3, tensor.shape[0])
+    ).astype(np.float32)
+    expected = gradient @ decoded
+    np.testing.assert_allclose(
+        _array(nint8_zero_backward_input(packed, gradient)),
+        expected,
+        rtol=3e-5,
+        atol=3e-5,
+    )
+
+    source = mx.array(
+        np.random.default_rng(491).normal(
+            0.0, 0.1, size=(3, tensor.neuron_len)
+        ).astype(np.float32)
+    )
+    cotangent = mx.array(gradient)
+    differentiated = mx.grad(
+        lambda value: mx.sum(nint8_zero_matmul(packed, value) * cotangent)
+    )(source)
+    np.testing.assert_allclose(
+        _array(differentiated), expected, rtol=3e-5, atol=3e-5
+    )
 
 
 def test_nint8_zero_mmap_linear_and_embedding(tmp_path):

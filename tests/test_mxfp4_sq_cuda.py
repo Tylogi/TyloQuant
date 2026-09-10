@@ -46,6 +46,22 @@ def test_packed_matmul(extension, bits, dtype):
 
 
 @pytest.mark.parametrize("bits", [2, 3])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_packed_backward_input(extension, bits, dtype):
+    n, k, m = 33, 96, 3
+    blob, dense = tensors(bits, n, k)
+    gradient = torch.randn(m, n, device="cuda", dtype=dtype)
+    actual = extension.mxfp4_sq_backward_input_cuda(
+        blob, gradient, bits, n, k, 120
+    )
+    expected = gradient.double().cpu() @ dense.double()
+    assert actual.shape == (m, k) and actual.dtype == dtype
+    torch.testing.assert_close(
+        actual.cpu().double(), expected, rtol=0.006, atol=0.02
+    )
+
+
+@pytest.mark.parametrize("bits", [2, 3])
 def test_stream_and_graph_replay(extension, bits):
     blob, dense = tensors(bits, 33, 96)
     for m in range(2, 7):

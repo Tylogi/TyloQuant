@@ -1041,3 +1041,169 @@ mfq_tensor_backend::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
+
+namespace {
+
+template <typename T>
+__device__ __forceinline__ float mx_backward_to_float(T value) {
+    return static_cast<float>(value);
+}
+
+template <>
+__device__ __forceinline__ float mx_backward_to_float(__half value) {
+    return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float mx_backward_to_float(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T mx_backward_from_float(float value) {
+    return static_cast<T>(value);
+}
+
+template <>
+__device__ __forceinline__ __half mx_backward_from_float(float value) {
+    return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 mx_backward_from_float(float value) {
+    return __float2bfloat16_rn(value);
+}
+
+template <typename T, bool MXFP4>
+__global__ void mx_backward_input_kernel(
+        const uint8_t * __restrict__ values,
+        const uint8_t * __restrict__ scales,
+        const T * __restrict__ output_gradient,
+        T * __restrict__ input_gradient,
+        int rows,
+        int outputs,
+        int width) {
+    const int64_t total = static_cast<int64_t>(rows) * width;
+    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         logical < total;
+         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(logical / width);
+        const int column = static_cast<int>(logical - static_cast<int64_t>(row) * width);
+        float accumulator = 0.0f;
+        for (int output = 0; output < outputs; ++output) {
+            float weight;
+            if constexpr (MXFP4) {
+                const uint8_t packed = values[
+                    static_cast<int64_t>(output) * (width / 2) + column / 2];
+                const uint8_t code = static_cast<uint8_t>(
+                    (packed >> ((column & 1) * 4)) & 15u);
+                weight = decode_mxfp4_e2m1(code) * decode_e8m0(scales[
+                    static_cast<int64_t>(output) * (width / 32) + column / 32]);
+            } else {
+                weight = decode_e4m3fn(values[
+                    static_cast<int64_t>(output) * width + column]) *
+                    decode_e8m0(scales[
+                        static_cast<int64_t>(output / 128) * (width / 128) +
+                        column / 128]);
+            }
+            accumulator = fmaf(
+                mx_backward_to_float(
+                    output_gradient[static_cast<int64_t>(row) * outputs + output]),
+                weight,
+                accumulator);
+        }
+        input_gradient[logical] = mx_backward_from_float<T>(accumulator);
+    }
+}
+
+template <typename T>
+void launch_mx_backward(
+        const mfq_tensor_backend::Tensor & values,
+        const mfq_tensor_backend::Tensor & scales,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & result,
+        bool mxfp4,
+        int rows,
+        int outputs,
+        int width,
+        int blocks,
+        int threads,
+        cudaStream_t stream) {
+    const T * source;
+    T * destination;
+    if constexpr (std::is_same_v<T, __half>) {
+        source = reinterpret_cast<const T *>(output_gradient.data_ptr<mfq_half>());
+        destination = reinterpret_cast<T *>(result.data_ptr<mfq_half>());
+    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        source = reinterpret_cast<const T *>(output_gradient.data_ptr<mfq_bfloat16>());
+        destination = reinterpret_cast<T *>(result.data_ptr<mfq_bfloat16>());
+    } else {
+        source = output_gradient.data_ptr<T>();
+        destination = result.data_ptr<T>();
+    }
+    if (mxfp4) {
+        mx_backward_input_kernel<T, true><<<blocks, threads, 0, stream>>>(
+            values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+            source, destination, rows, outputs, width);
+    } else {
+        mx_backward_input_kernel<T, false><<<blocks, threads, 0, stream>>>(
+            values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+            source, destination, rows, outputs, width);
+    }
+}
+
+}  // namespace
+
+mfq_tensor_backend::Tensor mx_backward_input_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor output_gradient,
+        bool mxfp4) {
+    if (mxfp4) {
+        validate_mxfp4_dense(values, scales);
+    } else {
+        validate_mxfp8(values, scales);
+    }
+    MFQ_RUNTIME_CHECK(
+        output_gradient.is_cuda() && output_gradient.is_contiguous() &&
+        output_gradient.dim() == 2 && output_gradient.size(1) == values.size(0),
+        "MX backward output gradient geometry mismatch");
+    MFQ_RUNTIME_CHECK(
+        values.device() == scales.device() &&
+        values.device() == output_gradient.device(),
+        "MX backward tensors must share one CUDA device");
+    const auto dtype = output_gradient.scalar_type();
+    MFQ_RUNTIME_CHECK(
+        dtype == mfq_tensor_backend::kFloat16 ||
+        dtype == mfq_tensor_backend::kFloat32 ||
+        dtype == mfq_tensor_backend::kBFloat16,
+        "MX backward output gradient must be fp16, bf16, or fp32");
+    const int rows = static_cast<int>(output_gradient.size(0));
+    const int outputs = static_cast<int>(values.size(0));
+    const int width = static_cast<int>(mxfp4 ? values.size(1) * 2 : values.size(1));
+    auto result = mfq_tensor_backend::empty({rows, width}, output_gradient.options());
+    const int64_t total = static_cast<int64_t>(rows) * width;
+    if (total == 0) {
+        return result;
+    }
+    MfqCudaGuard guard(output_gradient.device());
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (total + threads - 1) / threads, 65535));
+    const cudaStream_t stream = mfq_current_cuda_stream();
+    if (dtype == mfq_tensor_backend::kFloat16) {
+        launch_mx_backward<__half>(
+            values, scales, output_gradient, result, mxfp4,
+            rows, outputs, width, blocks, threads, stream);
+    } else if (dtype == mfq_tensor_backend::kBFloat16) {
+        launch_mx_backward<__nv_bfloat16>(
+            values, scales, output_gradient, result, mxfp4,
+            rows, outputs, width, blocks, threads, stream);
+    } else {
+        launch_mx_backward<float>(
+            values, scales, output_gradient, result, mxfp4,
+            rows, outputs, width, blocks, threads, stream);
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
+}

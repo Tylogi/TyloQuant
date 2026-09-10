@@ -48,6 +48,7 @@ from mfq.formats.nvq1_l import IQ1S_TERNARY_2048, NVQ1_L_T8_S3, Nvq1LTensor  # n
 from mfq.formats.nvq1_s import NVQ1_S, NVQ1_S_SYNTHETIC_BANKS, Nvq1STensor  # noqa: E402
 from mfq.kernels.metal.vq import (  # noqa: E402
     MetalVqWeight,
+    vq_backward_input,
     signed_hadamard,
     vq_dequantize,
     vq_dequantize_matmul,
@@ -278,6 +279,35 @@ def test_vq_fp16_m64_tile_row_mapping():
 
 
 @pytest.mark.parametrize("factory", _BASE_FACTORIES)
+def test_vq_packed_backward_and_custom_vjp(factory):
+    tensor, decoded = factory()
+    packed = MetalVqWeight.from_tensor(tensor)
+    gradient = np.random.default_rng(680).normal(
+        0.0, 0.1, size=(3, tensor.shape[0])
+    ).astype(np.float32)
+    expected = gradient @ decoded
+    np.testing.assert_allclose(
+        _array(vq_backward_input(packed, gradient)),
+        expected,
+        rtol=4e-5,
+        atol=4e-5,
+    )
+
+    source = mx.array(
+        np.random.default_rng(681).normal(
+            0.0, 0.1, size=(3, tensor.neuron_len)
+        ).astype(np.float32)
+    )
+    cotangent = mx.array(gradient)
+    differentiated = mx.grad(
+        lambda value: mx.sum(vq_matmul(packed, value) * cotangent)
+    )(source)
+    np.testing.assert_allclose(
+        _array(differentiated), expected, rtol=4e-5, atol=4e-5
+    )
+
+
+@pytest.mark.parametrize("factory", _BASE_FACTORIES)
 def test_vq_temporary_dequant_dense_gemm(factory):
     tensor, decoded = factory()
     weight = MetalVqWeight.from_tensor(tensor)
@@ -472,6 +502,46 @@ def test_nepq_a_rejects_residual_unaware_vq_swiglu_fusion():
     tensor, _ = _nepq_a_tensor(NEPQ1_A)
     weight = MetalVqWeight.from_tensor(tensor)
     assert not vq_swiglu_compatible(weight, weight)
+
+
+@pytest.mark.parametrize("spec", [NEPQ0_S, NEPQ0_A])
+def test_nepq_packed_backward_inverts_rotation_and_includes_residual(spec):
+    tensor = _nepq_tensor(spec) if spec is NEPQ0_S else _nepq_a_tensor(spec)[0]
+    packed = MetalVqWeight.from_tensor(tensor)
+    dense = dequantize_nepq(tensor).reshape(-1, tensor.neuron_len)
+    gradient = np.random.default_rng(20260910 + spec.profile_id).normal(
+        0.0,
+        0.1,
+        size=(3, tensor.n_experts, tensor.out_per_expert),
+    ).astype(np.float32)
+    stored_gradient = gradient.reshape(3, -1) @ dense
+    signs = rotation_signs(
+        tensor.neuron_len, tensor.rotation_block, tensor.rotation_seed
+    ).astype(np.float32)
+    expected = _fwht_reference(
+        stored_gradient,
+        tensor.rotation_block,
+        np.ones_like(signs),
+    ) * signs
+    np.testing.assert_allclose(
+        _array(vq_backward_input(packed, gradient)),
+        expected,
+        rtol=4e-5,
+        atol=4e-5,
+    )
+
+    source = mx.array(
+        np.random.default_rng(20260920 + spec.profile_id).normal(
+            0.0, 0.1, size=(3, tensor.neuron_len)
+        ).astype(np.float32)
+    )
+    cotangent = mx.array(gradient)
+    differentiated = mx.grad(
+        lambda value: mx.sum(vq_matmul(packed, value) * cotangent)
+    )(source)
+    np.testing.assert_allclose(
+        _array(differentiated), expected, rtol=4e-5, atol=4e-5
+    )
 
 
 @pytest.mark.parametrize("rows", [1, 8, 32])

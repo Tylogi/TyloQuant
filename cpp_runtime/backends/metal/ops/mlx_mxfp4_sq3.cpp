@@ -585,6 +585,49 @@ constexpr const char *kSq3Gemv = R"METAL(
     }
 )METAL";
 
+constexpr const char *kSq3BackwardInput = R"METAL(
+    uint lane = thread_index_in_simdgroup;
+    uint column = threadgroup_position_in_grid.x;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || first_row >= uint(M)) {
+        return;
+    }
+    uint block = column / 32u;
+    uint component = column & 31u;
+    float accumulators[TILE_M];
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        accumulators[local] = 0.0f;
+    }
+    for (uint output = lane; output < uint(OUT); output += 32u) {
+        uint block_index = output * uint(BLOCKS) + block;
+        uint tag = mfq_sq3_scalar_block_tag(symbols, selectors, block_index);
+        uint state_index = output * 8u + tag;
+        float scale = mfq_sq3_e8m0(uchar(
+            uint(matrix_base[0])
+            + mfq_sq3_read_bits(state_scales, state_index, 2u)));
+        uint palette = mfq_sq3_read_bits(
+            state_palettes, state_index, 5u);
+        uint symbol = mfq_sq3_read_symbol(symbols, block_index, component);
+        float weight = mfq_sq3_palette_values[palette * 8u + symbol] * scale;
+        for (uint local = 0u; local < uint(TILE_M); ++local) {
+            uint row = first_row + local;
+            if (row < uint(M)) {
+                accumulators[local] = fma(
+                    float(x[row * uint(OUT) + output]),
+                    weight,
+                    accumulators[local]);
+            }
+        }
+    }
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        uint row = first_row + local;
+        float total = simd_sum(accumulators[local]);
+        if (lane == 0u && row < uint(M)) {
+            y[row * uint(K) + column] = T(total);
+        }
+    }
+)METAL";
+
 const mlx::core::fast::CustomKernelFunction &sq3_dequantize_kernel() {
   static const auto kernel = [] {
     CompileOptions options;
@@ -631,6 +674,12 @@ mlx::core::fast::CustomKernelFunction make_sq3_matmul_kernel(
       {"symbols", "selectors", "matrix_base", "state_scales",
        "state_palettes", "x"},
       {"y"}, source, kSq3Header, true, false, options);
+}
+
+const mlx::core::fast::CustomKernelFunction &sq3_backward_input_kernel() {
+  static const auto kernel = make_sq3_matmul_kernel(
+      "mfq_cpp_mxfp4_sq3_backward_input", kSq3BackwardInput);
+  return kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction &sq3_mmq_2_6_kernel() {
@@ -905,6 +954,44 @@ array MlxMxfp4Sq3Weight::matmul(const array &input) const {
       },
       {Shape{static_cast<int>(rows), output_size_}}, {source.dtype()}, grid,
       threadgroup, std::move(arguments), std::nullopt, false, {});
+  return mlx::core::reshape(std::move(outputs.front()),
+                            std::move(output_shape));
+}
+
+array MlxMxfp4Sq3Weight::backward_input(
+    const array &output_gradient) const {
+  if (output_gradient.ndim() == 0 ||
+      output_gradient.shape(-1) != output_size_) {
+    throw std::runtime_error(
+        "MXFP4-SQ3 output-gradient width does not match packed weight");
+  }
+  const auto rows =
+      output_gradient.size() / static_cast<std::size_t>(output_size_);
+  if (rows == 0 ||
+      rows > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error("unsupported MXFP4-SQ3 backward row count");
+  }
+  Shape output_shape = output_gradient.shape();
+  output_shape.back() = input_size_;
+  auto source = output_gradient;
+  if (source.dtype() != mlx::core::float16 &&
+      source.dtype() != mlx::core::float32) {
+    source = mlx::core::astype(source, mlx::core::float16);
+  }
+  source = mlx::core::reshape(
+      source, Shape{static_cast<int>(rows), output_size_});
+  const int tile_rows = std::min<int>(static_cast<int>(rows), 4);
+  auto arguments = mmq_templates(
+      source.dtype(), input_size_, output_size_,
+      static_cast<int>(rows), tile_rows);
+  auto outputs = sq3_backward_input_kernel()(
+      {symbols_, block_selectors_, matrix_scale_base_, state_scales_,
+       state_palettes_, source},
+      {Shape{static_cast<int>(rows), input_size_}}, {source.dtype()},
+      {input_size_ * 32,
+       (static_cast<int>(rows) + tile_rows - 1) / tile_rows,
+       1},
+      {32, 1, 1}, std::move(arguments), std::nullopt, false, {});
   return mlx::core::reshape(std::move(outputs.front()),
                             std::move(output_shape));
 }
