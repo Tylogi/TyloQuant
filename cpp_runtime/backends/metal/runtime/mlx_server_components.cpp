@@ -634,6 +634,133 @@ MlxServerComponentCallbacks make_mlx_server_components(
 
 MlxServerComponentCallbacks make_mlx_server_components(
     const MfqModelGraph* graph,
+    std::shared_ptr<std::mutex> runtime_mutex,
+    std::shared_ptr<std::optional<MlxDeepseekV41CausalLm>> runtime_holder,
+    mlx::core::Stream runtime_stream) {
+    MlxServerComponentCallbacks result;
+    result.duplex.name = "metal";
+    result.mtp_available =
+        component_with_implementation(
+            graph, "predictor", "deepseek_v41_dspark") != nullptr &&
+        runtime_holder->has_value() &&
+        runtime_holder->value().supports_mtp();
+    if (component_with_implementation(
+            graph, "vision", "deepseek_v41_vision") == nullptr ||
+        !runtime_holder->has_value() ||
+        !runtime_holder->value().supports_multimodal()) {
+        return result;
+    }
+    result.multimodal_generate =
+        [runtime_mutex = std::move(runtime_mutex),
+         runtime_holder = std::move(runtime_holder), runtime_stream](
+            const std::vector<std::int64_t>& prompt,
+            const MfqMultimodalInput& media,
+            const MfqSamplingParams& sampling,
+            const MfqTokenCallback& callback,
+            const MfqPrefillCallback& on_prefill,
+            const MfqTokenConstraintPtr& token_constraint) {
+            std::lock_guard<std::mutex> lock(*runtime_mutex);
+            if (!runtime_holder->has_value()) {
+                throw std::runtime_error(
+                    "DeepSeek-V4.1 runtime is unavailable after a failed reload");
+            }
+            if (media.processor != MfqMultimodalProcessor::deepseek_v41 ||
+                media.processor_name != "deepseek_v41") {
+                throw std::invalid_argument(
+                    "DeepSeek-V4.1 received a foreign multimodal payload");
+            }
+            mlx::core::set_default_device(mlx::core::Device::gpu);
+            mlx::core::set_default_stream(runtime_stream);
+            const auto& config = runtime_holder->value().config();
+            const auto pixel_shape = checked_shape(
+                media.pixel_shape, "pixel_values");
+            if (pixel_shape.size() != 3 ||
+                media.image_bounds.size() % 4 != 0 ||
+                media.vision_grid.size() != media.image_bounds.size() ||
+                pixel_shape[0] !=
+                    static_cast<int>(media.image_bounds.size() / 4)) {
+                throw std::invalid_argument(
+                    "DeepSeek-V4.1 media payload geometry is invalid");
+            }
+            const auto pixels = mlx::core::array(
+                media.pixel_values.begin(), pixel_shape,
+                mlx::core::float32);
+            std::vector<MlxDeepseekV41ImageInput> images;
+            const std::size_t count = media.image_bounds.size() / 4;
+            images.reserve(count);
+            for (std::size_t source = 0; source < count; ++source) {
+                const int bound_source = static_cast<int>(
+                    media.image_bounds[4 * source + 1]);
+                const int begin = static_cast<int>(
+                    media.image_bounds[4 * source + 2]);
+                const int end = static_cast<int>(
+                    media.image_bounds[4 * source + 3]);
+                const int vit_h = media.vision_grid[4 * source];
+                const int vit_w = media.vision_grid[4 * source + 1];
+                const int llm_h = media.vision_grid[4 * source + 2];
+                const int llm_w = media.vision_grid[4 * source + 3];
+                const int active = vit_h * vit_w;
+                const int span = llm_h * (llm_w + 1) + 2;
+                if (bound_source != static_cast<int>(source) ||
+                    begin < 0 || end - begin != span ||
+                    end > static_cast<int>(prompt.size()) ||
+                    vit_h <= 0 || vit_w <= 0 ||
+                    llm_h != (vit_h + 2) / 3 ||
+                    llm_w != (vit_w + 2) / 3 ||
+                    active > pixel_shape[1]) {
+                    throw std::invalid_argument(
+                        "DeepSeek-V4.1 image span is invalid");
+                }
+                for (int position = begin; position < end; ++position) {
+                    if (prompt[static_cast<std::size_t>(position)] !=
+                        config.image_token_id) {
+                        throw std::invalid_argument(
+                            "DeepSeek-V4.1 image span contains a text token");
+                    }
+                }
+                auto patches = mlx::core::slice(
+                    pixels,
+                    mlx::core::Shape{static_cast<int>(source), 0, 0},
+                    mlx::core::Shape{
+                        static_cast<int>(source + 1), active,
+                        pixel_shape[2]});
+                patches = mlx::core::reshape(
+                    patches, mlx::core::Shape{active, pixel_shape[2]});
+                std::vector<std::int64_t> types;
+                types.reserve(static_cast<std::size_t>(span));
+                types.push_back(0);
+                for (int row = 0; row < llm_h; ++row) {
+                    types.insert(
+                        types.end(), static_cast<std::size_t>(llm_w), 1);
+                    types.push_back(2);
+                }
+                types.push_back(3);
+                images.push_back({
+                    std::move(patches), vit_h, vit_w, begin, end,
+                    std::move(types)});
+            }
+            std::function<void(std::size_t, double)> report_prefill;
+            if (on_prefill) {
+                report_prefill = [on_prefill](
+                    std::size_t tokens, double total_ms) {
+                    on_prefill(MfqPrefillTiming{
+                        tokens, total_ms, 0.0, total_ms});
+                };
+            }
+            return runtime_holder->value().generate_multimodal(
+                prompt,
+                images,
+                metal_sampling(sampling),
+                sampling.max_tokens,
+                callback,
+                report_prefill,
+                token_constraint);
+        };
+    return result;
+}
+
+MlxServerComponentCallbacks make_mlx_server_components(
+    const MfqModelGraph* graph,
     std::shared_ptr<std::mutex>,
     std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime_holder,
     mlx::core::Stream) {

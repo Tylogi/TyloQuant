@@ -70,8 +70,24 @@ def test_deepseek_v4_vision_alias_advertises_only_image_input() -> None:
     }
 
 
+def test_deepseek_v41_is_not_folded_into_the_v4_family() -> None:
+    profile = capabilities_for_architecture("deepseek_v41_vision")
+    assert profile.architecture_family == "deepseek_v41"
+    assert profile.features.model_dump() == {
+        "text": True,
+        "image_input": True,
+        "video_input": False,
+        "audio_input": False,
+        "audio_output": False,
+        "full_duplex": False,
+        "mtp": True,
+    }
+
+
 def test_every_mtp_runtime_family_registers_architecture_support() -> None:
     for model_type in (
+        "deepseek_v41",
+        "deepseek_v41_vision",
         "deepseek_v4",
         "deepseek_v4_vision",
         "qwen3_5",
@@ -94,6 +110,8 @@ def test_cpp_server_publishes_the_same_architecture_capability_contract() -> Non
     assert "kModelCapabilityRegistry" in SERVER
     for model_type in (
         "minicpmo",
+        "deepseek_v41",
+        "deepseek_v41_vision",
         "deepseek_v4",
         "deepseek_v4_vision",
         "glm_moe_dsa",

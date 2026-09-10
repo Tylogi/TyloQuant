@@ -1712,6 +1712,8 @@ class DeepseekV4VisionProcessor:
     """
 
     image_placeholder = "<｜deepseek_image｜>"
+    processor_name = "deepseek_v4"
+    model_label = "DeepSeek-V4"
     patch_size = 14
     downsample_ratio = 3
     maximum_image_tokens = 384
@@ -1800,7 +1802,8 @@ class DeepseekV4VisionProcessor:
         if source_width <= 0 or source_height <= 0:
             raise VisionProcessingError("image dimensions must be positive")
         width, height = source_width, source_height
-        if width > height * cls.maximum_width_height_ratio:
+        if (cls.maximum_width_height_ratio is not None and
+                width > height * cls.maximum_width_height_ratio):
             width = height * cls.maximum_width_height_ratio
         if width * height < cls.minimum_pixels:
             ratio = math.sqrt(cls.minimum_pixels / (width * height))
@@ -1816,7 +1819,8 @@ class DeepseekV4VisionProcessor:
         )
         n_vit_h = best_height // cls.patch_size
         n_vit_w = best_width // cls.patch_size
-        if source_width >= cls.maximum_width_height_ratio * source_height:
+        if (cls.maximum_width_height_ratio is not None and
+                source_width >= cls.maximum_width_height_ratio * source_height):
             image = image.resize((best_width, best_height))
         else:
             image = ImageOps.pad(
@@ -1873,12 +1877,12 @@ class DeepseekV4VisionProcessor:
         if use_binary_file:
             tensors, path = MiniCPMO45VisionProcessor._binary_tensors(values)
             tensors["version"] = 2
-            tensors["processor"] = "deepseek_v4"
+            tensors["processor"] = cls.processor_name
             return tensors, (path,)
         return (
             {
                 "version": 2,
-                "processor": "deepseek_v4",
+                "processor": cls.processor_name,
                 **{
                     name: MiniCPMO45VisionProcessor._tensor(value, dtype)
                     for name, value, dtype in values
@@ -1921,7 +1925,8 @@ class DeepseekV4VisionProcessor:
                     continue
                 if item_type != "image_url":
                     raise VisionProcessingError(
-                        f"DeepSeek-V4 Vision does not support {item_type or 'unknown'} input"
+                        f"{self.model_label} Vision does not support "
+                        f"{item_type or 'unknown'} input"
                     )
                 image_spec = item.get("image_url")
                 if not isinstance(image_spec, dict) or not isinstance(image_spec.get("url"), str):
@@ -1955,6 +1960,76 @@ class DeepseekV4VisionProcessor:
         )
 
 
+class DeepseekV41VisionProcessor(DeepseekV4VisionProcessor):
+    """Released DeepSeek-V4.1 patch and row-major image-span contract."""
+
+    processor_name = "deepseek_v41"
+    model_label = "DeepSeek-V4.1"
+    maximum_image_tokens = 1024
+    minimum_pixels = 544 * 544
+    maximum_width_height_ratio = None
+
+    @classmethod
+    def _grid_tokens(
+        cls,
+        best_height: int,
+        best_width: int,
+    ) -> tuple[int, int, int]:
+        n_llm_h = math.ceil(
+            (best_height // cls.patch_size) / cls.downsample_ratio
+        )
+        n_llm_w = math.ceil(
+            (best_width // cls.patch_size) / cls.downsample_ratio
+        )
+        return n_llm_h, n_llm_w, n_llm_h * (n_llm_w + 1) + 2
+
+    @classmethod
+    def _solve_resize_ratio(
+        cls,
+        height: int,
+        width: int,
+        budget: int,
+    ) -> tuple[int, int, int, int, int]:
+        ratio = height / width
+        max_w_float = math.sqrt((budget - 2) / ratio + 0.25) - 0.5
+        max_h_float = max_w_float * ratio
+        unit = cls.patch_size * cls.downsample_ratio
+        if max_w_float < 1.0:
+            best_height = (budget - 2) // 2 * unit
+            best_width = unit
+        elif max_h_float < 1.0:
+            best_height = unit
+            best_width = (budget - 3) * unit
+        else:
+            beta = min(
+                math.floor(max_w_float) * unit / width,
+                math.floor(max_h_float) * unit / height,
+            )
+            best_height = math.floor(height * beta / cls.patch_size) * cls.patch_size
+            best_width = math.floor(width * beta / cls.patch_size) * cls.patch_size
+        n_llm_h, n_llm_w, count = cls._grid_tokens(best_height, best_width)
+        return n_llm_h, n_llm_w, best_height, best_width, count
+
+    @classmethod
+    def _safe_resize(
+        cls,
+        height: int,
+        width: int,
+        best_height: int,
+        best_width: int,
+    ) -> tuple[int, int, int, int]:
+        n_llm_h, n_llm_w, count = cls._grid_tokens(best_height, best_width)
+        if count > cls.maximum_image_tokens:
+            n_llm_h, n_llm_w, best_height, best_width, count = (
+                cls._solve_resize_ratio(
+                    height, width, cls.maximum_image_tokens
+                )
+            )
+        if count > cls.maximum_image_tokens:
+            raise VisionProcessingError("unable to fit image in the token budget")
+        return n_llm_h, n_llm_w, best_height, best_width
+
+
 def multimodal_processor_for_architecture(
     model_type: str,
     *,
@@ -1973,6 +2048,13 @@ def multimodal_processor_for_architecture(
         "deepseek_v4_vision",
     }:
         return DeepseekV4VisionProcessor()
+    if identity in {
+        "deepseek_v41",
+        "deepseekv41",
+        "deepseek_v41_text",
+        "deepseek_v41_vision",
+    }:
+        return DeepseekV41VisionProcessor()
     if identity in {"qwen4_exp", "qwen4_exp_text"}:
         return Qwen4ExpVisionProcessor(avfoundation_library=avfoundation_library)
     if identity in {"qwen3_5", "qwen3_5_text", "qwen35"}:
@@ -1983,6 +2065,7 @@ def multimodal_processor_for_architecture(
 
 
 __all__ = [
+    "DeepseekV41VisionProcessor",
     "DeepseekV4VisionProcessor",
     "Glm5NextVisionProcessor",
     "MiniCPMO45VisionProcessor",

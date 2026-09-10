@@ -71,8 +71,11 @@ bool deepseek_v4_family(
         const json& config) {
     const auto stored = identity(architecture);
     const auto config_type = identity(config.value("model_type", std::string{}));
-    return starts_with(stored, "deepseek_v4") ||
-        starts_with(config_type, "deepseek_v4");
+    const auto legacy_v4 = [](const std::string& value) {
+        return starts_with(value, "deepseek_v4") &&
+            !starts_with(value, "deepseek_v41");
+    };
+    return legacy_v4(stored) || legacy_v4(config_type);
 }
 
 bool gemma4_family(

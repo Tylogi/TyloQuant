@@ -1385,14 +1385,8 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
                         throw std::runtime_error(
                             "Qwen3.5 MTP shifted history is inconsistent");
                     }
-                    hidden_rows = mlx::core::slice(
-                        *context.verified_hidden,
-                        Shape{0, 0, 0},
-                        Shape{
-                            1,
-                            committed,
-                            static_cast<int>(config_.hidden_size),
-                        });
+                    hidden_rows = mlx_mtp_committed_hidden(
+                        context, 1, static_cast<int>(config_.hidden_size));
                     next_ids.assign(
                         context.next_token_ids.begin(),
                         context.next_token_ids.end());
@@ -1466,19 +1460,8 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
             [&](std::int32_t pending_token,
                 const array& draft_tokens,
                 int draft_count) {
-                const array pending_id(
-                    {pending_token},
-                    Shape{1},
-                    mlx::core::int32);
-                auto verify_ids = mlx::core::reshape(
-                    mlx::core::concatenate(
-                        {
-                            pending_id,
-                            mlx::core::reshape(
-                                draft_tokens, Shape{draft_count}),
-                        },
-                        0),
-                    Shape{1, draft_count + 1});
+                auto verify_ids = mlx_mtp_verification_ids(
+                    pending_token, draft_tokens, draft_count);
                 auto verified = forward_decode_with_hidden(
                     verify_ids,
                     draft_count > 0 ? 1 : 0);

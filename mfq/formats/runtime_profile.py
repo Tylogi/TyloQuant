@@ -73,6 +73,14 @@ def _profile(
 # Verified model-family defaults. Keep these partial instead of copying generic
 # runtime defaults into every profile.
 _ARCHITECTURE_REGISTRY: dict[str, dict[str, Any]] = {
+    "deepseek_v41": _profile(
+        chat={
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "mtp_max_draft_tokens": 5,
+        },
+        source="architecture-registry:deepseek_v41",
+    ),
     "deepseek_v4": _profile(
         chat={
             "temperature": 1.0,

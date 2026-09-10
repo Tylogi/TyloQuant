@@ -83,6 +83,10 @@ MfqModelGraph synthesize_legacy_model_graph(
                starts_with(config_family, "glm5_next") ||
                starts_with(stored_family, "glm5_next")) {
         family = backbone = "glm5_next";
+    } else if (starts_with(text_family, "deepseek_v41") ||
+               starts_with(config_family, "deepseek_v41") ||
+               starts_with(stored_family, "deepseek_v41")) {
+        family = backbone = "deepseek_v41";
     } else if (starts_with(text_family, "deepseek_v4") ||
                starts_with(config_family, "deepseek_v4") ||
                starts_with(stored_family, "deepseek_v4")) {
@@ -183,6 +187,21 @@ MfqModelGraph synthesize_legacy_model_graph(
             contains_tensor("mtp.0.main_proj.weight")) {
             graph.topology.predictor_layers = 1;
             add_optional("predictor", "predictor", "dspark");
+        }
+    }
+
+    if (family == "deepseek_v41") {
+        if (contains_tensor("vision.patch_embedding.weight")) {
+            graph.topology.vision_layers = 1;
+            add_optional(
+                "vision", "vision", "deepseek_v41_vision",
+                "deepseek_v41_vision.v1", "deepseek_v41_positions");
+        }
+        if (contains_tensor("predictor.stage.0.main_projection.weight")) {
+            graph.topology.predictor_layers = std::max<std::int64_t>(
+                1, predictor_layers);
+            add_optional(
+                "predictor", "predictor", "deepseek_v41_dspark");
         }
     }
 

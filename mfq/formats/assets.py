@@ -25,11 +25,14 @@ HF_TOKENIZER_CONFIG_ASSET = ASSET_PREFIX + "hf/tokenizer_config.json"
 HF_CHAT_TEMPLATE_ASSET = ASSET_PREFIX + "hf/chat_template.jinja"
 HF_GENERATION_CONFIG_ASSET = ASSET_PREFIX + "hf/generation_config.json"
 MINICPMO45_RESAMPLER_POS_EMBED_ASSET = ASSET_PREFIX + "minicpmo45-resampler-pos-embed-v1.bf16"
+DEEPSEEK_V41_ENGRAM_ASSET = ASSET_PREFIX + "deepseek-v41-engram-v1.bin"
 ASSET_DTYPE = "BLOB"
 ASSET_MANIFEST_KEY = "runtime_assets"
 
 _MINICPMO45_RESAMPLER_MAGIC = b"MFQRSPB1"
 _MINICPMO45_RESAMPLER_HEADER = struct.Struct("<8sIII")
+_DEEPSEEK_V41_ENGRAM_MAGIC = b"MFQENGR1"
+_DEEPSEEK_V41_ENGRAM_HEADER = struct.Struct("<8sIIIII")
 
 
 @dataclass(frozen=True)
@@ -193,6 +196,141 @@ def minicpmo45_resampler_pos_embed_asset(
         MINICPMO45_RESAMPLER_POS_EMBED_ASSET,
         "application/vnd.mfq.minicpmo45-resampler-pos-embed+bfloat16",
         header + bf16.tobytes(order="C"),
+    )
+
+
+def deepseek_v41_engram_asset(
+    tokenizer_path: str | Path,
+    text_config: dict[str, Any],
+) -> RuntimeAsset:
+    """Build the tokenizer-dependent Engram hash contract once at conversion."""
+
+    try:
+        from tokenizers import Regex, Tokenizer, normalizers
+    except ImportError as error:  # pragma: no cover - dependency error path
+        raise RuntimeError(
+            "DeepSeek-V4.1 conversion requires tokenizers to build its Engram asset"
+        ) from error
+
+    tokenizer = Tokenizer.from_file(str(Path(tokenizer_path).resolve()))
+    vocabulary = tokenizer.get_vocab_size(with_added_tokens=True)
+    sentinel = "\ue000"
+    normalizer = normalizers.Sequence(
+        [
+            normalizers.NFKC(),
+            normalizers.NFD(),
+            normalizers.StripAccents(),
+            normalizers.Lowercase(),
+            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
+            normalizers.Replace(Regex(r"^ $"), sentinel),
+            normalizers.Strip(),
+            normalizers.Replace(sentinel, " "),
+        ]
+    )
+    token_map = np.empty(vocabulary, dtype="<i4")
+    normalized_ids: dict[str, int] = {}
+    for token_id in range(vocabulary):
+        decoded = tokenizer.decode([token_id], skip_special_tokens=False)
+        if "\ufffd" in decoded:
+            key = tokenizer.id_to_token(token_id)
+        else:
+            normalized = normalizer.normalize_str(decoded)
+            key = normalized if normalized else decoded
+        if key is None:
+            raise ValueError(f"DeepSeek-V4.1 tokenizer has no token {token_id}")
+        compressed = normalized_ids.setdefault(key, len(normalized_ids))
+        token_map[token_id] = compressed
+
+    expected_compressed = int(text_config["engram_compressed_vocab_size"])
+    if len(normalized_ids) != expected_compressed:
+        raise ValueError(
+            "DeepSeek-V4.1 Engram compressed vocabulary differs: "
+            f"{len(normalized_ids)} != {expected_compressed}"
+        )
+    layer_ids = np.asarray(text_config["engram_layer_ids"], dtype="<i4")
+    table_rows = np.asarray(text_config["engram_num_embeddings"], dtype="<i8")
+    max_ngram = int(text_config["engram_max_ngram_size"])
+    heads = int(text_config["engram_n_heads"])
+    base = int(text_config["engram_vocab_size"])
+    if (
+        layer_ids.ndim != 1
+        or table_rows.shape != layer_ids.shape
+        or max_ngram < 2
+        or heads <= 0
+        or base <= 0
+    ):
+        raise ValueError("DeepSeek-V4.1 Engram config geometry is invalid")
+
+    def is_prime(value: int) -> bool:
+        if value < 2 or value % 2 == 0:
+            return value == 2
+        divisor = 3
+        while divisor * divisor <= value:
+            if value % divisor == 0:
+                return False
+            divisor += 2
+        return True
+
+    seen: set[int] = set()
+    primes = np.empty((len(layer_ids), max_ngram - 1, heads), dtype="<i8")
+    for layer in range(len(layer_ids)):
+        current = base - 1
+        for order in range(max_ngram - 1):
+            for head in range(heads):
+                current += 1
+                while not is_prime(current) or current in seen:
+                    current += 1
+                seen.add(current)
+                primes[layer, order, head] = current
+    flat_primes = primes.reshape(len(layer_ids), -1)
+    offsets = np.zeros_like(flat_primes)
+    if flat_primes.shape[1] > 1:
+        offsets[:, 1:] = np.cumsum(flat_primes[:, :-1], axis=1)
+    if not np.array_equal(offsets[:, -1] + flat_primes[:, -1], table_rows):
+        raise ValueError("DeepSeek-V4.1 Engram table rows differ from hash buckets")
+
+    multiplier_bound = max(1, (np.iinfo(np.int64).max // expected_compressed) // 2)
+    multipliers = np.stack(
+        [
+            np.random.default_rng(10007 * int(layer)).integers(
+                0,
+                multiplier_bound,
+                size=max_ngram,
+                dtype=np.int64,
+            )
+            * 2
+            + 1
+            for layer in layer_ids
+        ]
+    ).astype("<i8", copy=False)
+    pad_token_id = int(text_config["engram_pad_token_id"])
+    if pad_token_id < 0 or pad_token_id >= vocabulary:
+        raise ValueError("DeepSeek-V4.1 Engram pad token is outside the tokenizer")
+
+    header = _DEEPSEEK_V41_ENGRAM_HEADER.pack(
+        _DEEPSEEK_V41_ENGRAM_MAGIC,
+        vocabulary,
+        expected_compressed,
+        len(layer_ids),
+        max_ngram,
+        heads,
+    )
+    data = b"".join(
+        (
+            header,
+            struct.pack("<i", int(token_map[pad_token_id])),
+            layer_ids.tobytes(order="C"),
+            table_rows.tobytes(order="C"),
+            primes.tobytes(order="C"),
+            offsets.tobytes(order="C"),
+            multipliers.tobytes(order="C"),
+            token_map.tobytes(order="C"),
+        )
+    )
+    return RuntimeAsset(
+        DEEPSEEK_V41_ENGRAM_ASSET,
+        "application/vnd.mfq.deepseek-v41-engram+binary",
+        data,
     )
 
 

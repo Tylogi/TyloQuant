@@ -669,6 +669,51 @@ std::size_t mlx_prime_mtp_history(
     return static_cast<std::size_t>(pairs);
 }
 
+array mlx_mtp_verification_ids(
+    std::int32_t pending_token,
+    const array& draft_tokens,
+    int draft_count) {
+    if (pending_token < 0 || draft_count < 0 ||
+        draft_count > kMlxMtpEngineMaximumDraftDepth ||
+        draft_tokens.size() != static_cast<std::size_t>(draft_count)) {
+        throw std::invalid_argument("invalid MTP verification token batch");
+    }
+    auto drafts = draft_tokens.dtype() == mlx::core::int32
+        ? draft_tokens
+        : mlx::core::astype(draft_tokens, mlx::core::int32);
+    const array pending(
+        {pending_token}, Shape{1}, mlx::core::int32);
+    auto flat = draft_count > 0
+        ? mlx::core::concatenate(
+              {
+                  pending,
+                  mlx::core::reshape(drafts, Shape{draft_count}),
+              },
+              0)
+        : pending;
+    return mlx::core::reshape(
+        std::move(flat), Shape{1, draft_count + 1});
+}
+
+array mlx_mtp_committed_hidden(
+    const MlxMtpDraftContext& context,
+    int expected_batch,
+    int expected_width) {
+    const int committed = context.accepted_drafts + 1;
+    if (context.initial || context.verified_hidden == nullptr ||
+        expected_batch <= 0 || expected_width <= 0 || committed <= 0 ||
+        context.verified_hidden->ndim() != 3 ||
+        context.verified_hidden->shape(0) != expected_batch ||
+        context.verified_hidden->shape(1) < committed ||
+        context.verified_hidden->shape(2) != expected_width) {
+        throw std::invalid_argument("invalid committed MTP hidden prefix");
+    }
+    return mlx::core::slice(
+        *context.verified_hidden,
+        Shape{0, 0, 0},
+        Shape{expected_batch, committed, expected_width});
+}
+
 std::optional<array> mlx_generation_token_counts(
     const MlxSamplingParams& sampling,
     const array& prompt_ids,

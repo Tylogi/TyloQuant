@@ -78,6 +78,20 @@ std::size_t mlx_prime_mtp_history(
     const MlxMtpHistoryFold& fold,
     int chunk_size = 512);
 
+// Build the teacher-forced target batch shared by every speculative adapter.
+// The result is int32 [1, draft_count + 1] and starts with pending_token.
+mlx::core::array mlx_mtp_verification_ids(
+    std::int32_t pending_token,
+    const mlx::core::array& draft_tokens,
+    int draft_count);
+
+// Validate and slice the committed target prefix delivered after a verify
+// cycle. The pending token is always committed, followed by accepted drafts.
+mlx::core::array mlx_mtp_committed_hidden(
+    const MlxMtpDraftContext& context,
+    int expected_batch,
+    int expected_width);
+
 struct MlxMtpTargetBatch {
     // [drafts + 1, vocab], one target row for each draft and the bonus row.
     mlx::core::array logits;

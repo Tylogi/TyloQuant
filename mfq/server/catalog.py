@@ -25,6 +25,7 @@ from mfq.server.models import (
 MODEL_FILE_INDEX = ".mfq-files.json"
 
 _NATIVE_HF_MODEL_TYPE_PREFIXES = (
+    "deepseek_v41",
     "deepseek_v4",
     "minicpmo",
     "qwen35",

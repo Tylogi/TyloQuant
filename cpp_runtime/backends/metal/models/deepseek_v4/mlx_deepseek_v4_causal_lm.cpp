@@ -2405,25 +2405,15 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             [&](const MlxMtpDraftContext& context,
                 const MlxMtpTokenSelector& select_token) {
                 if (!context.initial) {
-                    if (context.verified_hidden == nullptr) {
-                        throw std::runtime_error(
-                            "DeepSeek-V4 verified DSpark history is unavailable");
-                    }
-                    const int committed = context.accepted_drafts + 1;
-                    if (context.verified_hidden->ndim() != 3 ||
-                        context.verified_hidden->shape(0) != 1 ||
-                        context.verified_hidden->shape(1) < committed) {
-                        throw std::runtime_error(
-                            "DeepSeek-V4 verified DSpark history is malformed");
-                    }
-                    auto committed_hidden = mlx::core::slice(
-                        *context.verified_hidden,
-                        Shape{0, 0, 0},
-                        Shape{
-                            1,
-                            committed,
-                            context.verified_hidden->shape(2),
-                        });
+                    const int target_width = checked_product(
+                        checked_int(config_.hidden, "hidden size"),
+                        checked_int(
+                            static_cast<std::int64_t>(
+                                config_.dspark_target_layer_ids.size()),
+                            "DSpark target count"),
+                        "DSpark target width");
+                    auto committed_hidden = mlx_mtp_committed_hidden(
+                        context, 1, target_width);
                     dspark_->append_context(
                         committed_hidden,
                         *dspark_state,
@@ -2450,19 +2440,8 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     begin_speculative_target(1, draft_count + 1);
                 }
 
-                const array pending_ids(
-                    {pending_token}, Shape{1}, mlx::core::int32);
-                auto verify_ids = mlx::core::reshape(
-                    draft_count > 0
-                        ? mlx::core::concatenate(
-                              {
-                                  pending_ids,
-                                  mlx::core::reshape(
-                                      draft_tokens, Shape{draft_count}),
-                              },
-                              0)
-                        : pending_ids,
-                    Shape{1, draft_count + 1});
+                auto verify_ids = mlx_mtp_verification_ids(
+                    pending_token, draft_tokens, draft_count);
                 array target_hidden(0.0f);
                 auto verified_logits = forward_chunk(
                     verify_ids,

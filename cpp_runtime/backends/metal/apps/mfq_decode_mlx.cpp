@@ -1,5 +1,6 @@
 #include "mfq_container.h"
 #include "mlx_deepseek_v4_causal_lm.h"
+#include "mlx_deepseek_v41_causal_lm.h"
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_minicpmo45.h"
 #include "mlx_moe.h"
@@ -1287,6 +1288,36 @@ std::int32_t generate_with_prefill_metrics(
 }
 
 std::int32_t generate_with_prefill_metrics(
+    mfq::metal::MlxDeepseekV41CausalLm& runtime,
+    const std::vector<std::int64_t>& prompt,
+    const mfq::metal::MlxSamplingParams& sampling,
+    std::int32_t max_tokens,
+    const MfqTokenCallback& callback,
+    const MfqPrefillCallback& on_prefill,
+    const MfqPromptCachePlan& cache_plan,
+    const MfqTokenConstraintPtr& token_constraint,
+    int prefill_chunk_size) {
+    std::function<void(std::size_t, double)> report_prefill;
+    if (on_prefill) {
+        report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
+            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+        };
+    }
+    return runtime.generate(
+        prompt,
+        sampling,
+        max_tokens,
+        callback,
+        report_prefill,
+        token_constraint,
+        cache_plan.stable_prefix_tokens > 0
+            ? std::optional<std::size_t>(
+                  cache_plan.stable_prefix_tokens)
+            : std::nullopt,
+        prefill_chunk_size);
+}
+
+std::int32_t generate_with_prefill_metrics(
     mfq::metal::MlxQwen4CausalLm& runtime,
     const std::vector<std::int64_t>& prompt,
     const mfq::metal::MlxSamplingParams& sampling,
@@ -1834,6 +1865,53 @@ int run_native_server(
         std::chrono::steady_clock::now();
     const auto graph = mfq::metal::effective_model_graph(container);
     const auto& backbone = graph.backbone;
+    if (backbone == "deepseek_v41") {
+        const auto config =
+            mfq::metal::DeepseekV41Config::from_mfq(container);
+        const int context = static_cast<int>(
+            std::min<std::int64_t>(
+                arguments.context_size,
+                config.max_position_embeddings));
+        std::cout
+            << "Loading native C++/MLX DeepSeek-V4.1 model "
+               "on Apple GPU..."
+            << std::endl;
+        auto runtime =
+            mfq::metal::MlxDeepseekV41CausalLm::load(
+                container, context);
+        release_model_load_staging_memory();
+        const auto load_seconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+        std::cout
+            << "Loaded " << runtime.layer_count()
+            << " DeepSeek-V4.1 layers in "
+            << load_seconds << " s; runtime=native-cpp"
+            << std::endl;
+        const auto load_runtime =
+            [&container](std::int64_t requested_context) {
+                if (requested_context < 1 ||
+                    requested_context >
+                        std::numeric_limits<int>::max()) {
+                    throw std::invalid_argument(
+                        "Metal runtime context is out of range");
+                }
+                return mfq::metal::MlxDeepseekV41CausalLm::load(
+                    container,
+                    static_cast<int>(requested_context));
+            };
+        return serve_loaded_runtime(
+            arguments,
+            &container,
+            std::move(runtime),
+            load_runtime,
+            config.has_vision()
+                ? std::string("deepseek_v41_vision")
+                : config.text_model_type,
+            config.max_position_embeddings,
+            config.vocab,
+            runtime_stream);
+    }
     if (backbone == "deepseek_v4") {
         const auto config =
             mfq::metal::DeepseekV4Config::from_mfq(

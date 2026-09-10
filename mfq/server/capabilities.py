@@ -34,6 +34,11 @@ _REGISTRY = (
         features=ModelFeatureSet(text=False, audio_output=True),
     ),
     _CapabilityRegistration(
+        family="deepseek_v41",
+        aliases=("deepseek_v41", "deepseek_v41_text", "deepseek_v41_vision"),
+        features=ModelFeatureSet(text=True, image_input=True, mtp=True),
+    ),
+    _CapabilityRegistration(
         family="deepseek_v4",
         aliases=("deepseek_v4",),
         features=ModelFeatureSet(text=True, mtp=True),

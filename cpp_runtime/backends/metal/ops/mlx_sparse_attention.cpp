@@ -94,6 +94,56 @@ array typed_contiguous(const array& input, Dtype dtype) {
     return mlx::core::contiguous(result);
 }
 
+array generic_selected_mla_attention(
+    const array& query,
+    const array& cache,
+    const array& indices,
+    const array& mask,
+    const array& sinks,
+    float scale) {
+    const int batch = query.shape(0);
+    const int heads = query.shape(1);
+    const int tokens = query.shape(2);
+    const int selected = indices.shape(2);
+    const int dimension = query.shape(3);
+    auto safe_indices = mlx::core::maximum(
+        indices, array(0, mlx::core::int32));
+    auto expanded_cache = mlx::core::broadcast_to(
+        mlx::core::expand_dims(cache, 1),
+        Shape{batch, tokens, cache.shape(1), dimension});
+    auto expanded_indices = mlx::core::broadcast_to(
+        mlx::core::expand_dims(safe_indices, -1),
+        Shape{batch, tokens, selected, dimension});
+    auto gathered = mlx::core::astype(
+        mlx::core::take_along_axis(
+            expanded_cache, expanded_indices, 2),
+        mlx::core::float32);
+    auto query_values = mlx::core::astype(
+        mlx::core::transpose(query, {0, 2, 1, 3}),
+        mlx::core::float32);
+    auto scores = mlx::core::sum(
+        mlx::core::expand_dims(query_values, 3) *
+            mlx::core::expand_dims(gathered, 2),
+        -1) * scale;
+    scores = scores + mlx::core::expand_dims(
+        mlx::core::astype(mask, mlx::core::float32), 2);
+    auto sink_values = mlx::core::reshape(
+        mlx::core::astype(sinks, mlx::core::float32),
+        Shape{1, 1, heads});
+    auto maximum = mlx::core::maximum(
+        mlx::core::max(scores, -1), sink_values);
+    auto exponentials = mlx::core::exp(
+        scores - mlx::core::expand_dims(maximum, -1));
+    auto denominator = mlx::core::sum(exponentials, -1) +
+        mlx::core::exp(sink_values - maximum);
+    auto probabilities = exponentials /
+        mlx::core::expand_dims(denominator, -1);
+    return mlx::core::sum(
+        mlx::core::expand_dims(probabilities, -1) *
+            mlx::core::expand_dims(gathered, 2),
+        3);
+}
+
 int checked_grid_product(
     std::initializer_list<int> factors,
     const char* label) {
@@ -536,32 +586,44 @@ array mlx_sparse_selected_mla_attention(
     const array& selected_mask,
     const array& sinks,
     std::optional<float> scale) {
-    constexpr int kHeads = 64;
-    constexpr int kDimension = 512;
     auto selected_query = typed_contiguous(query, mlx::core::float32);
     auto selected_cache = typed_contiguous(kv_cache, mlx::core::float16);
     auto indices = typed_contiguous(selected_indices, mlx::core::int32);
     auto mask = typed_contiguous(selected_mask, mlx::core::float16);
     auto sink_logits = typed_contiguous(sinks, mlx::core::float32);
     if (selected_query.ndim() != 4 || selected_query.shape(0) <= 0 ||
-        selected_query.shape(1) != kHeads || selected_query.shape(2) <= 0 ||
-        selected_query.shape(3) != kDimension || selected_cache.ndim() != 3 ||
+        selected_query.shape(1) <= 0 || selected_query.shape(2) <= 0 ||
+        selected_query.shape(3) <= 0 || selected_cache.ndim() != 3 ||
         selected_cache.shape(0) != selected_query.shape(0) ||
         selected_cache.shape(1) <= 0 ||
-        selected_cache.shape(2) != kDimension || indices.ndim() != 3 ||
+        selected_cache.shape(2) != selected_query.shape(3) || indices.ndim() != 3 ||
         indices.shape(0) != selected_query.shape(0) ||
         indices.shape(1) != selected_query.shape(2) ||
         indices.shape(2) <= 0 || indices.shape(2) % 32 != 0 ||
-        mask.shape() != indices.shape() || sink_logits.size() != kHeads) {
+        mask.shape() != indices.shape() ||
+        sink_logits.size() != static_cast<std::size_t>(selected_query.shape(1))) {
         throw std::invalid_argument(
             "unsupported selected-token sparse MLA geometry");
     }
+    const int heads = selected_query.shape(1);
+    const int dimension = selected_query.shape(3);
     const float selected_scale = scale.value_or(
-        1.0f / std::sqrt(static_cast<float>(kDimension)));
+        1.0f / std::sqrt(static_cast<float>(dimension)));
     if (!std::isfinite(selected_scale) || selected_scale <= 0.0f) {
         throw std::invalid_argument(
             "selected-token sparse MLA scale must be finite and positive");
     }
+    if (heads != 64 || dimension != 512) {
+        return generic_selected_mla_attention(
+            selected_query,
+            selected_cache,
+            indices,
+            mask,
+            sink_logits,
+            selected_scale);
+    }
+    constexpr int kHeads = 64;
+    constexpr int kDimension = 512;
     SparseSelectedMlaParams params{
         .batch = selected_query.shape(0),
         .queries = selected_query.shape(2),

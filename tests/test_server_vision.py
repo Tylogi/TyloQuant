@@ -17,6 +17,7 @@ from PIL import Image
 from mfq.server.backend import OpenAIChatBackend
 from mfq.server.models import SamplingParams
 from mfq.server.vision import (
+    DeepseekV41VisionProcessor,
     DeepseekV4VisionProcessor,
     Glm5NextVisionProcessor,
     MiniCPMO45VisionProcessor,
@@ -130,6 +131,34 @@ def test_deepseek_v4_request_defers_position_dependent_image_block() -> None:
         _decode_tensor(result.tensors["vision_grid"]),
         [[3, 5, 1, 2]],
     )
+
+
+def test_deepseek_v41_processor_uses_released_row_major_contract() -> None:
+    class TinyProcessor(DeepseekV41VisionProcessor):
+        minimum_pixels = 0
+
+    image = Image.new("RGB", (70, 42), (20, 40, 60))
+    result = TinyProcessor().prepare_openai_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {"type": "image_url", "image_url": {"url": _data_url(image)}},
+                ],
+            }
+        ]
+    )
+
+    assert result is not None
+    assert result.tensors["version"] == 2
+    assert result.tensors["processor"] == "deepseek_v41"
+    assert _decode_tensor(result.tensors["pixel_values"]).shape == (1, 15, 588)
+    np.testing.assert_array_equal(
+        _decode_tensor(result.tensors["vision_grid"]),
+        [[3, 5, 1, 2]],
+    )
+    assert TinyProcessor._grid_tokens(42, 70) == (1, 2, 5)
 
 
 def test_qwen4_exp_image_processor_matches_official_block_major_layout() -> None:
@@ -435,6 +464,10 @@ def test_multimodal_processor_registry_is_architecture_specific() -> None:
     assert isinstance(
         multimodal_processor_for_architecture("deepseek-v4"),
         DeepseekV4VisionProcessor,
+    )
+    assert isinstance(
+        multimodal_processor_for_architecture("deepseek-v41-vision"),
+        DeepseekV41VisionProcessor,
     )
     assert isinstance(
         multimodal_processor_for_architecture("qwen4_exp"),

@@ -91,10 +91,26 @@ def validate_mx_shapes(
         expected_storage = (rows, columns // 2)
         expected_scales = (rows, columns // 32)
     else:
-        if columns % 128:
-            raise ValueError("MXFP8 columns must be divisible by 128")
+        if columns % 32:
+            raise ValueError("MXFP8 columns must be divisible by 32")
         expected_storage = (rows, columns)
-        expected_scales = ((rows + 127) // 128, columns // 128)
+        # MXFP8 is used by more than one native QAT layout.  Dense matrices
+        # use 128x128 or 32x32 E8M0 blocks, while sparse associative-memory
+        # tables use an independent scale for every 1x32 row segment.  The
+        # payload already records the scale matrix, so no format revision is
+        # needed to preserve all three source-exact geometries.
+        expected_scale_shapes = {
+            ((rows + 127) // 128, columns // 128),
+            ((rows + 31) // 32, columns // 32),
+            (rows, columns // 32),
+        }
+        if (scale_rows, scale_columns) not in expected_scale_shapes:
+            expected = ", ".join(str(value) for value in sorted(expected_scale_shapes))
+            raise ValueError(
+                f"MXFP8 scale shape {scale_shape} is not a supported native geometry: "
+                f"{expected}"
+            )
+        expected_scales = (scale_rows, scale_columns)
     if (storage_rows, storage_columns) != expected_storage:
         raise ValueError(f"{dtype} storage shape {storage_shape} != {expected_storage}")
     if (scale_rows, scale_columns) != expected_scales:

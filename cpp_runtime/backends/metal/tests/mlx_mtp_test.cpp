@@ -131,6 +131,37 @@ int main() {
             }
         }
         {
+            auto verification_ids = mfq::metal::mlx_mtp_verification_ids(
+                7,
+                mlx::core::array({8, 9}, mlx::core::int32),
+                2);
+            verification_ids.eval();
+            const auto* values = verification_ids.data<std::int32_t>();
+            if (verification_ids.shape() != mlx::core::Shape{1, 3} ||
+                values[0] != 7 || values[1] != 8 || values[2] != 9) {
+                throw std::runtime_error(
+                    "common MTP verification batch mismatch");
+            }
+
+            mlx::core::array verified_hidden(
+                {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f},
+                mlx::core::Shape{1, 3, 2},
+                mlx::core::float32);
+            mfq::metal::MlxMtpDraftContext context;
+            context.accepted_drafts = 1;
+            context.verified_hidden = &verified_hidden;
+            auto committed = mfq::metal::mlx_mtp_committed_hidden(
+                context, 1, 2);
+            committed.eval();
+            const auto* hidden = committed.data<float>();
+            if (committed.shape() != mlx::core::Shape{1, 2, 2} ||
+                hidden[0] != 1.0f || hidden[1] != 2.0f ||
+                hidden[2] != 3.0f || hidden[3] != 4.0f) {
+                throw std::runtime_error(
+                    "common MTP committed hidden prefix mismatch");
+            }
+        }
+        {
             const mlx::core::array proposal_indices(
                 {0, 1}, mlx::core::int32);
             const mlx::core::array proposal_probabilities(
