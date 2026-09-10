@@ -1448,6 +1448,7 @@ void test_dspark_generation_uses_common_mtp_engine() {
     require(model.supports_mtp(), "DeepSeek-V4 DSpark was not attached");
     mfq::metal::MlxSamplingParams sampling;
     sampling.temperature = 0.0;
+    sampling.mtp_max_draft_tokens = 1;
     std::vector<std::int64_t> emitted;
     const auto count = model.generate(
         {1, 2},

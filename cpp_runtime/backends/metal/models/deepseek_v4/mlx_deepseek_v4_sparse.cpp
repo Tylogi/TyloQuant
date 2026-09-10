@@ -299,7 +299,7 @@ const Kernel& topk_kernel() {
 const Kernel& prefill_plan_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_dsv4_prefill_plan",
-        {"topk"},
+        {"topk", "plan_params"},
         {"indices", "mask"},
         kPrefillPlanSource);
     return kernel;
@@ -308,7 +308,7 @@ const Kernel& prefill_plan_kernel() {
 const Kernel& visible_prefill_plan_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_dsv4_visible_prefill_plan",
-        {"topk", "left", "right"},
+        {"topk", "left", "right", "plan_params"},
         {"indices", "mask"},
         kVisiblePrefillPlanSource);
     return kernel;
@@ -1136,18 +1136,28 @@ std::pair<array, array> dsv4_build_prefill_plan(
     const int batch = selected_topk.shape(0);
     const int queries = selected_topk.shape(1);
     const int topk_count = selected_topk.shape(2);
+    if (queries > std::numeric_limits<int>::max() - local_history) {
+        throw std::invalid_argument(
+            "DSV4 prefill local width exceeds integer range");
+    }
+    const int local_width = std::min(
+        window,
+        local_history + queries);
     if (topk_count >
-        std::numeric_limits<int>::max() - window - 31) {
+        std::numeric_limits<int>::max() - local_width - 31) {
         throw std::invalid_argument(
             "DSV4 prefill plan width exceeds MLX limits");
     }
     const int selected =
-        ((window + topk_count + 31) / 32) * 32;
+        ((local_width + topk_count + 31) / 32) * 32;
     const int total = checked_product(
         {batch, queries, selected},
         "prefill plan size");
+    const array plan_params(
+        {query_offset, local_history, local_width, pool_len, ratio, window},
+        mlx::core::int32);
     auto outputs = prefill_plan_kernel()(
-        {selected_topk},
+        {selected_topk, plan_params},
         {
             Shape{batch, queries, selected},
             Shape{batch, queries, selected},
@@ -1163,11 +1173,6 @@ std::pair<array, array> dsv4_build_prefill_plan(
             {"M", queries},
             {"TOPK_COUNT", topk_count},
             {"SELECTED", selected},
-            {"QUERY_OFFSET", query_offset},
-            {"LOCAL_HISTORY", local_history},
-            {"POOL_LEN", pool_len},
-            {"RATIO", ratio},
-            {"WINDOW", window},
         },
         std::nullopt,
         false,
@@ -1218,8 +1223,11 @@ std::pair<array, array> dsv4_build_prefill_plan_visible(
     const int total = checked_product(
         {batch, queries, selected},
         "visible prefill plan size");
+    const array plan_params(
+        {query_offset, local_history, local_width, pool_len, ratio, window},
+        mlx::core::int32);
     auto outputs = visible_prefill_plan_kernel()(
-        {selected_topk, left_values, right_values},
+        {selected_topk, left_values, right_values, plan_params},
         {
             Shape{batch, queries, selected},
             Shape{batch, queries, selected},
@@ -1232,12 +1240,6 @@ std::pair<array, array> dsv4_build_prefill_plan_visible(
             {"M", queries},
             {"TOPK_COUNT", topk_count},
             {"SELECTED", selected},
-            {"LOCAL_WIDTH", local_width},
-            {"QUERY_OFFSET", query_offset},
-            {"LOCAL_HISTORY", local_history},
-            {"POOL_LEN", pool_len},
-            {"RATIO", ratio},
-            {"WINDOW", window},
         },
         std::nullopt,
         false,

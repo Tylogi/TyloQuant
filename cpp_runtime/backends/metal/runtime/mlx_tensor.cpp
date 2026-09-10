@@ -4,6 +4,7 @@
 #include <mlx/allocator.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -82,6 +83,79 @@ constexpr const char* kDenseSmallM = R"METAL(
     }
 )METAL";
 
+// M=2..6 verifier GEMV with the same 32-lane reduction geometry as MLX's
+// one-token large-output GEMV. Four output rows share every activation load
+// inside each SIMD group, while each weight is reused across all M inputs.
+//
+// Scheduling derived from oMLX 0.6.4 verify_qmv.py.
+// Copyright © 2026 Apple Inc.  Licensed under Apache-2.0.
+constexpr const char* kDenseSmallMExact = R"METAL(
+    constexpr uint OUTPUTS_PER_SIMD = 4u;
+    constexpr uint SIMD_GROUPS = 8u;
+    constexpr uint OUTPUTS_PER_TG = OUTPUTS_PER_SIMD * SIMD_GROUPS;
+    constexpr uint VALUES_PER_LANE = 4u;
+    constexpr uint K_BLOCK = VALUES_PER_LANE * 32u;
+
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint output_base =
+        threadgroup_position_in_grid.x * OUTPUTS_PER_TG
+        + simd_group * OUTPUTS_PER_SIMD;
+    if (output_base >= uint(OUT)) {
+        return;
+    }
+
+    uint k_base = lane * VALUES_PER_LANE;
+    float accum[M][OUTPUTS_PER_SIMD] = {{0.0f}};
+    for (uint block = 0u; block < uint(K); block += K_BLOCK) {
+        float input_values[M][VALUES_PER_LANE];
+        for (uint row = 0u; row < uint(M); ++row) {
+            for (uint column = 0u;
+                 column < VALUES_PER_LANE;
+                 ++column) {
+                input_values[row][column] =
+                    float(x[row * uint(K) + k_base + column]);
+            }
+        }
+        for (uint result = 0u;
+             result < OUTPUTS_PER_SIMD;
+             ++result) {
+            device const T* row_weight =
+                weight + (output_base + result) * uint(K) + k_base;
+            float weight_values[VALUES_PER_LANE];
+            for (uint column = 0u;
+                 column < VALUES_PER_LANE;
+                 ++column) {
+                weight_values[column] = float(row_weight[column]);
+            }
+            for (uint row = 0u; row < uint(M); ++row) {
+                for (uint column = 0u;
+                     column < VALUES_PER_LANE;
+                     ++column) {
+                    accum[row][result] +=
+                        weight_values[column] * input_values[row][column];
+                }
+            }
+        }
+        k_base += K_BLOCK;
+    }
+
+    for (uint row = 0u; row < uint(M); ++row) {
+        for (uint result = 0u;
+             result < OUTPUTS_PER_SIMD;
+             ++result) {
+            for (ushort step = 16u; step >= 1u; step >>= 1u) {
+                accum[row][result] +=
+                    simd_shuffle_down(accum[row][result], step);
+            }
+            if (lane == 0u) {
+                y[row * uint(OUT) + output_base + result] =
+                    T(accum[row][result]);
+            }
+        }
+    }
+)METAL";
+
 const mlx::core::fast::CustomKernelFunction& dense_small_m_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
@@ -99,12 +173,68 @@ const mlx::core::fast::CustomKernelFunction& dense_small_m_kernel() {
     return kernel;
 }
 
+const mlx::core::fast::CustomKernelFunction&
+dense_small_m_exact_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_dense_small_m_exact_m2_6",
+            {"weight", "x"},
+            {"y"},
+            kDenseSmallMExact,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
 array dense_small_m_matmul(
     const array& weight,
     const array& input,
     int rows,
     int input_size,
     int output_size) {
+    const auto* layout = std::getenv(
+        "MFQ_METAL_DENSE_SMALL_M_LAYOUT");
+    const bool exact =
+        input_size % 128 == 0 &&
+        output_size >= 4096 &&
+        output_size % 32 == 0 &&
+        (layout == nullptr || std::strcmp(layout, "legacy") != 0);
+    if (exact) {
+        auto source = mlx::core::reshape(
+            input.flags().row_contiguous
+                ? input
+                : mlx::core::contiguous(input),
+            Shape{rows, input_size});
+        auto outputs = dense_small_m_exact_kernel()(
+            {weight, std::move(source)},
+            {Shape{rows, output_size}},
+            {weight.dtype()},
+            {
+                ((output_size + 31) / 32) * 256,
+                1,
+                1,
+            },
+            {256, 1, 1},
+            {
+                {"T", weight.dtype()},
+                {"M", rows},
+                {"K", input_size},
+                {"OUT", output_size},
+            },
+            std::nullopt,
+            false,
+            {});
+        Shape output_shape = input.shape();
+        output_shape.back() = output_size;
+        return mlx::core::reshape(
+            std::move(outputs.front()),
+            std::move(output_shape));
+    }
     constexpr int simd_groups = 4;
     const int k_lanes = input_size >= 16384 ? 16 : 32;
     const int outputs_per_threadgroup = simd_groups * 32 / k_lanes;
@@ -137,6 +267,32 @@ array dense_small_m_matmul(
     output_shape.back() = output_size;
     return mlx::core::reshape(
         std::move(outputs.front()),
+        std::move(output_shape));
+}
+
+array dense_decode_consistent_matmul(
+    const array& weight,
+    const array& input,
+    int rows,
+    int input_size,
+    int output_size) {
+    // This is the same fallback used by oMLX's decode-consistency patch:
+    // express M independent projections as a batch of matrix-vector
+    // products. MLX consequently keeps its M=1 GEMV reduction for every row
+    // instead of selecting a width-M GEMM kernel.
+    auto source = mlx::core::reshape(
+        input.flags().row_contiguous
+            ? input
+            : mlx::core::contiguous(input),
+        Shape{rows, input_size});
+    auto projected = mlx::core::matmul(
+        weight,
+        mlx::core::expand_dims(std::move(source), -1));
+    projected = mlx::core::squeeze(std::move(projected), -1);
+    Shape output_shape = input.shape();
+    output_shape.back() = output_size;
+    return mlx::core::reshape(
+        std::move(projected),
         std::move(output_shape));
 }
 
@@ -478,15 +634,29 @@ array MlxLinear::operator()(const array& input) const {
     if (rows >= 2 && rows <= 6 &&
         input_size_ % 4 == 0 &&
         dense.size() >= 65536 &&
-        dense.flags().row_contiguous &&
-        (dense.dtype() == mlx::core::float16 ||
-         dense.dtype() == mlx::core::bfloat16)) {
-        return dense_small_m_matmul(
-            dense,
-            source,
-            static_cast<int>(rows),
-            input_size_,
-            output_size_);
+        dense.flags().row_contiguous) {
+        const auto* layout = std::getenv(
+            "MFQ_METAL_DENSE_SMALL_M_LAYOUT");
+        const bool legacy = layout != nullptr &&
+            std::strcmp(layout, "legacy") == 0;
+        if (!legacy &&
+            output_size_ < 4096) {
+            return dense_decode_consistent_matmul(
+                dense,
+                source,
+                static_cast<int>(rows),
+                input_size_,
+                output_size_);
+        }
+        if (dense.dtype() == mlx::core::float16 ||
+            dense.dtype() == mlx::core::bfloat16) {
+            return dense_small_m_matmul(
+                dense,
+                source,
+                static_cast<int>(rows),
+                input_size_,
+                output_size_);
+        }
     }
     return mlx::core::matmul(source, mlx::core::transpose(dense));
 }

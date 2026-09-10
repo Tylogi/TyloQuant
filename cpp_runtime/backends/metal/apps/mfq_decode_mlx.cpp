@@ -323,10 +323,7 @@ std::size_t requested_cache_bytes(
                 "DeepSeek-V4 expert cache exceeds addressable memory");
         }
         const auto bytes = static_cast<std::size_t>(requested);
-        if (hf_streaming && bytes == 0) {
-            throw std::runtime_error(
-                "HF SSD expert streaming requires a non-zero cache");
-        }
+        // An explicit zero keeps native HF expert banks fully resident.
         return bytes;
     }
     if (!hf_streaming) {
@@ -337,6 +334,53 @@ std::size_t requested_cache_bytes(
     return std::max<std::size_t>(
         std::uint64_t{1} << 30,
         physical_memory_bytes() * 2 / 3);
+}
+
+std::size_t resident_hf_wired_limit_bytes(
+    const std::filesystem::path& model_root) {
+    constexpr std::size_t gib = std::size_t{1} << 30;
+    if (const char* value = std::getenv("MFQ_HF_RESIDENT_WIRED_GIB")) {
+        const auto requested = std::stoull(value);
+        if (requested > std::numeric_limits<std::size_t>::max() / gib) {
+            throw std::invalid_argument(
+                "resident HF wired limit exceeds addressable memory");
+        }
+        return static_cast<std::size_t>(requested) * gib;
+    }
+
+    std::size_t checkpoint_bytes = 0;
+    std::error_code error;
+    for (std::filesystem::directory_iterator entries(model_root, error), end;
+         !error && entries != end;
+         entries.increment(error)) {
+        if (!entries->is_regular_file(error) || error ||
+            entries->path().extension() != ".safetensors") {
+            continue;
+        }
+        const auto bytes = entries->file_size(error);
+        if (error || bytes > std::numeric_limits<std::size_t>::max() -
+                checkpoint_bytes) {
+            throw std::runtime_error(
+                "cannot size resident HF checkpoint for its wired budget");
+        }
+        checkpoint_bytes += static_cast<std::size_t>(bytes);
+    }
+    if (error || checkpoint_bytes == 0) {
+        throw std::runtime_error(
+            "cannot discover resident HF safetensor payload");
+    }
+    const auto memory = physical_memory_bytes();
+    const auto reserve = std::max<std::size_t>(32 * gib, memory / 4);
+    if (memory <= reserve || checkpoint_bytes > memory - reserve) {
+        throw std::runtime_error(
+            "resident HF checkpoint does not fit the safe UMA budget");
+    }
+    const auto headroom = std::max<std::size_t>(32 * gib, checkpoint_bytes / 8);
+    return std::min(
+        memory - reserve,
+        checkpoint_bytes > std::numeric_limits<std::size_t>::max() - headroom
+            ? memory - reserve
+            : checkpoint_bytes + headroom);
 }
 
 std::filesystem::path executable_path() {
@@ -1624,7 +1668,7 @@ int serve_loaded_runtime(
                                 ? 0.0
                                 : static_cast<double>(
                                       stats.position_accepted[position]) /
-                                      stats.position_drafted[position]);
+                                  stats.position_drafted[position]);
                     }
                     for (std::size_t depth = 0;
                          depth < stats.measured_depth_ms.size();
@@ -1694,6 +1738,11 @@ int run_native_hf_server(const Arguments& arguments) {
             config.max_position_embeddings));
     const auto expert_cache_bytes = requested_cache_bytes(
         arguments.expert_cache_gb, true);
+    std::size_t resident_wired_limit = 0;
+    if (expert_cache_bytes == 0) {
+        resident_wired_limit = resident_hf_wired_limit_bytes(arguments.mfq);
+        mlx::core::set_wired_limit(resident_wired_limit);
+    }
     constexpr std::size_t prefill_buffers_minimum =
         std::size_t{7} << 30;
     const bool prefill_overlap =
@@ -1703,8 +1752,15 @@ int run_native_hf_server(const Arguments& arguments) {
     mlx::core::set_default_stream(runtime_stream);
     const auto started = std::chrono::steady_clock::now();
     std::cout
-        << "Loading native-format DeepSeek-V4 HF weights with SSD expert "
-           "streaming on Apple UMA..."
+        << "Loading native-format DeepSeek-V4 HF weights on Apple UMA: "
+        << (expert_cache_bytes == 0
+                ? "fully resident"
+                : "SSD expert streaming")
+        << (resident_wired_limit == 0
+                ? ""
+                : " (wired budget GiB=" + std::to_string(
+                      static_cast<double>(resident_wired_limit) /
+                      static_cast<double>(std::uint64_t{1} << 30)) + ")")
         << std::endl;
     auto runtime = mfq::metal::MlxDeepseekV4CausalLm::load_hf(
         arguments.mfq,
@@ -1720,7 +1776,10 @@ int run_native_hf_server(const Arguments& arguments) {
     std::cout
         << "Loaded " << runtime.layer_count()
         << " DeepSeek-V4 layers in " << load_seconds << " s"
-        << " expert_backing=hf-safetensors-ssd"
+        << " expert_backing="
+        << (expert_cache_bytes == 0
+                ? "hf-native-resident"
+                : "hf-safetensors-ssd")
         << " expert_cache_gib="
         << static_cast<double>(runtime.expert_cache_limit_bytes()) / gib
         << " prefill_double_buffer="

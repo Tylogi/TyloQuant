@@ -681,6 +681,7 @@ void add_deepseek_v4_aliases(
             {"attention.indexer.compressor.norm.weight", "attn.indexer.compressor.norm.weight"},
             {"mlp.router.weight", "ffn.gate.weight"},
             {"mlp.router.bias", "ffn.gate.bias"},
+            {"mlp.router.vision_bias", "ffn.gate.bias_vl"},
             {"mlp.router.token_to_expert", "ffn.gate.tid2eid"},
             {"mlp.experts.gate_up.weight", "ffn.experts.gate_up.weight"},
             {"mlp.experts.gate.weight", "ffn.experts.gate.weight"},

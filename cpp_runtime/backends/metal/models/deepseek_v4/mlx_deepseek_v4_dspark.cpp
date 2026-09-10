@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -26,6 +28,25 @@ using mlx::core::array;
 
 constexpr int kConnections = 4;
 constexpr int kHcProjectionWidth = 24;
+
+void trace_dspark_value(
+    std::string_view label,
+    const array& value) {
+    if (std::getenv("MFQ_MLX_MTP_TRACE") == nullptr) return;
+    auto floating = mlx::core::astype(value, mlx::core::float32);
+    auto nan_count = mlx::core::sum(mlx::core::astype(
+        mlx::core::isnan(floating), mlx::core::int32));
+    auto maximum = mlx::core::max(mlx::core::abs(mlx::core::where(
+        mlx::core::isnan(floating),
+        mlx::core::zeros_like(floating),
+        floating)));
+    mlx::core::eval(nan_count, maximum);
+    std::cout
+        << "mtp_value_trace name=" << label
+        << " nan=" << nan_count.item<std::int32_t>()
+        << " max_abs=" << maximum.item<float>()
+        << std::endl;
+}
 
 int checked_int(std::int64_t value, const char* label) {
     if (value <= 0 ||
@@ -518,6 +539,7 @@ struct MlxDeepseekV4DSpark::Impl {
         const int window = checked_int(config.sliding_window, "window");
         const int rotary = checked_int(config.qk_rope_head_dim, "rotary width");
         auto kv = stage.kv_norm(stage.components.attention.kv(main_x));
+        trace_dspark_value("context.kv_before_rope", kv);
         auto positions = mlx::core::arange(
             start_position,
             start_position + tokens,
@@ -526,7 +548,9 @@ struct MlxDeepseekV4DSpark::Impl {
         auto cosine = mlx::core::take(rope.first, positions, 0);
         auto sine = mlx::core::take(rope.second, positions, 0);
         kv = apply_tail_rope(kv, rotary, cosine, sine);
+        trace_dspark_value("context.kv_after_rope", kv);
         kv = deepseek_v4_kv_fp8_sim_prefix(kv, rotary);
+        trace_dspark_value("context.kv_after_fp8", kv);
         int retained = std::min(tokens, window);
         if (retained != tokens) {
             kv = slice_axis(kv, 1, tokens - retained, tokens);
@@ -574,6 +598,8 @@ struct MlxDeepseekV4DSpark::Impl {
         q = apply_tail_rope(q, rotary, cosine, sine);
         kv = apply_tail_rope(kv, rotary, cosine, sine);
         kv = deepseek_v4_kv_fp8_sim_prefix(kv, rotary);
+        trace_dspark_value("attention.q", q);
+        trace_dspark_value("attention.kv", kv);
         const int active = std::min(position, ring.shape(1));
         if (active <= 0) {
             throw std::runtime_error(
@@ -583,8 +609,10 @@ struct MlxDeepseekV4DSpark::Impl {
             {slice_axis(ring, 1, 0, active),
              mlx::core::astype(kv, ring.dtype())},
             1);
+        trace_dspark_value("attention.keys", keys);
         auto attended = full_attention(
             q, keys, stage.components.attention.sinks);
+        trace_dspark_value("attention.output", attended);
         attended = apply_tail_rope(
             attended, rotary, cosine, sine, true);
         const int group_input = heads * head_dim / groups;
@@ -612,6 +640,7 @@ struct MlxDeepseekV4DSpark::Impl {
             stage.components.hc_attention_scale,
             stage.components.hc_attention_base,
             stage.attention_norm);
+        trace_dspark_value("block.attention_input", attn_hc.reduced);
         auto attended = attention(
             attn_hc.reduced, stage, ring, position);
         auto result = deepseek_v4_hc_post(
@@ -619,6 +648,7 @@ struct MlxDeepseekV4DSpark::Impl {
             residual,
             attn_hc.post,
             attn_hc.combination);
+        trace_dspark_value("block.attention_result", result);
 
         residual = result;
         auto ffn_hc = hc_pre_norm(
@@ -627,14 +657,19 @@ struct MlxDeepseekV4DSpark::Impl {
             stage.components.hc_ffn_scale,
             stage.components.hc_ffn_base,
             stage.ffn_norm);
+        trace_dspark_value("block.ffn_input", ffn_hc.reduced);
         auto branches = stage.components.moe.forward_branches(
             ffn_hc.reduced, token_ids);
-        return deepseek_v4_hc_post_sum(
+        trace_dspark_value("block.ffn_routed", branches.routed);
+        trace_dspark_value("block.ffn_shared", branches.shared);
+        auto output = deepseek_v4_hc_post_sum(
             branches.routed,
             branches.shared,
             residual,
             ffn_hc.post,
             ffn_hc.combination);
+        trace_dspark_value("block.output", output);
+        return output;
     }
 
     array head_hidden(const array& hidden) const {
@@ -728,9 +763,13 @@ MlxDeepseekV4DSpark::load_if_present(
             MlxLinear::load(
                 model,
                 last + ".markov.output.weight"),
-            MlxLinear::load(
+            // The released DSpark implementation promotes this BF16 tensor
+            // to FP32 and evaluates the confidence dot product in FP32. A
+            // BF16/FP16 accumulation can overflow on valid hidden states and
+            // yields NaN acceptance probabilities for short text prompts.
+            MlxLinear(load_float(
                 model,
-                last + ".confidence.projection.weight"),
+                last + ".confidence.projection.weight")),
         },
         max_context,
         deepseek_v4_yarn_tables(
@@ -747,9 +786,9 @@ MlxDeepseekV4DSpark MlxDeepseekV4DSpark::load_hf(
     int max_context,
     std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
     std::size_t expert_layer_base) {
-    if (!config.has_dspark() || !expert_cache) {
+    if (!config.has_dspark()) {
         throw std::invalid_argument(
-            "DeepSeek-V4 HF DSpark requires config and SSD expert cache");
+            "DeepSeek-V4 HF DSpark requires predictor configuration");
     }
     std::vector<MlxDeepseekV4DSparkStageComponents> stages;
     stages.reserve(static_cast<std::size_t>(config.n_mtp_layers));
@@ -782,8 +821,8 @@ MlxDeepseekV4DSpark MlxDeepseekV4DSpark::load_hf(
                 last + ".markov.input.weight"),
             model.load_linear(
                 last + ".markov.output.weight"),
-            model.load_linear(
-                last + ".confidence.projection.weight"),
+            MlxLinear(float32_contiguous(model.load_dense(
+                last + ".confidence.projection.weight"))),
         },
         max_context,
         deepseek_v4_yarn_tables(
@@ -844,7 +883,21 @@ void MlxDeepseekV4DSpark::append_context(
         throw std::invalid_argument(
             "invalid DeepSeek-V4 DSpark context append");
     }
-    auto main_x = impl_->main_norm(impl_->main_projection(source));
+    trace_dspark_value("context.target_hidden", source);
+    // MXFP8 matmul otherwise converts BF16 target hiddens directly to FP16.
+    // The first token can legitimately exceed 32768. Bound each token before
+    // that conversion; the following RMS normalization makes a positive
+    // per-token scale immaterial while retaining the fast packed FP16 path.
+    auto floating_source = mlx::core::astype(source, mlx::core::float32);
+    auto source_scale = mlx::core::maximum(
+        mlx::core::max(mlx::core::abs(floating_source), -1, true) /
+            mlx::core::array(64.0f),
+        mlx::core::array(1.0f));
+    auto main_x = impl_->main_norm(impl_->main_projection(
+        mlx::core::astype(
+            floating_source / source_scale,
+            mlx::core::float16)));
+    trace_dspark_value("context.main_x", main_x);
     for (std::size_t stage = 0; stage < impl_->stages.size(); ++stage) {
         state.rings_[stage] = impl_->append_stage_context(
             main_x,
@@ -866,21 +919,28 @@ MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft(
     }
     anchors = mlx::core::contiguous(anchors);
     const int requested = width == 0 ? block_size() : width;
+    // DSpark's attention over the draft block is intentionally non-causal.
+    // Earlier draft states therefore depend on every noise-filled slot in
+    // the checkpoint's fixed block, even when serving returns fewer drafts.
+    // Preserve that trained geometry and truncate only the head outputs.
+    const int physical_width = std::min(
+        block_size(),
+        impl_->maximum_context - state.position_);
     const int vocab = checked_int(impl_->config.vocab, "vocabulary size");
     const int hidden_size = checked_int(impl_->config.hidden, "hidden size");
     if (anchors.ndim() != 2 || anchors.shape(0) != state.batch() ||
         anchors.shape(1) != 1 || requested <= 0 ||
         requested > block_size() || state.position_ <= 0 ||
-        requested > impl_->maximum_context - state.position_ ||
+        requested > physical_width ||
         state.stages() != impl_->stages.size()) {
         throw std::invalid_argument("invalid DeepSeek-V4 DSpark draft input");
     }
-    auto draft_ids = requested == 1
+    auto draft_ids = physical_width == 1
         ? anchors
         : mlx::core::concatenate(
               {anchors,
                mlx::core::full(
-                   Shape{state.batch(), requested - 1},
+                   Shape{state.batch(), physical_width - 1},
                    static_cast<std::int32_t>(
                        impl_->config.dspark_noise_token_id),
                    mlx::core::int32)},
@@ -890,7 +950,8 @@ MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft(
         mlx::core::broadcast_to(
             mlx::core::expand_dims(embedded, 2),
             Shape{
-                state.batch(), requested, kConnections, hidden_size}));
+                state.batch(), physical_width, kConnections, hidden_size}));
+    trace_dspark_value("embedding", hidden);
     for (std::size_t stage = 0; stage < impl_->stages.size(); ++stage) {
         hidden = impl_->block(
             hidden,
@@ -898,13 +959,15 @@ MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft(
             impl_->stages[stage],
             state.rings_[stage],
             state.position_);
+        trace_dspark_value("stage." + std::to_string(stage), hidden);
     }
     auto head_hidden = impl_->head_hidden(hidden);
+    trace_dspark_value("head_hidden", head_hidden);
     auto base_logits = mlx::core::astype(
         impl_->output(impl_->output_norm(head_hidden)),
         mlx::core::float32);
     if (base_logits.shape() !=
-        Shape{state.batch(), requested, vocab}) {
+        Shape{state.batch(), physical_width, vocab}) {
         throw std::runtime_error("DSpark LM head shape mismatch");
     }
 
@@ -934,11 +997,15 @@ MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft(
     auto token_values = mlx::core::concatenate(tokens, 1);
     auto logit_values = mlx::core::concatenate(logits, 1);
     auto markov_values = mlx::core::concatenate(markov_embeddings, 1);
+    auto returned_hidden = requested == physical_width
+        ? head_hidden
+        : slice_axis(head_hidden, 1, 0, requested);
     auto confidence = impl_->head_components.confidence(
-        mlx::core::concatenate({head_hidden, markov_values}, -1));
+        mlx::core::concatenate({returned_hidden, markov_values}, -1));
     confidence = mlx::core::reshape(
         confidence,
         Shape{state.batch(), requested});
+    trace_dspark_value("confidence", confidence);
     return {
         std::move(token_values),
         std::move(logit_values),

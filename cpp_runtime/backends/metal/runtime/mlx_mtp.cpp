@@ -165,6 +165,8 @@ namespace mfq::metal {
 namespace {
 
 constexpr double kDepthAcceptanceAlpha = 0.08;
+constexpr double kDepthAcceptancePrior = 0.6;
+constexpr std::uint64_t kDepthAcceptanceBootstrapTrials = 16;
 constexpr double kDepthTimeTauMs = 400.0;
 constexpr double kDepthProbePeriodMs = 1000.0;
 constexpr double kDepthExplorePeriodMs = 5000.0;
@@ -176,7 +178,14 @@ constexpr double kDepthSpikeDamp = 0.25;
 constexpr double kDepthMarginalMs = 7.0;
 constexpr double kDepthHysteresis = 1.03;
 constexpr double kDepthExitMargin = 1.15;
-constexpr int kDepthExitStreak = 16;
+// oMLX can afford a long losing streak because its standard decoder later
+// schedules MTP re-entry probes. The native C++ engine hands the remainder of
+// this request to plain decode with no re-entry path, so lingering for 16
+// cycles consumes most short generations. The full depth warmup has already
+// measured both alternatives; require only three consecutive losing choices.
+constexpr int kDepthExitStreak = 3;
+constexpr int kDepthRealizedWindow = 3;
+constexpr double kDepthRealizedMargin = 1.03;
 
 } // namespace
 
@@ -186,7 +195,9 @@ MlxMtpDepthController::MlxMtpDepthController(
       current_depth_(maximum_depth_),
       acceptance_(
           static_cast<std::size_t>(maximum_depth_),
-          0.6),
+          kDepthAcceptancePrior),
+      acceptance_hits_(static_cast<std::size_t>(maximum_depth_)),
+      acceptance_trials_(static_cast<std::size_t>(maximum_depth_)),
       cycle_ms_(
           static_cast<std::size_t>(maximum_depth_ + 1)),
       cycle_age_ms_(
@@ -209,9 +220,25 @@ void MlxMtpDepthController::observe(
     accepted_drafts = std::clamp(accepted_drafts, 0, used_depth);
     for (int position = 0; position < used_depth; ++position) {
         const double hit = position < accepted_drafts ? 1.0 : 0.0;
-        auto& estimate = acceptance_[static_cast<std::size_t>(position)];
-        estimate = (1.0 - kDepthAcceptanceAlpha) * estimate +
-            kDepthAcceptanceAlpha * hit;
+        const auto index = static_cast<std::size_t>(position);
+        auto& estimate = acceptance_[index];
+        auto& trials = acceptance_trials_.at(index);
+        auto& hits = acceptance_hits_.at(index);
+        ++trials;
+        hits += static_cast<std::uint64_t>(hit);
+        if (trials <= kDepthAcceptanceBootstrapTrials) {
+            // A controller is created for each request. Bootstrap from the
+            // observed conditional rate with one prior sample, then switch to
+            // oMLX's slow EMA once the estimate is established. Applying the
+            // EMA immediately lets one lucky warmup sweep lock a short,
+            // low-acceptance request at an expensive deep width.
+            estimate = (kDepthAcceptancePrior +
+                        static_cast<double>(hits)) /
+                (1.0 + static_cast<double>(trials));
+        } else {
+            estimate = (1.0 - kDepthAcceptanceAlpha) * estimate +
+                kDepthAcceptanceAlpha * hit;
+        }
         if (position >= accepted_drafts) {
             break;
         }
@@ -220,6 +247,12 @@ void MlxMtpDepthController::observe(
     cycle_ms = std::max(0.0, cycle_ms);
     if (time_sample) {
         update_time(used_depth, cycle_ms);
+        if (used_depth > 0) {
+            ++realized_window_cycles_;
+            realized_window_tokens_ +=
+                static_cast<std::uint64_t>(accepted_drafts + 1);
+            realized_window_ms_ += cycle_ms;
+        }
     }
     for (std::size_t depth = 0; depth < cycle_age_ms_.size(); ++depth) {
         if (cycle_age_ms_[depth]) {
@@ -231,6 +264,24 @@ void MlxMtpDepthController::observe(
     }
     milliseconds_since_probe_ += cycle_ms;
     milliseconds_since_explore_ += cycle_ms;
+
+    const auto resolve_realized_window = [&] {
+        if (realized_window_cycles_ < kDepthRealizedWindow ||
+            !cycle_ms_.front() || realized_window_ms_ <= 0.0) {
+            return;
+        }
+        const double measured_tokens_per_ms =
+            static_cast<double>(realized_window_tokens_) /
+            realized_window_ms_;
+        const double baseline_tokens_per_ms =
+            1.0 / std::max(1.0e-6, *cycle_ms_.front());
+        realized_speculation_losing_ =
+            measured_tokens_per_ms <
+                baseline_tokens_per_ms * kDepthRealizedMargin;
+        realized_window_cycles_ = 0;
+        realized_window_tokens_ = 0;
+        realized_window_ms_ = 0.0;
+    };
 
     if (speculation_losing()) {
         ++exit_streak_;
@@ -244,10 +295,16 @@ void MlxMtpDepthController::observe(
             current_depth_ = warmup_.front();
             return;
         }
+        // The descending sweep plus three plain cycles has measured actual
+        // request-local throughput. A clear loss should hand off immediately
+        // instead of spending the rest of a short response exploring depths.
+        resolve_realized_window();
         current_depth_ = best_depth();
         milliseconds_since_probe_ = 0.0;
         return;
     }
+
+    resolve_realized_window();
 
     if (probe_left_ > 0) {
         --probe_left_;
@@ -284,7 +341,8 @@ void MlxMtpDepthController::observe(
 }
 
 bool MlxMtpDepthController::should_exit() const noexcept {
-    return exit_streak_ >= kDepthExitStreak;
+    return realized_speculation_losing_ ||
+        exit_streak_ >= kDepthExitStreak;
 }
 
 double MlxMtpDepthController::conditional_acceptance(

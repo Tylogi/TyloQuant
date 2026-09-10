@@ -214,6 +214,9 @@ int main() {
                 "mtp.0.main_proj.weight",
                 "mtp.0.norm.weight",
                 "mtp.0.markov_head.markov_w1.weight",
+                "mtp.2.norm.weight",
+                "layers.0.ffn.gate.bias_vl",
+                "mtp.0.ffn.gate.bias_vl",
             });
         require(
             deepseek_aliases.canonical_to_stored.at(
@@ -230,7 +233,16 @@ int main() {
                 "mtp.0.norm.weight" &&
             deepseek_aliases.canonical_to_stored.at(
                 "predictor.stage.0.markov.input.weight") ==
-                "mtp.0.markov_head.markov_w1.weight",
+                "mtp.0.markov_head.markov_w1.weight" &&
+            deepseek_aliases.canonical_to_stored.at(
+                "predictor.stage.2.output_norm.weight") ==
+                "mtp.2.norm.weight" &&
+            deepseek_aliases.canonical_to_stored.at(
+                "model.block.0.mlp.router.vision_bias") ==
+                "layers.0.ffn.gate.bias_vl" &&
+            deepseek_aliases.canonical_to_stored.at(
+                "predictor.stage.0.mlp.router.vision_bias") ==
+                "mtp.0.ffn.gate.bias_vl",
             "legacy DeepSeek-V4 aliases were not canonicalized");
 
         const auto gemma_aliases = mfq::make_legacy_tensor_aliases(
