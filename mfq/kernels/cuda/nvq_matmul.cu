@@ -5525,17 +5525,30 @@ mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_ws_cuda(
 }
 
 // Route-compacted online-dequant FP16 Tensor Core path for mixed NVQ pools.
-// Each task reuses one 64-row weight tile across 16, 32, or 64 routed rows.
+// Each task reuses one 64/128-row weight tile across 16, 32, or 64 routed rows.
 // Keep the format switch outside the inner K loop so one launch can serve
 // every NVQ cohort without a runtime branch per decoded value.
-constexpr int kNvqMoeF16TileN = 64;
+constexpr int kNvqMoeF16PoolTileN = 64;
+constexpr int kNvqMoeF16HeteroTileN = 128;
 constexpr int kNvqMoeF16GroupsPerChunk = 4;
 constexpr int kNvqMoeF16TileK =
     kGroupSize * kNvqMoeF16GroupsPerChunk;
 constexpr int kNvqMoeF16StrideK = kNvqMoeF16TileK + 8;
-constexpr int kNvqMoeF16Fragments = kNvqMoeF16TileN / 16;
 
-template <int FORMAT, int BM>
+template <int BM, int BN>
+struct __align__(16) NvqMoeF16SharedStorage {
+    static constexpr int kOperandBytes =
+        (BN + BM) * kNvqMoeF16StrideK * sizeof(__half);
+    static constexpr int kOutputBytes =
+        (BN / 16) * BM * 16 * sizeof(float);
+    static constexpr int kBytes =
+        kOperandBytes > kOutputBytes ? kOperandBytes : kOutputBytes;
+    uint8_t bytes[kBytes];
+};
+
+static_assert(sizeof(NvqMoeF16SharedStorage<64, 128>) <= 48 * 1024);
+
+template <int FORMAT, int BM, int BN>
 __device__ __forceinline__ void nvq_moe_grouped_f16_task(
     const uint8_t * indices,
     int64_t indices_nbytes,
@@ -5574,7 +5587,9 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
     using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
 
     static_assert(BM == 16 || BM == 32 || BM == 64);
+    static_assert(BN == 64 || BN == 128);
     constexpr int kMFragments = BM / 16;
+    constexpr int kNFragments = BN / 16;
     FragmentC accumulators[kMFragments];
 #pragma unroll
     for (int m_fragment = 0; m_fragment < kMFragments; ++m_fragment) {
@@ -5584,11 +5599,18 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
         (ng + kNvqMoeF16GroupsPerChunk - 1) /
         kNvqMoeF16GroupsPerChunk;
     for (int chunk = 0; chunk < chunks; ++chunk) {
-            const int group_base = chunk * kNvqMoeF16GroupsPerChunk;
-            const int k_base = group_base * kGroupSize;
-            const int row_local = tid / kNvqMoeF16GroupsPerChunk;
-            const int group_local =
-                tid - row_local * kNvqMoeF16GroupsPerChunk;
+        const int group_base = chunk * kNvqMoeF16GroupsPerChunk;
+        const int k_base = group_base * kGroupSize;
+        constexpr int kWeightStates =
+            BN * kNvqMoeF16GroupsPerChunk;
+#pragma unroll
+        for (int weight_index = tid;
+             weight_index < kWeightStates;
+             weight_index += 256) {
+            const int row_local =
+                weight_index / kNvqMoeF16GroupsPerChunk;
+            const int group_local = weight_index -
+                row_local * kNvqMoeF16GroupsPerChunk;
             const int local_row = n0 + row_local;
             const int row = local_expert * out_per_expert + local_row;
             const int group = group_base + group_local;
@@ -5609,8 +5631,8 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             for (int quartet = 0; quartet < kChunksPerGroup; ++quartet) {
                 const int packed = valid_weight
                     ? decode_chunk4<FORMAT>(
-                          indices, indices_nbytes, aux, aux_nbytes, codebook,
-                          row, group, quartet, nvec, nsign, ng,
+                          indices, indices_nbytes, aux, aux_nbytes,
+                          codebook, row, group, quartet, nvec, nsign, ng,
                           sign_mode, state)
                     : 0;
 #pragma unroll
@@ -5619,74 +5641,79 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                     const int value0 = static_cast<int>(
                         static_cast<int8_t>((packed >> shift) & 0xff));
                     const int value1 = static_cast<int>(
-                        static_cast<int8_t>((packed >> (shift + 8)) & 0xff));
+                        static_cast<int8_t>(
+                            (packed >> (shift + 8)) & 0xff));
                     *reinterpret_cast<__half2 *>(
                         weight_tile + row_local * kNvqMoeF16StrideK +
-                            group_local * kGroupSize + quartet * 4 + pair * 2) =
+                            group_local * kGroupSize +
+                            quartet * 4 + pair * 2) =
                         __halves2half2(
-                            __float2half(scale * static_cast<float>(value0)),
-                            __float2half(scale * static_cast<float>(value1)));
+                            __float2half(
+                                scale * static_cast<float>(value0)),
+                            __float2half(
+                                scale * static_cast<float>(value1)));
                 }
             }
+        }
 
-            constexpr int kActivationPairs =
-                BM * (kNvqMoeF16TileK / 2);
-            for (int index = tid; index < kActivationPairs; index += 256) {
-                const int m_local = index / (kNvqMoeF16TileK / 2);
-                const int k_pair =
-                    index - m_local * (kNvqMoeF16TileK / 2);
-                const int compact = first + m_local;
-                const int k = k_base + k_pair * 2;
-                __half2 values = __float2half2_rn(0.0f);
-                if (compact < last) {
-                    const int pair_index = ids_dst[compact];
-                    const int source_row = routed_input
-                        ? pair_index : pair_index / routes;
-                    if (k + 1 < K) {
-                        values = *reinterpret_cast<const __half2 *>(
-                            x + static_cast<int64_t>(source_row) * K + k);
-                    } else if (k < K) {
-                        values = __halves2half2(
-                            x[static_cast<int64_t>(source_row) * K + k],
-                            __float2half(0.0f));
-                    }
+        constexpr int kActivationPairs =
+            BM * (kNvqMoeF16TileK / 2);
+        for (int index = tid; index < kActivationPairs; index += 256) {
+            const int m_local = index / (kNvqMoeF16TileK / 2);
+            const int k_pair =
+                index - m_local * (kNvqMoeF16TileK / 2);
+            const int compact = first + m_local;
+            const int k = k_base + k_pair * 2;
+            __half2 values = __float2half2_rn(0.0f);
+            if (compact < last) {
+                const int pair_index = ids_dst[compact];
+                const int source_row = routed_input
+                    ? pair_index : pair_index / routes;
+                if (k + 1 < K) {
+                    values = *reinterpret_cast<const __half2 *>(
+                        x + static_cast<int64_t>(source_row) * K + k);
+                } else if (k < K) {
+                    values = __halves2half2(
+                        x[static_cast<int64_t>(source_row) * K + k],
+                        __float2half(0.0f));
                 }
-                *reinterpret_cast<__half2 *>(
-                    activation_tile + m_local * kNvqMoeF16StrideK +
-                        k_pair * 2) = values;
             }
-            __syncthreads();
+            *reinterpret_cast<__half2 *>(
+                activation_tile + m_local * kNvqMoeF16StrideK +
+                    k_pair * 2) = values;
+        }
+        __syncthreads();
 
-            if (warp < kNvqMoeF16Fragments) {
+        if (warp < kNFragments) {
 #pragma unroll
-                for (int k_local = 0;
-                     k_local < kNvqMoeF16TileK;
-                     k_local += 16) {
-                    FragmentB weight_fragment;
+            for (int k_local = 0;
+                 k_local < kNvqMoeF16TileK;
+                 k_local += 16) {
+                FragmentB weight_fragment;
+                wmma::load_matrix_sync(
+                    weight_fragment,
+                    weight_tile + warp * 16 * kNvqMoeF16StrideK + k_local,
+                    kNvqMoeF16StrideK);
+#pragma unroll
+                for (int m_fragment = 0;
+                     m_fragment < kMFragments;
+                     ++m_fragment) {
+                    FragmentA activation_fragment;
                     wmma::load_matrix_sync(
-                        weight_fragment,
-                        weight_tile + warp * 16 * kNvqMoeF16StrideK + k_local,
+                        activation_fragment,
+                        activation_tile +
+                            m_fragment * 16 * kNvqMoeF16StrideK + k_local,
                         kNvqMoeF16StrideK);
-#pragma unroll
-                    for (int m_fragment = 0;
-                         m_fragment < kMFragments;
-                         ++m_fragment) {
-                        FragmentA activation_fragment;
-                        wmma::load_matrix_sync(
-                            activation_fragment,
-                            activation_tile +
-                                m_fragment * 16 * kNvqMoeF16StrideK + k_local,
-                            kNvqMoeF16StrideK);
-                        wmma::mma_sync(
-                            accumulators[m_fragment], activation_fragment,
-                            weight_fragment, accumulators[m_fragment]);
-                    }
+                    wmma::mma_sync(
+                        accumulators[m_fragment], activation_fragment,
+                        weight_fragment, accumulators[m_fragment]);
                 }
             }
-            __syncthreads();
+        }
+        __syncthreads();
     }
 
-    if (warp < kNvqMoeF16Fragments) {
+    if (warp < kNFragments) {
 #pragma unroll
         for (int m_fragment = 0;
              m_fragment < kMFragments;
@@ -5699,21 +5726,21 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
         }
     }
     __syncthreads();
-    if (warp < kNvqMoeF16Fragments) {
-            for (int element = lane; element < BM * 16; element += 32) {
-                const int m_local = element / 16;
-                const int n_local = element - m_local * 16;
-                const int compact = first + m_local;
-                const int local_row = n0 + warp * 16 + n_local;
-                if (compact < last && local_row < out_per_expert) {
-                    const int pair_index = ids_dst[compact];
-                    output[static_cast<int64_t>(pair_index) * out_per_expert +
-                           local_row] =
-                        __float2half(
-                            output_tile[
-                                (warp * BM + m_local) * 16 + n_local]);
-                }
+    if (warp < kNFragments) {
+        for (int element = lane; element < BM * 16; element += 32) {
+            const int m_local = element / 16;
+            const int n_local = element - m_local * 16;
+            const int compact = first + m_local;
+            const int local_row = n0 + warp * 16 + n_local;
+            if (compact < last && local_row < out_per_expert) {
+                const int pair_index = ids_dst[compact];
+                output[static_cast<int64_t>(pair_index) * out_per_expert +
+                       local_row] =
+                    __float2half(
+                        output_tile[
+                            (warp * BM + m_local) * 16 + n_local]);
             }
+        }
     }
     __syncthreads();
 }
@@ -5747,13 +5774,13 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
     int sign_mode,
     int max_tiles,
     bool routed_input) {
-    __shared__ __half
-        weight_tile[kNvqMoeF16TileN][kNvqMoeF16StrideK];
-    __shared__ __half
-        activation_tile[BM][kNvqMoeF16StrideK];
-    __shared__ float output_tile[kNvqMoeF16Fragments][BM][16];
+    constexpr int BN = kNvqMoeF16PoolTileN;
+    __shared__ NvqMoeF16SharedStorage<BM, BN> shared;
+    auto * weight_tile = reinterpret_cast<__half *>(shared.bytes);
+    auto * activation_tile = weight_tile + BN * kNvqMoeF16StrideK;
+    auto * output_tile = reinterpret_cast<float *>(shared.bytes);
     const int ntiles_n =
-        (out_per_expert + kNvqMoeF16TileN - 1) / kNvqMoeF16TileN;
+        (out_per_expert + BN - 1) / BN;
     const int64_t max_tasks =
         static_cast<int64_t>(max_tiles) * ntiles_n;
     for (int64_t task = blockIdx.x; task < max_tasks; task += gridDim.x) {
@@ -5770,14 +5797,14 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
         const int first = expert_bounds[expert] + local_fine_tile * 8;
         const int last = min(
             first + BM, expert_bounds[expert + 1]);
-        nvq_moe_grouped_f16_task<FORMAT, BM>(
+        nvq_moe_grouped_f16_task<FORMAT, BM, BN>(
             indices, indices_nbytes, aux, aux_nbytes,
             sub_scale, sub_scale_nbytes, neuron_scale, codebook,
-            x, ids_dst, output, &weight_tile[0][0],
-            &activation_tile[0][0], &output_tile[0][0][0], routes,
+            x, ids_dst, output, weight_tile,
+            activation_tile, output_tile, routes,
             out_per_expert, K, ng, nvec, nsign, sub_bits, sign_mode,
             routed_input, local_expert, first, last,
-            ntile * kNvqMoeF16TileN);
+            ntile * BN);
     }
 }
 
@@ -5802,13 +5829,13 @@ nvq_moe_grouped_hetero_f16_kernel(
     int K,
     int max_tiles,
     bool routed_input) {
-    __shared__ __half
-        weight_tile[kNvqMoeF16TileN][kNvqMoeF16StrideK];
-    __shared__ __half
-        activation_tile[BM][kNvqMoeF16StrideK];
-    __shared__ float output_tile[kNvqMoeF16Fragments][BM][16];
+    constexpr int BN = kNvqMoeF16HeteroTileN;
+    __shared__ NvqMoeF16SharedStorage<BM, BN> shared;
+    auto * weight_tile = reinterpret_cast<__half *>(shared.bytes);
+    auto * activation_tile = weight_tile + BN * kNvqMoeF16StrideK;
+    auto * output_tile = reinterpret_cast<float *>(shared.bytes);
     const int ntiles_n =
-        (out_per_expert + kNvqMoeF16TileN - 1) / kNvqMoeF16TileN;
+        (out_per_expert + BN - 1) / BN;
     const int64_t max_tasks =
         static_cast<int64_t>(max_tiles) * ntiles_n;
     for (int64_t task = blockIdx.x; task < max_tasks; task += gridDim.x) {
@@ -5855,13 +5882,13 @@ nvq_moe_grouped_hetero_f16_kernel(
 
 #define NVQ_MOE_HETERO_F16_CASE(FORMAT_VALUE)                                  \
         case FORMAT_VALUE:                                                      \
-            nvq_moe_grouped_f16_task<FORMAT_VALUE, BM>(                         \
+            nvq_moe_grouped_f16_task<FORMAT_VALUE, BM, BN>(                     \
                 indices, sizes[0], aux, sizes[1], sub_scale, sizes[2],          \
                 neuron_scale, codebook, x, ids_dst, output,                     \
-                &weight_tile[0][0], &activation_tile[0][0],                     \
-                &output_tile[0][0][0], routes, out_per_expert, K, ng, nvec,     \
+                weight_tile, activation_tile, output_tile, routes,              \
+                out_per_expert, K, ng, nvec,                                    \
                 nsign, sub_bits, sign_mode, routed_input, local_expert, first,  \
-                last, ntile * kNvqMoeF16TileN);                                 \
+                last, ntile * BN);                                              \
             break
         switch (format) {
             NVQ_MOE_HETERO_F16_CASE(kNvq1L);
@@ -6239,8 +6266,8 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     const int max_tiles =
         (pairs + tile_m - 1) / tile_m + static_cast<int>(n_experts);
     const int ntiles_n =
-        (static_cast<int>(out_per_expert) + kNvqMoeF16TileN - 1) /
-        kNvqMoeF16TileN;
+        (static_cast<int>(out_per_expert) + kNvqMoeF16HeteroTileN - 1) /
+        kNvqMoeF16HeteroTileN;
     const int block_cap = pairs >= 32768 ? 8192 : 4096;
     const int blocks = static_cast<int>(std::max<int64_t>(
         1, std::min<int64_t>(
