@@ -23,6 +23,7 @@
 #include "moe_cache_transfer.h"
 #include "moe_cache_policy.h"
 #include "moe_cache_profile.h"
+#include "nintm_expert_store.h"
 #include "tensor_parallel.h"
 #include "nvq_codebooks.generated.h"
 #include "nlohmann/json.hpp"
@@ -7657,16 +7658,56 @@ static NintMoeCpu load_nint_moe_cpu(
     return cpu;
 }
 
+static std::shared_ptr<MixedMoeRuntime> make_mxfp4_range_runtime(
+        const mfq::cuda::NintMxfp4ExpertStore & store) {
+    auto runtime = std::make_shared<MixedMoeRuntime>();
+    runtime->n_experts = store.num_experts();
+    runtime->out_per_expert = store.out_per_expert();
+    runtime->neuron_len = store.neuron_len();
+    MixedMoePool pool;
+    pool.family = MixedMoeFamily::Mxfp4;
+    pool.local_experts = store.num_experts();
+    pool.mxfp4.out =
+        static_cast<int64_t>(store.num_experts()) * store.out_per_expert();
+    pool.mxfp4.neuron_len = store.neuron_len();
+    std::vector<int32_t> local(static_cast<size_t>(store.num_experts()));
+    std::iota(local.begin(), local.end(), int32_t{0});
+    pool.expert_local = mfq_tensor_backend::from_blob(
+        local.data(),
+        {static_cast<int64_t>(local.size())},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone();
+    runtime->pools.push_back(std::move(pool));
+    return runtime;
+}
+
 struct MoeCacheTransfer {
     const uint8_t * source = nullptr;
     uint8_t * destination = nullptr;
     int64_t nbytes = 0;
     bool packed_weight = false;
     const uint8_t * mapped_source = nullptr;
+    const mfq::cuda::NintMxfp4ExpertStore * range_store = nullptr;
+    const mfq::cuda::NintMxfp4ExpertPart * range_part = nullptr;
+};
+
+struct MoeCacheNewLease {
+    mfq::MoeCacheSlotBook * book = nullptr;
+    mfq::MoeCacheKey key;
+    int slot = -1;
+    uint64_t generation = 0;
 };
 
 struct MoeCachedCohort;
 class MoeCachedSource;
+
+struct MoeCacheFieldLayout {
+    mfq_tensor_backend::ScalarType scalar_type =
+        mfq_tensor_backend::kUInt8;
+    std::vector<int64_t> slot_shape;
+    int64_t elements = 0;
+    int64_t element_size = 0;
+};
 
 static int64_t tensor_nbytes(const mfq_tensor_backend::Tensor & value) {
     return value.defined()
@@ -7717,6 +7758,31 @@ static std::vector<mfq_tensor_backend::Tensor> moe_cache_fields(
         fields.push_back(pool.nepq.residual_second);
     }
     return fields;
+}
+
+static std::vector<MoeCacheFieldLayout> moe_cache_field_layouts(
+        const MixedMoePool & pool) {
+    const auto fields = moe_cache_fields(pool);
+    std::vector<MoeCacheFieldLayout> result;
+    result.reserve(fields.size());
+    for (const auto & field : fields) {
+        if (!field.defined() || !field.is_cpu() || !field.is_contiguous() ||
+                field.dim() < 1 || pool.local_experts <= 0 ||
+                field.size(0) % pool.local_experts != 0 ||
+                field.numel() % pool.local_experts != 0) {
+            throw std::runtime_error(
+                "MoE cache source fields must be contiguous, expert-major CPU tensors");
+        }
+        auto shape = field.sizes().vec();
+        shape[0] /= pool.local_experts;
+        result.push_back({
+            field.scalar_type(),
+            std::move(shape),
+            field.numel() / pool.local_experts,
+            static_cast<int64_t>(field.element_size()),
+        });
+    }
+    return result;
 }
 
 static void validate_nepq_expert_boundaries(
@@ -7816,7 +7882,8 @@ static void validate_tpq_expert_boundaries(
 static std::string moe_cache_signature(
         const MixedMoePool & pool,
         int out_per_expert,
-        int neuron_len) {
+        int neuron_len,
+        const std::vector<MoeCacheFieldLayout> & layouts) {
     std::ostringstream stream;
     stream << static_cast<int>(pool.family)
            << ":o" << out_per_expert
@@ -7851,18 +7918,9 @@ static std::string moe_cache_signature(
                    << ":v" << pool.nepq.residual_block_vectors;
         }
     }
-    const auto fields = moe_cache_fields(pool);
-    for (const auto & field : fields) {
-        if (!field.defined() || !field.is_cpu() || !field.is_contiguous()) {
-            throw std::runtime_error(
-                "MoE cache source fields must be contiguous CPU tensors");
-        }
-        if (field.numel() % pool.local_experts != 0) {
-            throw std::runtime_error(
-                "MoE cache source field cannot be split by expert");
-        }
-        stream << ":" << static_cast<int>(field.scalar_type())
-               << "x" << field.numel() / pool.local_experts;
+    for (const auto & layout : layouts) {
+        stream << ":" << static_cast<int>(layout.scalar_type)
+               << "x" << layout.elements;
     }
     return stream.str();
 }
@@ -7872,10 +7930,8 @@ struct MoeGpuArena {
     int64_t slot_bytes = 0;
     int minimum_slots = 0;
     int registered_experts = 0;
-    int prototype_experts = 0;
     int slots = 0;
-    std::vector<mfq_tensor_backend::Tensor> prototypes;
-    std::vector<int64_t> elements_per_expert;
+    std::vector<MoeCacheFieldLayout> layouts;
     std::vector<mfq_tensor_backend::Tensor> fields;
     std::unique_ptr<mfq::MoeCacheSlotBook> book;
 };
@@ -7902,6 +7958,9 @@ struct MoeCacheStats {
     int64_t mapped_gather_bytes = 0;
     int64_t mapped_gather_submissions = 0;
     int64_t mapped_gather_descriptors = 0;
+    int64_t range_read_bytes = 0;
+    int64_t range_read_calls = 0;
+    int64_t range_read_nanoseconds = 0;
 };
 
 class MoeExpertCache : public std::enable_shared_from_this<MoeExpertCache> {
@@ -7938,6 +7997,15 @@ public:
             mapped_copy_blocks_ = std::max(
                 4, std::min(128, std::atoi(blocks)));
         }
+        int range_workers = 8;
+        const char * workers =
+            std::getenv("MFQ_MOE_SSD_IO_WORKERS");
+        if (workers != nullptr) {
+            range_workers = std::max(
+                1, std::min(64, std::atoi(workers)));
+        }
+        range_read_pool_ =
+            std::make_unique<mfq::cuda::NintMxfp4ReadPool>(range_workers);
     }
 
     ~MoeExpertCache() {
@@ -7976,6 +8044,14 @@ public:
         int layer_id,
         std::string projection_role);
 
+    std::shared_ptr<MoeCachedSource> register_range_source(
+        const std::string & name,
+        std::shared_ptr<MixedMoeRuntime> metadata,
+        std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> store,
+        int minimum_slots,
+        int layer_id,
+        std::string projection_role);
+
     MoeGpuArena * register_cohort(
             const MixedMoePool & pool,
             int out_per_expert,
@@ -7989,25 +8065,48 @@ public:
             pool, out_per_expert, neuron_len);
         validate_tpq_expert_boundaries(
             pool, out_per_expert, neuron_len);
+        return register_cohort_layout(
+            pool,
+            out_per_expert,
+            neuron_len,
+            minimum_slots,
+            pool.local_experts,
+            moe_cache_field_layouts(pool));
+    }
+
+    MoeGpuArena * register_cohort_layout(
+            const MixedMoePool & pool,
+            int out_per_expert,
+            int neuron_len,
+            int minimum_slots,
+            int registered_experts,
+            std::vector<MoeCacheFieldLayout> layouts) {
+        if (finalized_) {
+            throw std::runtime_error(
+                "cannot register a MoE source after cache finalization");
+        }
+        if (registered_experts <= 0 || layouts.empty()) {
+            throw std::runtime_error("invalid MoE cache cohort layout");
+        }
         const std::string signature =
-            moe_cache_signature(pool, out_per_expert, neuron_len);
-        const auto fields = moe_cache_fields(pool);
+            moe_cache_signature(pool, out_per_expert, neuron_len, layouts);
         auto found = arenas_.find(signature);
         if (found == arenas_.end()) {
             auto arena = std::make_unique<MoeGpuArena>();
             arena->signature = signature;
             arena->minimum_slots =
-                std::min(minimum_slots, pool.local_experts);
-            arena->registered_experts = pool.local_experts;
-            arena->prototype_experts = pool.local_experts;
-            for (const auto & field : fields) {
-                const int64_t elements =
-                    field.numel() / pool.local_experts;
-                arena->prototypes.push_back(field);
-                arena->elements_per_expert.push_back(elements);
+                std::min(minimum_slots, registered_experts);
+            arena->registered_experts = registered_experts;
+            for (const auto & layout : layouts) {
+                if (layout.slot_shape.empty() || layout.elements < 0 ||
+                        layout.element_size <= 0) {
+                    throw std::runtime_error(
+                        "invalid MoE cache field layout");
+                }
                 arena->slot_bytes +=
-                    elements * static_cast<int64_t>(field.element_size());
+                    layout.elements * layout.element_size;
             }
+            arena->layouts = std::move(layouts);
             MoeGpuArena * result = arena.get();
             arenas_.emplace(signature, std::move(arena));
             return result;
@@ -8015,11 +8114,22 @@ public:
         MoeGpuArena * arena = found->second.get();
         arena->minimum_slots = std::max(
             arena->minimum_slots,
-            std::min(minimum_slots, pool.local_experts));
-        arena->registered_experts += pool.local_experts;
-        if (arena->prototypes.size() != fields.size()) {
+            std::min(minimum_slots, registered_experts));
+        arena->registered_experts += registered_experts;
+        if (arena->layouts.size() != layouts.size()) {
             throw std::runtime_error(
                 "MoE cache signature merged incompatible field counts");
+        }
+        for (size_t index = 0; index < layouts.size(); ++index) {
+            const auto & left = arena->layouts[index];
+            const auto & right = layouts[index];
+            if (left.scalar_type != right.scalar_type ||
+                    left.slot_shape != right.slot_shape ||
+                    left.elements != right.elements ||
+                    left.element_size != right.element_size) {
+                throw std::runtime_error(
+                    "MoE cache signature merged incompatible field layouts");
+            }
         }
         return arena;
     }
@@ -8249,6 +8359,15 @@ public:
                << stats_.mapped_gather_submissions
                << " mapped_gather_descriptors="
                << stats_.mapped_gather_descriptors
+               << " range_read_bytes="
+               << stats_.range_read_bytes
+               << " range_read_calls="
+               << stats_.range_read_calls
+               << " range_io_workers="
+               << range_read_pool_->workers()
+               << " range_read_ms="
+               << static_cast<double>(stats_.range_read_nanoseconds) /
+                    1.0e6
                << "\n";
     }
 
@@ -8261,7 +8380,13 @@ private:
         bool prefetch,
         std::vector<MoeCacheTransfer> & transfers,
         bool & replaced_occupied,
-        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots);
+        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots,
+        std::vector<MoeCacheNewLease> * new_leases);
+
+    void rollback_preparation(
+        const std::vector<MoeCacheNewLease> & new_leases,
+        const std::vector<
+            std::pair<mfq::MoeCacheSlotBook *, int>> & held_slots) noexcept;
 
     MoePinnedStage & acquire_stage(
             int64_t required_bytes,
@@ -8333,15 +8458,52 @@ private:
             const std::vector<MoeCacheTransfer> & transfers,
             bool waits_for_compute,
             bool wait_on_compute_stream) {
+        std::vector<mfq::cuda::NintMxfp4ReadRequest> range_requests;
+        auto materialize_source = [&range_requests](
+                const MoeCacheTransfer & transfer,
+                uint8_t * destination) {
+            if (transfer.range_store != nullptr) {
+                range_requests.push_back({
+                    transfer.range_store,
+                    transfer.range_part,
+                    std::span<uint8_t>(
+                        destination,
+                        static_cast<size_t>(transfer.nbytes)),
+                });
+            } else {
+                std::memcpy(
+                    destination,
+                    transfer.source,
+                    static_cast<size_t>(transfer.nbytes));
+            }
+        };
+        auto finish_range_reads = [this, &range_requests]() {
+            if (range_requests.empty()) return;
+            const auto range_stats = range_read_pool_->read(range_requests);
+            stats_.range_read_bytes += static_cast<int64_t>(range_stats.bytes);
+            stats_.range_read_calls += static_cast<int64_t>(range_stats.calls);
+            stats_.range_read_nanoseconds +=
+                static_cast<int64_t>(range_stats.wall_nanoseconds);
+            range_requests.clear();
+        };
         int64_t staged_payload_bytes = 0;
         int transfer_count = 0;
         int staged_count = 0;
         int mapped_count = 0;
         for (const auto & transfer : transfers) {
+            const bool range_source =
+                transfer.range_store != nullptr &&
+                transfer.range_part != nullptr;
             if (transfer.nbytes < 0 ||
                 (transfer.nbytes > 0 &&
-                 (transfer.source == nullptr ||
-                  transfer.destination == nullptr))) {
+                 ((!range_source && transfer.source == nullptr) ||
+                  transfer.destination == nullptr)) ||
+                ((transfer.range_store == nullptr) !=
+                 (transfer.range_part == nullptr)) ||
+                (range_source &&
+                 (transfer.mapped_source != nullptr ||
+                  transfer.range_part->nbytes !=
+                    static_cast<uint64_t>(transfer.nbytes)))) {
                 throw std::runtime_error(
                     "invalid MoE cache transfer");
             }
@@ -8382,10 +8544,14 @@ private:
             for (const auto & transfer : transfers) {
                 if (transfer.nbytes == 0) continue;
                 offset = (offset + 15) & ~int64_t{15};
-                std::memcpy(
-                    staging + offset,
-                    transfer.source,
-                    static_cast<size_t>(transfer.nbytes));
+                materialize_source(transfer, staging + offset);
+                offset += transfer.nbytes;
+            }
+            finish_range_reads();
+            offset = 0;
+            for (const auto & transfer : transfers) {
+                if (transfer.nbytes == 0) continue;
+                offset = (offset + 15) & ~int64_t{15};
                 MFQ_CUDA_CHECK(cudaMemcpyAsync(
                     transfer.destination,
                     staging + offset,
@@ -8463,10 +8629,7 @@ private:
                 stats_.mapped_gather_bytes += transfer.nbytes;
             } else {
                 offset = (offset + 15) & ~int64_t{15};
-                std::memcpy(
-                    staging + offset,
-                    transfer.source,
-                    static_cast<size_t>(transfer.nbytes));
+                materialize_source(transfer, staging + offset);
                 scatter_descriptors[scatter_descriptor++] = {
                     static_cast<uint64_t>(
                         reinterpret_cast<uintptr_t>(
@@ -8480,6 +8643,7 @@ private:
                 stats_.h2d_bytes += transfer.nbytes;
             }
         }
+        finish_range_reads();
         if (scatter_descriptor != staged_count ||
                 mapped_descriptor != mapped_count) {
             throw std::runtime_error(
@@ -8564,6 +8728,7 @@ private:
     int64_t mapped_registered_bytes_ = 0;
     std::vector<RegisteredHostField> registered_host_fields_;
     std::unordered_map<void *, const uint8_t *> mapped_host_lookup_;
+    std::unique_ptr<mfq::cuda::NintMxfp4ReadPool> range_read_pool_;
 };
 
 struct MoeCachedCohort {
@@ -8575,6 +8740,7 @@ struct MoeCachedCohort {
     std::vector<int64_t> bytes_per_expert;
     std::vector<int32_t> expert_to_local;
     std::vector<int32_t> host_map;
+    std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> range_store;
     bool map_dirty = false;
     MixedMoePool active;
 };
@@ -8588,13 +8754,15 @@ public:
             std::shared_ptr<MixedMoeRuntime> cpu,
             int minimum_slots,
             int layer_id,
-            std::string projection_role)
+            std::string projection_role,
+            std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> range_store)
         : cache_(cache),
           id_(id),
           name_(std::move(name)),
           layer_id_(layer_id),
           projection_role_(std::move(projection_role)),
           cpu_(std::move(cpu)),
+          range_store_(std::move(range_store)),
           expert_to_cohort_(
               static_cast<size_t>(cpu_->n_experts), -1),
           expert_to_local_(
@@ -8604,51 +8772,109 @@ public:
                 "MoE cache source minimum slots must be positive");
         }
         cohorts_.reserve(cpu_->pools.size());
-        for (int cohort_index = 0;
-             cohort_index < static_cast<int>(cpu_->pools.size());
-             ++cohort_index) {
-            const auto & pool =
-                cpu_->pools.at(static_cast<size_t>(cohort_index));
+        if (range_store_) {
+            if (cpu_->pools.size() != 1 ||
+                    cpu_->pools.front().family != MixedMoeFamily::Mxfp4 ||
+                    cpu_->n_experts != range_store_->num_experts() ||
+                    cpu_->out_per_expert != range_store_->out_per_expert() ||
+                    cpu_->neuron_len != range_store_->neuron_len() ||
+                    range_store_->values_bytes_per_expert() >
+                        static_cast<uint64_t>(
+                            std::numeric_limits<int64_t>::max()) ||
+                    range_store_->scales_bytes_per_expert() >
+                        static_cast<uint64_t>(
+                            std::numeric_limits<int64_t>::max())) {
+                throw std::runtime_error(
+                    "invalid exact-range MXFP4 cache metadata");
+            }
+            const auto & pool = cpu_->pools.front();
             MoeCachedCohort cohort;
-            cohort.index = cohort_index;
+            cohort.index = 0;
             cohort.cpu = &pool;
-            cohort.arena = cache_->register_cohort(
-                pool, cpu_->out_per_expert, cpu_->neuron_len,
-                minimum_slots);
-            cohort.cpu_fields = moe_cache_fields(pool);
-            cohort.expert_to_local.assign(
-                static_cast<size_t>(cpu_->n_experts), -1);
+            cohort.range_store = range_store_;
+            const int64_t values = static_cast<int64_t>(
+                range_store_->values_bytes_per_expert());
+            const int64_t scales = static_cast<int64_t>(
+                range_store_->scales_bytes_per_expert());
+            cohort.arena = cache_->register_cohort_layout(
+                pool,
+                cpu_->out_per_expert,
+                cpu_->neuron_len,
+                minimum_slots,
+                cpu_->n_experts,
+                {
+                    {
+                        mfq_tensor_backend::kUInt8,
+                        {cpu_->out_per_expert, cpu_->neuron_len / 2},
+                        values,
+                        1,
+                    },
+                    {
+                        mfq_tensor_backend::kUInt8,
+                        {cpu_->out_per_expert, cpu_->neuron_len / 32},
+                        scales,
+                        1,
+                    },
+                });
+            cohort.bytes_per_expert = {values, scales};
+            cohort.mapped_fields = {nullptr, nullptr};
+            cohort.expert_to_local.resize(
+                static_cast<size_t>(cpu_->n_experts));
             cohort.host_map.assign(
                 static_cast<size_t>(cpu_->n_experts), -1);
-            const auto * local =
-                pool.expert_local.data_ptr<int32_t>();
             for (int expert = 0; expert < cpu_->n_experts; ++expert) {
-                const int local_index = local[expert];
-                cohort.expert_to_local[
-                    static_cast<size_t>(expert)] = local_index;
-                if (local_index < 0) continue;
-                if (expert_to_cohort_[
-                        static_cast<size_t>(expert)] >= 0) {
-                    throw std::runtime_error(
-                        "MoE cache source has duplicate expert ownership");
-                }
-                expert_to_cohort_[
-                    static_cast<size_t>(expert)] = cohort_index;
-                expert_to_local_[
-                    static_cast<size_t>(expert)] = local_index;
-            }
-            for (const auto & field : cohort.cpu_fields) {
-                const int64_t nbytes = tensor_nbytes(field);
-                if (nbytes % pool.local_experts != 0) {
-                    throw std::runtime_error(
-                        "MoE cache field byte count is not expert aligned");
-                }
-                cohort.bytes_per_expert.push_back(
-                    nbytes / pool.local_experts);
-                cohort.mapped_fields.push_back(
-                    cache_->register_mapped_field(field));
+                cohort.expert_to_local[static_cast<size_t>(expert)] = expert;
+                expert_to_cohort_[static_cast<size_t>(expert)] = 0;
+                expert_to_local_[static_cast<size_t>(expert)] = expert;
             }
             cohorts_.push_back(std::move(cohort));
+        } else {
+            for (int cohort_index = 0;
+                 cohort_index < static_cast<int>(cpu_->pools.size());
+                 ++cohort_index) {
+                const auto & pool =
+                    cpu_->pools.at(static_cast<size_t>(cohort_index));
+                MoeCachedCohort cohort;
+                cohort.index = cohort_index;
+                cohort.cpu = &pool;
+                cohort.arena = cache_->register_cohort(
+                    pool, cpu_->out_per_expert, cpu_->neuron_len,
+                    minimum_slots);
+                cohort.cpu_fields = moe_cache_fields(pool);
+                cohort.expert_to_local.assign(
+                    static_cast<size_t>(cpu_->n_experts), -1);
+                cohort.host_map.assign(
+                    static_cast<size_t>(cpu_->n_experts), -1);
+                const auto * local =
+                    pool.expert_local.data_ptr<int32_t>();
+                for (int expert = 0; expert < cpu_->n_experts; ++expert) {
+                    const int local_index = local[expert];
+                    cohort.expert_to_local[
+                        static_cast<size_t>(expert)] = local_index;
+                    if (local_index < 0) continue;
+                    if (expert_to_cohort_[
+                            static_cast<size_t>(expert)] >= 0) {
+                        throw std::runtime_error(
+                            "MoE cache source has duplicate expert ownership");
+                    }
+                    expert_to_cohort_[
+                        static_cast<size_t>(expert)] = cohort_index;
+                    expert_to_local_[
+                        static_cast<size_t>(expert)] = local_index;
+                }
+                for (const auto & field : cohort.cpu_fields) {
+                    const int64_t nbytes = tensor_nbytes(field);
+                    if (nbytes % pool.local_experts != 0) {
+                        throw std::runtime_error(
+                            "MoE cache field byte count is not expert aligned");
+                    }
+                    cohort.bytes_per_expert.push_back(
+                        nbytes / pool.local_experts);
+                    cohort.mapped_fields.push_back(
+                        cache_->register_mapped_field(field));
+                }
+                cohorts_.push_back(std::move(cohort));
+            }
         }
         if (std::any_of(
                 expert_to_cohort_.begin(),
@@ -8727,6 +8953,14 @@ public:
 
     int64_t host_bytes() const {
         return mixed_moe_storage_bytes(*cpu_);
+    }
+
+    int64_t logical_weight_bytes() const {
+        if (!range_store_) return host_bytes();
+        return range_store_->record().nbytes >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+            ? std::numeric_limits<int64_t>::max()
+            : static_cast<int64_t>(range_store_->record().nbytes);
     }
 
     void finalize() {
@@ -8900,7 +9134,7 @@ public:
     }
 
     bool use_full_projection(const MoeRoutePlan & route) const {
-        return route.ids.size(0) > 8;
+        return !range_store_ && route.ids.size(0) > 8;
     }
 
     mfq_tensor_backend::Tensor forward(
@@ -8908,17 +9142,13 @@ public:
             const MoeRoutePlan & route) {
         if (use_full_projection(route)) {
             cache_->count_full_projection_fallback();
-            auto staged = pure_nint_candidate_
-                ? stage_cpu_nint_moe(cpu_)
-                : stage_cpu_mixed_moe(cpu_);
+            auto staged = stage_fallback_runtime();
             return staged.forward(x, route);
         }
         if (!cache_->prepare(
                 *this, route_experts(route), false)) {
             cache_->count_full_projection_fallback();
-            auto staged = pure_nint_candidate_
-                ? stage_cpu_nint_moe(cpu_)
-                : stage_cpu_mixed_moe(cpu_);
+            auto staged = stage_fallback_runtime();
             return staged.forward(x, route);
         }
         mfq_tensor_backend::Tensor output;
@@ -8942,9 +9172,7 @@ public:
         if (!cache_->prepare(
                 *this, route_experts(route), false)) {
             cache_->count_full_projection_fallback();
-            auto staged = pure_nint_candidate_
-                ? stage_cpu_nint_moe(cpu_)
-                : stage_cpu_mixed_moe(cpu_);
+            auto staged = stage_fallback_runtime();
             return staged.forward(x, route);
         }
         mfq_tensor_backend::Tensor output;
@@ -9064,12 +9292,32 @@ public:
 private:
     friend class MoeExpertCache;
 
+    std::shared_ptr<MixedMoeRuntime> fallback_runtime() {
+        if (!range_store_) return cpu_;
+        std::lock_guard<std::mutex> guard(fallback_mutex_);
+        if (!fallback_cpu_) {
+            fallback_cpu_ = make_mixed_moe_runtime(
+                unpack_nint_moe(range_store_->read_blob()), false);
+        }
+        return fallback_cpu_;
+    }
+
+    NintMoeWeight stage_fallback_runtime() {
+        auto runtime = fallback_runtime();
+        return pure_nint_candidate_
+            ? stage_cpu_nint_moe(runtime)
+            : stage_cpu_mixed_moe(runtime);
+    }
+
     MoeExpertCache * cache_ = nullptr;
     int id_ = -1;
     std::string name_;
     int layer_id_ = -1;
     std::string projection_role_;
     std::shared_ptr<MixedMoeRuntime> cpu_;
+    std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> range_store_;
+    std::mutex fallback_mutex_;
+    std::shared_ptr<MixedMoeRuntime> fallback_cpu_;
     std::vector<MoeCachedCohort> cohorts_;
     std::vector<int> expert_to_cohort_;
     std::vector<int> expert_to_local_;
@@ -9089,7 +9337,23 @@ std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(
     const int id = static_cast<int>(sources_.size());
     auto source = std::make_shared<MoeCachedSource>(
         this, id, name, std::move(cpu), minimum_slots,
-        layer_id, std::move(projection_role));
+        layer_id, std::move(projection_role), nullptr);
+    host_bytes_ += source->host_bytes();
+    sources_.push_back(source);
+    return source;
+}
+
+std::shared_ptr<MoeCachedSource> MoeExpertCache::register_range_source(
+        const std::string & name,
+        std::shared_ptr<MixedMoeRuntime> metadata,
+        std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> store,
+        int minimum_slots,
+        int layer_id,
+        std::string projection_role) {
+    const int id = static_cast<int>(sources_.size());
+    auto source = std::make_shared<MoeCachedSource>(
+        this, id, name, std::move(metadata), minimum_slots,
+        layer_id, std::move(projection_role), std::move(store));
     host_bytes_ += source->host_bytes();
     sources_.push_back(source);
     return source;
@@ -9304,27 +9568,22 @@ void MoeExpertCache::finalize() {
     for (auto & item : arenas_) {
         auto & arena = *item.second;
         arena.slots = plan.at(arena.signature);
-        arena.fields.reserve(arena.prototypes.size());
+        arena.fields.reserve(arena.layouts.size());
         for (size_t index = 0;
-             index < arena.prototypes.size();
+             index < arena.layouts.size();
              ++index) {
-            const auto & prototype = arena.prototypes[index];
-            if (prototype.dim() < 1 ||
-                    prototype.size(0) %
-                        arena.prototype_experts != 0) {
+            const auto & layout = arena.layouts[index];
+            if (layout.slot_shape.empty()) {
                 throw std::runtime_error(
                     "MoE cache field has no expert-major leading dimension");
             }
-            auto shape = prototype.sizes().vec();
-            shape[0] =
-                prototype.size(0) /
-                arena.prototype_experts *
-                arena.slots;
+            auto shape = layout.slot_shape;
+            shape[0] *= arena.slots;
             arena.fields.push_back(mfq_tensor_backend::empty(
                 shape,
                 mfq_tensor_backend::TensorOptions()
                     .device(mfq_tensor_backend::kCUDA)
-                    .dtype(prototype.scalar_type())));
+                    .dtype(layout.scalar_type)));
         }
         arena.book =
             std::make_unique<mfq::MoeCacheSlotBook>(
@@ -9415,6 +9674,10 @@ void MoeExpertCache::prewarm() {
         std::chrono::duration<double, std::milli>(
             stopped - started).count();
     const int64_t prewarm_h2d_bytes = stats_.h2d_bytes;
+    const int64_t prewarm_range_read_bytes = stats_.range_read_bytes;
+    const int64_t prewarm_range_read_calls = stats_.range_read_calls;
+    const double prewarm_range_read_ms =
+        static_cast<double>(stats_.range_read_nanoseconds) / 1.0e6;
     const int64_t projection_entries =
         stats_.prefetch_misses;
     const int64_t unfilled_bytes =
@@ -9426,6 +9689,9 @@ void MoeExpertCache::prewarm() {
         << " expert_bundles=" << prewarm_selected_.size()
         << " projection_entries=" << projection_entries
         << " h2d_bytes=" << prewarm_h2d_bytes
+        << " range_read_bytes=" << prewarm_range_read_bytes
+        << " range_read_calls=" << prewarm_range_read_calls
+        << " range_read_ms=" << prewarm_range_read_ms
         << " time_ms=" << elapsed_ms
         << " unfilled_bytes=" << unfilled_bytes
         << "\n";
@@ -9450,7 +9716,8 @@ void MoeExpertCache::append_source_transfers(
         bool prefetch,
         std::vector<MoeCacheTransfer> & transfers,
         bool & replaced_occupied,
-        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots) {
+        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots,
+        std::vector<MoeCacheNewLease> * new_leases) {
     for (int expert : experts) {
         const int cohort_index =
             source.expert_to_cohort_.at(
@@ -9477,6 +9744,14 @@ void MoeExpertCache::append_source_transfers(
                 ++stats_.demand_hits;
             }
         } else {
+            if (new_leases != nullptr) {
+                new_leases->push_back({
+                    arena.book.get(),
+                    key,
+                    lease.slot,
+                    lease.generation,
+                });
+            }
             if (prefetch) {
                 ++stats_.prefetch_misses;
             } else {
@@ -9488,15 +9763,31 @@ void MoeExpertCache::append_source_transfers(
                 invalidate(*lease.replaced, lease.slot);
             }
             for (size_t field = 0;
-                 field < cohort.cpu_fields.size();
+                 field < cohort.bytes_per_expert.size();
                  ++field) {
                 const int64_t nbytes =
                     cohort.bytes_per_expert[field];
                 if (nbytes == 0) continue;
-                const auto & cpu_field =
-                    cohort.cpu_fields[field];
                 auto & gpu_field =
                     arena.fields[field];
+                if (cohort.range_store) {
+                    const auto & part =
+                        cohort.range_store->part(expert, field);
+                    transfers.push_back({
+                        nullptr,
+                        reinterpret_cast<uint8_t *>(
+                            gpu_field.data_ptr()) +
+                            static_cast<int64_t>(lease.slot) * nbytes,
+                        nbytes,
+                        true,
+                        nullptr,
+                        cohort.range_store.get(),
+                        &part,
+                    });
+                    continue;
+                }
+                const auto & cpu_field =
+                    cohort.cpu_fields[field];
                 transfers.push_back({
                     reinterpret_cast<const uint8_t *>(
                         cpu_field.data_ptr()) +
@@ -9567,6 +9858,29 @@ void MoeExpertCache::append_source_transfers(
     }
 }
 
+void MoeExpertCache::rollback_preparation(
+        const std::vector<MoeCacheNewLease> & new_leases,
+        const std::vector<
+            std::pair<mfq::MoeCacheSlotBook *, int>> & held_slots) noexcept {
+    (void)cudaStreamSynchronize(weight_stream_);
+    for (auto lease = new_leases.rbegin();
+         lease != new_leases.rend();
+         ++lease) {
+        try {
+            invalidate(lease->key, lease->slot);
+            (void)lease->book->discard(
+                lease->key, lease->slot, lease->generation);
+        } catch (...) {
+        }
+    }
+    for (const auto & held : held_slots) {
+        try {
+            held.first->clear_inflight(held.second);
+        } catch (...) {
+        }
+    }
+}
+
 bool MoeExpertCache::prepare(
         MoeCachedSource & source,
         const std::vector<int32_t> & experts,
@@ -9609,19 +9923,18 @@ bool MoeExpertCache::prepare(
         }
     }
     std::vector<MoeCacheTransfer> transfers;
+    std::vector<MoeCacheNewLease> new_leases;
     bool replaced_occupied = false;
     try {
         append_source_transfers(
             source, experts, prefetch, transfers,
-            replaced_occupied, &held_slots);
+            replaced_occupied, &held_slots, &new_leases);
         submit_transfers(
             transfers,
             replaced_occupied,
             !prefetch);
     } catch (...) {
-        for (const auto & held : held_slots) {
-            held.first->clear_inflight(held.second);
-        }
+        rollback_preparation(new_leases, held_slots);
         throw;
     }
     for (const auto & held : held_slots) {
@@ -9674,19 +9987,18 @@ bool MoeExpertCache::prepare_bundle(
         }
     }
     std::vector<MoeCacheTransfer> transfers;
+    std::vector<MoeCacheNewLease> new_leases;
     bool replaced_occupied = false;
     try {
         for (auto * source : sources) {
             append_source_transfers(
                 *source, experts, true, transfers,
-                replaced_occupied, &held_slots);
+                replaced_occupied, &held_slots, &new_leases);
         }
         submit_transfers(
             transfers, replaced_occupied, false);
     } catch (...) {
-        for (const auto & held : held_slots) {
-            held.first->clear_inflight(held.second);
-        }
+        rollback_preparation(new_leases, held_slots);
         throw;
     }
     for (const auto & held : held_slots) {
@@ -9700,6 +10012,7 @@ static NintMoeWeight wrap_cached_moe_source(
         const std::shared_ptr<MixedMoeRuntime> & cpu) {
     NintMoeWeight result =
         cpu_mixed_moe_metadata(cpu);
+    result.mixed_weight_bytes = source->logical_weight_bytes();
     result.hetero_supported =
         source->supports_nint_hetero();
     result.activation_workspace_domain =
@@ -9771,6 +10084,37 @@ static NintMoeWeight load_nint_moe_gpu(
         bool cacheable,
         int layer_id,
         const std::string & projection_role) {
+    const char * disable_ranges =
+        std::getenv("MFQ_DISABLE_MOE_SSD_RANGES");
+    if (g_moe_expert_cache && cacheable &&
+            !moe_parallel_config().enabled() &&
+            !mfq.has_expert_overlay(name) &&
+            (disable_ranges == nullptr || std::atoi(disable_ranges) == 0)) {
+        const auto & record = mfq.record(name);
+        try {
+            auto store =
+                std::make_shared<mfq::cuda::NintMxfp4ExpertStore>(
+                    mfq::cuda::MfqRecordRange{
+                        name,
+                        record.dtype,
+                        record.source_path,
+                        record.offset,
+                        record.nbytes,
+                    });
+            auto runtime = make_mxfp4_range_runtime(*store);
+            auto source = g_moe_expert_cache->register_range_source(
+                name,
+                runtime,
+                std::move(store),
+                std::min(
+                    g_moe_cache_registration_min_slots,
+                    runtime->n_experts),
+                layer_id,
+                projection_role);
+            return wrap_cached_moe_source(source, runtime);
+        } catch (const mfq::cuda::NintMxfp4Unsupported &) {
+        }
+    }
     auto cpu = load_nint_moe_cpu(mfq, name);
     if (moe_parallel_config().enabled()) {
         auto slices = plan_moe_expert_parallel_slices(

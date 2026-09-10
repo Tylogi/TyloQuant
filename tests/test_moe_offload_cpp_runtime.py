@@ -14,6 +14,7 @@ if not torch.cuda.is_available():
 from mfq.formats import io  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
 from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mx import MxTensor  # noqa: E402
 from mfq.formats.nepq import (  # noqa: E402
     NEPQ0_A,
     NEPQ0_S,
@@ -29,15 +30,14 @@ from tests.test_formats.test_nepq_a import _a_tensor as make_nepq_a  # noqa: E40
 
 
 def _executable() -> Path:
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "build"
-        / "cpp_runtime"
-        / "mfq-decode.exe"
-    )
-    if not path.exists():
-        pytest.skip("C++ runtime is not built")
-    return path
+    root = Path(__file__).resolve().parents[1]
+    for path in (
+        root / "build" / "cpp_runtime" / "mfq-decode.exe",
+        root / "build" / "cuda-local" / "mfq-decode.exe",
+    ):
+        if path.exists():
+            return path
+    pytest.skip("C++ runtime is not built")
 
 
 def _runtime_env(executable: Path) -> dict[str, str]:
@@ -155,6 +155,24 @@ def _container(family: str) -> NintMoeTensor:
     elif family == "NINT8-0":
         tensor = _nint8_zero(
             experts * rows, neuron_len, 20260728
+        )
+    elif family == "MXFP4":
+        rng = np.random.default_rng(20260728)
+        tensor = MxTensor(
+            "MXFP4",
+            (experts * rows, neuron_len),
+            rng.integers(
+                0,
+                256,
+                (experts * rows, neuron_len // 2),
+                dtype=np.uint8,
+            ),
+            rng.integers(
+                120,
+                135,
+                (experts * rows, neuron_len // 32),
+                dtype=np.uint8,
+            ),
         )
     elif family in {
         "NVQ2J",
@@ -338,6 +356,7 @@ def _run_profile_check(
     (
         "NINT4",
         "NINT8-0",
+        "MXFP4",
         "NVQ2J",
         "NVQ2J-L",
         "NVQ2J-XL",
@@ -366,6 +385,9 @@ def test_cached_nintm_is_bit_exact_to_resident(
     if family == "NINT4":
         assert cached["hetero"] == "1"
         assert int(cache_stats["hetero_dispatches"]) > 0
+    if family == "MXFP4":
+        assert int(cache_stats["range_read_bytes"]) > 0
+        assert int(cache_stats["range_read_calls"]) > 0
     assert int(cache_stats["demand_misses"]) > 0
     assert int(cache_stats["demand_hits"]) > 0
     assert int(cache_stats["prefetch_hits"]) > 0
@@ -386,6 +408,20 @@ def test_cached_prefill_fallback_is_bit_exact_to_resident(
     assert cached["values"] == resident["values"]
     assert cache_stats is not None
     assert int(cache_stats["full_projection_fallbacks"]) > 0
+
+
+def test_cached_mxfp4_prefill_streams_exact_ranges(tmp_path: Path) -> None:
+    model = _write_fixture(tmp_path, "MXFP4")
+    resident, _ = _run_check(model, cached=False, tokens=13)
+    cached, cache_stats = _run_check(model, cached=True, tokens=13)
+
+    assert cached["values"] == resident["values"]
+    assert cached["checksum"] == resident["checksum"]
+    assert cached["sqsum"] == resident["sqsum"]
+    assert cache_stats is not None
+    assert int(cache_stats["range_read_bytes"]) > 0
+    assert int(cache_stats["range_read_calls"]) > 0
+    assert int(cache_stats["full_projection_fallbacks"]) == 0
 
 
 @pytest.mark.parametrize("family", ("NEPQ0-A", "NEPQ1-A"))
@@ -474,6 +510,24 @@ def test_profile_prewarms_routes_without_polluting_runtime_counters(
     assert float(prewarm["time_ms"]) >= 0.0
     assert int(stats["demand_misses"]) == 0
     assert int(stats["h2d_bytes"]) == 0
+    assert int(stats["demand_hits"]) > 0
+
+
+def test_profile_prewarms_mxfp4_exact_ranges(tmp_path: Path) -> None:
+    model = _write_fixture(tmp_path, "MXFP4")
+    profile = tmp_path / "profile.json"
+    profile.write_text(
+        '{"version": 1, "layers": {"0": {"ranking": [0, 3]}}}',
+        encoding="utf-8",
+    )
+
+    prewarm, stats = _run_profile_check(model, profile)
+
+    assert int(prewarm["range_read_bytes"]) > 0
+    assert int(prewarm["range_read_calls"]) > 0
+    assert float(prewarm["range_read_ms"]) >= 0.0
+    assert int(stats["range_read_bytes"]) == 0
+    assert int(stats["range_read_calls"]) == 0
     assert int(stats["demand_hits"]) > 0
 
 

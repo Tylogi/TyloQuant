@@ -17,6 +17,22 @@ set(MFQ_CUDA_ARCHITECTURES "86" CACHE STRING
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
+add_library(mfq-cuda-storage STATIC
+    ${MFQ_CUDA_ROOT}/storage/nintm_expert_store.cpp
+)
+add_library(mfq::cuda-storage ALIAS mfq-cuda-storage)
+target_include_directories(mfq-cuda-storage PUBLIC
+    ${MFQ_CUDA_ROOT}/storage
+)
+target_link_libraries(mfq-cuda-storage PUBLIC Threads::Threads)
+target_compile_features(mfq-cuda-storage PUBLIC cxx_std_20)
+set_target_properties(mfq-cuda-storage PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+if(MSVC)
+    target_compile_options(mfq-cuda-storage PRIVATE /utf-8 /EHsc)
+endif()
+
 add_library(mfq-cuda-core STATIC
     ${MFQ_CUDA_ROOT}/src/mfq_cuda_context.cu
     ${MFQ_CUDA_ROOT}/src/mfq_native_tensor.cpp
@@ -119,6 +135,14 @@ if(BUILD_TESTING)
         add_test(NAME ${target} COMMAND ${target})
         set_tests_properties(${target} PROPERTIES SKIP_RETURN_CODE 77)
     endfunction()
+
+    add_executable(mfq-cuda-nintm-expert-store-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_nintm_expert_store_test.cpp)
+    target_link_libraries(mfq-cuda-nintm-expert-store-test PRIVATE
+        mfq-cuda-storage)
+    target_compile_features(mfq-cuda-nintm-expert-store-test PRIVATE cxx_std_20)
+    add_test(NAME mfq-cuda-nintm-expert-store-test
+        COMMAND mfq-cuda-nintm-expert-store-test)
 
     add_executable(mfq-mxfp4-sq-test ${MFQ_CUDA_ROOT}/tests/mfq_mxfp4_sq_test.cu)
     target_compile_definitions(mfq-mxfp4-sq-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
@@ -232,6 +256,7 @@ target_link_libraries(mfq-decode PRIVATE
     CUDA::cublas
     mfq-cuda-core
     mfq-cuda-native-kernels
+    mfq-cuda-storage
 )
 target_compile_definitions(mfq-decode PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1
@@ -288,6 +313,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         CUDA::cuda_driver
         CUDA::cudart
         CUDA::cublas
+        mfq-cuda-storage
     )
     target_compile_definitions(mfq-decode-torch PRIVATE NOMINMAX)
     target_compile_options(mfq-decode-torch PRIVATE

@@ -137,6 +137,23 @@ public:
         checked(slot).inflight = false;
     }
 
+    bool discard(
+            const MoeCacheKey & key,
+            int slot,
+            uint64_t generation) {
+        Slot & state = checked(slot);
+        if (!state.key.has_value() || !(*state.key == key) ||
+                state.generation != generation) {
+            return false;
+        }
+        by_key_.erase(key);
+        state.key.reset();
+        state.inflight = false;
+        erase_lru(slot);
+        free_.push_back(slot);
+        return true;
+    }
+
     bool inflight(int slot) const {
         return checked(slot).inflight;
     }

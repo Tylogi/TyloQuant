@@ -66,6 +66,33 @@ void test_all_inflight_slots_reject_replacement() {
     require(rejected, "all-inflight cache accepted a replacement");
 }
 
+void test_failed_lease_can_be_discarded() {
+    mfq::MoeCacheSlotBook book(1);
+    const mfq::MoeCacheKey failed{0, 1, 2};
+    const auto lease = book.acquire(failed);
+    book.mark_inflight(lease.slot);
+
+    require(
+        book.discard(failed, lease.slot, lease.generation),
+        "failed lease was not discarded");
+    require(book.size() == 0, "discarded lease remained resident");
+    require(book.slot_for(failed) == -1, "discarded key remained mapped");
+    require(
+        !book.discard(failed, lease.slot, lease.generation),
+        "stale lease discarded a free slot");
+
+    const mfq::MoeCacheKey replacement{0, 1, 3};
+    const auto next = book.acquire(replacement);
+    require(next.slot == lease.slot, "discarded slot was not reusable");
+    require(!next.hit, "replacement unexpectedly hit the cache");
+    require(
+        !book.discard(failed, next.slot, lease.generation),
+        "stale lease discarded a newer generation");
+    require(
+        book.slot_for(replacement) == next.slot,
+        "newer cache generation was damaged");
+}
+
 void test_budget_planner_honors_minimums_and_hard_limit() {
     const std::vector<mfq::MoeArenaDemand> demands{
         {"nint4-gu", 256, 8, 64},
@@ -111,10 +138,11 @@ int main() {
         test_lru_replaces_oldest_non_inflight_slot();
         test_inflight_slot_is_not_replaced();
         test_all_inflight_slots_reject_replacement();
+        test_failed_lease_can_be_discarded();
         test_budget_planner_honors_minimums_and_hard_limit();
         test_budget_planner_rejects_insufficient_budget();
         test_budget_planner_caps_registered_experts();
-        std::cout << "moe_cache_policy_tests=6 passed=6\n";
+        std::cout << "moe_cache_policy_tests=7 passed=7\n";
         return 0;
     } catch (const std::exception & error) {
         std::cerr << "moe_cache_policy_test failure=" << error.what() << "\n";
