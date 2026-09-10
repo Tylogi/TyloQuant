@@ -44,6 +44,10 @@ def _ids(tokens: int) -> torch.Tensor:
     )
 
 
+def _cuda_generator(seed: int) -> torch.Generator:
+    return torch.Generator(device="cuda").manual_seed(seed)
+
+
 def _selected_reference(
     dense: torch.Tensor,
     x: torch.Tensor,
@@ -68,7 +72,14 @@ def test_nintm_grouped_kernel_supports_flat_family(family: str, tokens: int):
         (NintMoePool(np.arange(2, dtype=np.int32), tensor),),
     )
     weight = to_gpu(container)
-    x = torch.randn(tokens, 96, device="cuda", dtype=torch.float16) * 0.1
+    family_index = FLAT_FAMILIES.index(family)
+    x = torch.randn(
+        tokens,
+        96,
+        device="cuda",
+        dtype=torch.float16,
+        generator=_cuda_generator(20260723 + tokens * 101 + family_index),
+    ) * 0.1
     ids = _ids(tokens)
     actual = grouped_matmul(weight, x, MoeRoutePlan.build(ids, 2)).float()
     dense = torch.as_tensor(
@@ -90,8 +101,13 @@ def test_nintm_grouped_kernel_supports_nepq_family(spec, tokens: int):
     )
     weight = to_gpu(container)
     packed = weight.pools[0].weight
+    spec_index = (NEPQ0_S, NEPQ0_L, NEPQ1_S, NEPQ1_L).index(spec)
     x = torch.randn(
-        tokens, tensor.neuron_len, device="cuda", dtype=torch.float16
+        tokens,
+        tensor.neuron_len,
+        device="cuda",
+        dtype=torch.float16,
+        generator=_cuda_generator(20260723 + tokens * 101 + spec_index),
     ) * 0.1
     rotated = ext().nepq_hadamard_input_cuda(
         x, packed["rotation_signs"], packed["rotation_block"]
@@ -148,7 +164,7 @@ def _all_family_container() -> NintMoeTensor:
     )
 
 
-@pytest.mark.parametrize("tokens", (3, 13, 257))
+@pytest.mark.parametrize("tokens", (3, 13, 257, 1024))
 def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path, tokens: int):
     root = Path(__file__).resolve().parents[1]
     executable = next(
