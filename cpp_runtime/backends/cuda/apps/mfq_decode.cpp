@@ -1,4 +1,6 @@
 #include "mfq_tensor_backend.h"
+#include "mfq/kernels/cuda/deepseek_v4_attention.h"
+#include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "mfq_cuda_model_plan.h"
 #include "mfq_cuda_mtp.h"
 #include "mfq_cuda_paged_kv.h"
@@ -213,40 +215,6 @@ mfq_tensor_backend::Tensor glm_dsa_indexer_scores_decode_cuda(
 mfq_tensor_backend::Tensor attention_glm_mla_sparse_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor indices,
     mfq_tensor_backend::Tensor meta, double scale);
-mfq_tensor_backend::Tensor dsv4_compress_cuda(
-    mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor ape,
-    mfq_tensor_backend::Tensor norm, mfq_tensor_backend::Tensor prev_kv, mfq_tensor_backend::Tensor prev_gate,
-    mfq_tensor_backend::Tensor positions, mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
-    int64_t ratio, bool overlap, int64_t quant_mode, double eps);
-mfq_tensor_backend::Tensor dsv4_fp4_sim_cuda(mfq_tensor_backend::Tensor input);
-std::vector<mfq_tensor_backend::Tensor> dsv4_hc_pre_cuda(
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor mixes, mfq_tensor_backend::Tensor scale,
-    mfq_tensor_backend::Tensor base, int64_t iterations, double eps);
-mfq_tensor_backend::Tensor dsv4_hc_post_cuda(
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor post,
-    mfq_tensor_backend::Tensor combination);
-mfq_tensor_backend::Tensor dsv4_decode_pool_update_cuda(
-    mfq_tensor_backend::Tensor kv_token, mfq_tensor_backend::Tensor gate_token,
-    mfq_tensor_backend::Tensor ape, mfq_tensor_backend::Tensor norm,
-    mfq_tensor_backend::Tensor state_kv, mfq_tensor_backend::Tensor state_gate,
-    mfq_tensor_backend::Tensor prev_kv, mfq_tensor_backend::Tensor prev_gate,
-    mfq_tensor_backend::Tensor pool, mfq_tensor_backend::Tensor seq_len,
-    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
-    int64_t ratio, bool overlap, int64_t quant_mode, double eps);
-mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
-    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor weights,
-    int64_t query_offset, int64_t ratio);
-mfq_tensor_backend::Tensor dsv4_topk512_cuda(mfq_tensor_backend::Tensor scores);
-std::vector<mfq_tensor_backend::Tensor> dsv4_build_prefill_plan_cuda(
-    mfq_tensor_backend::Tensor topk, int64_t query_offset, int64_t local_history,
-    int64_t pool_len, int64_t ratio, int64_t window);
-std::vector<mfq_tensor_backend::Tensor> dsv4_build_decode_plan_cuda(
-    mfq_tensor_backend::Tensor topk, mfq_tensor_backend::Tensor seq_len, int64_t pool_len,
-    int64_t ratio, int64_t window);
-mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda(
-    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor indices,
-    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor sinks, mfq_tensor_backend::Tensor meta,
-    double scale);
 mfq_tensor_backend::Tensor mfq_attention_mma256_swa_decode_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,

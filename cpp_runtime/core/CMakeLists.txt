@@ -3,6 +3,8 @@
 add_library(mfq-model-graph STATIC
     mfq_model_graph.cpp
     mfq_model_graph.h
+    models/deepseek_v41.cpp
+    models/deepseek_v41.h
     compat/mfq_legacy_model_graph.cpp
     compat/mfq_legacy_model_graph.h
     compat/mfq_legacy_tensor_names.cpp

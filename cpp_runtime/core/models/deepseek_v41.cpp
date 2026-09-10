@@ -1,4 +1,4 @@
-#include "deepseek_v41_model.h"
+#include "models/deepseek_v41.h"
 
 #include "nlohmann/json.hpp"
 
@@ -6,7 +6,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace mfq::models::deepseek_v41 {
 namespace {
 
 using json = nlohmann::json;
@@ -94,8 +94,7 @@ void require_layers(
 
 } // namespace
 
-DeepseekV41Config DeepseekV41Config::from_json(
-    std::string_view payload) {
+Config Config::from_json(std::string_view payload) {
     json root;
     try {
         root = json::parse(payload.begin(), payload.end());
@@ -128,7 +127,7 @@ DeepseekV41Config DeepseekV41Config::from_json(
             "DeepSeek-V4.1 runtime does not support this source encoding");
     }
 
-    DeepseekV41Config config;
+    Config config;
     config.vocab = positive(text, "vocab_size");
     config.hidden = positive(text, "hidden_size");
     config.n_layers = positive(text, "num_hidden_layers");
@@ -210,22 +209,7 @@ DeepseekV41Config DeepseekV41Config::from_json(
     return config;
 }
 
-DeepseekV41Config DeepseekV41Config::from_mfq(
-    const MfqContainer& model) {
-    const auto graph = model.model_graph();
-    if (!graph || graph->backbone != "deepseek_v41") {
-        throw std::runtime_error(
-            "DeepSeek-V4.1 C++ loading requires a deepseek_v41 model graph");
-    }
-    constexpr const char* asset = "__mfq_asset__/model_config.json";
-    if (!model.contains(asset)) {
-        throw std::runtime_error(
-            "DeepSeek-V4.1 MFQ has no embedded model_config.json asset");
-    }
-    return from_json(model.read_text(asset));
-}
-
-void DeepseekV41Config::validate() const {
+void Config::validate() const {
     if (vocab <= 0 || hidden <= 0 || n_layers <= 0 || n_heads <= 0 ||
         n_kv_heads <= 0 || head_dim <= 0 || rope_head_dim <= 0 ||
         q_lora_rank <= 0 || o_lora_rank <= 0 || o_groups <= 0 ||
@@ -281,28 +265,28 @@ void DeepseekV41Config::validate() const {
     }
 }
 
-bool DeepseekV41Config::has_engram(std::int64_t layer) const noexcept {
+bool Config::has_engram(std::int64_t layer) const noexcept {
     return contains(engram_layer_ids, layer);
 }
 
-bool DeepseekV41Config::is_kv_source(std::int64_t layer) const noexcept {
+bool Config::is_kv_source(std::int64_t layer) const noexcept {
     return contains(kv_source_layers, layer);
 }
 
-bool DeepseekV41Config::is_index_source(std::int64_t layer) const noexcept {
+bool Config::is_index_source(std::int64_t layer) const noexcept {
     return contains(index_source_layers, layer);
 }
 
-std::string DeepseekV41TensorNames::layer(
+std::string TensorNames::layer(
     std::size_t index,
     std::string_view suffix) {
     return "model.block." + std::to_string(index) + "." + std::string(suffix);
 }
 
-std::string DeepseekV41TensorNames::predictor(
+std::string TensorNames::predictor(
     std::size_t index,
     std::string_view suffix) {
     return "predictor.stage." + std::to_string(index) + "." + std::string(suffix);
 }
 
-} // namespace mfq::metal
+} // namespace mfq::models::deepseek_v41

@@ -48,6 +48,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/attention_mma.cu
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v4_attention.cu
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v4_hc.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v41.cu
     ${MFQ_CUDA_KERNEL_ROOT}/embedding.cu
     ${MFQ_CUDA_KERNEL_ROOT}/flash_next.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gated_delta_net.cu
@@ -158,6 +159,13 @@ if(BUILD_TESTING)
         mfq-cuda-native-kernels)
     target_compile_definitions(mfq-paged-kv-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1)
+    mfq_add_cuda_test(mfq-deepseek-v41-hc-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_deepseek_v41_hc_test.cu
+        mfq-cuda-native-kernels)
+    target_compile_definitions(mfq-deepseek-v41-hc-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1)
+    target_include_directories(mfq-deepseek-v41-hc-test PRIVATE
+        ${MFQ_REPOSITORY_ROOT})
     mfq_add_cuda_test(mfq-native-tensor-cuda-test
         ${MFQ_CUDA_ROOT}/tests/mfq_native_tensor_cuda_test.cu)
     mfq_add_cuda_test(mfq-flash-next-test

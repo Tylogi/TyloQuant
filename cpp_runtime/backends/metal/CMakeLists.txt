@@ -235,7 +235,6 @@ add_library(mfq-metal-runtime STATIC
     models/deepseek_v4/mlx_deepseek_v4_moe.cpp
     models/deepseek_v4/mlx_deepseek_v4_sparse.cpp
     models/deepseek_v4/mlx_deepseek_v4_vision.cpp
-    models/deepseek_v41/deepseek_v41_model.cpp
     models/deepseek_v41/mlx_deepseek_v41_attention.cpp
     models/deepseek_v41/mlx_deepseek_v41_causal_lm.cpp
     models/deepseek_v41/mlx_deepseek_v41_dspark.cpp
