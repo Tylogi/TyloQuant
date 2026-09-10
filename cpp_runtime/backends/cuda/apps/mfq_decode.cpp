@@ -344,7 +344,8 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor expert_pool,
     mfq_tensor_backend::Tensor expert_local, mfq_tensor_backend::Tensor x,
     int64_t n_experts, int64_t out_per_expert, int64_t neuron_len,
-    mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor ids_dst,
+    int64_t route_tile_m, mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor ids_dst,
     mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
     mfq_tensor_backend::Tensor tile_experts);
 mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
@@ -6834,9 +6835,10 @@ struct MixedMoeRuntime {
                 nvq_dispatch->pool_params,
                 nvq_dispatch->expert_pool,
                 nvq_dispatch->expert_local,
-                x, n_experts, out_per_expert, neuron_len, output,
+                x, n_experts, out_per_expert, neuron_len,
+                route.mma_tile_m, output,
                 route.ids_dst, route.expert_bounds,
-                route.tile_bounds, route.tile_experts);
+                route.mma_tile_bounds, route.mma_tile_experts);
         }
 
         mfq_tensor_backend::Tensor shared_nint_qx;

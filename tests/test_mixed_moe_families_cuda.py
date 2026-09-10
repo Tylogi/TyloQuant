@@ -148,7 +148,7 @@ def _all_family_container() -> NintMoeTensor:
     )
 
 
-@pytest.mark.parametrize("tokens", (3, 13))
+@pytest.mark.parametrize("tokens", (3, 13, 257))
 def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path, tokens: int):
     root = Path(__file__).resolve().parents[1]
     executable = next(

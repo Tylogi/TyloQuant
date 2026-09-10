@@ -5525,19 +5525,17 @@ mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_ws_cuda(
 }
 
 // Route-compacted online-dequant FP16 Tensor Core path for mixed NVQ pools.
-// One task covers up to 16 routed rows and a 64-row output tile.  Keep the
-// format switch outside the inner K loop so one launch can serve every NVQ
-// cohort without turning weight decoding into a runtime branch per value.
-constexpr int kNvqMoeF16TileM = 16;
+// Each task reuses one 64-row weight tile across 16, 32, or 64 routed rows.
+// Keep the format switch outside the inner K loop so one launch can serve
+// every NVQ cohort without a runtime branch per decoded value.
 constexpr int kNvqMoeF16TileN = 64;
 constexpr int kNvqMoeF16GroupsPerChunk = 4;
 constexpr int kNvqMoeF16TileK =
     kGroupSize * kNvqMoeF16GroupsPerChunk;
 constexpr int kNvqMoeF16StrideK = kNvqMoeF16TileK + 8;
 constexpr int kNvqMoeF16Fragments = kNvqMoeF16TileN / 16;
-constexpr int kNvqMoeF16FineTilesPerTask = kNvqMoeF16TileM / 8;
 
-template <int FORMAT>
+template <int FORMAT, int BM>
 __device__ __forceinline__ void nvq_moe_grouped_f16_task(
     const uint8_t * indices,
     int64_t indices_nbytes,
@@ -5575,8 +5573,13 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                                      __half, wmma::col_major>;
     using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
 
-    FragmentC accumulator;
-    wmma::fill_fragment(accumulator, 0.0f);
+    static_assert(BM == 16 || BM == 32 || BM == 64);
+    constexpr int kMFragments = BM / 16;
+    FragmentC accumulators[kMFragments];
+#pragma unroll
+    for (int m_fragment = 0; m_fragment < kMFragments; ++m_fragment) {
+        wmma::fill_fragment(accumulators[m_fragment], 0.0f);
+    }
     const int chunks =
         (ng + kNvqMoeF16GroupsPerChunk - 1) /
         kNvqMoeF16GroupsPerChunk;
@@ -5627,7 +5630,7 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             }
 
             constexpr int kActivationPairs =
-                kNvqMoeF16TileM * (kNvqMoeF16TileK / 2);
+                BM * (kNvqMoeF16TileK / 2);
             for (int index = tid; index < kActivationPairs; index += 256) {
                 const int m_local = index / (kNvqMoeF16TileK / 2);
                 const int k_pair =
@@ -5659,31 +5662,45 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                 for (int k_local = 0;
                      k_local < kNvqMoeF16TileK;
                      k_local += 16) {
-                    FragmentA activation_fragment;
                     FragmentB weight_fragment;
-                    wmma::load_matrix_sync(
-                        activation_fragment, activation_tile + k_local,
-                        kNvqMoeF16StrideK);
                     wmma::load_matrix_sync(
                         weight_fragment,
                         weight_tile + warp * 16 * kNvqMoeF16StrideK + k_local,
                         kNvqMoeF16StrideK);
-                    wmma::mma_sync(
-                        accumulator, activation_fragment,
-                        weight_fragment, accumulator);
+#pragma unroll
+                    for (int m_fragment = 0;
+                         m_fragment < kMFragments;
+                         ++m_fragment) {
+                        FragmentA activation_fragment;
+                        wmma::load_matrix_sync(
+                            activation_fragment,
+                            activation_tile +
+                                m_fragment * 16 * kNvqMoeF16StrideK + k_local,
+                            kNvqMoeF16StrideK);
+                        wmma::mma_sync(
+                            accumulators[m_fragment], activation_fragment,
+                            weight_fragment, accumulators[m_fragment]);
+                    }
                 }
             }
             __syncthreads();
     }
 
     if (warp < kNvqMoeF16Fragments) {
+#pragma unroll
+        for (int m_fragment = 0;
+             m_fragment < kMFragments;
+             ++m_fragment) {
             wmma::store_matrix_sync(
-                output_tile + warp * 16 * 16, accumulator,
+                output_tile +
+                    (warp * BM + m_fragment * 16) * 16,
+                accumulators[m_fragment],
                 16, wmma::mem_row_major);
+        }
     }
     __syncthreads();
     if (warp < kNvqMoeF16Fragments) {
-            for (int element = lane; element < 256; element += 32) {
+            for (int element = lane; element < BM * 16; element += 32) {
                 const int m_local = element / 16;
                 const int n_local = element - m_local * 16;
                 const int compact = first + m_local;
@@ -5693,14 +5710,15 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                     output[static_cast<int64_t>(pair_index) * out_per_expert +
                            local_row] =
                         __float2half(
-                            output_tile[warp * 16 * 16 + m_local * 16 + n_local]);
+                            output_tile[
+                                (warp * BM + m_local) * 16 + n_local]);
                 }
             }
     }
     __syncthreads();
 }
 
-template <int FORMAT>
+template <int FORMAT, int BM = 16>
 __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
     const uint8_t * indices,
     int64_t indices_nbytes,
@@ -5732,8 +5750,8 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
     __shared__ __half
         weight_tile[kNvqMoeF16TileN][kNvqMoeF16StrideK];
     __shared__ __half
-        activation_tile[kNvqMoeF16TileM][kNvqMoeF16StrideK];
-    __shared__ float output_tile[kNvqMoeF16Fragments][16][16];
+        activation_tile[BM][kNvqMoeF16StrideK];
+    __shared__ float output_tile[kNvqMoeF16Fragments][BM][16];
     const int ntiles_n =
         (out_per_expert + kNvqMoeF16TileN - 1) / kNvqMoeF16TileN;
     const int64_t max_tasks =
@@ -5745,14 +5763,14 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
         if (fine_tile >= tile_bounds[global_experts]) continue;
         const int expert = tile_experts[fine_tile];
         const int local_fine_tile = fine_tile - tile_bounds[expert];
-        if (local_fine_tile % kNvqMoeF16FineTilesPerTask != 0) continue;
+        if (local_fine_tile % (BM / 8) != 0) continue;
         const int local_expert = expert_local[expert];
         if (static_cast<unsigned int>(local_expert) >=
             static_cast<unsigned int>(pool_experts)) continue;
         const int first = expert_bounds[expert] + local_fine_tile * 8;
         const int last = min(
-            first + kNvqMoeF16TileM, expert_bounds[expert + 1]);
-        nvq_moe_grouped_f16_task<FORMAT>(
+            first + BM, expert_bounds[expert + 1]);
+        nvq_moe_grouped_f16_task<FORMAT, BM>(
             indices, indices_nbytes, aux, aux_nbytes,
             sub_scale, sub_scale_nbytes, neuron_scale, codebook,
             x, ids_dst, output, &weight_tile[0][0],
@@ -5763,7 +5781,9 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
     }
 }
 
-__global__ void __launch_bounds__(256, 1) nvq_moe_grouped_hetero_f16_kernel(
+template <int BM, bool COARSE_TILES>
+__global__ void __launch_bounds__(256, 1)
+nvq_moe_grouped_hetero_f16_kernel(
     const int64_t * weight_ptrs,
     const int64_t * weight_sizes,
     const int32_t * pool_params,
@@ -5785,8 +5805,8 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_hetero_f16_kernel(
     __shared__ __half
         weight_tile[kNvqMoeF16TileN][kNvqMoeF16StrideK];
     __shared__ __half
-        activation_tile[kNvqMoeF16TileM][kNvqMoeF16StrideK];
-    __shared__ float output_tile[kNvqMoeF16Fragments][16][16];
+        activation_tile[BM][kNvqMoeF16StrideK];
+    __shared__ float output_tile[kNvqMoeF16Fragments][BM][16];
     const int ntiles_n =
         (out_per_expert + kNvqMoeF16TileN - 1) / kNvqMoeF16TileN;
     const int64_t max_tasks =
@@ -5798,7 +5818,9 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_hetero_f16_kernel(
         if (fine_tile >= tile_bounds[global_experts]) continue;
         const int expert = tile_experts[fine_tile];
         const int local_fine_tile = fine_tile - tile_bounds[expert];
-        if (local_fine_tile % kNvqMoeF16FineTilesPerTask != 0) continue;
+        if constexpr (!COARSE_TILES) {
+            if (local_fine_tile % (BM / 8) != 0) continue;
+        }
         const int pool = expert_pool[expert];
         const int local_expert = expert_local[expert];
         if (static_cast<unsigned int>(pool) >=
@@ -5810,9 +5832,10 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_hetero_f16_kernel(
         const int32_t * params = pool_params + static_cast<size_t>(pool) * 7;
         const int pool_experts = params[0];
         if (local_expert >= pool_experts) continue;
-        const int first = expert_bounds[expert] + local_fine_tile * 8;
+        const int first = expert_bounds[expert] + local_fine_tile *
+            (COARSE_TILES ? BM : 8);
         const int last = min(
-            first + kNvqMoeF16TileM, expert_bounds[expert + 1]);
+            first + BM, expert_bounds[expert + 1]);
         const uint8_t * indices = reinterpret_cast<const uint8_t *>(
             static_cast<uintptr_t>(pointers[0]));
         const uint8_t * aux = reinterpret_cast<const uint8_t *>(
@@ -5832,7 +5855,7 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_hetero_f16_kernel(
 
 #define NVQ_MOE_HETERO_F16_CASE(FORMAT_VALUE)                                  \
         case FORMAT_VALUE:                                                      \
-            nvq_moe_grouped_f16_task<FORMAT_VALUE>(                             \
+            nvq_moe_grouped_f16_task<FORMAT_VALUE, BM>(                         \
                 indices, sizes[0], aux, sizes[1], sub_scale, sizes[2],          \
                 neuron_scale, codebook, x, ids_dst, output,                     \
                 &weight_tile[0][0], &activation_tile[0][0],                     \
@@ -6115,6 +6138,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     int64_t n_experts,
     int64_t out_per_expert,
     int64_t neuron_len,
+    int64_t route_tile_m,
     mfq_tensor_backend::Tensor out,
     mfq_tensor_backend::Tensor ids_dst,
     mfq_tensor_backend::Tensor expert_bounds,
@@ -6127,6 +6151,9 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         out_per_expert > 0 && out_per_expert <= INT_MAX &&
             neuron_len > 0 && neuron_len <= INT_MAX,
         "NVQ heterogeneous dimensions must fit int32");
+    MFQ_RUNTIME_CHECK(
+        route_tile_m == 8 || route_tile_m == 64,
+        "NVQ heterogeneous route tile must be 8 or 64");
     MFQ_RUNTIME_CHECK(
         weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
             weight_ptrs.scalar_type() == mfq_tensor_backend::kInt64 &&
@@ -6205,25 +6232,40 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
             "NVQ heterogeneous tensors must share one CUDA device");
     }
 
-    const int max_tiles = (pairs + 7) / 8 + static_cast<int>(n_experts);
+    const int tile_m = static_cast<int>(route_tile_m);
+    const int bm = tile_m == 64
+        ? 64
+        : (tokens <= 128 ? 64 : (tokens <= 512 ? 32 : 64));
+    const int max_tiles =
+        (pairs + tile_m - 1) / tile_m + static_cast<int>(n_experts);
     const int ntiles_n =
         (static_cast<int>(out_per_expert) + kNvqMoeF16TileN - 1) /
         kNvqMoeF16TileN;
+    const int block_cap = pairs >= 32768 ? 8192 : 4096;
     const int blocks = static_cast<int>(std::max<int64_t>(
         1, std::min<int64_t>(
-               static_cast<int64_t>(max_tiles) * ntiles_n, 4096)));
-    nvq_moe_grouped_hetero_f16_kernel<<<
-        blocks, dim3(32, 8), 0, mfq_current_cuda_stream()>>>(
-        weight_ptrs.data_ptr<int64_t>(), weight_sizes.data_ptr<int64_t>(),
-        pool_params.data_ptr<int32_t>(), expert_pool.data_ptr<int32_t>(),
-        expert_local.data_ptr<int32_t>(),
-        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
-        ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),
-        tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
-        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes,
-        static_cast<int>(n_experts), pools,
-        static_cast<int>(out_per_expert), static_cast<int>(neuron_len),
-        max_tiles, routed_input);
+               static_cast<int64_t>(max_tiles) * ntiles_n, block_cap)));
+#define NVQ_MOE_HETERO_F16_LAUNCH(BM_VALUE, COARSE_VALUE)                      \
+    nvq_moe_grouped_hetero_f16_kernel<BM_VALUE, COARSE_VALUE><<<               \
+        blocks, dim3(32, 8), 0, mfq_current_cuda_stream()>>>(                   \
+        weight_ptrs.data_ptr<int64_t>(), weight_sizes.data_ptr<int64_t>(),      \
+        pool_params.data_ptr<int32_t>(), expert_pool.data_ptr<int32_t>(),       \
+        expert_local.data_ptr<int32_t>(),                                      \
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),              \
+        ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),         \
+        tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),      \
+        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes,          \
+        static_cast<int>(n_experts), pools,                                    \
+        static_cast<int>(out_per_expert), static_cast<int>(neuron_len),        \
+        max_tiles, routed_input)
+    if (tile_m == 64) {
+        NVQ_MOE_HETERO_F16_LAUNCH(64, true);
+    } else if (bm == 32) {
+        NVQ_MOE_HETERO_F16_LAUNCH(32, false);
+    } else {
+        NVQ_MOE_HETERO_F16_LAUNCH(64, false);
+    }
+#undef NVQ_MOE_HETERO_F16_LAUNCH
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
