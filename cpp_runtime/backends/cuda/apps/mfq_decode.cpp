@@ -1,12 +1,14 @@
 #include "mfq_tensor_backend.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
+#include "mfq/kernels/cuda/deepseek_v41.h"
 #include "mfq_cuda_model_plan.h"
 #include "mfq_cuda_mtp.h"
 #include "mfq_cuda_paged_kv.h"
 #include "flash_next/config.h"
 #include "flash_next/state.h"
 #include "flash_next/qwen4.h"
+#include "models/deepseek_v41.h"
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 
@@ -43,6 +45,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -13946,6 +13949,7 @@ struct Config {
     std::vector<int64_t> compress_ratios;
     std::optional<mfq::flash_next::GlmConfig> glm5_next;
     std::optional<mfq::flash_next::QwenConfig> qwen4;
+    std::optional<mfq::models::deepseek_v41::Config> deepseek_v41;
     bool is_qwen4() const { return runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::qwen4_exp; }
     bool is_flash_next() const { return is_qwen4() || is_glm5_next(); }
     bool is_glm5_next() const {
@@ -13959,6 +13963,9 @@ struct Config {
     }
     bool is_dsv4() const {
         return runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::deepseek_v4;
+    }
+    bool is_deepseek_v41() const {
+        return runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::deepseek_v41;
     }
     bool is_minicpmo45() const {
         return runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::minicpmo45;
@@ -14136,6 +14143,56 @@ static Config parse_config_json(
         c.tie_word_embeddings=parsed.tied_embeddings;c.layer_types=parsed.layer_types;
         c.num_experts=parsed.experts;c.num_experts_per_tok=parsed.topk;c.moe_intermediate_size=parsed.moe_width;
         c.mtp_num_hidden_layers=parsed.predictor_layers;
+        return c;
+    }
+    if (runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::deepseek_v41) {
+        const auto parsed = mfq::models::deepseek_v41::Config::from_json(s);
+        c.deepseek_v41 = parsed;
+        c.model_type = parsed.text_model_type;
+        c.vocab_size = parsed.vocab;
+        c.hidden_size = parsed.hidden;
+        c.num_hidden_layers = parsed.n_layers;
+        c.num_attention_heads = parsed.n_heads;
+        c.num_key_value_heads = parsed.n_kv_heads;
+        c.max_position_embeddings = parsed.max_position_embeddings;
+        c.head_dim = parsed.head_dim;
+        c.rope_base = parsed.rope_theta;
+        c.rotary_dim = parsed.rope_head_dim;
+        c.sliding_window = parsed.sliding_window;
+        c.rms_norm_eps = parsed.rms_eps;
+        c.norm_weight_offset = 0.0;
+        c.tie_word_embeddings = document.value("tie_word_embeddings", false);
+        c.mtp_num_hidden_layers = parsed.n_mtp_layers;
+        c.num_experts = parsed.n_experts;
+        c.num_experts_per_tok = parsed.top_k;
+        c.moe_intermediate_size = parsed.moe_inter;
+        c.n_shared_experts = parsed.n_shared;
+        c.shared_expert_intermediate_size = parsed.n_shared * parsed.moe_inter;
+        c.q_lora_rank = parsed.q_lora_rank;
+        c.qk_nope_head_dim = parsed.head_dim - parsed.rope_head_dim;
+        c.qk_rope_head_dim = parsed.rope_head_dim;
+        c.v_head_dim = parsed.head_dim;
+        c.index_head_dim = parsed.index_head_dim;
+        c.index_n_heads = parsed.index_n_heads;
+        c.index_topk = parsed.index_topk;
+        c.hc_mult = parsed.hc_mult;
+        c.hc_sinkhorn_iters = parsed.hc_sinkhorn_iters;
+        c.hc_eps = parsed.hc_eps;
+        c.o_groups = parsed.o_groups;
+        c.o_lora_rank = parsed.o_lora_rank;
+        c.swiglu_limit = parsed.swiglu_limit;
+        c.compress_rope_base = parsed.compress_rope_theta;
+        c.rope_original_positions =
+            parsed.rope_scaling.original_max_position_embeddings;
+        c.rope_factor = parsed.rope_scaling.factor;
+        c.rope_beta_fast = parsed.rope_scaling.beta_fast;
+        c.rope_beta_slow = parsed.rope_scaling.beta_slow;
+        c.compress_ratios = parsed.compress_ratios;
+        c.routed_scaling_factor = parsed.routed_scaling;
+        c.norm_topk_prob = parsed.norm_topk_prob;
+        c.expert_gating_func = "sqrtsoftplus";
+        c.layer_types.assign(
+            static_cast<std::size_t>(parsed.n_layers), "deepseek_v41");
         return c;
     }
     c.model_type = json_string(s, "model_type");
@@ -18607,6 +18664,9 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i) {
     return f;
 }
 
+#include "deepseek_v41/deepseek_v41_engram.inc"
+#include "deepseek_v41/deepseek_v41_runtime.inc"
+
 #include "flash_next/flash_next_layers.h"
 
 static std::unique_ptr<Block> load_block(
@@ -18615,7 +18675,9 @@ static std::unique_ptr<Block> load_block(
     int i,
     const std::string & type,
     const std::shared_ptr<GlmDsaSharedState> & glm_state = nullptr,
-    const std::shared_ptr<Dsv4SharedState> & dsv4_state = nullptr) {
+    const std::shared_ptr<Dsv4SharedState> & dsv4_state = nullptr,
+    const std::shared_ptr<mfq::cuda::deepseek_v41_runtime::SharedState> &
+        deepseek_v41_state = nullptr) {
     if (c.is_glm5_next()) {
         MFQ_RUNTIME_CHECK(c.glm5_next.has_value(), "missing GLM Flash-Next configuration");
         return std::make_unique<Glm5NextBlock>(mfq,*c.glm5_next,i);
@@ -18623,6 +18685,13 @@ static std::unique_ptr<Block> load_block(
     if (c.is_qwen4()) {
         MFQ_RUNTIME_CHECK(c.qwen4.has_value(),"missing Qwen4 configuration");
         return std::make_unique<Qwen4Block>(mfq,*c.qwen4,i);
+    }
+    if (c.is_deepseek_v41()) {
+        MFQ_RUNTIME_CHECK(
+            type == "deepseek_v41" && deepseek_v41_state,
+            "invalid DeepSeek-V4.1 block loader state");
+        return mfq::cuda::deepseek_v41_runtime::load_block(
+            mfq, c, i, deepseek_v41_state);
     }
     if (c.is_dsv4()) {
         if (type != "deepseek_v4" || !dsv4_state) {
@@ -19706,6 +19775,8 @@ struct Model {
     std::unique_ptr<flash_runtime::Gr> qwen4_final_mixer;
     mfq_tensor_backend::Tensor qwen4_positions;
     int64_t qwen4_batch=0;
+    std::shared_ptr<mfq::cuda::deepseek_v41_runtime::SharedState>
+        deepseek_v41_state;
 
     bool supports_qwen_speculation() const {
         return (c.runtime_plan.backbone==mfq::cuda::MfqCudaBackbone::generic_qwen || c.is_flash_next()) &&
@@ -20021,6 +20092,15 @@ struct Model {
                     .sum(2).to(mfq_tensor_backend::kFloat16).contiguous();
             });
         }
+        if (c.is_deepseek_v41()) {
+            MFQ_RUNTIME_CHECK(
+                deepseek_v41_state && c.deepseek_v41.has_value(),
+                "DeepSeek-V4.1 final state is unavailable");
+            x = g_profiler.measure("model.deepseek_v41.final_collapse", [&]() {
+                return deepseek_v41_state->final_collapse(
+                    x, c.deepseek_v41->n_layers);
+            });
+        }
         return g_profiler.measure("model.output_norm", [&]() {
             return c.is_minicpmo45()
                 ? qwen_rms_norm_bf16(
@@ -20075,10 +20155,12 @@ struct Model {
         }
         const int64_t B = ids.size(0);
         const int64_t T = ids.size(1);
-        if (c.is_glm5_next()) {
+        if (c.is_glm5_next() || c.is_deepseek_v41()) {
             MFQ_RUNTIME_CHECK(T > 0 && cache_pos + T <= c.max_position_embeddings &&
                 !pos_override.has_value() && !cache_positions_override.has_value() && !attention_mask.has_value(),
-                "GLM Flash-Next currently requires contiguous causal cache positions without an external mask");
+                c.is_deepseek_v41()
+                    ? "DeepSeek-V4.1 currently requires contiguous causal cache positions without an external mask"
+                    : "GLM Flash-Next currently requires contiguous causal cache positions without an external mask");
         }
         if (c.is_qwen4()) {
             if (qwen4_batch!=0 && qwen4_batch!=B) reset(B);
@@ -20171,7 +20253,7 @@ struct Model {
                 return x * c.embed_scale;
             });
         }
-        if (c.is_dsv4() || c.is_glm5_next()) {
+        if (c.is_dsv4() || c.is_glm5_next() || c.is_deepseek_v41()) {
             x = x.to(mfq_tensor_backend::kFloat16)
                 .unsqueeze(2)
                 .expand({B, T, c.hc_mult, c.hidden_size})
@@ -20389,6 +20471,13 @@ static Model load_model(const std::string & mfq_path, const std::string & config
             "Flash-Next native adapter supports expert parallelism, but "
             "tensor/layer parallelism and offload still require a different placement path");
     }
+    if (m.c.is_deepseek_v41() &&
+            (g_tensor_parallel.enabled() || g_layer_placement.enabled() ||
+             g_n_gpu_layers >= 0)) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 native CUDA currently supports single-device dense "
+            "placement or expert parallelism");
+    }
     if (g_expert_parallel.enabled() && m.c.num_experts <= 0) {
         throw std::runtime_error(
             "--expert-parallel requires a model with routed experts");
@@ -20451,7 +20540,8 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         if (m.c.glm5_next) m.c.glm5_next->maximum=context_size_override;
         if (m.c.qwen4) m.c.qwen4->maximum=context_size_override;
     }
-    if (!m.c.is_gemma4() && !m.c.is_dsv4() && !m.c.is_flash_next()) {
+    if (!m.c.is_gemma4() && !m.c.is_dsv4() && !m.c.is_flash_next() &&
+            !m.c.is_deepseek_v41()) {
         m.rope = RopeCache(m.c);
         if (g_dense_cpu_layer_count > 0) {
             m.cpu_rope = RopeCache(
@@ -20465,7 +20555,8 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         }
     }
     m.c.norm_weight_offset =
-        (m.c.is_gemma4() || m.c.is_glm_dsa() || m.c.is_minicpmo45() || m.c.is_flash_next())
+        (m.c.is_gemma4() || m.c.is_glm_dsa() || m.c.is_minicpmo45() ||
+         m.c.is_flash_next() || m.c.is_deepseek_v41())
         ? 0.0 : m.c.legacy_tensor_layout.norm_weight_offset;
     const std::string embed_name = "model.token_embedding.weight";
     const std::string norm_name = "model.output_norm.weight";
@@ -20521,6 +20612,16 @@ static Model load_model(const std::string & mfq_path, const std::string & config
             glm_states;
         std::unordered_map<int, std::shared_ptr<Dsv4SharedState>>
             dsv4_states;
+        if (m.c.is_deepseek_v41()) {
+            m.deepseek_v41_state = std::make_shared<
+                mfq::cuda::deepseek_v41_runtime::SharedState>();
+            MFQ_RUNTIME_CHECK(
+                m.c.deepseek_v41.has_value(),
+                "missing DeepSeek-V4.1 configuration");
+            m.deepseek_v41_state->engram_hash =
+                mfq::cuda::deepseek_v41_runtime::EngramHashState::load(
+                    mfq, *m.c.deepseek_v41);
+        }
         for (int i = 0; i < m.c.num_hidden_layers; ++i) {
             const int device = g_layer_placement.device_for_layer(i);
             const bool cpu_offloaded = i < g_dense_cpu_layer_count;
@@ -20544,7 +20645,7 @@ static Model load_model(const std::string & mfq_path, const std::string & config
                       << (cpu_offloaded ? "CPU" : "CUDA") << std::endl;
             auto block = load_block(
                 mfq, m.c, i, m.c.layer_types[(size_t)i],
-                glm_state, dsv4_state);
+                glm_state, dsv4_state, m.deepseek_v41_state);
             block->cuda_device = device;
             block->cpu_offloaded = cpu_offloaded;
             m.blocks.push_back(std::move(block));
@@ -28363,6 +28464,7 @@ int main(int argc, char ** argv) {
         bool check_glm_dsa = false;
         bool check_dsv4_attention = false;
         bool check_dsv4_hc = false;
+        bool check_deepseek_v41 = false;
         bool check_text_session_state = false;
         bool check_qwen35_mtp = false;
         bool check_continuous_batching = false;
@@ -28496,6 +28598,7 @@ int main(int argc, char ** argv) {
             else if (a == "--check-glm-dsa") check_glm_dsa = true;
             else if (a == "--check-dsv4-attention") check_dsv4_attention = true;
             else if (a == "--check-dsv4-hc") check_dsv4_hc = true;
+            else if (a == "--check-deepseek-v41") check_deepseek_v41 = true;
             else if (a == "--check-text-session-state") {
                 check_text_session_state = true;
             }
@@ -28947,6 +29050,9 @@ int main(int argc, char ** argv) {
         }
         if (check_dsv4_hc) {
             return run_dsv4_hc_check(check_attention_reps);
+        }
+        if (check_deepseek_v41) {
+            return mfq::cuda::deepseek_v41_runtime::run_self_check();
         }
         if (check_text_session_state) {
             return run_text_session_state_check();

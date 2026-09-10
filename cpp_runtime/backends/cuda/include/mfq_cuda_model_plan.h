@@ -19,6 +19,7 @@ enum class MfqCudaBackbone {
     glm5_next,
     qwen4_exp,
     deepseek_v4,
+    deepseek_v41,
     unsupported,
 };
 
@@ -68,6 +69,9 @@ inline constexpr MfqCudaBackbone mfq_cuda_backbone(
     if (implementation == "qwen4_exp") return MfqCudaBackbone::qwen4_exp;
     if (implementation == "deepseek_v4") {
         return MfqCudaBackbone::deepseek_v4;
+    }
+    if (implementation == "deepseek_v41") {
+        return MfqCudaBackbone::deepseek_v41;
     }
     return MfqCudaBackbone::unsupported;
 }

@@ -195,6 +195,19 @@ class DeepseekV41Config:
             or candidate_source not in index_sources
         ):
             raise ValueError("DeepSeek-V4.1 CSA2 source-layer schedule is inconsistent")
+        active_ratio = 0
+        kv_source_set = set(kv_sources)
+        for layer, ratio in enumerate(backbone_ratios):
+            if layer in kv_source_set:
+                if ratio <= 0:
+                    raise ValueError(
+                        "DeepSeek-V4.1 KV source has no compressed stream"
+                    )
+                active_ratio = ratio
+            if ratio > 0 and active_ratio != ratio:
+                raise ValueError(
+                    "DeepSeek-V4.1 CSA2 consumer has no compatible KV source"
+                )
 
         engram_layers = _integers(text.get("engram_layer_ids"), "engram_layer_ids")
         engram_rows = _integers(

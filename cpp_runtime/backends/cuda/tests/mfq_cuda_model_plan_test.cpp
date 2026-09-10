@@ -113,6 +113,17 @@ int main() {
                 "Flash-Next predictor declaration was confused with loaded weights");
         }
 
+        const auto deepseek_v41 = graph_with(
+            "deepseek_v41", "deepseek_v41_vision", "deepseek_v41_dspark");
+        const auto deepseek_v41_plan = mfq_cuda_model_plan(deepseek_v41);
+        require(
+            deepseek_v41_plan.backbone == MfqCudaBackbone::deepseek_v41,
+            "DeepSeek-V4.1 text adapter was not selected");
+        require(
+            deepseek_v41_plan.vision == MfqCudaVisionAdapter::none &&
+                deepseek_v41_plan.predictor == MfqCudaPredictorAdapter::none,
+            "unfinished DeepSeek-V4.1 optional adapters were advertised");
+
         std::cout << "MFQ CUDA model plan tests passed\n";
         return 0;
     } catch (const std::exception& error) {

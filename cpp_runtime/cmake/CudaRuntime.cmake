@@ -250,6 +250,11 @@ set_target_properties(mfq-decode PROPERTIES
     CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
     CUDA_RUNTIME_LIBRARY Shared
 )
+if(BUILD_TESTING)
+    add_test(
+        NAME mfq-deepseek-v41-runtime-check
+        COMMAND mfq-decode --check-deepseek-v41)
+endif()
 
 option(MFQ_BUILD_TORCH_REFERENCE_RUNTIME
     "Build the optional LibTorch CUDA runtime used only for A/B validation"

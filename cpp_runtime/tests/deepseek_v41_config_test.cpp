@@ -55,7 +55,7 @@ const char* valid_config = R"json({
     "sliding_window": 128,
     "compress_ratios": [0, 2, 1, 1, 0, 0, 0],
     "compress_rope_theta": 160000,
-    "kv_source_layer_ids": [1],
+    "kv_source_layer_ids": [1, 2],
     "index_source_layer_ids": [1, 2],
     "index_n_heads": 32,
     "index_head_dim": 128,
@@ -139,9 +139,9 @@ int main() {
             "non-decoder compression after the CED split was accepted");
         require_rejected(
             [](auto& root) {
-                root["text_config"]["kv_source_layer_ids"] = {0};
+                root["text_config"]["kv_source_layer_ids"] = {0, 2};
             },
-            "KV source absent from the index schedule was accepted");
+            "zero-ratio KV source was accepted");
         require_rejected(
             [](auto& root) {
                 root["quantization_config"]["weight_block_size"] = {128, 128};

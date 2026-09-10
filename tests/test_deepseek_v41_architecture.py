@@ -60,7 +60,7 @@ def _config() -> dict[str, object]:
             "sliding_window": 128,
             "compress_ratios": [0, 2, 1, 1, 0, 0, 0],
             "compress_rope_theta": 160000,
-            "kv_source_layer_ids": [1],
+            "kv_source_layer_ids": [1, 2],
             "index_source_layer_ids": [1, 2],
             "index_n_heads": 32,
             "index_head_dim": 128,
@@ -116,6 +116,19 @@ def test_deepseek_v41_is_an_independent_strict_contract() -> None:
     wrong["model_type"] = "deepseek_v4"
     with pytest.raises(ValueError, match="expected deepseek_v41"):
         parse_deepseek_v41_config(wrong)
+
+
+def test_deepseek_v41_rejects_incompatible_kv_source_schedule() -> None:
+    zero_ratio = _config()
+    zero_ratio["text_config"]["kv_source_layer_ids"] = [0, 2]
+    zero_ratio["text_config"]["index_source_layer_ids"] = [0, 1, 2]
+    with pytest.raises(ValueError, match="KV source has no compressed stream"):
+        parse_deepseek_v41_config(zero_ratio)
+
+    stale_ratio = _config()
+    stale_ratio["text_config"]["kv_source_layer_ids"] = [1]
+    with pytest.raises(ValueError, match="no compatible KV source"):
+        parse_deepseek_v41_config(stale_ratio)
 
 
 @pytest.mark.parametrize(

@@ -263,6 +263,21 @@ void Config::validate() const {
         dspark_target_layer_ids.size() != static_cast<std::size_t>(n_mtp_layers)) {
         throw std::runtime_error("DeepSeek-V4.1 architecture schedules disagree");
     }
+    std::int64_t active_ratio = 0;
+    for (std::int64_t layer = 0; layer < n_layers; ++layer) {
+        const auto ratio = compress_ratios[static_cast<std::size_t>(layer)];
+        if (is_kv_source(layer)) {
+            if (ratio <= 0) {
+                throw std::runtime_error(
+                    "DeepSeek-V4.1 KV source has no compressed stream");
+            }
+            active_ratio = ratio;
+        }
+        if (ratio > 0 && active_ratio != ratio) {
+            throw std::runtime_error(
+                "DeepSeek-V4.1 CSA2 consumer has no compatible KV source");
+        }
+    }
 }
 
 bool Config::has_engram(std::int64_t layer) const noexcept {
