@@ -3523,7 +3523,7 @@ __global__ void __launch_bounds__(256) nepq_gemm_f16_gs24_kernel(
 }
 
 template <int FORMAT, int NWARPS, int ROWS_PER_BLOCK, bool SHARE_GROUP_STATE>
-__global__ void __launch_bounds__(NWARPS * 32) nvq_moe_mmvq_kernel(
+__device__ __forceinline__ void nvq_moe_mmvq_task(
     const uint8_t * indices,
     int64_t indices_nbytes,
     const uint8_t * aux,
@@ -3534,36 +3534,22 @@ __global__ void __launch_bounds__(NWARPS * 32) nvq_moe_mmvq_kernel(
     const int8_t * codebook,
     const int8_t * qx,
     const float * xscale,
-    const int32_t * ids,
-    const int32_t * expert_local,
     __half * output,
-    int pairs,
+    float * partial,
+    int pair,
     int routes,
-    int global_experts,
-    int pool_experts,
     int out_per_expert,
     int ng,
     int nvec,
     int nsign,
     int sub_bits,
     int sign_mode,
-    bool routed_input) {
-    const int pair = blockIdx.y;
-    const int row0 = blockIdx.x * ROWS_PER_BLOCK;
+    bool routed_input,
+    int source_row,
+    int local_expert,
+    int row0) {
     const int warp = threadIdx.y;
     const int lane = threadIdx.x;
-    if (pair >= pairs) return;
-    const int expert = ids[pair];
-    if (static_cast<unsigned int>(expert) >=
-        static_cast<unsigned int>(global_experts)) {
-        return;
-    }
-    const int local_expert = expert_local[expert];
-    if (static_cast<unsigned int>(local_expert) >=
-        static_cast<unsigned int>(pool_experts)) {
-        return;
-    }
-    const int source_row = routed_input ? pair : pair / routes;
 
     float acc[ROWS_PER_BLOCK];
 #pragma unroll
@@ -3642,18 +3628,19 @@ __global__ void __launch_bounds__(NWARPS * 32) nvq_moe_mmvq_kernel(
             acc[row_local] += __shfl_xor_sync(0xffffffff, acc[row_local], offset);
         }
     }
-    __shared__ float partial[ROWS_PER_BLOCK][NWARPS];
     if (lane == 0) {
 #pragma unroll
         for (int row_local = 0; row_local < ROWS_PER_BLOCK; ++row_local) {
-            partial[row_local][warp] = acc[row_local];
+            partial[row_local * NWARPS + warp] = acc[row_local];
         }
     }
     __syncthreads();
     if (warp == 0) {
 #pragma unroll
         for (int row_local = 0; row_local < ROWS_PER_BLOCK; ++row_local) {
-            float value = lane < NWARPS ? partial[row_local][lane] : 0.0f;
+            float value = lane < NWARPS
+                ? partial[row_local * NWARPS + lane]
+                : 0.0f;
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
                 value += __shfl_xor_sync(0xffffffff, value, offset);
@@ -3665,6 +3652,143 @@ __global__ void __launch_bounds__(NWARPS * 32) nvq_moe_mmvq_kernel(
             }
         }
     }
+}
+
+template <int FORMAT, int NWARPS, int ROWS_PER_BLOCK, bool SHARE_GROUP_STATE>
+__global__ void __launch_bounds__(NWARPS * 32) nvq_moe_mmvq_kernel(
+    const uint8_t * indices,
+    int64_t indices_nbytes,
+    const uint8_t * aux,
+    int64_t aux_nbytes,
+    const uint8_t * sub_scale,
+    int64_t sub_scale_nbytes,
+    const float * neuron_scale,
+    const int8_t * codebook,
+    const int8_t * qx,
+    const float * xscale,
+    const int32_t * ids,
+    const int32_t * expert_local,
+    __half * output,
+    int pairs,
+    int routes,
+    int global_experts,
+    int pool_experts,
+    int out_per_expert,
+    int ng,
+    int nvec,
+    int nsign,
+    int sub_bits,
+    int sign_mode,
+    bool routed_input) {
+    const int pair = blockIdx.y;
+    if (pair >= pairs) return;
+    const int expert = ids[pair];
+    if (static_cast<unsigned int>(expert) >=
+        static_cast<unsigned int>(global_experts)) {
+        return;
+    }
+    const int local_expert = expert_local[expert];
+    if (static_cast<unsigned int>(local_expert) >=
+        static_cast<unsigned int>(pool_experts)) {
+        return;
+    }
+    __shared__ float partial[ROWS_PER_BLOCK][NWARPS];
+    nvq_moe_mmvq_task<
+        FORMAT, NWARPS, ROWS_PER_BLOCK, SHARE_GROUP_STATE>(
+        indices, indices_nbytes, aux, aux_nbytes,
+        sub_scale, sub_scale_nbytes, neuron_scale, codebook,
+        qx, xscale, output, &partial[0][0], pair, routes,
+        out_per_expert, ng, nvec, nsign, sub_bits, sign_mode,
+        routed_input, routed_input ? pair : pair / routes,
+        local_expert, blockIdx.x * ROWS_PER_BLOCK);
+}
+
+template <int NWARPS, int ROWS_PER_BLOCK, bool SHARE_GROUP_STATE>
+__global__ void __launch_bounds__(NWARPS * 32)
+nvq_moe_mmvq_hetero_kernel(
+    const int64_t * weight_ptrs,
+    const int64_t * weight_sizes,
+    const int32_t * pool_params,
+    const int32_t * expert_pool,
+    const int32_t * expert_local,
+    const int8_t * qx,
+    const float * xscale,
+    const int32_t * ids,
+    __half * output,
+    int pairs,
+    int routes,
+    int global_experts,
+    int pool_count,
+    int out_per_expert,
+    bool routed_input) {
+    const int pair = blockIdx.y;
+    if (pair >= pairs) return;
+    const int expert = ids[pair];
+    if (static_cast<unsigned int>(expert) >=
+        static_cast<unsigned int>(global_experts)) {
+        return;
+    }
+    const int pool = expert_pool[expert];
+    const int local_expert = expert_local[expert];
+    if (static_cast<unsigned int>(pool) >=
+            static_cast<unsigned int>(pool_count) || local_expert < 0) {
+        return;
+    }
+    const int64_t * pointers =
+        weight_ptrs + static_cast<size_t>(pool) * 5;
+    const int64_t * sizes =
+        weight_sizes + static_cast<size_t>(pool) * 3;
+    const int32_t * params =
+        pool_params + static_cast<size_t>(pool) * 7;
+    if (local_expert >= params[0]) return;
+    const uint8_t * indices = reinterpret_cast<const uint8_t *>(
+        static_cast<uintptr_t>(pointers[0]));
+    const uint8_t * aux = reinterpret_cast<const uint8_t *>(
+        static_cast<uintptr_t>(pointers[1]));
+    const uint8_t * sub_scale = reinterpret_cast<const uint8_t *>(
+        static_cast<uintptr_t>(pointers[2]));
+    const float * neuron_scale = reinterpret_cast<const float *>(
+        static_cast<uintptr_t>(pointers[3]));
+    const int8_t * codebook = reinterpret_cast<const int8_t *>(
+        static_cast<uintptr_t>(pointers[4]));
+    const int ng = params[1];
+    const int nvec = params[2];
+    const int nsign = params[3];
+    const int sub_bits = params[4];
+    const int sign_mode = params[5];
+    const int format = params[6];
+    __shared__ float partial[ROWS_PER_BLOCK][NWARPS];
+
+#define NVQ_MOE_HETERO_MMVQ_CASE(FORMAT_VALUE)                                 \
+    case FORMAT_VALUE:                                                          \
+        nvq_moe_mmvq_task<                                                      \
+            FORMAT_VALUE, NWARPS, ROWS_PER_BLOCK, SHARE_GROUP_STATE>(           \
+            indices, sizes[0], aux, sizes[1], sub_scale, sizes[2],              \
+            neuron_scale, codebook, qx, xscale, output, &partial[0][0],         \
+            pair, routes, out_per_expert, ng, nvec, nsign, sub_bits,           \
+            sign_mode, routed_input, routed_input ? pair : pair / routes,       \
+            local_expert, blockIdx.x * ROWS_PER_BLOCK);                         \
+        break
+    switch (format) {
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq1L);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2Exec);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2Jsc);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2JscExec);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNpq0L);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq1S);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNpq0S);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3Jsc);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3Jsc2);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3Jsc512);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2JscL);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2JscXL);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3JscL);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2JscXLGroupExec);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3JscLGroupExec);
+    }
+#undef NVQ_MOE_HETERO_MMVQ_CASE
 }
 
 template <int FORMAT, int PHYSICAL_WARPS, int LOGICAL_WARPS, int ROWS_PER_BLOCK>
@@ -6100,6 +6224,130 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         static_cast<int>(n_experts), pools,
         static_cast<int>(out_per_expert), static_cast<int>(neuron_len),
         max_tiles, routed_input);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs,
+    mfq_tensor_backend::Tensor weight_sizes,
+    mfq_tensor_backend::Tensor pool_params,
+    mfq_tensor_backend::Tensor expert_pool,
+    mfq_tensor_backend::Tensor expert_local,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor ids,
+    int64_t n_experts,
+    int64_t out_per_expert,
+    int64_t neuron_len,
+    bool input_quantized,
+    mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
+    MFQ_RUNTIME_CHECK(
+        n_experts > 0 && n_experts <= 4096,
+        "NVQ heterogeneous expert count must be in [1,4096]");
+    MFQ_RUNTIME_CHECK(
+        out_per_expert > 0 && out_per_expert <= INT_MAX &&
+            neuron_len > 0 && neuron_len <= INT_MAX,
+        "NVQ heterogeneous dimensions must fit int32");
+    MFQ_RUNTIME_CHECK(
+        weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
+            weight_ptrs.scalar_type() == mfq_tensor_backend::kInt64 &&
+            weight_ptrs.dim() == 2 && weight_ptrs.size(0) > 0 &&
+            weight_ptrs.size(1) == 5,
+        "NVQ heterogeneous weight pointers must be CUDA int64 [pools,5]");
+    const int pools = static_cast<int>(weight_ptrs.size(0));
+    MFQ_RUNTIME_CHECK(
+        weight_sizes.is_cuda() && weight_sizes.is_contiguous() &&
+            weight_sizes.scalar_type() == mfq_tensor_backend::kInt64 &&
+            weight_sizes.dim() == 2 && weight_sizes.size(0) == pools &&
+            weight_sizes.size(1) == 3,
+        "NVQ heterogeneous weight sizes must be CUDA int64 [pools,3]");
+    MFQ_RUNTIME_CHECK(
+        pool_params.is_cuda() && pool_params.is_contiguous() &&
+            pool_params.scalar_type() == mfq_tensor_backend::kInt32 &&
+            pool_params.dim() == 2 && pool_params.size(0) == pools &&
+            pool_params.size(1) == 7,
+        "NVQ heterogeneous pool parameters must be CUDA int32 [pools,7]");
+    MFQ_RUNTIME_CHECK(
+        expert_pool.is_cuda() && expert_pool.is_contiguous() &&
+            expert_pool.scalar_type() == mfq_tensor_backend::kInt32 &&
+            expert_pool.numel() == n_experts &&
+            expert_local.is_cuda() && expert_local.is_contiguous() &&
+            expert_local.scalar_type() == mfq_tensor_backend::kInt32 &&
+            expert_local.numel() == n_experts,
+        "NVQ heterogeneous expert maps must be CUDA int32 [experts]");
+    MFQ_RUNTIME_CHECK(
+        ids.is_cuda() && ids.is_contiguous() &&
+            ids.scalar_type() == mfq_tensor_backend::kInt32 && ids.dim() == 2,
+        "NVQ heterogeneous route IDs must be CUDA int32 [tokens,routes]");
+    const int tokens = static_cast<int>(ids.size(0));
+    const int routes = static_cast<int>(ids.size(1));
+    const int pairs = tokens * routes;
+    MFQ_RUNTIME_CHECK(
+        tokens > 0 && tokens <= 8 && routes > 0,
+        "NVQ heterogeneous MMVQ requires one to eight tokens");
+    MFQ_RUNTIME_CHECK(
+        x.is_cuda() && x.is_contiguous() &&
+            x.scalar_type() == mfq_tensor_backend::kFloat16 &&
+            (x.dim() == 2 || x.dim() == 3) &&
+            (input_quantized || x.size(-1) == neuron_len),
+        "NVQ heterogeneous routed input shape mismatch");
+    const bool routed_input = x.dim() == 3;
+    MFQ_RUNTIME_CHECK(
+        (!routed_input && x.size(0) == tokens) ||
+            (routed_input && x.size(0) == tokens && x.size(1) == routes),
+        "NVQ heterogeneous input leading dimensions do not match routes");
+    MFQ_RUNTIME_CHECK(
+        out.is_cuda() && out.is_contiguous() &&
+            out.scalar_type() == mfq_tensor_backend::kFloat16 &&
+            out.dim() == 3 && out.size(0) == tokens &&
+            out.size(1) == routes && out.size(2) == out_per_expert,
+        "NVQ heterogeneous output must be CUDA FP16 [tokens,routes,out]");
+    const int K = static_cast<int>(neuron_len);
+    const int ng = (K + kGroupSize - 1) / kGroupSize;
+    const int K_pad = ng * kGroupSize;
+    const int input_rows = routed_input ? pairs : tokens;
+    MFQ_RUNTIME_CHECK(
+        qx.is_cuda() && qx.is_contiguous() &&
+            qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.dim() == 2 &&
+            qx.size(0) >= input_rows && qx.size(1) >= K_pad,
+        "NVQ heterogeneous qx workspace mismatch");
+    MFQ_RUNTIME_CHECK(
+        xscale.is_cuda() && xscale.is_contiguous() &&
+            xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
+            xscale.dim() == 2 && xscale.size(0) >= input_rows &&
+            xscale.size(1) >= ng,
+        "NVQ heterogeneous xscale workspace mismatch");
+    for (const auto * tensor : {
+             &weight_sizes, &pool_params, &expert_pool, &expert_local,
+             &x, &ids, &out, &qx, &xscale}) {
+        MFQ_RUNTIME_CHECK(
+            tensor->device() == weight_ptrs.device(),
+            "NVQ heterogeneous tensors must share one CUDA device");
+    }
+
+    const cudaStream_t stream = mfq_current_cuda_stream();
+    if (!input_quantized) {
+        nvq_quantize_x_gs24_kernel<<<dim3(input_rows, ng), 32, 0, stream>>>(
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
+            qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), input_rows, K, ng);
+    }
+#define NVQ_MOE_HETERO_MMVQ_LAUNCH(NWARPS_VALUE)                               \
+    nvq_moe_mmvq_hetero_kernel<                                                \
+        NWARPS_VALUE, 2, false><<<                                             \
+        dim3((static_cast<int>(out_per_expert) + 1) / 2, pairs),               \
+        dim3(32, NWARPS_VALUE), 0, stream>>>(                                  \
+        weight_ptrs.data_ptr<int64_t>(), weight_sizes.data_ptr<int64_t>(),     \
+        pool_params.data_ptr<int32_t>(), expert_pool.data_ptr<int32_t>(),      \
+        expert_local.data_ptr<int32_t>(), qx.data_ptr<int8_t>(),               \
+        xscale.data_ptr<float>(), ids.data_ptr<int32_t>(),                     \
+        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), pairs, routes,   \
+        static_cast<int>(n_experts), pools, static_cast<int>(out_per_expert),  \
+        routed_input)
+    if (K >= 4096) NVQ_MOE_HETERO_MMVQ_LAUNCH(8);
+    else NVQ_MOE_HETERO_MMVQ_LAUNCH(4);
+#undef NVQ_MOE_HETERO_MMVQ_LAUNCH
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }

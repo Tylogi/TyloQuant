@@ -347,6 +347,13 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor ids_dst,
     mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
     mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor weight_sizes,
+    mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor expert_pool,
+    mfq_tensor_backend::Tensor expert_local, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor ids, int64_t n_experts, int64_t out_per_expert,
+    int64_t neuron_len, bool input_quantized, mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
     mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor table_pool, mfq_tensor_backend::Tensor bank_ids,
@@ -6762,6 +6769,21 @@ struct MixedMoeRuntime {
             const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_MIN_TOKENS");
             return value == nullptr ? 256 : std::max(9, std::atoi(value));
         }();
+        static const bool disable_nvq_hetero_decode = [] {
+            const char * disabled =
+                std::getenv("MFQ_DISABLE_MOE_NVQ_HETERO_DECODE");
+            const char * exact =
+                std::getenv("MFQ_NVQ_MOE_EXACT_REDUCTION");
+            const char * rows =
+                std::getenv("MFQ_NVQ_MOE_ROWS_PER_BLOCK");
+            const char * warps =
+                std::getenv("MFQ_NVQ_MOE_WARPS");
+            const char * shared =
+                std::getenv("MFQ_NVQ_MOE_SHARE_GROUP_STATE");
+            return (disabled != nullptr && std::atoi(disabled) != 0) ||
+                (exact != nullptr && std::atoi(exact) != 0) ||
+                rows != nullptr || warps != nullptr || shared != nullptr;
+        }();
         const bool use_f16_mma =
             !disable_prefill_mma && !g_force_moe_prefill_mma_off &&
             tokens >= prefill_mma_min_tokens && route.map_ready &&
@@ -6775,6 +6797,10 @@ struct MixedMoeRuntime {
             nint_dispatch->hetero_supported;
         const bool use_nvq_prefill =
             use_f16_mma && !use_kl_mmq && nvq_dispatch;
+        const bool use_nvq_decode =
+            !use_f16_mma && !use_kl_mmq && nvq_dispatch &&
+            tokens <= 8 && !g_force_moe_pool_path &&
+            !disable_nvq_hetero_decode;
         if (input_prequantized && use_kl_mmq) {
             throw std::runtime_error(
                 "mixed prequantized activation reuse is unavailable in KLD MMQ mode");
@@ -6834,13 +6860,39 @@ struct MixedMoeRuntime {
                 }
             }
         }
+        if (use_nvq_decode) {
+            const int groups = (neuron_len + 23) / 24;
+            const MixedMoeActivationKey activation_key{
+                input_rows, groups, 24, x.get_device(), identity};
+            auto & workspace = activation_workspace(
+                x, input_rows, groups, 24, identity);
+            auto qx = workspace.qx;
+            auto xscale = workspace.xscale;
+            bool input_quantized = input_prequantized;
+            if (shared_nint_qx.defined() &&
+                    shared_nint_groups == groups && shared_nint_gs == 24) {
+                qx = shared_nint_qx;
+                xscale = shared_nint_xscale;
+                input_quantized = true;
+            }
+            nvq_moe_grouped_matmul_hetero_ws_cuda(
+                nvq_dispatch->weight_ptrs,
+                nvq_dispatch->weight_sizes,
+                nvq_dispatch->pool_params,
+                nvq_dispatch->expert_pool,
+                nvq_dispatch->expert_local,
+                x, route.ids, n_experts, out_per_expert, neuron_len,
+                input_quantized, output, qx, xscale);
+            quantized.insert(activation_key);
+        }
 
         for (const auto & pool : pools) {
             if (pool.family == MixedMoeFamily::Nint &&
                     (use_nint_prefill || use_nint_decode)) {
                 continue;
             }
-            if (pool.family == MixedMoeFamily::Nvq && use_nvq_prefill) {
+            if (pool.family == MixedMoeFamily::Nvq &&
+                    (use_nvq_prefill || use_nvq_decode)) {
                 continue;
             }
             int gs = 24;

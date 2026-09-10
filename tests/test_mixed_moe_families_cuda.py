@@ -236,28 +236,30 @@ def test_cpp_runtime_matches_python_for_all_nintm_families(tmp_path, tokens: int
         if value.startswith("nintm_tensor_check ")
     )
     fields = dict(part.split("=", 1) for part in line.split()[1:])
+    legacy_env = env.copy()
     if tokens > 8:
-        legacy_env = env.copy()
         legacy_env["MFQ_DISABLE_MOE_NVQ_HETERO"] = "1"
-        legacy = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            env=legacy_env,
-            text=True,
-            timeout=60,
-        )
-        legacy_line = next(
-            value
-            for value in legacy.stdout.splitlines()
-            if value.startswith("nintm_tensor_check ")
-        )
-        legacy_fields = dict(
-            part.split("=", 1) for part in legacy_line.split()[1:]
-        )
-        assert fields["values"] == legacy_fields["values"]
-        assert fields["checksum"] == legacy_fields["checksum"]
-        assert fields["sqsum"] == legacy_fields["sqsum"]
+    else:
+        legacy_env["MFQ_DISABLE_MOE_NVQ_HETERO_DECODE"] = "1"
+    legacy = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        env=legacy_env,
+        text=True,
+        timeout=60,
+    )
+    legacy_line = next(
+        value
+        for value in legacy.stdout.splitlines()
+        if value.startswith("nintm_tensor_check ")
+    )
+    legacy_fields = dict(
+        part.split("=", 1) for part in legacy_line.split()[1:]
+    )
+    assert fields["values"] == legacy_fields["values"]
+    assert fields["checksum"] == legacy_fields["checksum"]
+    assert fields["sqsum"] == legacy_fields["sqsum"]
     actual = torch.as_tensor(
         [float(value) for value in fields["values"].split(",")],
         dtype=torch.float32,
