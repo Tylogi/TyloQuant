@@ -258,8 +258,16 @@ def copy_sparse_range(source, target, nbytes: int, *, offset: int = 0) -> None:
             target.write(chunk)
             remaining -= len(chunk)
 
+    seek_data = getattr(os, "SEEK_DATA", None)
+    seek_hole = getattr(os, "SEEK_HOLE", None)
+    if seek_data is None or seek_hole is None:
+        target.seek(destination_start)
+        copy_bytes(start, end)
+        target.seek(destination_start + size)
+        return
+
     try:
-        data = os.lseek(source.fileno(), start, os.SEEK_DATA)
+        data = os.lseek(source.fileno(), start, seek_data)
     except OSError as exc:
         if exc.errno == errno.ENXIO:
             target.truncate(destination_start + size)
@@ -274,7 +282,7 @@ def copy_sparse_range(source, target, nbytes: int, *, offset: int = 0) -> None:
     cursor = start
     while data < end:
         try:
-            hole = os.lseek(source.fileno(), data, os.SEEK_HOLE)
+            hole = os.lseek(source.fileno(), data, seek_hole)
         except OSError as exc:  # pragma: no cover - paired seek support is expected
             if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.ENXIO}:
                 raise
@@ -286,7 +294,7 @@ def copy_sparse_range(source, target, nbytes: int, *, offset: int = 0) -> None:
         if cursor >= end:
             break
         try:
-            data = os.lseek(source.fileno(), cursor, os.SEEK_DATA)
+            data = os.lseek(source.fileno(), cursor, seek_data)
         except OSError as exc:
             if exc.errno == errno.ENXIO:
                 break

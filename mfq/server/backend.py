@@ -137,7 +137,7 @@ class OpenAIChatBackend:
             avfoundation_library=avfoundation_video_library
         )
         self._avfoundation_video_library = avfoundation_video_library
-        self._local_tensor_files = local_tensor_files and os.name == "posix"
+        self._local_tensor_files = local_tensor_files and os.name in {"posix", "nt"}
         self._runtime_metric_overrides: dict[str, dict[str, float]] = {}
 
     async def stream(

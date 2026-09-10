@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import stat
 import wave
 from pathlib import Path
@@ -664,7 +665,8 @@ def test_binary_tensor_transport_matches_base64_and_uses_private_file() -> None:
         file_spec = binary.tensors["binary_file"]
         assert file_spec["path"] == str(path)
         assert path.stat().st_size == file_spec["size"]
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        if os.name != "nt":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
         with path.open("rb") as stream:
             header = stream.read(64)
         assert header[:8] == b"MFQMM01\0"

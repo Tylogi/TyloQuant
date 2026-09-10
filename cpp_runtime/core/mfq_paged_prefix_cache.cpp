@@ -238,7 +238,7 @@ std::uint64_t monotonic_tick() {
 bool sync_regular_file(const std::filesystem::path& path) {
 #if defined(_WIN32)
     const int descriptor = _wopen(
-        path.c_str(), _O_RDONLY | _O_BINARY);
+        path.c_str(), _O_RDWR | _O_BINARY);
     if (descriptor < 0) return false;
     const bool synced = _commit(descriptor) == 0;
     (void)_close(descriptor);
@@ -805,9 +805,9 @@ private:
         std::error_code error;
         std::filesystem::create_directories(final_path.parent_path(), error);
         if (error) return false;
-        const auto temporary = final_path.string() + ".tmp." +
-            std::to_string(monotonic_tick()) + "." +
-            std::to_string(temp_counter_.fetch_add(1));
+        const auto temporary = final_path.parent_path() /
+            (".mfqkv.tmp." + std::to_string(monotonic_tick()) + "." +
+             std::to_string(temp_counter_.fetch_add(1)));
         std::ofstream output(
             temporary,
             std::ios::binary | std::ios::trunc);

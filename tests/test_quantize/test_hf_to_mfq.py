@@ -458,7 +458,9 @@ def test_scaled_fp8_tensor_slice_applies_modelopt_block_multipliers(tmp_path):
         torch.as_tensor(rows // 128)[:, None],
         (torch.arange(260) // 128)[None, :],
     ]
-    torch.testing.assert_close(actual, weight[rows].float() * expected_scale)
+    # CPU indexing is not implemented for float8 on every supported PyTorch
+    # build.  Convert before indexing so the reference remains portable.
+    torch.testing.assert_close(actual, weight.float()[rows] * expected_scale)
 
 
 def test_canonical_source_contract_resolves_and_decodes_mxfp8_e8m0(tmp_path):
