@@ -25,8 +25,8 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using mlx::core::Shape;
 using mlx::core::array;
-using mfq::metal::MlxDeepseekV4SsdExpertArena;
-using mfq::metal::MlxDeepseekV4SsdExpertWeights;
+using mfq::metal::MlxMxfp4SsdExpertArena;
+using mfq::metal::MlxSsdExpertWeights;
 
 constexpr int kHidden = 4096;
 constexpr int kRouted = 2048;
@@ -124,7 +124,7 @@ Options parse_options(int argc, char** argv) {
 }
 
 void fill_slot(
-    MlxDeepseekV4SsdExpertArena& arena,
+    MlxMxfp4SsdExpertArena& arena,
     std::size_t slot) {
     auto destination = arena.destination(slot);
     for (const auto bytes : {
@@ -234,7 +234,7 @@ class Benchmark {
 public:
     explicit Benchmark(const Options& options)
         : options_(options),
-          arena_(kSlots),
+          arena_(kSlots, kHidden, kRouted),
           input_(make_input(options.rows, kHidden, 11)),
           down_input_(mlx::core::broadcast_to(
               mlx::core::expand_dims(
@@ -322,7 +322,7 @@ public:
     }
 
 private:
-    MlxDeepseekV4SsdExpertWeights make_routed_weights() {
+    MlxSsdExpertWeights make_routed_weights() {
         for (int slot = 0; slot < kSlots; ++slot) {
             fill_slot(arena_, static_cast<std::size_t>(slot));
         }
@@ -492,12 +492,12 @@ private:
     }
 
     const Options& options_;
-    MlxDeepseekV4SsdExpertArena arena_;
+    MlxMxfp4SsdExpertArena arena_;
     array input_;
     array down_input_;
     array ids_;
     array route_weights_;
-    MlxDeepseekV4SsdExpertWeights routed_;
+    MlxSsdExpertWeights routed_;
     array omlx_up_weight_;
     array omlx_gate_weight_;
     array omlx_down_weight_;

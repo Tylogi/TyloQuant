@@ -88,6 +88,10 @@ public:
         const std::string& name,
         std::uint64_t relative_offset,
         std::uint64_t nbytes) const;
+    void read_range_into(
+        const std::string& name,
+        std::uint64_t relative_offset,
+        std::span<std::byte> destination) const;
     std::vector<std::uint8_t> read(const std::string& name) const;
     // Read-only mmap view used by full-resident model loading. The mapping is
     // released as soon as the parser has copied the record into its final MLX
@@ -105,6 +109,13 @@ public:
     void install_legacy_aliases(
         std::unordered_map<std::string, std::string> canonical_to_stored,
         mfq::MfqLegacyTensorLayout layout = {});
+    // Turn per-expert native HF tensors into canonical, virtual NINTM
+    // projections. The logical container is assembled from exact tensor
+    // ranges, so callers can stream one expert without materializing its
+    // siblings or rewriting the source checkpoint.
+    void install_hf_nintm_views(
+        const std::unordered_map<std::string, std::string>&
+            canonical_to_stored);
     bool has_legacy_aliases() const noexcept {
         return !legacy_aliases_.empty();
     }
@@ -114,13 +125,23 @@ public:
 
 private:
     using RecordMap = std::unordered_map<std::string, MfqRecord>;
+    struct RandomAccessFiles;
 
     struct HfVirtualRecord {
+        struct Segment {
+            std::uint64_t logical_offset = 0;
+            std::vector<std::uint8_t> inline_bytes;
+            std::string tensor_name;
+            std::uint64_t tensor_offset = 0;
+            std::uint64_t nbytes = 0;
+        };
+
         std::string values_name;
         std::string scales_name;
         std::vector<std::uint8_t> prefix;
         std::uint64_t values_offset = 0;
         std::uint64_t scales_offset = 0;
+        std::vector<Segment> segments;
     };
 
     static MfqHeader load_records(
@@ -139,6 +160,10 @@ private:
         const std::string& name,
         std::uint64_t relative_offset,
         std::uint64_t nbytes) const;
+    void read_hf_range_into(
+        const std::string& name,
+        std::uint64_t relative_offset,
+        std::span<std::byte> destination) const;
 
     MfqHeader header_;
     std::vector<std::filesystem::path> source_paths_;
@@ -148,6 +173,7 @@ private:
     std::unordered_map<std::string, std::vector<std::uint8_t>> hf_assets_;
     std::unordered_map<std::string, std::string> legacy_aliases_;
     mfq::MfqLegacyTensorLayout legacy_tensor_layout_;
+    std::shared_ptr<RandomAccessFiles> random_access_files_;
 };
 
 } // namespace mfq::metal

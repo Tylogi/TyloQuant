@@ -191,27 +191,6 @@ void preadv_exact(
     }
 }
 
-std::string expert_tensor_name(
-    std::string_view layer_prefix,
-    std::size_t expert,
-    std::string_view suffix) {
-    // Source-framework spelling is confined to this Safetensors boundary.
-    std::string source_prefix;
-    constexpr std::string_view model_prefix = "model.block.";
-    constexpr std::string_view predictor_prefix = "predictor.stage.";
-    if (layer_prefix.starts_with(model_prefix)) {
-        source_prefix = "layers." +
-            std::string(layer_prefix.substr(model_prefix.size()));
-    } else if (layer_prefix.starts_with(predictor_prefix)) {
-        source_prefix = "mtp." +
-            std::string(layer_prefix.substr(predictor_prefix.size()));
-    } else {
-        source_prefix = std::string(layer_prefix);
-    }
-    return source_prefix + ".ffn.experts." +
-        std::to_string(expert) + "." + std::string(suffix);
-}
-
 void require_tensor(
     const HfSafetensorRecord& record,
     std::string_view dtype,
@@ -219,7 +198,7 @@ void require_tensor(
     if (record.dtype != dtype ||
         record.shape != std::vector<std::int64_t>(shape)) {
         throw std::runtime_error(
-            "unexpected native DeepSeek-V4 expert tensor " + record.name);
+            "unexpected native MXFP4 expert tensor " + record.name);
     }
 }
 
@@ -507,82 +486,80 @@ void HfSafetensorStore::drop_file_cache() const noexcept {
     }
 }
 
-struct DeepseekV4NativeExpertStore::ExpertRecord {
+struct MlxNativeMxfp4ExpertStore::ExpertRecord {
     std::array<const HfSafetensorRecord*, kParts> parts{};
+    bool scales_contiguous = false;
+    bool weights_contiguous = false;
 };
 
-DeepseekV4NativeExpertStore::DeepseekV4NativeExpertStore(
-    std::filesystem::path root,
-    std::size_t num_layers,
-    std::size_t num_experts)
-    : DeepseekV4NativeExpertStore(
-          std::move(root),
-          [&] {
-              std::vector<std::string> prefixes;
-              prefixes.reserve(num_layers);
-              for (std::size_t layer = 0; layer < num_layers; ++layer) {
-                  prefixes.push_back(
-                      "model.block." + std::to_string(layer));
-              }
-              return prefixes;
-          }(),
-          num_experts) {}
-
-DeepseekV4NativeExpertStore::DeepseekV4NativeExpertStore(
-    std::filesystem::path root,
+MlxNativeMxfp4ExpertStore::MlxNativeMxfp4ExpertStore(
+    std::shared_ptr<HfSafetensorStore> checkpoint,
     std::vector<std::string> layer_prefixes,
-    std::size_t num_experts)
-    : checkpoint_(std::move(root)),
+    std::size_t num_experts,
+    std::size_t hidden_size,
+    std::size_t intermediate_size,
+    TensorNameResolver resolve)
+    : checkpoint_(std::move(checkpoint)),
       num_layers_(layer_prefixes.size()),
-      num_experts_(num_experts) {
-    if (num_layers_ == 0 || num_experts_ == 0) {
+      num_experts_(num_experts),
+      hidden_size_(hidden_size),
+      intermediate_size_(intermediate_size) {
+    if (!checkpoint_ || !resolve || num_layers_ == 0 || num_experts_ == 0 ||
+        hidden_size_ == 0 || intermediate_size_ == 0 ||
+        hidden_size_ % 32 != 0 || intermediate_size_ % 32 != 0) {
         throw std::invalid_argument(
-            "DeepSeek-V4 expert store dimensions must be positive");
+            "native MXFP4 expert store geometry is invalid");
     }
     experts_.resize(num_layers_ * num_experts_);
-    constexpr std::array<std::string_view, kParts> suffixes = {
-        "w1.scale", "w2.scale", "w3.scale",
-        "w1.weight", "w2.weight", "w3.weight",
+    constexpr std::array<std::string_view, 3> projections = {
+        "gate", "down", "up",
     };
 
     for (std::size_t layer = 0; layer < num_layers_; ++layer) {
         for (std::size_t expert = 0; expert < num_experts_; ++expert) {
             auto& record = experts_[layer * num_experts_ + expert];
-            for (std::size_t part = 0; part < suffixes.size(); ++part) {
-                record.parts[part] = &checkpoint_.tensor(
-                    expert_tensor_name(
-                        layer_prefixes[layer], expert, suffixes[part]));
+            const auto base = layer_prefixes[layer] + ".mlp.experts." +
+                std::to_string(expert) + ".";
+            for (std::size_t projection = 0;
+                 projection < projections.size(); ++projection) {
+                record.parts[projection] = &checkpoint_->tensor(resolve(
+                    base + std::string(projections[projection]) +
+                    ".weight_scale"));
+                record.parts[projection + 3] = &checkpoint_->tensor(resolve(
+                    base + std::string(projections[projection]) +
+                    ".weight"));
             }
-            require_tensor(*record.parts[0], "F8_E8M0", {2048, 128});
-            require_tensor(*record.parts[1], "F8_E8M0", {4096, 64});
-            require_tensor(*record.parts[2], "F8_E8M0", {2048, 128});
-            require_tensor(*record.parts[3], "I8", {2048, 2048});
-            require_tensor(*record.parts[4], "I8", {4096, 1024});
-            require_tensor(*record.parts[5], "I8", {2048, 2048});
+            require_tensor(*record.parts[0], "F8_E8M0", {
+                static_cast<std::int64_t>(intermediate_size_),
+                static_cast<std::int64_t>(hidden_size_ / 32)});
+            require_tensor(*record.parts[1], "F8_E8M0", {
+                static_cast<std::int64_t>(hidden_size_),
+                static_cast<std::int64_t>(intermediate_size_ / 32)});
+            require_tensor(*record.parts[2], "F8_E8M0", {
+                static_cast<std::int64_t>(intermediate_size_),
+                static_cast<std::int64_t>(hidden_size_ / 32)});
+            require_tensor(*record.parts[3], "I8", {
+                static_cast<std::int64_t>(intermediate_size_),
+                static_cast<std::int64_t>(hidden_size_ / 2)});
+            require_tensor(*record.parts[4], "I8", {
+                static_cast<std::int64_t>(hidden_size_),
+                static_cast<std::int64_t>(intermediate_size_ / 2)});
+            require_tensor(*record.parts[5], "I8", {
+                static_cast<std::int64_t>(intermediate_size_),
+                static_cast<std::int64_t>(hidden_size_ / 2)});
+            record.scales_contiguous = true;
+            record.weights_contiguous = true;
             for (std::size_t part = 1; part < 3; ++part) {
-                if (record.parts[part]->shard != record.parts[0]->shard ||
-                    record.parts[part]->offset !=
-                        record.parts[part - 1]->offset +
-                            record.parts[part - 1]->nbytes) {
-                    throw std::runtime_error(
-                        "DeepSeek-V4 expert scales are not contiguous: " +
-                        record.parts[part]->name);
-                }
+                record.scales_contiguous = record.scales_contiguous &&
+                    record.parts[part]->shard == record.parts[0]->shard &&
+                    record.parts[part]->offset == record.parts[part - 1]->offset +
+                        record.parts[part - 1]->nbytes;
             }
             for (std::size_t part = 4; part < 6; ++part) {
-                if (record.parts[part]->shard != record.parts[3]->shard ||
-                    record.parts[part]->offset !=
-                        record.parts[part - 1]->offset +
-                            record.parts[part - 1]->nbytes) {
-                    throw std::runtime_error(
-                        "DeepSeek-V4 expert weights are not contiguous: " +
-                        record.parts[part]->name);
-                }
-            }
-            if (record.parts[0]->shard != record.parts[3]->shard) {
-                throw std::runtime_error(
-                    "DeepSeek-V4 expert parts span multiple shards: " +
-                    record.parts[0]->name);
+                record.weights_contiguous = record.weights_contiguous &&
+                    record.parts[part]->shard == record.parts[3]->shard &&
+                    record.parts[part]->offset == record.parts[part - 1]->offset +
+                        record.parts[part - 1]->nbytes;
             }
         }
     }
@@ -603,42 +580,42 @@ DeepseekV4NativeExpertStore::DeepseekV4NativeExpertStore(
     }
 }
 
-DeepseekV4NativeExpertStore::~DeepseekV4NativeExpertStore() = default;
+MlxNativeMxfp4ExpertStore::~MlxNativeMxfp4ExpertStore() = default;
 
-const HfSafetensorStore& DeepseekV4NativeExpertStore::checkpoint() const noexcept {
-    return checkpoint_;
+const HfSafetensorStore& MlxNativeMxfp4ExpertStore::checkpoint() const noexcept {
+    return *checkpoint_;
 }
 
-std::size_t DeepseekV4NativeExpertStore::num_layers() const noexcept {
+std::size_t MlxNativeMxfp4ExpertStore::num_layers() const noexcept {
     return num_layers_;
 }
 
-std::size_t DeepseekV4NativeExpertStore::num_experts() const noexcept {
+std::size_t MlxNativeMxfp4ExpertStore::num_experts() const noexcept {
     return num_experts_;
 }
 
-std::size_t DeepseekV4NativeExpertStore::slot_bytes() const noexcept {
+std::size_t MlxNativeMxfp4ExpertStore::slot_bytes() const noexcept {
     return slot_bytes_;
 }
 
-const DeepseekV4NativeExpertStore::ExpertRecord&
-DeepseekV4NativeExpertStore::expert_record(
+const MlxNativeMxfp4ExpertStore::ExpertRecord&
+MlxNativeMxfp4ExpertStore::expert_record(
     std::size_t layer,
     std::size_t expert) const {
     if (layer >= num_layers_ || expert >= num_experts_) {
-        throw std::out_of_range("DeepSeek-V4 expert index out of range");
+        throw std::out_of_range("native MXFP4 expert index out of range");
     }
     return experts_[layer * num_experts_ + expert];
 }
 
-DeepseekV4NativeExpertLoadStats DeepseekV4NativeExpertStore::load(
+MlxNativeMxfp4ExpertLoadStats MlxNativeMxfp4ExpertStore::load(
     std::size_t layer,
     std::size_t expert,
     std::span<std::byte> slot) const {
     if (slot.size() < slot_bytes_) {
-        throw std::runtime_error("DeepSeek-V4 expert slot is too small");
+        throw std::runtime_error("native MXFP4 expert slot is too small");
     }
-    DeepseekV4NativeExpertDestination destination{
+    MlxNativeMxfp4ExpertDestination destination{
         .w1_scale = slot.subspan(
             slot_offsets_[0], slot_offsets_[1] - slot_offsets_[0]),
         .w2_scale = slot.subspan(
@@ -655,10 +632,10 @@ DeepseekV4NativeExpertLoadStats DeepseekV4NativeExpertStore::load(
     return load_scatter(layer, expert, destination);
 }
 
-DeepseekV4NativeExpertLoadStats DeepseekV4NativeExpertStore::load_scatter(
+MlxNativeMxfp4ExpertLoadStats MlxNativeMxfp4ExpertStore::load_scatter(
     std::size_t layer,
     std::size_t expert,
-    const DeepseekV4NativeExpertDestination& destination) const {
+    const MlxNativeMxfp4ExpertDestination& destination) const {
     const auto& record = expert_record(layer, expert);
     const std::array<std::span<std::byte>, 3> scales{
         destination.w1_scale,
@@ -682,30 +659,47 @@ DeepseekV4NativeExpertLoadStats DeepseekV4NativeExpertStore::load_scatter(
     for (std::size_t part = 0; part < kParts; ++part) {
         if (all[part].size() != record.parts[part]->nbytes) {
             throw std::runtime_error(
-                "DeepSeek-V4 expert destination size mismatch for " +
+                "native MXFP4 expert destination size mismatch for " +
                 record.parts[part]->name);
         }
         bytes = checked_add(bytes, all[part].size());
     }
-    checkpoint_.readv_range(
-        record.parts[0]->shard,
-        record.parts[0]->offset,
-        scales);
-    checkpoint_.readv_range(
-        record.parts[3]->shard,
-        record.parts[3]->offset,
-        weights);
+    std::uint64_t read_calls = 0;
+    if (record.scales_contiguous) {
+        checkpoint_->readv_range(
+            record.parts[0]->shard,
+            record.parts[0]->offset,
+            scales);
+        ++read_calls;
+    } else {
+        for (std::size_t part = 0; part < scales.size(); ++part) {
+            checkpoint_->read_tensor(*record.parts[part], scales[part]);
+            ++read_calls;
+        }
+    }
+    if (record.weights_contiguous) {
+        checkpoint_->readv_range(
+            record.parts[3]->shard,
+            record.parts[3]->offset,
+            weights);
+        ++read_calls;
+    } else {
+        for (std::size_t part = 0; part < weights.size(); ++part) {
+            checkpoint_->read_tensor(*record.parts[part + 3], weights[part]);
+            ++read_calls;
+        }
+    }
     return {
         .bytes = bytes,
-        .read_calls = 2,
+        .read_calls = read_calls,
     };
 }
 
-DeepseekV4NativeExpertLoadStats
-DeepseekV4NativeExpertStore::load_gate_up_scatter(
+MlxNativeMxfp4ExpertLoadStats
+MlxNativeMxfp4ExpertStore::load_gate_up_scatter(
     std::size_t layer,
     std::size_t expert,
-    const DeepseekV4NativeExpertDestination& destination) const {
+    const MlxNativeMxfp4ExpertDestination& destination) const {
     const auto scales = load_scales_scatter(layer, expert, destination);
     const auto gate = load_gate_scatter(layer, expert, destination);
     const auto up = load_up_scatter(layer, expert, destination);
@@ -715,11 +709,11 @@ DeepseekV4NativeExpertStore::load_gate_up_scatter(
     };
 }
 
-DeepseekV4NativeExpertLoadStats
-DeepseekV4NativeExpertStore::load_scales_scatter(
+MlxNativeMxfp4ExpertLoadStats
+MlxNativeMxfp4ExpertStore::load_scales_scatter(
     std::size_t layer,
     std::size_t expert,
-    const DeepseekV4NativeExpertDestination& destination) const {
+    const MlxNativeMxfp4ExpertDestination& destination) const {
     const auto& record = expert_record(layer, expert);
     const std::array<std::span<std::byte>, 3> scales{
         destination.w1_scale,
@@ -729,32 +723,41 @@ DeepseekV4NativeExpertStore::load_scales_scatter(
     for (std::size_t part = 0; part < scales.size(); ++part) {
         if (scales[part].size() != record.parts[part]->nbytes) {
             throw std::runtime_error(
-                "DeepSeek-V4 phased scale destination size mismatch for " +
+                "native MXFP4 scale destination size mismatch for " +
                 record.parts[part]->name);
         }
     }
-    checkpoint_.readv_range(
-        record.parts[0]->shard,
-        record.parts[0]->offset,
-        scales);
+    std::uint64_t read_calls = 0;
+    if (record.scales_contiguous) {
+        checkpoint_->readv_range(
+            record.parts[0]->shard,
+            record.parts[0]->offset,
+            scales);
+        read_calls = 1;
+    } else {
+        for (std::size_t part = 0; part < scales.size(); ++part) {
+            checkpoint_->read_tensor(*record.parts[part], scales[part]);
+            ++read_calls;
+        }
+    }
     return {
         .bytes = record.parts[0]->nbytes + record.parts[1]->nbytes +
             record.parts[2]->nbytes,
-        .read_calls = 1,
+        .read_calls = read_calls,
     };
 }
 
-DeepseekV4NativeExpertLoadStats
-DeepseekV4NativeExpertStore::load_gate_scatter(
+MlxNativeMxfp4ExpertLoadStats
+MlxNativeMxfp4ExpertStore::load_gate_scatter(
     std::size_t layer,
     std::size_t expert,
-    const DeepseekV4NativeExpertDestination& destination) const {
+    const MlxNativeMxfp4ExpertDestination& destination) const {
     const auto& record = expert_record(layer, expert);
     if (destination.w1_weight.size() != record.parts[3]->nbytes) {
         throw std::runtime_error(
-            "DeepSeek-V4 phased Gate destination size mismatch");
+            "native MXFP4 Gate destination size mismatch");
     }
-    checkpoint_.read_range(
+    checkpoint_->read_range(
         record.parts[3]->shard,
         record.parts[3]->offset,
         destination.w1_weight);
@@ -764,17 +767,17 @@ DeepseekV4NativeExpertStore::load_gate_scatter(
     };
 }
 
-DeepseekV4NativeExpertLoadStats
-DeepseekV4NativeExpertStore::load_up_scatter(
+MlxNativeMxfp4ExpertLoadStats
+MlxNativeMxfp4ExpertStore::load_up_scatter(
     std::size_t layer,
     std::size_t expert,
-    const DeepseekV4NativeExpertDestination& destination) const {
+    const MlxNativeMxfp4ExpertDestination& destination) const {
     const auto& record = expert_record(layer, expert);
     if (destination.w3_weight.size() != record.parts[5]->nbytes) {
         throw std::runtime_error(
-            "DeepSeek-V4 phased Up destination size mismatch");
+            "native MXFP4 Up destination size mismatch");
     }
-    checkpoint_.read_range(
+    checkpoint_->read_range(
         record.parts[5]->shard,
         record.parts[5]->offset,
         destination.w3_weight);
@@ -784,18 +787,18 @@ DeepseekV4NativeExpertStore::load_up_scatter(
     };
 }
 
-DeepseekV4NativeExpertLoadStats
-DeepseekV4NativeExpertStore::load_down_scatter(
+MlxNativeMxfp4ExpertLoadStats
+MlxNativeMxfp4ExpertStore::load_down_scatter(
     std::size_t layer,
     std::size_t expert,
-    const DeepseekV4NativeExpertDestination& destination) const {
+    const MlxNativeMxfp4ExpertDestination& destination) const {
     const auto& record = expert_record(layer, expert);
     if (destination.w2_weight.size() != record.parts[4]->nbytes) {
         throw std::runtime_error(
-            "DeepSeek-V4 phased Down destination size mismatch for " +
+            "native MXFP4 Down destination size mismatch for " +
             record.parts[4]->name);
     }
-    checkpoint_.read_range(
+    checkpoint_->read_range(
         record.parts[4]->shard,
         record.parts[4]->offset,
         destination.w2_weight);
@@ -805,10 +808,10 @@ DeepseekV4NativeExpertStore::load_down_scatter(
     };
 }
 
-DeepseekV4NativeExpertView DeepseekV4NativeExpertStore::view(
+MlxNativeMxfp4ExpertView MlxNativeMxfp4ExpertStore::view(
     std::span<const std::byte> slot) const {
     if (slot.size() < slot_bytes_) {
-        throw std::runtime_error("DeepSeek-V4 expert slot is too small");
+        throw std::runtime_error("native MXFP4 expert slot is too small");
     }
     return {
         .w1_scale = slot.subspan(

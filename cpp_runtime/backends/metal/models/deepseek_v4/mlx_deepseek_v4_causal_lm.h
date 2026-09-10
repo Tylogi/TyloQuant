@@ -59,6 +59,8 @@ public:
         std::pair<mlx::core::array, mlx::core::array>
             rope_compressed,
         std::shared_ptr<MlxNintMoeOffloadCache> offload =
+            nullptr,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache =
             nullptr);
 
     static MlxDeepseekV4Layer load(
@@ -70,7 +72,7 @@ public:
             rope_base,
         std::pair<mlx::core::array, mlx::core::array>
             rope_compressed,
-        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+        std::shared_ptr<MlxMoeSsdExpertCache>
             expert_cache,
         const std::optional<mlx::core::array>& available =
             std::nullopt);
@@ -94,17 +96,17 @@ public:
         const mlx::core::array& token_ids,
         MlxDeepseekV4LayerState& state,
         int pos0,
-        MlxDeepseekV4SsdPrefetchedLayer* prefetched) const;
+        MlxSsdPrefetchedExpertLayer* prefetched) const;
 
     mlx::core::array forward(
         const mlx::core::array& hidden,
         const mlx::core::array& token_ids,
         MlxDeepseekV4LayerState& state,
         int pos0,
-        MlxDeepseekV4SsdPrefetchedLayer* prefetched,
+        MlxSsdPrefetchedExpertLayer* prefetched,
         const MlxDeepseekV4ImageVisibility* visibility) const;
 
-    std::optional<MlxDeepseekV4SsdPrefetchedLayer>
+    std::optional<MlxSsdPrefetchedExpertLayer>
     prefetch_routed(std::size_t rows) const {
         return components_.moe.prefetch_routed(rows);
     }
@@ -219,7 +221,7 @@ public:
             mlx::core::float16,
         std::shared_ptr<MlxNintMoeOffloadCache>
             expert_offload = nullptr,
-        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+        std::shared_ptr<MlxMoeSsdExpertCache>
             ssd_expert_cache = nullptr,
         std::optional<MlxDeepseekV4Vision> vision =
             std::nullopt,
@@ -306,7 +308,7 @@ public:
     std::size_t expert_cache_limit_bytes() const noexcept;
     std::size_t expert_resident_packed_bytes() const;
     std::size_t cached_expert_count() const;
-    std::optional<MlxDeepseekV4SsdCacheStats>
+    std::optional<MlxSsdExpertCacheStats>
     ssd_expert_cache_stats() const;
     void prewarm_ssd_expert_arena();
     void clear_expert_cache();
@@ -381,7 +383,7 @@ private:
     mlx::core::array hc_head_scale_;
     std::shared_ptr<MlxNintMoeOffloadCache>
         expert_offload_;
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+    std::shared_ptr<MlxMoeSsdExpertCache>
         ssd_expert_cache_;
     std::optional<MlxDeepseekV4Vision> vision_;
     std::optional<MlxDeepseekV4DSpark> dspark_;

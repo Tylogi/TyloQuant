@@ -1,7 +1,9 @@
 #include "mlx_deepseek_v41_moe.h"
 
+#include "mlx_eval_timing.h"
 #include "mlx_moe_ops.h"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -52,15 +54,21 @@ MlxDeepseekV41Moe MlxDeepseekV41Moe::load(
     const MfqContainer& model,
     const DeepseekV41Config& config,
     const std::string& prefix,
-    bool predictor) {
+    bool predictor,
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
+    std::size_t expert_cache_layer) {
     const int experts = checked_int(
         predictor ? config.dspark_n_experts : config.n_experts,
         "expert count");
     const int top_k = checked_int(
         predictor ? config.dspark_top_k : config.top_k,
         "route count");
-    auto gate_up = load_routed_gate_up_weight(model, prefix);
-    auto down = moe_weight(model, prefix + ".experts.down.weight");
+    std::optional<MlxRoutedLinear> gate_up;
+    std::optional<MlxRoutedLinear> down;
+    if (!ssd_expert_cache) {
+        gate_up.emplace(load_routed_gate_up_weight(model, prefix));
+        down.emplace(moe_weight(model, prefix + ".experts.down.weight"));
+    }
     return MlxDeepseekV41Moe(
         checked_int(config.hidden, "hidden size"),
         checked_int(config.moe_inter, "expert intermediate size"),
@@ -81,8 +89,10 @@ MlxDeepseekV41Moe MlxDeepseekV41Moe::load(
         MlxLinear::load(model, prefix + ".shared_expert.gate.weight"),
         MlxLinear::load(model, prefix + ".shared_expert.up.weight"),
         MlxLinear::load(model, prefix + ".shared_expert.down.weight"),
-        MlxRoutedLinear(std::move(gate_up)),
-        MlxRoutedLinear(std::move(down)));
+        std::move(gate_up),
+        std::move(down),
+        std::move(ssd_expert_cache),
+        expert_cache_layer);
 }
 
 MlxDeepseekV41Moe::MlxDeepseekV41Moe(
@@ -99,8 +109,10 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
     MlxLinear shared_gate,
     MlxLinear shared_up,
     MlxLinear shared_down,
-    MlxRoutedLinear routed_gate_up,
-    MlxRoutedLinear routed_down)
+    std::optional<MlxRoutedLinear> routed_gate_up,
+    std::optional<MlxRoutedLinear> routed_down,
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
+    std::size_t expert_cache_layer)
     : hidden_(hidden),
       intermediate_(intermediate),
       experts_(experts),
@@ -116,7 +128,9 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
       shared_up_(std::move(shared_up)),
       shared_down_(std::move(shared_down)),
       routed_gate_up_(std::move(routed_gate_up)),
-      routed_down_(std::move(routed_down)) {
+      routed_down_(std::move(routed_down)),
+      ssd_expert_cache_(std::move(ssd_expert_cache)),
+      expert_cache_layer_(expert_cache_layer) {
     if (top_k_ > experts_ || router_.input_size() != hidden_ ||
         router_.output_size() != experts_ ||
         shared_gate_.input_size() != hidden_ ||
@@ -125,17 +139,20 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
         shared_up_.output_size() != intermediate_ ||
         shared_down_.input_size() != intermediate_ ||
         shared_down_.output_size() != hidden_ ||
-        routed_gate_up_.weight().experts() != experts_ ||
-        routed_gate_up_.weight().neuron_len() != hidden_ ||
+        routed_gate_up_.has_value() != routed_down_.has_value() ||
+        routed_gate_up_.has_value() == static_cast<bool>(ssd_expert_cache_) ||
+        (routed_gate_up_ && (
+        routed_gate_up_->weight().experts() != experts_ ||
+        routed_gate_up_->weight().neuron_len() != hidden_ ||
         !(
-            (routed_gate_up_.weight().projections() == 2 &&
-             routed_gate_up_.weight().out_per_expert() == intermediate_) ||
-            (routed_gate_up_.weight().projections() == 1 &&
-             routed_gate_up_.weight().out_per_expert() == 2 * intermediate_)
+            (routed_gate_up_->weight().projections() == 2 &&
+             routed_gate_up_->weight().out_per_expert() == intermediate_) ||
+            (routed_gate_up_->weight().projections() == 1 &&
+             routed_gate_up_->weight().out_per_expert() == 2 * intermediate_)
         ) ||
-        routed_down_.weight().experts() != experts_ ||
-        routed_down_.weight().neuron_len() != intermediate_ ||
-        routed_down_.weight().out_per_expert() != hidden_) {
+        routed_down_->weight().experts() != experts_ ||
+        routed_down_->weight().neuron_len() != intermediate_ ||
+        routed_down_->weight().out_per_expert() != hidden_))) {
         throw std::runtime_error("DeepSeek-V4.1 MoE tensor geometry disagrees");
     }
     if (vision_bias_.has_value()) {
@@ -190,9 +207,41 @@ array MlxDeepseekV41Moe::forward(
         routes.weights = mlx::core::where(mask, visual.weights, routes.weights);
     }
 
-    auto routed_hidden = routed_gate_up_.swiglu(
-        source, routes.ids, swiglu_limit_);
-    auto routed_pairs = routed_down_(routed_hidden, routes.ids);
+    array routed_pairs(0.0f);
+    if (ssd_expert_cache_) {
+        auto host_ids = mlx::core::contiguous(
+            mlx::core::astype(routes.ids, mlx::core::int32));
+        detail::eval_with_timing(host_ids);
+        std::vector<std::int32_t> active(
+            host_ids.data<std::int32_t>(),
+            host_ids.data<std::int32_t>() + host_ids.size());
+        active.erase(
+            std::remove_if(
+                active.begin(), active.end(),
+                [](std::int32_t expert) { return expert < 0; }),
+            active.end());
+        std::sort(active.begin(), active.end());
+        active.erase(std::unique(active.begin(), active.end()), active.end());
+        auto prepared = ssd_expert_cache_->prepare(
+            expert_cache_layer_, active);
+        std::vector<std::int32_t> slot_ids(host_ids.size(), -1);
+        const auto slot_map = prepared.slot_for_expert();
+        for (std::size_t index = 0; index < slot_ids.size(); ++index) {
+            const auto expert = host_ids.data<std::int32_t>()[index];
+            if (expert >= 0) {
+                slot_ids[index] = slot_map[static_cast<std::size_t>(expert)];
+            }
+        }
+        const array resident_ids(slot_ids.begin(), routes.ids.shape());
+        auto routed_hidden = prepared.weights().gate_up.swiglu(
+            source, resident_ids, swiglu_limit_);
+        routed_pairs = prepared.weights().down(
+            routed_hidden, resident_ids);
+    } else {
+        auto routed_hidden = routed_gate_up_->swiglu(
+            source, routes.ids, swiglu_limit_);
+        routed_pairs = (*routed_down_)(routed_hidden, routes.ids);
+    }
     auto routed = moe_weighted_reduce(routed_pairs, routes.weights);
     auto shared = shared_down_(limited_swiglu(
         shared_gate_(source), shared_up_(source), swiglu_limit_));

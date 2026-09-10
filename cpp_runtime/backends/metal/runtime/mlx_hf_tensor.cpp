@@ -114,7 +114,7 @@ void MlxHfTensorStore::initialize_aliases() {
         {}, config, names).canonical_to_stored;
 }
 
-std::string MlxHfTensorStore::resolve(std::string_view canonical) const {
+std::string MlxHfTensorStore::stored_name(std::string_view canonical) const {
     const auto found = canonical_to_stored_.find(std::string(canonical));
     return found == canonical_to_stored_.end()
         ? std::string(canonical) : found->second;
@@ -130,7 +130,7 @@ MlxHfTensorStore::shared_checkpoint() const noexcept {
 }
 
 array MlxHfTensorStore::load_dense(const std::string& name) const {
-    const auto& record = checkpoint_->tensor(resolve(name));
+    const auto& record = checkpoint_->tensor(stored_name(name));
     return allocate_and_read(
         *checkpoint_,
         record,
@@ -139,9 +139,9 @@ array MlxHfTensorStore::load_dense(const std::string& name) const {
 }
 
 MlxMxWeight MlxHfTensorStore::load_mx(const std::string& name) const {
-    const auto stored_name = resolve(name);
-    const auto& values_record = checkpoint_->tensor(stored_name);
-    const auto& scales_record = checkpoint_->tensor(scale_name(stored_name));
+    const auto resolved_name = stored_name(name);
+    const auto& values_record = checkpoint_->tensor(resolved_name);
+    const auto& scales_record = checkpoint_->tensor(scale_name(resolved_name));
     if (values_record.shard != scales_record.shard ||
         scales_record.dtype != "F8_E8M0" ||
         values_record.shape.size() != 2 || scales_record.shape.size() != 2) {
@@ -180,7 +180,7 @@ MlxMxWeight MlxHfTensorStore::load_mx(const std::string& name) const {
 }
 
 MlxLinear MlxHfTensorStore::load_linear(const std::string& name) const {
-    const auto& record = checkpoint_->tensor(resolve(name));
+    const auto& record = checkpoint_->tensor(stored_name(name));
     if (record.dtype == "I8" || record.dtype == "F8_E4M3" ||
         record.dtype == "F8_E4M3FN") {
         return MlxLinear(load_mx(name));
@@ -189,7 +189,7 @@ MlxLinear MlxHfTensorStore::load_linear(const std::string& name) const {
 }
 
 MlxEmbedding MlxHfTensorStore::load_embedding(const std::string& name) const {
-    const auto& record = checkpoint_->tensor(resolve(name));
+    const auto& record = checkpoint_->tensor(stored_name(name));
     if (record.dtype == "I8" || record.dtype == "F8_E4M3" ||
         record.dtype == "F8_E4M3FN") {
         return MlxEmbedding(load_mx(name));

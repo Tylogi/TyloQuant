@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -66,7 +67,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-struct DeepseekV4NativeExpertView {
+struct MlxNativeMxfp4ExpertView {
     std::span<const std::byte> w1_scale;
     std::span<const std::byte> w2_scale;
     std::span<const std::byte> w3_scale;
@@ -75,7 +76,7 @@ struct DeepseekV4NativeExpertView {
     std::span<const std::byte> w3_weight;
 };
 
-struct DeepseekV4NativeExpertDestination {
+struct MlxNativeMxfp4ExpertDestination {
     std::span<std::byte> w1_scale;
     std::span<std::byte> w2_scale;
     std::span<std::byte> w3_scale;
@@ -84,65 +85,64 @@ struct DeepseekV4NativeExpertDestination {
     std::span<std::byte> w3_weight;
 };
 
-struct DeepseekV4NativeExpertLoadStats {
+struct MlxNativeMxfp4ExpertLoadStats {
     std::uint64_t bytes = 0;
     std::uint64_t read_calls = 0;
 };
 
-// Exact, non-quantizing view of the official DeepSeek-V4 routed experts. Each
-// cache slot preserves the checkpoint's native MXFP4 I8 payload and F8_E8M0
-// scales. Full loads use one contiguous scale read and one contiguous packed-
-// weight read. Decode cache admission may instead expose Gate/Up before Down
-// with phased reads so Metal can consume one region while SSD fills another.
-class DeepseekV4NativeExpertStore {
+// Exact, non-quantizing view of canonical Gate/Down/Up MXFP4 experts in an HF
+// checkpoint. Source-framework spelling is supplied by the tensor-name
+// resolver; geometry and storage scheduling are architecture independent.
+class MlxNativeMxfp4ExpertStore {
 public:
     static constexpr std::size_t kParts = 6;
+    using TensorNameResolver =
+        std::function<std::string(std::string_view)>;
 
-    DeepseekV4NativeExpertStore(
-        std::filesystem::path root,
-        std::size_t num_layers,
-        std::size_t num_experts);
-    DeepseekV4NativeExpertStore(
-        std::filesystem::path root,
+    MlxNativeMxfp4ExpertStore(
+        std::shared_ptr<HfSafetensorStore> checkpoint,
         std::vector<std::string> layer_prefixes,
-        std::size_t num_experts);
-    ~DeepseekV4NativeExpertStore();
+        std::size_t num_experts,
+        std::size_t hidden_size,
+        std::size_t intermediate_size,
+        TensorNameResolver resolve);
+    ~MlxNativeMxfp4ExpertStore();
 
     const HfSafetensorStore& checkpoint() const noexcept;
     std::size_t num_layers() const noexcept;
     std::size_t num_experts() const noexcept;
     std::size_t slot_bytes() const noexcept;
 
-    DeepseekV4NativeExpertLoadStats load(
+    MlxNativeMxfp4ExpertLoadStats load(
         std::size_t layer,
         std::size_t expert,
         std::span<std::byte> slot) const;
-    DeepseekV4NativeExpertLoadStats load_scatter(
+    MlxNativeMxfp4ExpertLoadStats load_scatter(
         std::size_t layer,
         std::size_t expert,
-        const DeepseekV4NativeExpertDestination& destination) const;
-    DeepseekV4NativeExpertLoadStats load_gate_up_scatter(
+        const MlxNativeMxfp4ExpertDestination& destination) const;
+    MlxNativeMxfp4ExpertLoadStats load_gate_up_scatter(
         std::size_t layer,
         std::size_t expert,
-        const DeepseekV4NativeExpertDestination& destination) const;
-    DeepseekV4NativeExpertLoadStats load_scales_scatter(
+        const MlxNativeMxfp4ExpertDestination& destination) const;
+    MlxNativeMxfp4ExpertLoadStats load_scales_scatter(
         std::size_t layer,
         std::size_t expert,
-        const DeepseekV4NativeExpertDestination& destination) const;
-    DeepseekV4NativeExpertLoadStats load_gate_scatter(
+        const MlxNativeMxfp4ExpertDestination& destination) const;
+    MlxNativeMxfp4ExpertLoadStats load_gate_scatter(
         std::size_t layer,
         std::size_t expert,
-        const DeepseekV4NativeExpertDestination& destination) const;
-    DeepseekV4NativeExpertLoadStats load_up_scatter(
+        const MlxNativeMxfp4ExpertDestination& destination) const;
+    MlxNativeMxfp4ExpertLoadStats load_up_scatter(
         std::size_t layer,
         std::size_t expert,
-        const DeepseekV4NativeExpertDestination& destination) const;
-    DeepseekV4NativeExpertLoadStats load_down_scatter(
+        const MlxNativeMxfp4ExpertDestination& destination) const;
+    MlxNativeMxfp4ExpertLoadStats load_down_scatter(
         std::size_t layer,
         std::size_t expert,
-        const DeepseekV4NativeExpertDestination& destination) const;
+        const MlxNativeMxfp4ExpertDestination& destination) const;
 
-    DeepseekV4NativeExpertView view(
+    MlxNativeMxfp4ExpertView view(
         std::span<const std::byte> slot) const;
 
 private:
@@ -152,9 +152,11 @@ private:
         std::size_t layer,
         std::size_t expert) const;
 
-    HfSafetensorStore checkpoint_;
+    std::shared_ptr<HfSafetensorStore> checkpoint_;
     std::size_t num_layers_ = 0;
     std::size_t num_experts_ = 0;
+    std::size_t hidden_size_ = 0;
+    std::size_t intermediate_size_ = 0;
     std::size_t slot_bytes_ = 0;
     std::array<std::size_t, kParts + 1> slot_offsets_{};
     std::vector<ExpertRecord> experts_;

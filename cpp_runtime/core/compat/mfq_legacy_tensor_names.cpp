@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -29,6 +30,11 @@ std::string identity(std::string_view value) {
 
 bool starts_with(std::string_view value, std::string_view prefix) {
     return value.substr(0, prefix.size()) == prefix;
+}
+
+bool ends_with(std::string_view value, std::string_view suffix) {
+    return value.size() >= suffix.size() &&
+        value.substr(value.size() - suffix.size()) == suffix;
 }
 
 bool qwen35_family(
@@ -76,6 +82,15 @@ bool deepseek_v4_family(
             !starts_with(value, "deepseek_v41");
     };
     return legacy_v4(stored) || legacy_v4(config_type);
+}
+
+bool deepseek_v41_family(
+        std::string_view architecture,
+        const json& config) {
+    const auto stored = identity(architecture);
+    const auto config_type = identity(config.value("model_type", std::string{}));
+    return starts_with(stored, "deepseek_v41") ||
+        starts_with(config_type, "deepseek_v41");
 }
 
 bool gemma4_family(
@@ -694,12 +709,55 @@ void add_deepseek_v4_aliases(
             {"mlp.shared_expert.up.weight", "ffn.shared_experts.w3.weight"},
             {"mlp.shared_expert.down.weight", "ffn.shared_experts.w2.weight"},
         };
+    const auto dynamic_expert_suffix = [](std::string_view suffix)
+            -> std::optional<std::string> {
+        constexpr std::string_view experts = "ffn.experts.";
+        if (starts_with(suffix, experts)) {
+            const auto expert_end = suffix.find('.', experts.size());
+            if (expert_end == std::string_view::npos) return std::nullopt;
+            const auto expert = suffix.substr(
+                experts.size(), expert_end - experts.size());
+            if (expert.empty() || !std::all_of(
+                    expert.begin(), expert.end(),
+                    [](unsigned char value) { return std::isdigit(value); })) {
+                return std::nullopt;
+            }
+            const auto tail = suffix.substr(expert_end + 1);
+            const auto projection = starts_with(tail, "w1.") ? "gate" :
+                starts_with(tail, "w2.") ? "down" :
+                starts_with(tail, "w3.") ? "up" : nullptr;
+            if (projection == nullptr) return std::nullopt;
+            const auto leaf = ends_with(tail, ".weight") ? "weight" :
+                ends_with(tail, ".scale") ? "weight_scale" : nullptr;
+            if (leaf == nullptr) return std::nullopt;
+            return "mlp.experts." + std::string(expert) + "." +
+                projection + "." + leaf;
+        }
+        constexpr std::string_view shared = "ffn.shared_experts.w";
+        if (!starts_with(suffix, shared) || suffix.size() <= shared.size()) {
+            return std::nullopt;
+        }
+        const char projection_id = suffix[shared.size()];
+        const auto tail = suffix.substr(shared.size() + 1);
+        const auto projection = projection_id == '1' ? "gate" :
+            projection_id == '2' ? "down" :
+            projection_id == '3' ? "up" : nullptr;
+        if (projection == nullptr) return std::nullopt;
+        const auto leaf = tail == ".weight" ? "weight" :
+            tail == ".scale" ? "weight_scale" : nullptr;
+        if (leaf == nullptr) return std::nullopt;
+        return "mlp.shared_expert." + std::string(projection) + "." + leaf;
+    };
     for (const auto& stored : names) {
         if (!starts_with(stored, "layers.")) continue;
         const auto layer_end = stored.find('.', 7);
         if (layer_end == std::string::npos) continue;
         const auto layer = stored.substr(7, layer_end - 7);
         const auto stored_suffix = std::string_view(stored).substr(layer_end + 1);
+        if (const auto suffix = dynamic_expert_suffix(stored_suffix)) {
+            add("model.block." + layer + "." + *suffix, stored);
+            continue;
+        }
         for (const auto& [canonical_suffix, private_suffix] : private_suffixes) {
             if (stored_suffix == private_suffix) {
                 add(
@@ -731,6 +789,10 @@ void add_deepseek_v4_aliases(
         const auto stored_suffix =
             std::string_view(stored).substr(stage_end + 1);
         const auto prefix = "predictor.stage." + stage + ".";
+        if (const auto suffix = dynamic_expert_suffix(stored_suffix)) {
+            add(prefix + *suffix, stored);
+            continue;
+        }
         bool mapped = false;
         for (const auto& [canonical_suffix, private_suffix] : private_suffixes) {
             if (stored_suffix == private_suffix) {
@@ -741,6 +803,198 @@ void add_deepseek_v4_aliases(
         }
         if (mapped) continue;
         const auto found = predictor_suffixes.find(stored_suffix);
+        if (found != predictor_suffixes.end()) {
+            add(prefix + std::string(found->second), stored);
+        }
+    }
+}
+
+void add_deepseek_v41_aliases(
+        MfqLegacyTensorAliases& result,
+        const std::unordered_set<std::string>& names) {
+    result.layout.norm_weight_offset = 0.0;
+    const auto add = [&](std::string canonical, std::string stored) {
+        add_alias(result, names, std::move(canonical), std::move(stored));
+    };
+    add("model.token_embedding.weight", "embed.weight");
+    add("model.output_norm.weight", "norm.weight");
+    add("model.output.weight", "head.weight");
+    static const std::unordered_map<std::string_view, std::string_view>
+        vision_roots{
+            {"vision.patch_embedding.weight", "vision.patch_embed.proj.weight"},
+            {"vision.patch_embedding.bias", "vision.patch_embed.proj.bias"},
+            {"vision.output_norm.weight", "vision.norm.weight"},
+            {"vision.aligner.input.weight", "aligner.w1.weight"},
+            {"vision.aligner.input.bias", "aligner.w1.bias"},
+            {"vision.aligner.output.weight", "aligner.w2.weight"},
+            {"vision.aligner.output.bias", "aligner.w2.bias"},
+            {"vision.special_token.start", "image_start"},
+            {"vision.special_token.newline", "image_newline"},
+            {"vision.special_token.end", "image_end"},
+        };
+    for (const auto& [canonical, stored] : vision_roots) {
+        add(std::string(canonical), std::string(stored));
+    }
+    static const std::unordered_map<std::string_view, std::string_view>
+        vision_suffixes{
+            {"norm1.weight", "norm1.weight"},
+            {"norm2.weight", "norm2.weight"},
+            {"attention.qkv.weight", "attn.wqkv.weight"},
+            {"attention.qkv.bias", "attn.wqkv.bias"},
+            {"attention.output.weight", "attn.wo.weight"},
+            {"attention.output.bias", "attn.wo.bias"},
+            {"mlp.gate_up.weight", "mlp.w1.weight"},
+            {"mlp.down.weight", "mlp.w2.weight"},
+        };
+    for (const auto& stored : names) {
+        constexpr std::string_view prefix = "vision.blocks.";
+        if (!starts_with(stored, prefix)) continue;
+        const auto layer_end = stored.find('.', prefix.size());
+        if (layer_end == std::string::npos) continue;
+        const auto layer = stored.substr(prefix.size(), layer_end - prefix.size());
+        const auto suffix = std::string_view(stored).substr(layer_end + 1);
+        for (const auto& [canonical_suffix, source_suffix] : vision_suffixes) {
+            if (suffix == source_suffix) {
+                add("vision.block." + layer + "." +
+                        std::string(canonical_suffix), stored);
+                break;
+            }
+        }
+    }
+    static const std::unordered_map<std::string_view, std::string_view>
+        suffixes{
+            {"attention.norm.weight", "attn_norm.weight"},
+            {"mlp.norm.weight", "ffn_norm.weight"},
+            {"attention.mhc.pre.function", "hc_attn_fn"},
+            {"attention.mhc.pre.base", "hc_attn_base"},
+            {"attention.mhc.pre.scale", "hc_attn_scale"},
+            {"mlp.mhc.pre.function", "hc_ffn_fn"},
+            {"mlp.mhc.pre.base", "hc_ffn_base"},
+            {"mlp.mhc.pre.scale", "hc_ffn_scale"},
+            {"attention.query_a.weight", "attn.wq_a.weight"},
+            {"attention.query_a.weight_scale", "attn.wq_a.scale"},
+            {"attention.query_a_norm.weight", "attn.q_norm.weight"},
+            {"attention.query_b.weight", "attn.wq_b.weight"},
+            {"attention.query_b.weight_scale", "attn.wq_b.scale"},
+            {"attention.key_value.weight", "attn.wkv.weight"},
+            {"attention.key_value.weight_scale", "attn.wkv.scale"},
+            {"attention.key_value_norm.weight", "attn.kv_norm.weight"},
+            {"attention.sink", "attn.attn_sink"},
+            {"attention.output_a.weight", "attn.wo_a.weight"},
+            {"attention.output_a.weight_scale", "attn.wo_a.scale"},
+            {"attention.output_b.weight", "attn.wo_b.weight"},
+            {"attention.output_b.weight_scale", "attn.wo_b.scale"},
+            {"attention.compressor.key_value.weight", "attn.compressor.wkv.weight"},
+            {"attention.compressor.gate.weight", "attn.compressor.wgate.weight"},
+            {"attention.compressor.norm.weight", "attn.compressor.norm.weight"},
+            {"attention.indexer.query.weight", "attn.indexer.wq_b.weight"},
+            {"attention.indexer.query.weight_scale", "attn.indexer.wq_b.scale"},
+            {"attention.indexer.key.weight", "attn.indexer.wk.weight"},
+            {"attention.indexer.key_norm.weight", "attn.indexer.k_norm.weight"},
+            {"attention.indexer.score.weight", "attn.indexer.weights_proj.weight"},
+            {"associative_memory.embedding.weight", "engram.embed.weight"},
+            {"associative_memory.embedding.weight_scale", "engram.embed.scale"},
+            {"associative_memory.query.weight", "engram.q_weight"},
+            {"associative_memory.key.weight", "engram.k_weight"},
+            {"associative_memory.projection.weight", "engram.wkv.weight"},
+            {"associative_memory.projection.weight_scale", "engram.wkv.scale"},
+            {"mlp.router.weight", "ffn.gate.weight"},
+            {"mlp.router.bias", "ffn.gate.bias"},
+            {"mlp.router.vision_bias", "ffn.gate.bias_vl"},
+        };
+    const auto dynamic_expert_suffix = [](std::string_view suffix)
+            -> std::optional<std::string> {
+        constexpr std::string_view experts = "ffn.experts.";
+        constexpr std::string_view shared = "ffn.shared_experts.w";
+        if (starts_with(suffix, experts)) {
+            const auto expert_end = suffix.find('.', experts.size());
+            if (expert_end == std::string_view::npos) return std::nullopt;
+            const auto expert = suffix.substr(
+                experts.size(), expert_end - experts.size());
+            if (expert.empty() || !std::all_of(
+                    expert.begin(), expert.end(),
+                    [](unsigned char value) { return std::isdigit(value); })) {
+                return std::nullopt;
+            }
+            const auto tail = suffix.substr(expert_end + 1);
+            const auto projection = starts_with(tail, "w1.") ? "gate" :
+                starts_with(tail, "w2.") ? "down" :
+                starts_with(tail, "w3.") ? "up" : nullptr;
+            const auto leaf = ends_with(tail, ".weight") ? "weight" :
+                ends_with(tail, ".scale") ? "weight_scale" : nullptr;
+            if (projection == nullptr || leaf == nullptr) return std::nullopt;
+            return "mlp.experts." + std::string(expert) + "." +
+                projection + "." + leaf;
+        }
+        if (!starts_with(suffix, shared) || suffix.size() <= shared.size()) {
+            return std::nullopt;
+        }
+        const char projection_id = suffix[shared.size()];
+        const auto tail = suffix.substr(shared.size() + 1);
+        const auto projection = projection_id == '1' ? "gate" :
+            projection_id == '2' ? "down" :
+            projection_id == '3' ? "up" : nullptr;
+        const auto leaf = tail == ".weight" ? "weight" :
+            tail == ".scale" ? "weight_scale" : nullptr;
+        if (projection == nullptr || leaf == nullptr) return std::nullopt;
+        return "mlp.shared_expert." + std::string(projection) + "." + leaf;
+    };
+    const auto add_block = [&](std::string_view stored,
+                               std::string_view source_root,
+                               std::string_view canonical_root) {
+        if (!starts_with(stored, source_root)) return false;
+        const auto layer_end = stored.find('.', source_root.size());
+        if (layer_end == std::string_view::npos) return true;
+        const auto layer = stored.substr(
+            source_root.size(), layer_end - source_root.size());
+        const auto source_suffix = stored.substr(layer_end + 1);
+        const auto canonical_prefix = std::string(canonical_root) +
+            std::string(layer) + ".";
+        if (const auto suffix = dynamic_expert_suffix(source_suffix)) {
+            add(canonical_prefix + *suffix, std::string(stored));
+            return true;
+        }
+        for (const auto& [canonical_suffix, candidate] : suffixes) {
+            if (source_suffix == candidate) {
+                add(canonical_prefix + std::string(canonical_suffix),
+                    std::string(stored));
+                return true;
+            }
+        }
+        return true;
+    };
+    static const std::unordered_map<std::string_view, std::string_view>
+        predictor_suffixes{
+            {"main_norm.weight", "main_norm.weight"},
+            {"main_proj.weight", "main_projection.weight"},
+            {"main_proj.scale", "main_projection.weight_scale"},
+            {"norm.weight", "output_norm.weight"},
+            {"confidence_head.proj.weight", "confidence.projection.weight"},
+            {"markov_head.embed.weight", "markov.embedding.weight"},
+            {"markov_head.head.weight", "markov.output.weight"},
+        };
+    for (const auto& stored : names) {
+        if (add_block(stored, "layers.", "model.block.")) continue;
+        if (!starts_with(stored, "mtp.")) continue;
+        const auto stage_end = stored.find('.', 4);
+        if (stage_end == std::string::npos) continue;
+        const auto stage = stored.substr(4, stage_end - 4);
+        const auto source_suffix = std::string_view(stored).substr(stage_end + 1);
+        const auto prefix = "predictor.stage." + stage + ".";
+        if (const auto suffix = dynamic_expert_suffix(source_suffix)) {
+            add(prefix + *suffix, stored);
+            continue;
+        }
+        bool mapped = false;
+        for (const auto& [canonical_suffix, candidate] : suffixes) {
+            if (source_suffix == candidate) {
+                add(prefix + std::string(canonical_suffix), stored);
+                mapped = true;
+                break;
+            }
+        }
+        if (mapped) continue;
+        const auto found = predictor_suffixes.find(source_suffix);
         if (found != predictor_suffixes.end()) {
             add(prefix + std::string(found->second), stored);
         }
@@ -816,6 +1070,11 @@ MfqLegacyTensorAliases make_legacy_tensor_aliases(
     MfqLegacyTensorAliases result;
     if (gemma4_family(artifact_architecture, config)) {
         add_gemma4_aliases(result, config, names);
+        add_derived_aliases(result, names);
+        return result;
+    }
+    if (deepseek_v41_family(artifact_architecture, config)) {
+        add_deepseek_v41_aliases(result, names);
         add_derived_aliases(result, names);
         return result;
     }

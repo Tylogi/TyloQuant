@@ -202,6 +202,7 @@ configure_file(
 add_library(mfq-metal-runtime STATIC
     storage/hf_safetensors_store.cpp
     storage/mfq_container.cpp
+    storage/nintm_expert_store.cpp
     storage/mlx_tensor_schema.cpp
     storage/compat/mlx_legacy_tensor_compat.cpp
     runtime/mlx_axial_patch_vision.cpp

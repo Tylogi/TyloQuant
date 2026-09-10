@@ -52,7 +52,8 @@ public:
         int index,
         int max_context,
         std::pair<mlx::core::array, mlx::core::array> rope_base,
-        std::pair<mlx::core::array, mlx::core::array> rope_compressed);
+        std::pair<mlx::core::array, mlx::core::array> rope_compressed,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr);
 
     MlxDeepseekV41LayerResult forward(
         const mlx::core::array& hidden,
@@ -102,7 +103,8 @@ class MlxDeepseekV41CausalLm {
 public:
     static MlxDeepseekV41CausalLm load(
         const MfqContainer& model,
-        int max_context = 4096);
+        int max_context = 4096,
+        std::optional<std::size_t> expert_cache_bytes = std::nullopt);
 
     MlxDeepseekV41CausalLm(
         DeepseekV41Config config,
@@ -112,6 +114,7 @@ public:
         MlxLinear output,
         MlxDeepseekV41EngramHashState engram_hash,
         int max_context,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
         std::optional<MlxDeepseekV41Vision> vision = std::nullopt,
         std::optional<MlxDeepseekV41DSpark> dspark = std::nullopt);
 
@@ -168,6 +171,10 @@ public:
     std::size_t layer_count() const noexcept { return layers_.size(); }
     bool supports_multimodal() const noexcept { return vision_.has_value(); }
     bool supports_mtp() const noexcept { return dspark_.has_value(); }
+    std::size_t expert_cache_limit_bytes() const noexcept;
+    std::optional<MlxSsdExpertCacheStats> ssd_expert_cache_stats() const;
+    void prewarm_ssd_expert_arena();
+    void clear_expert_cache();
     const MlxMtpGenerationStats& last_mtp_stats() const noexcept {
         return last_mtp_stats_;
     }
@@ -208,6 +215,7 @@ private:
     MlxRmsNorm output_norm_;
     MlxLinear output_;
     MlxDeepseekV41EngramHashState engram_hash_;
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
     std::optional<MlxDeepseekV41Vision> vision_;
     std::optional<MlxDeepseekV41DSpark> dspark_;
     std::optional<MlxDeepseekV41DSparkState> dspark_state_;

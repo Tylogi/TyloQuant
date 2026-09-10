@@ -2,8 +2,11 @@
 
 #include "deepseek_v41_model.h"
 #include "mlx_moe.h"
+#include "mlx_ssd_expert_cache.h"
 #include "mlx_tensor.h"
 
+#include <cstddef>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -19,7 +22,9 @@ public:
         const MfqContainer& model,
         const DeepseekV41Config& config,
         const std::string& prefix,
-        bool predictor = false);
+        bool predictor = false,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
+        std::size_t expert_cache_layer = 0);
 
     mlx::core::array forward(
         const mlx::core::array& input,
@@ -40,8 +45,10 @@ private:
         MlxLinear shared_gate,
         MlxLinear shared_up,
         MlxLinear shared_down,
-        MlxRoutedLinear routed_gate_up,
-        MlxRoutedLinear routed_down);
+        std::optional<MlxRoutedLinear> routed_gate_up,
+        std::optional<MlxRoutedLinear> routed_down,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
+        std::size_t expert_cache_layer);
 
     int hidden_;
     int intermediate_;
@@ -56,8 +63,10 @@ private:
     MlxLinear shared_gate_;
     MlxLinear shared_up_;
     MlxLinear shared_down_;
-    MlxRoutedLinear routed_gate_up_;
-    MlxRoutedLinear routed_down_;
+    std::optional<MlxRoutedLinear> routed_gate_up_;
+    std::optional<MlxRoutedLinear> routed_down_;
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
+    std::size_t expert_cache_layer_ = 0;
 };
 
 } // namespace mfq::metal

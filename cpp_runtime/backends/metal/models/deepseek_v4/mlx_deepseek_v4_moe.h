@@ -43,13 +43,15 @@ public:
         const std::optional<mlx::core::array>& available =
             std::nullopt,
         std::shared_ptr<MlxNintMoeOffloadCache> offload =
+            nullptr,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache =
             nullptr);
 
     static MlxDeepseekV4Moe load(
         const MlxHfTensorStore& model,
         const DeepseekV4Config& config,
         std::size_t layer,
-        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+        std::shared_ptr<MlxMoeSsdExpertCache>
             expert_cache,
         const std::optional<mlx::core::array>& available =
             std::nullopt);
@@ -65,13 +67,15 @@ public:
             std::nullopt,
         std::shared_ptr<MlxNintMoeOffloadCache> offload =
             nullptr,
-        std::size_t expert_cache_layer = 0);
+        std::size_t expert_cache_layer = 0,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache =
+            nullptr);
 
     static MlxDeepseekV4Moe load_named(
         const MlxHfTensorStore& model,
         const DeepseekV4Config& config,
         const std::string& prefix,
-        std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
+        std::shared_ptr<MlxMoeSsdExpertCache> expert_cache,
         std::size_t expert_cache_layer,
         const std::optional<mlx::core::array>& available =
             std::nullopt);
@@ -106,12 +110,12 @@ public:
     // Begin the full-layer native-expert read before the layer's attention
     // work. The caller keeps the handle alive and passes it back to the
     // three-argument forward_branches overload after submitting attention.
-    std::optional<MlxDeepseekV4SsdPrefetchedLayer> prefetch_routed(
+    std::optional<MlxSsdPrefetchedExpertLayer> prefetch_routed(
         std::size_t rows) const;
     MlxDeepseekV4MoeBranches forward_branches(
         const mlx::core::array& input,
         const mlx::core::array& token_ids,
-        MlxDeepseekV4SsdPrefetchedLayer* prefetched) const;
+        MlxSsdPrefetchedExpertLayer* prefetched) const;
 
     mlx::core::array forward(
         const mlx::core::array& input,
@@ -145,7 +149,7 @@ private:
         std::optional<MlxRoutedLinear> routed_down,
         std::shared_ptr<MlxNintMoeOffloadCache>
             expert_offload,
-        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+        std::shared_ptr<MlxMoeSsdExpertCache>
             ssd_expert_cache,
         std::size_t layer,
         std::string streamed_gate_up_name,
@@ -173,7 +177,7 @@ private:
     std::optional<MlxRoutedLinear> routed_down_;
     std::shared_ptr<MlxNintMoeOffloadCache>
         expert_offload_;
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+    std::shared_ptr<MlxMoeSsdExpertCache>
         ssd_expert_cache_;
     std::size_t layer_ = 0;
     std::string streamed_gate_up_name_;

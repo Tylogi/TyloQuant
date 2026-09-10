@@ -9,9 +9,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unistd.h>
 
@@ -118,7 +120,33 @@ int main() {
         ("mfq-hf-store-test-" + std::to_string(::getpid()));
     try {
         write_fixture(root);
-        mfq::metal::DeepseekV4NativeExpertStore store(root, 1, 1);
+        auto checkpoint = std::make_shared<mfq::metal::HfSafetensorStore>(root);
+        mfq::metal::MlxNativeMxfp4ExpertStore store(
+            checkpoint,
+            std::vector<std::string>{"model.block.0"},
+            1,
+            4096,
+            2048,
+            [](std::string_view canonical) {
+                const auto expert = canonical.find(".mlp.experts.0.");
+                if (expert == std::string_view::npos) {
+                    return std::string(canonical);
+                }
+                const auto suffix = canonical.substr(
+                    expert + std::string_view(".mlp.experts.0.").size());
+                const auto source = [&]() -> std::string_view {
+                    if (suffix == "gate.weight_scale") return "w1.scale";
+                    if (suffix == "down.weight_scale") return "w2.scale";
+                    if (suffix == "up.weight_scale") return "w3.scale";
+                    if (suffix == "gate.weight") return "w1.weight";
+                    if (suffix == "down.weight") return "w2.weight";
+                    if (suffix == "up.weight") return "w3.weight";
+                    return {};
+                }();
+                return source.empty()
+                    ? std::string(canonical)
+                    : "layers.0.ffn.experts.0." + std::string(source);
+            });
         require(store.checkpoint().shard_count() == 1, "shard count mismatch");
         require(store.checkpoint().tensor_count() == 6, "tensor count mismatch");
         const auto expected_bytes = 3 * (2048 * 128) +
@@ -156,7 +184,7 @@ int main() {
             std::fill(scattered[part].begin(), scattered[part].end(), std::byte{0});
         }
 
-        const mfq::metal::DeepseekV4NativeExpertDestination phased{
+        const mfq::metal::MlxNativeMxfp4ExpertDestination phased{
             .w1_scale = scattered[0],
             .w2_scale = scattered[1],
             .w3_scale = scattered[2],

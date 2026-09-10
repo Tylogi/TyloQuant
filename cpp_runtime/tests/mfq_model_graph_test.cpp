@@ -279,10 +279,26 @@ int main() {
         const auto v41_aliases = mfq::make_legacy_tensor_aliases(
             "deepseek_v41",
             R"json({"model_type":"deepseek_v41"})json",
-            {"layers.0.attn.wq_a.weight"});
+            {
+                "layers.0.attn.wq_a.weight",
+                "layers.0.ffn.experts.3.w1.weight",
+                "layers.0.ffn.experts.3.w1.scale",
+                "mtp.0.markov_head.embed.weight",
+            });
         require(
-            v41_aliases.canonical_to_stored.empty(),
-            "DeepSeek-V4.1 incorrectly inherited V4 tensor aliases");
+            v41_aliases.canonical_to_stored.at(
+                "model.block.0.attention.query_a.weight") ==
+                "layers.0.attn.wq_a.weight" &&
+            v41_aliases.canonical_to_stored.at(
+                "model.block.0.mlp.experts.3.gate.weight") ==
+                "layers.0.ffn.experts.3.w1.weight" &&
+            v41_aliases.canonical_to_stored.at(
+                "model.block.0.mlp.experts.3.gate.weight_scale") ==
+                "layers.0.ffn.experts.3.w1.scale" &&
+            v41_aliases.canonical_to_stored.at(
+                "predictor.stage.0.markov.embedding.weight") ==
+                "mtp.0.markov_head.embed.weight",
+            "legacy DeepSeek-V4.1 aliases were not canonicalized");
 
         const auto gemma_aliases = mfq::make_legacy_tensor_aliases(
             "gemma4",

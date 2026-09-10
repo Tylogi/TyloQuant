@@ -59,7 +59,9 @@ public:
         const DeepseekV41Config& config,
         const MlxEmbedding& embedding,
         const MlxLinear& output,
-        int max_context);
+        int max_context,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
+        std::size_t expert_layer_base = 0);
 
     MlxDeepseekV41DSparkState make_state(
         int batch = 1,

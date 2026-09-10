@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include <mlx/mlx.h>
@@ -24,6 +25,7 @@ public:
 
     const HfSafetensorStore& checkpoint() const noexcept;
     std::shared_ptr<HfSafetensorStore> shared_checkpoint() const noexcept;
+    std::string stored_name(std::string_view canonical) const;
 
     mlx::core::array load_dense(const std::string& name) const;
     MlxMxWeight load_mx(const std::string& name) const;
@@ -32,7 +34,6 @@ public:
 
 private:
     void initialize_aliases();
-    std::string resolve(std::string_view canonical) const;
 
     std::shared_ptr<HfSafetensorStore> checkpoint_;
     std::unordered_map<std::string, std::string> canonical_to_stored_;

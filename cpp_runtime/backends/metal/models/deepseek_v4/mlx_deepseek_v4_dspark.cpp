@@ -254,7 +254,8 @@ MlxDeepseekV4DSparkStageComponents load_stage(
     const DeepseekV4Config& config,
     std::size_t stage,
     std::shared_ptr<MlxNintMoeOffloadCache> expert_offload,
-    std::size_t cache_layer) {
+    std::size_t cache_layer,
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache) {
     const auto prefix = "predictor.stage." + std::to_string(stage);
     const auto name = [&prefix](std::string_view suffix) {
         return prefix + "." + std::string(suffix);
@@ -267,7 +268,8 @@ MlxDeepseekV4DSparkStageComponents load_stage(
             prefix,
             std::nullopt,
             std::move(expert_offload),
-            cache_layer),
+            cache_layer,
+            std::move(ssd_expert_cache)),
         load_float(model, name("attention.norm.weight")),
         load_float(model, name("mlp.norm.weight")),
         MlxLinear::load(model, name("attention.mhc.pre.function")),
@@ -283,7 +285,7 @@ MlxDeepseekV4DSparkStageComponents load_stage(
     const MlxHfTensorStore& model,
     const DeepseekV4Config& config,
     std::size_t stage,
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
+    std::shared_ptr<MlxMoeSsdExpertCache> expert_cache,
     std::size_t cache_layer) {
     const auto prefix = "predictor.stage." + std::to_string(stage);
     const auto name = [&prefix](std::string_view suffix) {
@@ -711,7 +713,8 @@ MlxDeepseekV4DSpark::load_if_present(
     const MlxLinear& output,
     int max_context,
     std::shared_ptr<MlxNintMoeOffloadCache> expert_offload,
-    std::size_t expert_layer_base) {
+    std::size_t expert_layer_base,
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache) {
     const bool root = model.contains(
         "predictor.stage.0.main_projection.weight");
     const bool any = root ||
@@ -739,7 +742,8 @@ MlxDeepseekV4DSpark::load_if_present(
             config,
             stage,
             expert_offload,
-            expert_layer_base + stage));
+            expert_layer_base + stage,
+            ssd_expert_cache));
     }
     const auto first = std::string("predictor.stage.0");
     const auto last = "predictor.stage." +
@@ -782,7 +786,7 @@ MlxDeepseekV4DSpark MlxDeepseekV4DSpark::load_hf(
     const MlxEmbedding& embedding,
     const MlxLinear& output,
     int max_context,
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
+    std::shared_ptr<MlxMoeSsdExpertCache> expert_cache,
     std::size_t expert_layer_base) {
     if (!config.has_dspark()) {
         throw std::invalid_argument(

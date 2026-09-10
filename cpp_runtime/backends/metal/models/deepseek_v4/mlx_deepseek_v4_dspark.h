@@ -107,7 +107,9 @@ public:
         int max_context,
         std::shared_ptr<MlxNintMoeOffloadCache> expert_offload =
             nullptr,
-        std::size_t expert_layer_base = 0);
+        std::size_t expert_layer_base = 0,
+        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache =
+            nullptr);
 
     static MlxDeepseekV4DSpark load_hf(
         const MlxHfTensorStore& model,
@@ -115,7 +117,7 @@ public:
         const MlxEmbedding& embedding,
         const MlxLinear& output,
         int max_context,
-        std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
+        std::shared_ptr<MlxMoeSsdExpertCache> expert_cache,
         std::size_t expert_layer_base);
 
     MlxDeepseekV4DSpark(

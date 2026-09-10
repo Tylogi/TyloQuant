@@ -2,6 +2,8 @@
 
 #include "mlx_deepseek_v4_attention.h"
 #include "mlx_eval_timing.h"
+#include "mlx_legacy_tensor_compat.h"
+#include "nintm_expert_store.h"
 
 #include <algorithm>
 #include <chrono>
@@ -61,7 +63,8 @@ MlxDeepseekV41Layer MlxDeepseekV41Layer::load(
     int index,
     int max_context,
     std::pair<array, array> rope_base,
-    std::pair<array, array> rope_compressed) {
+    std::pair<array, array> rope_compressed,
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache) {
     config.validate();
     if (index < 0 || index >= config.n_layers) {
         throw std::out_of_range(
@@ -96,7 +99,13 @@ MlxDeepseekV41Layer MlxDeepseekV41Layer::load(
             config,
             name("mlp.mhc.pre"),
             name("mlp.norm.weight")),
-        MlxDeepseekV41Moe::load(model, config, name("mlp")),
+        MlxDeepseekV41Moe::load(
+            model,
+            config,
+            name("mlp"),
+            false,
+            std::move(ssd_expert_cache),
+            static_cast<std::size_t>(index)),
         std::move(engram));
 }
 
@@ -199,8 +208,10 @@ std::vector<array> MlxDeepseekV41Layer::rollback_speculative(
 
 MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
     const MfqContainer& model,
-    int max_context) {
-    auto config = DeepseekV41Config::from_mfq(model);
+    int max_context,
+    std::optional<std::size_t> expert_cache_bytes) {
+    auto config = DeepseekV41Config::from_mfq(
+        model, effective_model_graph(model));
     config.validate();
     if (max_context <= 0 || max_context > config.max_position_embeddings ||
         max_context > std::numeric_limits<int>::max()) {
@@ -217,6 +228,39 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         max_context,
         static_cast<float>(config.compress_rope_theta),
         rope_scaling(config, true));
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache;
+    if (expert_cache_bytes.has_value() && *expert_cache_bytes > 0) {
+        std::vector<std::string> prefixes;
+        std::vector<std::size_t> experts_per_layer;
+        prefixes.reserve(static_cast<std::size_t>(
+            config.n_layers + config.n_mtp_layers));
+        experts_per_layer.reserve(prefixes.capacity());
+        for (std::int64_t layer = 0; layer < config.n_layers; ++layer) {
+            prefixes.push_back("model.block." + std::to_string(layer));
+            experts_per_layer.push_back(
+                static_cast<std::size_t>(config.n_experts));
+        }
+        if (config.has_dspark()) {
+            for (std::int64_t stage = 0;
+                 stage < config.n_mtp_layers; ++stage) {
+                prefixes.push_back(
+                    "predictor.stage." + std::to_string(stage));
+                experts_per_layer.push_back(
+                    static_cast<std::size_t>(config.dspark_n_experts));
+            }
+        }
+        constexpr std::size_t prefill_buffers_minimum =
+            std::size_t{7} << 30;
+        ssd_expert_cache = std::make_shared<MlxMoeSsdExpertCache>(
+            model,
+            std::move(prefixes),
+            static_cast<std::size_t>(config.hidden),
+            static_cast<std::size_t>(config.moe_inter),
+            std::move(experts_per_layer),
+            *expert_cache_bytes,
+            8,
+            *expert_cache_bytes >= prefill_buffers_minimum);
+    }
     std::vector<MlxDeepseekV41Layer> layers;
     layers.reserve(static_cast<std::size_t>(config.n_layers));
     for (int index = 0; index < config.n_layers; ++index) {
@@ -226,7 +270,8 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
             index,
             max_context,
             base_rope,
-            compressed_rope));
+            compressed_rope,
+            ssd_expert_cache));
     }
     auto embedding = MlxEmbedding::load(
         model, "model.token_embedding.weight");
@@ -236,7 +281,13 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         vision.emplace(MlxDeepseekV41Vision::load(model, config));
     }
     auto dspark = MlxDeepseekV41DSpark::load_if_present(
-        model, config, embedding, output, max_context);
+        model,
+        config,
+        embedding,
+        output,
+        max_context,
+        ssd_expert_cache,
+        static_cast<std::size_t>(config.n_layers));
     return MlxDeepseekV41CausalLm(
         config,
         std::move(embedding),
@@ -245,6 +296,7 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         std::move(output),
         MlxDeepseekV41EngramHashState::load(model, config),
         max_context,
+        std::move(ssd_expert_cache),
         std::move(vision),
         std::move(dspark));
 }
@@ -257,6 +309,7 @@ MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
     MlxLinear output,
     MlxDeepseekV41EngramHashState engram_hash,
     int max_context,
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
     std::optional<MlxDeepseekV41Vision> vision,
     std::optional<MlxDeepseekV41DSpark> dspark)
     : config_(std::move(config)),
@@ -265,6 +318,7 @@ MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
       output_norm_(std::move(output_norm), static_cast<float>(config_.rms_eps)),
       output_(std::move(output)),
       engram_hash_(std::move(engram_hash)),
+      ssd_expert_cache_(std::move(ssd_expert_cache)),
       vision_(std::move(vision)),
       dspark_(std::move(dspark)),
       max_context_(max_context) {
@@ -333,6 +387,33 @@ void MlxDeepseekV41CausalLm::clear_cache() noexcept {
     mtp_context_requested_ = false;
     cache_position_ = 0;
     cache_batch_ = 0;
+}
+
+std::size_t
+MlxDeepseekV41CausalLm::expert_cache_limit_bytes() const noexcept {
+    return ssd_expert_cache_
+        ? ssd_expert_cache_->cache_limit_bytes()
+        : 0;
+}
+
+std::optional<MlxSsdExpertCacheStats>
+MlxDeepseekV41CausalLm::ssd_expert_cache_stats() const {
+    return ssd_expert_cache_
+        ? std::optional<MlxSsdExpertCacheStats>(
+              ssd_expert_cache_->stats())
+        : std::nullopt;
+}
+
+void MlxDeepseekV41CausalLm::prewarm_ssd_expert_arena() {
+    if (ssd_expert_cache_) {
+        ssd_expert_cache_->prewarm_metal();
+    }
+}
+
+void MlxDeepseekV41CausalLm::clear_expert_cache() {
+    if (ssd_expert_cache_) {
+        ssd_expert_cache_->clear();
+    }
 }
 
 array MlxDeepseekV41CausalLm::forward_impl(

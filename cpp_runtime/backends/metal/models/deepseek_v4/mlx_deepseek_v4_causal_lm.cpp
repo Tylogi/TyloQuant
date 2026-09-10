@@ -1,4 +1,6 @@
 #include "mlx_deepseek_v4_causal_lm.h"
+
+#include "nintm_expert_store.h"
 #include "mlx_eval_timing.h"
 #include "mlx_mtp.h"
 
@@ -432,7 +434,8 @@ MlxDeepseekV4Layer MlxDeepseekV4Layer::load(
     const array& available,
     std::pair<array, array> rope_base,
     std::pair<array, array> rope_compressed,
-    std::shared_ptr<MlxNintMoeOffloadCache> offload) {
+    std::shared_ptr<MlxNintMoeOffloadCache> offload,
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache) {
     config.validate();
     if (index >=
         static_cast<std::size_t>(
@@ -465,7 +468,8 @@ MlxDeepseekV4Layer MlxDeepseekV4Layer::load(
                 config,
                 index,
                 available,
-                std::move(offload)),
+                std::move(offload),
+                std::move(ssd_expert_cache)),
             load_float_array(
                 model,
                 name("attention.norm.weight")),
@@ -500,7 +504,7 @@ MlxDeepseekV4Layer MlxDeepseekV4Layer::load(
     int max_context,
     std::pair<array, array> rope_base,
     std::pair<array, array> rope_compressed,
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
+    std::shared_ptr<MlxMoeSsdExpertCache> expert_cache,
     const std::optional<array>& available) {
     config.validate();
     if (index >= static_cast<std::size_t>(config.n_layers)) {
@@ -722,7 +726,7 @@ array MlxDeepseekV4Layer::forward(
     const array& token_ids,
     MlxDeepseekV4LayerState& state,
     int pos0,
-    MlxDeepseekV4SsdPrefetchedLayer* prefetched) const {
+    MlxSsdPrefetchedExpertLayer* prefetched) const {
     return forward(
         hidden, token_ids, state, pos0, prefetched, nullptr);
 }
@@ -732,7 +736,7 @@ array MlxDeepseekV4Layer::forward(
     const array& token_ids,
     MlxDeepseekV4LayerState& state,
     int pos0,
-    MlxDeepseekV4SsdPrefetchedLayer* prefetched,
+    MlxSsdPrefetchedExpertLayer* prefetched,
     const MlxDeepseekV4ImageVisibility* visibility) const {
     auto source = floating_contiguous(hidden);
     const int expected_hidden =
@@ -897,14 +901,44 @@ MlxDeepseekV4CausalLm::load(
         expert_availability(model, config);
     std::shared_ptr<MlxNintMoeOffloadCache>
         expert_offload;
-    if (expert_cache_bytes.has_value()) {
-        expert_offload =
-            std::make_shared<MlxNintMoeOffloadCache>(
+    std::shared_ptr<MlxMoeSsdExpertCache>
+        ssd_expert_cache;
+    if (expert_cache_bytes.has_value() && *expert_cache_bytes > 0) {
+        std::vector<std::string> expert_prefixes;
+        expert_prefixes.reserve(static_cast<std::size_t>(
+            config.n_layers + config.n_mtp_layers));
+        for (std::int64_t layer = 0; layer < config.n_layers; ++layer) {
+            expert_prefixes.push_back(
+                "model.block." + std::to_string(layer));
+        }
+        if (config.has_dspark()) {
+            for (std::int64_t stage = 0;
+                 stage < config.n_mtp_layers; ++stage) {
+                expert_prefixes.push_back(
+                    "predictor.stage." + std::to_string(stage));
+            }
+        }
+        try {
+            constexpr std::size_t prefill_buffers_minimum =
+                std::size_t{7} << 30;
+            ssd_expert_cache = std::make_shared<MlxMoeSsdExpertCache>(
                 model,
+                std::move(expert_prefixes),
+                static_cast<std::size_t>(config.hidden),
+                static_cast<std::size_t>(config.moe_inter),
+                static_cast<std::size_t>(config.n_experts),
                 *expert_cache_bytes,
-                checked_int(
-                    config.n_experts,
-                    "expert count"));
+                8,
+                *expert_cache_bytes >= prefill_buffers_minimum);
+        } catch (const MlxNintMxfp4Unsupported&) {
+            expert_offload =
+                std::make_shared<MlxNintMoeOffloadCache>(
+                    model,
+                    *expert_cache_bytes,
+                    checked_int(
+                        config.n_experts,
+                        "expert count"));
+        }
     }
     std::vector<MlxDeepseekV4Layer> layers;
     layers.reserve(
@@ -924,7 +958,8 @@ MlxDeepseekV4CausalLm::load(
                 availability.at(index),
                 rope_base,
                 rope_compressed,
-                expert_offload));
+                expert_offload,
+                ssd_expert_cache));
     }
     std::optional<MlxDeepseekV4Vision> vision;
     if (config.has_vision()) {
@@ -939,7 +974,8 @@ MlxDeepseekV4CausalLm::load(
         output,
         context,
         expert_offload,
-        static_cast<std::size_t>(config.n_layers));
+        static_cast<std::size_t>(config.n_layers),
+        ssd_expert_cache);
     return MlxDeepseekV4CausalLm(
         config,
         std::move(embedding),
@@ -958,9 +994,13 @@ MlxDeepseekV4CausalLm::load(
             model,
             names.hc_head_scale),
         context,
-        mlx::core::float16,
+        model.header().extra_json.count("source.format") != 0 &&
+                model.header().extra_json.at("source.format") ==
+                    "hf-safetensors"
+            ? mlx::core::bfloat16
+            : mlx::core::float16,
         std::move(expert_offload),
-        nullptr,
+        std::move(ssd_expert_cache),
         std::move(vision),
         std::move(dspark));
 }
@@ -971,101 +1011,15 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
     std::size_t expert_cache_bytes,
     std::size_t io_workers,
     bool prefill_overlap) {
-    const auto config = DeepseekV4Config::from_json(
-        read_text_file(model_root / "config.json"));
-    const int context = std::min(
+    static_cast<void>(io_workers);
+    static_cast<void>(prefill_overlap);
+    const MfqContainer model(model_root);
+    return load(
+        model,
         max_context,
-        checked_int(
-            config.max_position_embeddings,
-            "maximum context"));
-    if (context <= 0) {
-        throw std::invalid_argument(
-            "DeepSeek-V4 HF max_context must be positive");
-    }
-    auto checkpoint = std::make_shared<HfSafetensorStore>(model_root);
-    MlxHfTensorStore model(std::move(checkpoint));
-    std::vector<std::string> expert_prefixes;
-    expert_prefixes.reserve(
-        static_cast<std::size_t>(config.n_layers + config.n_mtp_layers));
-    for (std::size_t layer = 0;
-         layer < static_cast<std::size_t>(config.n_layers);
-         ++layer) {
-        expert_prefixes.push_back("model.block." + std::to_string(layer));
-    }
-    if (config.has_dspark()) {
-        for (std::size_t stage = 0;
-             stage < static_cast<std::size_t>(config.n_mtp_layers);
-             ++stage) {
-            expert_prefixes.push_back(
-                "predictor.stage." + std::to_string(stage));
-        }
-    }
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache;
-    if (expert_cache_bytes > 0) {
-        expert_cache = std::make_shared<MlxDeepseekV4SsdExpertCache>(
-            model_root,
-            std::move(expert_prefixes),
-            expert_cache_bytes,
-            io_workers,
-            prefill_overlap,
-            static_cast<std::size_t>(config.n_experts));
-    }
-    auto rope_base = deepseek_v4_yarn_tables(
-        checked_int(config.qk_rope_head_dim, "rotary dimension"),
-        context,
-        static_cast<float>(config.rope_theta));
-    auto rope_compressed = deepseek_v4_yarn_tables(
-        checked_int(config.qk_rope_head_dim, "rotary dimension"),
-        context,
-        static_cast<float>(config.compress_rope_theta),
-        config.rope_scaling);
-    std::vector<MlxDeepseekV4Layer> layers;
-    layers.reserve(static_cast<std::size_t>(config.n_layers));
-    for (std::size_t index = 0;
-         index < static_cast<std::size_t>(config.n_layers);
-         ++index) {
-        layers.push_back(MlxDeepseekV4Layer::load(
-            model,
-            config,
-            index,
-            context,
-            rope_base,
-            rope_compressed,
-            expert_cache));
-    }
-    const DeepseekV4TensorNames names;
-    std::optional<MlxDeepseekV4Vision> vision;
-    if (config.has_vision()) {
-        vision.emplace(MlxDeepseekV4Vision::load(model, config));
-    }
-    auto embedding = model.load_embedding(names.embedding);
-    auto output = model.load_linear(names.output);
-    std::optional<MlxDeepseekV4DSpark> dspark;
-    if (config.has_dspark()) {
-        dspark.emplace(MlxDeepseekV4DSpark::load_hf(
-            model,
-            config,
-            embedding,
-            output,
-            context,
-            expert_cache,
-            static_cast<std::size_t>(config.n_layers)));
-    }
-    return MlxDeepseekV4CausalLm(
-        config,
-        std::move(embedding),
-        std::move(layers),
-        float32_contiguous(model.load_dense(names.output_norm)),
-        std::move(output),
-        model.load_linear(names.hc_head_fn),
-        float32_contiguous(model.load_dense(names.hc_head_base)),
-        float32_contiguous(model.load_dense(names.hc_head_scale)),
-        context,
-        mlx::core::bfloat16,
-        nullptr,
-        std::move(expert_cache),
-        std::move(vision),
-        std::move(dspark));
+        expert_cache_bytes == 0
+            ? std::nullopt
+            : std::optional<std::size_t>(expert_cache_bytes));
 }
 
 MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
@@ -1081,7 +1035,7 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
     Dtype activation_dtype,
     std::shared_ptr<MlxNintMoeOffloadCache>
         expert_offload,
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+    std::shared_ptr<MlxMoeSsdExpertCache>
         ssd_expert_cache,
     std::optional<MlxDeepseekV4Vision> vision,
     std::optional<MlxDeepseekV4DSpark> dspark)
@@ -1427,7 +1381,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
     const bool materialize_each_layer =
         bounded_prefill && !compact_resident_speculation;
     std::array<
-        std::optional<MlxDeepseekV4SsdPrefetchedLayer>,
+        std::optional<MlxSsdPrefetchedExpertLayer>,
         2> routed_pipeline;
     if (bounded_prefill && !layers_.empty()) {
         const auto rows = static_cast<std::size_t>(batch) *
@@ -1473,7 +1427,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
             const auto hidden_checkpoint = hidden_values;
             auto state_checkpoint = states_;
             std::vector<
-                std::optional<MlxDeepseekV4SsdPreparedExperts>> pins(
+                std::optional<MlxSsdPreparedExperts>> pins(
                     group_end - group_begin);
             bool completed = false;
             try {
@@ -1824,10 +1778,10 @@ MlxDeepseekV4CausalLm::cached_expert_count() const {
         : 0;
 }
 
-std::optional<MlxDeepseekV4SsdCacheStats>
+std::optional<MlxSsdExpertCacheStats>
 MlxDeepseekV4CausalLm::ssd_expert_cache_stats() const {
     return ssd_expert_cache_
-        ? std::optional<MlxDeepseekV4SsdCacheStats>(
+        ? std::optional<MlxSsdExpertCacheStats>(
               ssd_expert_cache_->stats())
         : std::nullopt;
 }

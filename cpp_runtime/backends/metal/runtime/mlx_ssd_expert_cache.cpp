@@ -1,6 +1,6 @@
 #include "mlx_ssd_expert_cache.h"
 
-#include "hf_safetensors_store.h"
+#include "nintm_expert_store.h"
 
 #include <algorithm>
 #include <array>
@@ -28,18 +28,9 @@ std::uint64_t expert_key(std::size_t layer, std::int32_t expert) {
         static_cast<std::uint32_t>(expert);
 }
 
-std::vector<std::string> main_layer_prefixes(std::size_t count) {
-    std::vector<std::string> result;
-    result.reserve(count);
-    for (std::size_t layer = 0; layer < count; ++layer) {
-        result.push_back("model.block." + std::to_string(layer));
-    }
-    return result;
-}
-
 } // namespace
 
-struct MlxDeepseekV4SsdExpertCache::Impl {
+struct MlxMoeSsdExpertCache::Impl {
     enum class State {
         empty,
         loading,
@@ -118,24 +109,28 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
     };
 
     Impl(
-        std::filesystem::path root,
+        const MfqContainer& model,
         std::vector<std::string> layer_prefixes,
-        std::size_t num_experts,
+        std::vector<std::size_t> experts_per_layer,
+        std::size_t hidden_size,
+        std::size_t intermediate_size,
         std::size_t bytes,
         std::size_t worker_count,
         bool overlap)
         : store(
-              std::move(root),
+              model,
               std::move(layer_prefixes),
-              num_experts),
+              std::move(experts_per_layer),
+              hidden_size,
+              intermediate_size),
           slot_bytes(store.slot_bytes()),
-          prefill_slots(overlap ? 2 * store.num_experts() : 0),
+          prefill_slots(overlap ? 2 * store.max_num_experts() : 0),
           total_slots(bytes / slot_bytes),
           slot_count(total_slots > prefill_slots
               ? total_slots - prefill_slots
               : 0),
           limit_bytes(total_slots * slot_bytes),
-          arena(total_slots),
+          arena(total_slots, hidden_size, intermediate_size),
           slots(slot_count),
           page_tables(store.num_layers()),
           route_confidence(store.num_layers(), 0) {
@@ -165,7 +160,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
 
     Acquisition acquire(std::size_t layer, std::int32_t expert) {
         if (layer >= store.num_layers() || expert < 0 ||
-            static_cast<std::size_t>(expert) >= store.num_experts()) {
+            static_cast<std::size_t>(expert) >= store.num_experts(layer)) {
             throw std::out_of_range("SSD expert cache key out of range");
         }
         std::unique_lock lock(mutex);
@@ -429,7 +424,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
         });
     }
 
-    MlxDeepseekV4SsdRouteTransactionResult resolve_route_transaction() {
+    MlxSsdExpertRouteTransactionResult resolve_route_transaction() {
         std::vector<TransactionRoute> routes;
         {
             std::scoped_lock lock(mutex);
@@ -442,7 +437,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
             route_transaction_active = false;
         }
 
-        MlxDeepseekV4SsdRouteTransactionResult result;
+        MlxSsdExpertRouteTransactionResult result;
         result.routes.reserve(routes.size());
         for (const auto& route : routes) {
             std::vector<std::int32_t> experts;
@@ -626,7 +621,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
         const auto begin = std::chrono::steady_clock::now();
         try {
             const auto destination = arena.destination(load->arena_slot);
-            DeepseekV4NativeExpertLoadStats result;
+            MlxNativeMxfp4ExpertLoadStats result;
             switch (part) {
             case TaskPart::scales:
                 result = store.load_scales_scatter(
@@ -744,7 +739,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
         }
     }
 
-    MlxDeepseekV4SsdCacheStats stats() const {
+    MlxSsdExpertCacheStats stats() const {
         std::scoped_lock lock(mutex);
         auto result = counters;
         result.cache_slots = slot_count;
@@ -763,13 +758,13 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
         }
     }
 
-    DeepseekV4NativeExpertStore store;
+    MlxNintMxfp4ExpertStore store;
     const std::size_t slot_bytes;
     const std::size_t prefill_slots;
     const std::size_t total_slots;
     const std::size_t slot_count;
     const std::size_t limit_bytes;
-    MlxDeepseekV4SsdExpertArena arena;
+    MlxMxfp4SsdExpertArena arena;
     mutable std::mutex mutex;
     std::condition_variable condition;
     bool stopping = false;
@@ -786,11 +781,11 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
     std::vector<TransactionRoute> transaction_routes;
     std::vector<PageTable> page_tables;
     std::vector<std::uint8_t> route_confidence;
-    MlxDeepseekV4SsdCacheStats counters;
+    MlxSsdExpertCacheStats counters;
 };
 
-struct MlxDeepseekV4SsdPageTableSnapshot::Impl {
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache::Impl> cache;
+struct MlxSsdExpertPageTableSnapshot::Impl {
+    std::shared_ptr<MlxMoeSsdExpertCache::Impl> cache;
     std::size_t layer = 0;
     std::shared_ptr<const std::vector<std::int32_t>> slot_map;
     std::shared_ptr<const std::vector<std::uint64_t>> generation_map;
@@ -867,7 +862,7 @@ struct MlxDeepseekV4SsdPageTableSnapshot::Impl {
                     }
                     const auto& slot = cache->slots[cache_slot];
                     if (slot.state !=
-                            MlxDeepseekV4SsdExpertCache::Impl::State::ready ||
+                            MlxMoeSsdExpertCache::Impl::State::ready ||
                         slot.key != expert_key(layer, expert) ||
                         slot.generation != (*generation_map)[
                             static_cast<std::size_t>(expert)]) {
@@ -943,17 +938,17 @@ struct MlxDeepseekV4SsdPageTableSnapshot::Impl {
     }
 };
 
-struct MlxDeepseekV4SsdPrefetchedLayer::Impl {
-    std::shared_ptr<MlxDeepseekV4SsdExpertCache::Impl> cache;
+struct MlxSsdPrefetchedExpertLayer::Impl {
+    std::shared_ptr<MlxMoeSsdExpertCache::Impl> cache;
     std::size_t layer = 0;
     std::size_t buffer = 0;
-    std::vector<MlxDeepseekV4SsdExpertCache::Impl::Acquisition> cache_pins;
+    std::vector<MlxMoeSsdExpertCache::Impl::Acquisition> cache_pins;
     std::vector<std::shared_future<void>> reads;
     std::vector<std::int32_t> slot_map;
-    std::unique_ptr<MlxDeepseekV4SsdExpertWeights> weights;
+    std::unique_ptr<MlxSsdExpertWeights> weights;
     bool released = false;
 
-    const MlxDeepseekV4SsdExpertWeights& wait() {
+    const MlxSsdExpertWeights& wait() {
         if (weights) {
             return *weights;
         }
@@ -966,12 +961,12 @@ struct MlxDeepseekV4SsdPrefetchedLayer::Impl {
         }
         const auto seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - begin).count();
-        const auto expert_count = cache->store.num_experts();
+        const auto expert_count = cache->store.num_experts(layer);
         std::vector<std::int32_t> active(expert_count);
         for (std::size_t expert = 0; expert < expert_count; ++expert) {
             active[expert] = static_cast<std::int32_t>(expert);
         }
-        weights = std::make_unique<MlxDeepseekV4SsdExpertWeights>(
+        weights = std::make_unique<MlxSsdExpertWeights>(
             cache->arena.routed_weights(slot_map, active));
         {
             std::scoped_lock lock(cache->mutex);
@@ -1007,26 +1002,26 @@ struct MlxDeepseekV4SsdPrefetchedLayer::Impl {
     }
 };
 
-MlxDeepseekV4SsdPreparedExperts::MlxDeepseekV4SsdPreparedExperts(
-    MlxDeepseekV4SsdExpertWeights weights,
+MlxSsdPreparedExperts::MlxSsdPreparedExperts(
+    MlxSsdExpertWeights weights,
     std::vector<std::int32_t> slot_for_expert,
     std::function<void()> release)
-    : weights_(std::make_unique<MlxDeepseekV4SsdExpertWeights>(
+    : weights_(std::make_unique<MlxSsdExpertWeights>(
           std::move(weights))),
       slot_for_expert_(std::move(slot_for_expert)),
       release_(std::move(release)) {}
 
-MlxDeepseekV4SsdPreparedExperts::MlxDeepseekV4SsdPreparedExperts(
-    MlxDeepseekV4SsdPreparedExperts&& other) noexcept
+MlxSsdPreparedExperts::MlxSsdPreparedExperts(
+    MlxSsdPreparedExperts&& other) noexcept
     : weights_(std::move(other.weights_)),
       slot_for_expert_(std::move(other.slot_for_expert_)),
       release_(std::move(other.release_)) {
     other.release_ = {};
 }
 
-MlxDeepseekV4SsdPreparedExperts&
-MlxDeepseekV4SsdPreparedExperts::operator=(
-    MlxDeepseekV4SsdPreparedExperts&& other) noexcept {
+MlxSsdPreparedExperts&
+MlxSsdPreparedExperts::operator=(
+    MlxSsdPreparedExperts&& other) noexcept {
     if (this != &other) {
         if (release_) {
             release_();
@@ -1039,62 +1034,62 @@ MlxDeepseekV4SsdPreparedExperts::operator=(
     return *this;
 }
 
-MlxDeepseekV4SsdPreparedExperts::~MlxDeepseekV4SsdPreparedExperts() {
+MlxSsdPreparedExperts::~MlxSsdPreparedExperts() {
     if (release_) {
         release_();
     }
 }
 
-const MlxDeepseekV4SsdExpertWeights&
-MlxDeepseekV4SsdPreparedExperts::weights() const noexcept {
+const MlxSsdExpertWeights&
+MlxSsdPreparedExperts::weights() const noexcept {
     return *weights_;
 }
 
 std::span<const std::int32_t>
-MlxDeepseekV4SsdPreparedExperts::slot_for_expert() const noexcept {
+MlxSsdPreparedExperts::slot_for_expert() const noexcept {
     return slot_for_expert_;
 }
 
-MlxDeepseekV4SsdPageTableSnapshot::MlxDeepseekV4SsdPageTableSnapshot(
+MlxSsdExpertPageTableSnapshot::MlxSsdExpertPageTableSnapshot(
     std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 
-MlxDeepseekV4SsdPageTableSnapshot::MlxDeepseekV4SsdPageTableSnapshot(
-    MlxDeepseekV4SsdPageTableSnapshot&&) noexcept = default;
+MlxSsdExpertPageTableSnapshot::MlxSsdExpertPageTableSnapshot(
+    MlxSsdExpertPageTableSnapshot&&) noexcept = default;
 
-MlxDeepseekV4SsdPageTableSnapshot&
-MlxDeepseekV4SsdPageTableSnapshot::operator=(
-    MlxDeepseekV4SsdPageTableSnapshot&&) noexcept = default;
+MlxSsdExpertPageTableSnapshot&
+MlxSsdExpertPageTableSnapshot::operator=(
+    MlxSsdExpertPageTableSnapshot&&) noexcept = default;
 
-MlxDeepseekV4SsdPageTableSnapshot::~MlxDeepseekV4SsdPageTableSnapshot() =
+MlxSsdExpertPageTableSnapshot::~MlxSsdExpertPageTableSnapshot() =
     default;
 
-const MlxDeepseekV4SsdExpertWeights&
-MlxDeepseekV4SsdPageTableSnapshot::weights() const noexcept {
+const MlxSsdExpertWeights&
+MlxSsdExpertPageTableSnapshot::weights() const noexcept {
     return impl_->cache->arena.slot_weights();
 }
 
 const mlx::core::array&
-MlxDeepseekV4SsdPageTableSnapshot::slot_ids() const noexcept {
+MlxSsdExpertPageTableSnapshot::slot_ids() const noexcept {
     return *impl_->slot_ids;
 }
 
 const mlx::core::array&
-MlxDeepseekV4SsdPageTableSnapshot::generations() const noexcept {
+MlxSsdExpertPageTableSnapshot::generations() const noexcept {
     return *impl_->generations;
 }
 
 const mlx::core::array&
-MlxDeepseekV4SsdPageTableSnapshot::readiness() const noexcept {
+MlxSsdExpertPageTableSnapshot::readiness() const noexcept {
     return *impl_->readiness;
 }
 
 std::span<const std::int32_t>
-MlxDeepseekV4SsdPageTableSnapshot::slot_for_expert() const noexcept {
+MlxSsdExpertPageTableSnapshot::slot_for_expert() const noexcept {
     return *impl_->slot_map;
 }
 
-void MlxDeepseekV4SsdPageTableSnapshot::finish(
+void MlxSsdExpertPageTableSnapshot::finish(
     std::span<const std::int32_t> active_experts,
     bool all_hit,
     double eval_seconds,
@@ -1110,7 +1105,7 @@ void MlxDeepseekV4SsdPageTableSnapshot::finish(
         host_seconds);
 }
 
-void MlxDeepseekV4SsdPageTableSnapshot::defer_finish(
+void MlxSsdExpertPageTableSnapshot::defer_finish(
     std::span<const std::int32_t> active_experts,
     double eval_seconds,
     double host_seconds) {
@@ -1126,7 +1121,7 @@ void MlxDeepseekV4SsdPageTableSnapshot::defer_finish(
         true);
 }
 
-void MlxDeepseekV4SsdPageTableSnapshot::defer_transaction(
+void MlxSsdExpertPageTableSnapshot::defer_transaction(
     const mlx::core::array& packed_expert_ids) {
     if (!impl_) {
         throw std::logic_error(
@@ -1135,70 +1130,80 @@ void MlxDeepseekV4SsdPageTableSnapshot::defer_transaction(
     impl_->defer_transaction(packed_expert_ids);
 }
 
-MlxDeepseekV4SsdPrefetchedLayer::MlxDeepseekV4SsdPrefetchedLayer(
+MlxSsdPrefetchedExpertLayer::MlxSsdPrefetchedExpertLayer(
     std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 
-MlxDeepseekV4SsdPrefetchedLayer::MlxDeepseekV4SsdPrefetchedLayer(
-    MlxDeepseekV4SsdPrefetchedLayer&&) noexcept = default;
+MlxSsdPrefetchedExpertLayer::MlxSsdPrefetchedExpertLayer(
+    MlxSsdPrefetchedExpertLayer&&) noexcept = default;
 
-MlxDeepseekV4SsdPrefetchedLayer&
-MlxDeepseekV4SsdPrefetchedLayer::operator=(
-    MlxDeepseekV4SsdPrefetchedLayer&&) noexcept = default;
+MlxSsdPrefetchedExpertLayer&
+MlxSsdPrefetchedExpertLayer::operator=(
+    MlxSsdPrefetchedExpertLayer&&) noexcept = default;
 
-MlxDeepseekV4SsdPrefetchedLayer::~MlxDeepseekV4SsdPrefetchedLayer() = default;
+MlxSsdPrefetchedExpertLayer::~MlxSsdPrefetchedExpertLayer() = default;
 
-const MlxDeepseekV4SsdExpertWeights&
-MlxDeepseekV4SsdPrefetchedLayer::wait() {
+const MlxSsdExpertWeights&
+MlxSsdPrefetchedExpertLayer::wait() {
     if (!impl_) {
         throw std::runtime_error("SSD expert prefetch handle is empty");
     }
     return impl_->wait();
 }
 
-std::size_t MlxDeepseekV4SsdPrefetchedLayer::layer() const noexcept {
+std::size_t MlxSsdPrefetchedExpertLayer::layer() const noexcept {
     return impl_ ? impl_->layer : 0;
 }
 
-MlxDeepseekV4SsdExpertCache::MlxDeepseekV4SsdExpertCache(
-    std::filesystem::path model_root,
+MlxMoeSsdExpertCache::MlxMoeSsdExpertCache(
+    const MfqContainer& model,
+    std::vector<std::string> layer_prefixes,
+    std::size_t hidden_size,
+    std::size_t intermediate_size,
+    std::vector<std::size_t> experts_per_layer,
     std::size_t cache_bytes,
     std::size_t io_workers,
     bool prefill_overlap)
     : impl_(std::make_shared<Impl>(
-          std::move(model_root),
-          main_layer_prefixes(43),
-          256,
+          model,
+          std::move(layer_prefixes),
+          std::move(experts_per_layer),
+          hidden_size,
+          intermediate_size,
           cache_bytes,
           io_workers,
           prefill_overlap)) {}
 
-MlxDeepseekV4SsdExpertCache::MlxDeepseekV4SsdExpertCache(
-    std::filesystem::path model_root,
+MlxMoeSsdExpertCache::MlxMoeSsdExpertCache(
+    const MfqContainer& model,
     std::vector<std::string> layer_prefixes,
+    std::size_t hidden_size,
+    std::size_t intermediate_size,
+    std::size_t num_experts,
     std::size_t cache_bytes,
     std::size_t io_workers,
-    bool prefill_overlap,
-    std::size_t num_experts)
+    bool prefill_overlap)
     : impl_(std::make_shared<Impl>(
-          std::move(model_root),
-          std::move(layer_prefixes),
-          num_experts,
+          model,
+          layer_prefixes,
+          std::vector<std::size_t>(layer_prefixes.size(), num_experts),
+          hidden_size,
+          intermediate_size,
           cache_bytes,
           io_workers,
           prefill_overlap)) {}
 
-MlxDeepseekV4SsdExpertCache::~MlxDeepseekV4SsdExpertCache() = default;
+MlxMoeSsdExpertCache::~MlxMoeSsdExpertCache() = default;
 
-MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
+MlxSsdPreparedExperts MlxMoeSsdExpertCache::prepare(
     std::size_t layer,
     std::span<const std::int32_t> active_experts,
     std::function<void(
-        const MlxDeepseekV4SsdExpertWeights&,
+        const MlxSsdExpertWeights&,
         std::span<const std::int32_t>,
         std::span<const std::int32_t>)> overlap,
     std::function<void(
-        const MlxDeepseekV4SsdExpertWeights&,
+        const MlxSsdExpertWeights&,
         std::span<const std::int32_t>,
         std::span<const std::int32_t>)> gate_up_ready) {
     const auto prepare_begin = std::chrono::steady_clock::now();
@@ -1234,7 +1239,8 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
                 pending_experts.push_back(unique[index]);
             }
         }
-        std::vector<std::int32_t> slot_map(impl_->store.num_experts(), -1);
+        std::vector<std::int32_t> slot_map(
+            impl_->store.num_experts(layer), -1);
         for (std::size_t index = 0; index < unique.size(); ++index) {
             slot_map[static_cast<std::size_t>(unique[index])] =
                 static_cast<std::int32_t>(
@@ -1283,7 +1289,7 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
             impl_->counters.prepare_seconds += prepare_seconds;
         }
         auto impl = impl_;
-        return MlxDeepseekV4SsdPreparedExperts(
+        return MlxSsdPreparedExperts(
             weights,
             std::move(slot_map),
             [impl, acquisitions = std::move(acquisitions)]() mutable noexcept {
@@ -1295,14 +1301,14 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
     }
 }
 
-MlxDeepseekV4SsdPageTableSnapshot
-MlxDeepseekV4SsdExpertCache::snapshot_page_table(std::size_t layer) {
+MlxSsdExpertPageTableSnapshot
+MlxMoeSsdExpertCache::snapshot_page_table(std::size_t layer) {
     if (layer >= impl_->store.num_layers()) {
         throw std::out_of_range(
             "SSD expert page-table layer out of range");
     }
-    const auto expert_count = impl_->store.num_experts();
-    auto state = std::make_unique<MlxDeepseekV4SsdPageTableSnapshot::Impl>();
+    const auto expert_count = impl_->store.num_experts(layer);
+    auto state = std::make_unique<MlxSsdExpertPageTableSnapshot::Impl>();
     state->cache = impl_;
     state->layer = layer;
     try {
@@ -1359,39 +1365,39 @@ MlxDeepseekV4SsdExpertCache::snapshot_page_table(std::size_t layer) {
         state->slot_ids = page_table.slot_ids;
         state->generations = page_table.generations;
         state->readiness = page_table.readiness;
-        return MlxDeepseekV4SsdPageTableSnapshot(std::move(state));
+        return MlxSsdExpertPageTableSnapshot(std::move(state));
     } catch (...) {
         state->release_freeze();
         throw;
     }
 }
 
-void MlxDeepseekV4SsdExpertCache::begin_route_transaction() {
+void MlxMoeSsdExpertCache::begin_route_transaction() {
     impl_->begin_route_transaction();
 }
 
-bool MlxDeepseekV4SsdExpertCache::route_transaction_active() const noexcept {
+bool MlxMoeSsdExpertCache::route_transaction_active() const noexcept {
     std::scoped_lock lock(impl_->mutex);
     return impl_->route_transaction_active;
 }
 
-bool MlxDeepseekV4SsdExpertCache::route_layer_likely_hit(
+bool MlxMoeSsdExpertCache::route_layer_likely_hit(
     std::size_t layer) const noexcept {
     std::scoped_lock lock(impl_->mutex);
     return layer < impl_->route_confidence.size() &&
         impl_->route_confidence[layer] >= 8;
 }
 
-MlxDeepseekV4SsdRouteTransactionResult
-MlxDeepseekV4SsdExpertCache::resolve_route_transaction() {
+MlxSsdExpertRouteTransactionResult
+MlxMoeSsdExpertCache::resolve_route_transaction() {
     return impl_->resolve_route_transaction();
 }
 
-void MlxDeepseekV4SsdExpertCache::cancel_route_transaction() noexcept {
+void MlxMoeSsdExpertCache::cancel_route_transaction() noexcept {
     impl_->cancel_route_transaction();
 }
 
-void MlxDeepseekV4SsdExpertCache::record_route_timing(
+void MlxMoeSsdExpertCache::record_route_timing(
     double sync_seconds,
     double sync_cpu_seconds,
     double host_seconds) noexcept {
@@ -1401,23 +1407,24 @@ void MlxDeepseekV4SsdExpertCache::record_route_timing(
     impl_->counters.route_host_seconds += host_seconds;
 }
 
-MlxDeepseekV4SsdPrefetchedLayer
-MlxDeepseekV4SsdExpertCache::prefetch_layer(std::size_t layer) {
+MlxSsdPrefetchedExpertLayer
+MlxMoeSsdExpertCache::prefetch_layer(std::size_t layer) {
     if (layer >= impl_->store.num_layers()) {
         throw std::out_of_range("SSD expert prefetch layer out of range");
     }
     const auto buffer = layer % 2;
     impl_->claim_prefill_buffer(buffer);
-    auto state = std::make_unique<MlxDeepseekV4SsdPrefetchedLayer::Impl>();
+    auto state = std::make_unique<MlxSsdPrefetchedExpertLayer::Impl>();
     state->cache = impl_;
     state->layer = layer;
     state->buffer = buffer;
-    state->slot_map.assign(impl_->store.num_experts(), -1);
-    state->cache_pins.reserve(impl_->store.num_experts());
-    state->reads.reserve(impl_->store.num_experts());
+    const auto expert_count = impl_->store.num_experts(layer);
+    state->slot_map.assign(expert_count, -1);
+    state->cache_pins.reserve(expert_count);
+    state->reads.reserve(expert_count);
     try {
         for (std::size_t expert = 0;
-             expert < impl_->store.num_experts();
+             expert < expert_count;
              ++expert) {
             const auto id = static_cast<std::int32_t>(expert);
             auto resident = impl_->pin_if_resident(layer, id);
@@ -1428,49 +1435,50 @@ MlxDeepseekV4SsdExpertCache::prefetch_layer(std::size_t layer) {
                 std::scoped_lock lock(impl_->mutex);
                 ++impl_->counters.prefill_cache_hits;
             } else {
-                const auto arena_slot = buffer * impl_->store.num_experts() + expert;
+                const auto arena_slot =
+                    buffer * impl_->store.max_num_experts() + expert;
                 state->slot_map[expert] = static_cast<std::int32_t>(arena_slot);
                 state->reads.push_back(
                     impl_->schedule_direct(layer, id, arena_slot));
             }
         }
-        return MlxDeepseekV4SsdPrefetchedLayer(std::move(state));
+        return MlxSsdPrefetchedExpertLayer(std::move(state));
     } catch (...) {
         state->release();
         throw;
     }
 }
 
-std::size_t MlxDeepseekV4SsdExpertCache::cache_limit_bytes() const noexcept {
+std::size_t MlxMoeSsdExpertCache::cache_limit_bytes() const noexcept {
     return impl_->limit_bytes;
 }
 
-std::size_t MlxDeepseekV4SsdExpertCache::cache_slots() const noexcept {
+std::size_t MlxMoeSsdExpertCache::cache_slots() const noexcept {
     return impl_->slot_count;
 }
 
-bool MlxDeepseekV4SsdExpertCache::prefill_overlap_enabled() const noexcept {
+bool MlxMoeSsdExpertCache::prefill_overlap_enabled() const noexcept {
     return impl_->prefill_slots != 0;
 }
 
-MlxDeepseekV4SsdCacheStats MlxDeepseekV4SsdExpertCache::stats() const {
+MlxSsdExpertCacheStats MlxMoeSsdExpertCache::stats() const {
     return impl_->stats();
 }
 
-void MlxDeepseekV4SsdExpertCache::reset_stats() {
+void MlxMoeSsdExpertCache::reset_stats() {
     std::scoped_lock lock(impl_->mutex);
     impl_->counters = {};
 }
 
-void MlxDeepseekV4SsdExpertCache::prewarm_metal() {
+void MlxMoeSsdExpertCache::prewarm_metal() {
     impl_->arena.prewarm_metal();
 }
 
-void MlxDeepseekV4SsdExpertCache::release_deferred() {
+void MlxMoeSsdExpertCache::release_deferred() {
     impl_->release_deferred();
 }
 
-void MlxDeepseekV4SsdExpertCache::clear() {
+void MlxMoeSsdExpertCache::clear() {
     impl_->release_deferred();
     std::scoped_lock lock(impl_->mutex);
     if (impl_->active_page_table_snapshots != 0) {

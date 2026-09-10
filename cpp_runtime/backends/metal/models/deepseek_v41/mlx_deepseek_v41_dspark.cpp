@@ -507,7 +507,9 @@ MlxDeepseekV41DSpark::load_if_present(
     const DeepseekV41Config& config,
     const MlxEmbedding& embedding,
     const MlxLinear& output,
-    int max_context) {
+    int max_context,
+    std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
+    std::size_t expert_layer_base) {
     const bool root = model.contains(
         "predictor.stage.0.main_projection.weight");
     const bool any = root ||
@@ -544,7 +546,12 @@ MlxDeepseekV41DSpark::load_if_present(
                 root_prefix + ".mlp.mhc.pre",
                 root_prefix + ".mlp.norm.weight"),
             MlxDeepseekV41Moe::load(
-                model, config, root_prefix + ".mlp", true),
+                model,
+                config,
+                root_prefix + ".mlp",
+                true,
+                ssd_expert_cache,
+                expert_layer_base + static_cast<std::size_t>(stage)),
             static_cast<float>(config.rms_eps));
     }
     const auto first = std::string("predictor.stage.0");

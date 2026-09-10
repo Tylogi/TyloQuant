@@ -536,8 +536,7 @@ public:
             throw std::runtime_error(
                 "DeepSeek-V4.1 Engram table must use native MXFP8: " + name);
         }
-        auto mapping = model.map_record(name);
-        const auto bytes = mapping.view();
+        const auto bytes = model.read_range(name, 0, kMxHeaderBytes);
         if (bytes.size() < kMxHeaderBytes ||
             std::memcmp(bytes.data(), "MXT1", 4) != 0 ||
             bytes[4] != 1 || bytes[5] != 8 || bytes[6] != 0 || bytes[7] != 0) {
@@ -565,16 +564,15 @@ public:
                 kMxHeaderBytes ||
             scale_bytes > std::numeric_limits<std::uint64_t>::max() -
                 kMxHeaderBytes - value_bytes ||
-            kMxHeaderBytes + value_bytes + scale_bytes != bytes.size()) {
+            kMxHeaderBytes + value_bytes + scale_bytes != record.nbytes) {
             throw std::runtime_error(
                 "DeepSeek-V4.1 Engram MXFP8 payload size disagrees: " + name);
         }
-        const auto* values = bytes.data() + kMxHeaderBytes;
-        const auto* scales = values + static_cast<std::size_t>(value_bytes);
         return std::shared_ptr<Table>(new Table(
-            std::move(mapping),
-            values,
-            scales,
+            model,
+            name,
+            kMxHeaderBytes,
+            kMxHeaderBytes + value_bytes,
             static_cast<std::int64_t>(rows),
             static_cast<int>(columns),
             cache_capacity_rows()));
@@ -643,15 +641,17 @@ private:
     };
 
     Table(
-        MfqMappedBytes mapping,
-        const std::uint8_t* values,
-        const std::uint8_t* scales,
+        MfqContainer model,
+        std::string name,
+        std::uint64_t values_offset,
+        std::uint64_t scales_offset,
         std::int64_t rows,
         int width,
         std::size_t capacity)
-        : mapping_(std::move(mapping)),
-          values_(values),
-          scales_(scales),
+        : model_(std::move(model)),
+          name_(std::move(name)),
+          values_offset_(values_offset),
+          scales_offset_(scales_offset),
           rows_(rows),
           width_(width),
           capacity_(capacity) {
@@ -664,22 +664,32 @@ private:
                 : std::ldexp(1.0f, static_cast<int>(raw) - 127);
         }
         scratch_.resize(static_cast<std::size_t>(width_));
+        raw_values_.resize(static_cast<std::size_t>(width_));
+        raw_scales_.resize(static_cast<std::size_t>(width_ / 32));
     }
 
     void decode_row(
         std::int64_t row,
         std::vector<mlx::core::float16_t>& output) const {
-        const auto* values = values_ + static_cast<std::size_t>(row) * width_;
-        const auto* scales = scales_ +
-            static_cast<std::size_t>(row) * (width_ / 32);
+        model_.read_range_into(
+            name_,
+            values_offset_ + static_cast<std::uint64_t>(row) *
+                static_cast<std::uint64_t>(width_),
+            std::as_writable_bytes(std::span<std::uint8_t>(raw_values_)));
+        model_.read_range_into(
+            name_,
+            scales_offset_ + static_cast<std::uint64_t>(row) *
+                static_cast<std::uint64_t>(width_ / 32),
+            std::as_writable_bytes(std::span<std::uint8_t>(raw_scales_)));
         for (int group = 0; group < width_ / 32; ++group) {
-            const auto scale = e8m0_[scales[group]];
+            const auto scale = e8m0_[raw_scales_[static_cast<std::size_t>(group)]];
             if (!std::isfinite(scale)) {
                 throw std::runtime_error(
                     "DeepSeek-V4.1 Engram row contains an invalid E8M0 scale");
             }
             for (int column = 0; column < 32; ++column) {
-                const auto value = e4m3_[values[group * 32 + column]];
+                const auto value = e4m3_[raw_values_[static_cast<std::size_t>(
+                    group * 32 + column)]];
                 if (!std::isfinite(value)) {
                     throw std::runtime_error(
                         "DeepSeek-V4.1 Engram row contains an E4M3 NaN");
@@ -715,9 +725,10 @@ private:
         return cache_.emplace(row, std::move(entry)).first->second.values;
     }
 
-    MfqMappedBytes mapping_;
-    const std::uint8_t* values_;
-    const std::uint8_t* scales_;
+    MfqContainer model_;
+    std::string name_;
+    std::uint64_t values_offset_;
+    std::uint64_t scales_offset_;
     std::int64_t rows_;
     int width_;
     std::size_t capacity_;
@@ -727,6 +738,8 @@ private:
     mutable std::list<std::int64_t> recency_;
     mutable std::unordered_map<std::int64_t, CacheEntry> cache_;
     mutable std::vector<mlx::core::float16_t> scratch_;
+    mutable std::vector<std::uint8_t> raw_values_;
+    mutable std::vector<std::uint8_t> raw_scales_;
 };
 
 MlxDeepseekV41Engram MlxDeepseekV41Engram::load(

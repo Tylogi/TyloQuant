@@ -321,7 +321,7 @@ std::size_t requested_cache_bytes(
             static_cast<long double>(
                 std::numeric_limits<std::size_t>::max())) {
             throw std::runtime_error(
-                "DeepSeek-V4 expert cache exceeds addressable memory");
+                "MoE expert cache exceeds addressable memory");
         }
         const auto bytes = static_cast<std::size_t>(requested);
         // An explicit zero keeps native HF expert banks fully resident.
@@ -335,53 +335,6 @@ std::size_t requested_cache_bytes(
     return std::max<std::size_t>(
         std::uint64_t{1} << 30,
         physical_memory_bytes() * 2 / 3);
-}
-
-std::size_t resident_hf_wired_limit_bytes(
-    const std::filesystem::path& model_root) {
-    constexpr std::size_t gib = std::size_t{1} << 30;
-    if (const char* value = std::getenv("MFQ_HF_RESIDENT_WIRED_GIB")) {
-        const auto requested = std::stoull(value);
-        if (requested > std::numeric_limits<std::size_t>::max() / gib) {
-            throw std::invalid_argument(
-                "resident HF wired limit exceeds addressable memory");
-        }
-        return static_cast<std::size_t>(requested) * gib;
-    }
-
-    std::size_t checkpoint_bytes = 0;
-    std::error_code error;
-    for (std::filesystem::directory_iterator entries(model_root, error), end;
-         !error && entries != end;
-         entries.increment(error)) {
-        if (!entries->is_regular_file(error) || error ||
-            entries->path().extension() != ".safetensors") {
-            continue;
-        }
-        const auto bytes = entries->file_size(error);
-        if (error || bytes > std::numeric_limits<std::size_t>::max() -
-                checkpoint_bytes) {
-            throw std::runtime_error(
-                "cannot size resident HF checkpoint for its wired budget");
-        }
-        checkpoint_bytes += static_cast<std::size_t>(bytes);
-    }
-    if (error || checkpoint_bytes == 0) {
-        throw std::runtime_error(
-            "cannot discover resident HF safetensor payload");
-    }
-    const auto memory = physical_memory_bytes();
-    const auto reserve = std::max<std::size_t>(32 * gib, memory / 4);
-    if (memory <= reserve || checkpoint_bytes > memory - reserve) {
-        throw std::runtime_error(
-            "resident HF checkpoint does not fit the safe UMA budget");
-    }
-    const auto headroom = std::max<std::size_t>(32 * gib, checkpoint_bytes / 8);
-    return std::min(
-        memory - reserve,
-        checkpoint_bytes > std::numeric_limits<std::size_t>::max() - headroom
-            ? memory - reserve
-            : checkpoint_bytes + headroom);
 }
 
 std::filesystem::path executable_path() {
@@ -1756,95 +1709,6 @@ int serve_loaded_runtime(
         });
 }
 
-int run_native_hf_server(const Arguments& arguments) {
-    if (arguments.tokenizer_gguf.empty()) {
-        throw std::runtime_error(
-            "HF model directories currently require --tokenizer-gguf PATH");
-    }
-    const auto config = mfq::metal::DeepseekV4Config::from_json(
-        read_text(arguments.mfq / "config.json"));
-    const int context = static_cast<int>(
-        std::min<std::int64_t>(
-            arguments.context_size,
-            config.max_position_embeddings));
-    const auto expert_cache_bytes = requested_cache_bytes(
-        arguments.expert_cache_gb, true);
-    std::size_t resident_wired_limit = 0;
-    if (expert_cache_bytes == 0) {
-        resident_wired_limit = resident_hf_wired_limit_bytes(arguments.mfq);
-        mlx::core::set_wired_limit(resident_wired_limit);
-    }
-    constexpr std::size_t prefill_buffers_minimum =
-        std::size_t{7} << 30;
-    const bool prefill_overlap =
-        expert_cache_bytes >= prefill_buffers_minimum;
-    const auto runtime_stream = mlx::core::new_thread_unsafe_stream(
-        mlx::core::Device::gpu);
-    mlx::core::set_default_stream(runtime_stream);
-    const auto started = std::chrono::steady_clock::now();
-    std::cout
-        << "Loading native-format DeepSeek-V4 HF weights on Apple UMA: "
-        << (expert_cache_bytes == 0
-                ? "fully resident"
-                : "SSD expert streaming")
-        << (resident_wired_limit == 0
-                ? ""
-                : " (wired budget GiB=" + std::to_string(
-                      static_cast<double>(resident_wired_limit) /
-                      static_cast<double>(std::uint64_t{1} << 30)) + ")")
-        << std::endl;
-    auto runtime = mfq::metal::MlxDeepseekV4CausalLm::load_hf(
-        arguments.mfq,
-        context,
-        expert_cache_bytes,
-        8,
-        prefill_overlap);
-    runtime.prewarm_ssd_expert_arena();
-    release_model_load_staging_memory();
-    const auto load_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - started).count();
-    constexpr double gib = static_cast<double>(std::uint64_t{1} << 30);
-    std::cout
-        << "Loaded " << runtime.layer_count()
-        << " DeepSeek-V4 layers in " << load_seconds << " s"
-        << " expert_backing="
-        << (expert_cache_bytes == 0
-                ? "hf-native-resident"
-                : "hf-safetensors-ssd")
-        << " expert_cache_gib="
-        << static_cast<double>(runtime.expert_cache_limit_bytes()) / gib
-        << " prefill_double_buffer="
-        << static_cast<int>(prefill_overlap)
-        << std::endl;
-    const auto model_root = arguments.mfq;
-    const auto load_runtime =
-        [model_root, expert_cache_bytes, prefill_overlap](
-            std::int64_t requested_context) {
-            if (requested_context < 1 ||
-                requested_context > std::numeric_limits<int>::max()) {
-                throw std::invalid_argument(
-                    "Metal runtime context is out of range");
-            }
-            return mfq::metal::MlxDeepseekV4CausalLm::load_hf(
-                model_root,
-                static_cast<int>(requested_context),
-                expert_cache_bytes,
-                8,
-                prefill_overlap);
-        };
-    return serve_loaded_runtime(
-        arguments,
-        nullptr,
-        std::move(runtime),
-        load_runtime,
-        config.has_vision()
-            ? std::string("deepseek_v4_vision")
-            : config.model_type,
-        config.max_position_embeddings,
-        config.vocab,
-        runtime_stream);
-}
-
 int run_native_server(
     const Arguments& arguments,
     const mfq::metal::MfqContainer& container) {
@@ -1865,20 +1729,31 @@ int run_native_server(
         std::chrono::steady_clock::now();
     const auto graph = mfq::metal::effective_model_graph(container);
     const auto& backbone = graph.backbone;
+    const bool native_hf =
+        container.header().extra_json.count("source.format") != 0 &&
+        container.header().extra_json.at("source.format") ==
+            "hf-safetensors";
     if (backbone == "deepseek_v41") {
         const auto config =
-            mfq::metal::DeepseekV41Config::from_mfq(container);
+            mfq::metal::DeepseekV41Config::from_mfq(container, graph);
         const int context = static_cast<int>(
             std::min<std::int64_t>(
                 arguments.context_size,
                 config.max_position_embeddings));
+        std::optional<std::size_t> expert_cache_bytes;
+        if (arguments.expert_cache_gb.has_value() || native_hf) {
+            const auto bytes = requested_cache_bytes(
+                arguments.expert_cache_gb, native_hf);
+            if (bytes > 0) expert_cache_bytes = bytes;
+        }
         std::cout
             << "Loading native C++/MLX DeepSeek-V4.1 model "
                "on Apple GPU..."
             << std::endl;
         auto runtime =
             mfq::metal::MlxDeepseekV41CausalLm::load(
-                container, context);
+                container, context, expert_cache_bytes);
+        runtime.prewarm_ssd_expert_arena();
         release_model_load_staging_memory();
         const auto load_seconds =
             std::chrono::duration<double>(
@@ -1887,9 +1762,13 @@ int run_native_server(
             << "Loaded " << runtime.layer_count()
             << " DeepSeek-V4.1 layers in "
             << load_seconds << " s; runtime=native-cpp"
+            << " expert_backing="
+            << (expert_cache_bytes.has_value()
+                    ? "nintm-ssd"
+                    : "full-resident")
             << std::endl;
         const auto load_runtime =
-            [&container](std::int64_t requested_context) {
+            [&container, expert_cache_bytes](std::int64_t requested_context) {
                 if (requested_context < 1 ||
                     requested_context >
                         std::numeric_limits<int>::max()) {
@@ -1898,7 +1777,8 @@ int run_native_server(
                 }
                 return mfq::metal::MlxDeepseekV41CausalLm::load(
                     container,
-                    static_cast<int>(requested_context));
+                    static_cast<int>(requested_context),
+                    expert_cache_bytes);
             };
         return serve_loaded_runtime(
             arguments,
@@ -1921,25 +1801,10 @@ int run_native_server(
                 arguments.context_size,
                 config.max_position_embeddings));
         std::optional<std::size_t> expert_cache_bytes;
-        if (arguments.expert_cache_gb.has_value()) {
-            constexpr long double bytes_per_gib =
-                static_cast<long double>(
-                    std::uint64_t{1} << 30);
-            const long double requested_cache =
-                static_cast<long double>(
-                    *arguments.expert_cache_gb) *
-                bytes_per_gib;
-            if (requested_cache >
-                static_cast<long double>(
-                    std::numeric_limits<
-                        std::size_t>::max())) {
-                throw std::runtime_error(
-                    "DeepSeek-V4 expert cache exceeds "
-                    "addressable memory");
-            }
-            expert_cache_bytes =
-                static_cast<std::size_t>(
-                    requested_cache);
+        if (arguments.expert_cache_gb.has_value() || native_hf) {
+            const auto bytes = requested_cache_bytes(
+                arguments.expert_cache_gb, native_hf);
+            if (bytes > 0) expert_cache_bytes = bytes;
         }
         std::cout
             << "Loading native C++/MLX DeepSeek-V4 model "
@@ -1959,10 +1824,11 @@ int run_native_server(
             << "Loaded " << runtime.layer_count()
             << " DeepSeek-V4 layers in "
             << load_seconds << " s";
-        if (arguments.expert_cache_gb.has_value()) {
+        if (expert_cache_bytes.has_value()) {
             std::cout
                 << " nintm_load=disk-cache cache_gb="
-                << *arguments.expert_cache_gb;
+                << static_cast<double>(*expert_cache_bytes) /
+                    static_cast<double>(std::uint64_t{1} << 30);
         } else {
             std::cout << " nintm_load=full-resident";
         }
@@ -2142,24 +2008,6 @@ int main(int argc, char** argv) {
                 usage_error("--mfq is required");
             }
             return EXIT_SUCCESS;
-        }
-
-        if (std::filesystem::is_directory(arguments.mfq)) {
-            if (arguments.server) {
-                configure_mlx_metal();
-#ifdef MFQ_METAL_SERVER
-                const auto config_path = arguments.mfq / "config.json";
-                const auto config = nlohmann::json::parse(read_text(config_path));
-                const auto model_type = config.value("model_type", std::string{});
-                if (model_type.rfind("deepseek_v4", 0) == 0) {
-                    return run_native_hf_server(arguments);
-                }
-#else
-                throw std::runtime_error(
-                    "this build has no C++ server support; configure with "
-                    "-DMFQ_BUILD_CPP_SERVER=ON");
-#endif
-            }
         }
 
         const mfq::metal::MfqContainer model(arguments.mfq);

@@ -89,10 +89,11 @@ struct Config {
 
     static Config from_json(std::string_view payload);
 
-    template <class Container>
-    static Config from_mfq(const Container& model) {
-        const auto graph = model.model_graph();
-        if (!graph || graph->backbone != "deepseek_v41") {
+    template <class Container, class Graph>
+    static Config from_mfq(
+        const Container& model,
+        const Graph& graph) {
+        if (graph.backbone != "deepseek_v41") {
             throw std::runtime_error(
                 "DeepSeek-V4.1 C++ loading requires a deepseek_v41 model graph");
         }
@@ -102,6 +103,16 @@ struct Config {
                 "DeepSeek-V4.1 MFQ has no embedded model_config.json asset");
         }
         return from_json(model.read_text(asset));
+    }
+
+    template <class Container>
+    static Config from_mfq(const Container& model) {
+        const auto graph = model.model_graph();
+        if (!graph) {
+            throw std::runtime_error(
+                "DeepSeek-V4.1 C++ loading requires a deepseek_v41 model graph");
+        }
+        return from_mfq(model, *graph);
     }
 
     void validate() const;
