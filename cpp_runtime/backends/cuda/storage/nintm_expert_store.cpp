@@ -11,6 +11,7 @@
 #include <mutex>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 
 namespace mfq::cuda {
@@ -320,6 +321,7 @@ struct NintMxfp4ReadPool::Impl {
         std::mutex mutex;
         std::condition_variable condition;
         std::size_t remaining = 0;
+        std::uint64_t file_opens = 0;
         std::exception_ptr error;
     };
 
@@ -330,10 +332,21 @@ struct NintMxfp4ReadPool::Impl {
 
     explicit Impl(std::size_t requested_workers)
         : worker_count(std::max<std::size_t>(1, requested_workers)) {
-        if (worker_count == 1) return;
         threads.reserve(worker_count);
-        for (std::size_t index = 0; index < worker_count; ++index) {
-            threads.emplace_back([this] { worker(); });
+        try {
+            for (std::size_t index = 0; index < worker_count; ++index) {
+                threads.emplace_back([this] { worker(); });
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> guard(mutex);
+                stopping = true;
+            }
+            condition.notify_all();
+            for (auto& thread : threads) {
+                if (thread.joinable()) thread.join();
+            }
+            throw;
         }
     }
 
@@ -348,15 +361,66 @@ struct NintMxfp4ReadPool::Impl {
         }
     }
 
-    void execute(const NintMxfp4ReadRequest& request) {
+    using StreamCache =
+        std::unordered_map<std::string, std::unique_ptr<std::ifstream>>;
+
+    void execute(
+        const NintMxfp4ReadRequest& request,
+        StreamCache& streams,
+        bool& opened) {
         if (request.store == nullptr || request.part == nullptr ||
             request.destination.size() != request.part->nbytes) {
             throw std::invalid_argument("invalid exact-range read request");
         }
-        request.store->read_part_into(*request.part, request.destination);
+        const auto& record = request.store->record();
+        const auto& part = *request.part;
+        if (part.offset > record.nbytes ||
+            part.nbytes > record.nbytes - part.offset) {
+            throw std::out_of_range("exact-range read exceeds the MFQ record");
+        }
+        const auto absolute = checked_add(
+            record.offset, part.offset, "MFQ absolute range offset");
+        if (absolute > static_cast<std::uint64_t>(
+                std::numeric_limits<std::streamoff>::max()) ||
+            request.destination.size() > static_cast<std::size_t>(
+                std::numeric_limits<std::streamsize>::max())) {
+            throw std::runtime_error("exact-range read exceeds stream limits");
+        }
+
+        auto found = streams.find(record.source_path);
+        if (found == streams.end()) {
+            auto stream = std::make_unique<std::ifstream>(
+                record.source_path, std::ios::binary);
+            if (!*stream) {
+                throw std::runtime_error(
+                    "cannot open MFQ expert source: " + record.source_path);
+            }
+            found = streams.emplace(
+                record.source_path, std::move(stream)).first;
+            opened = true;
+        }
+        auto& stream = *found->second;
+        stream.clear();
+        stream.seekg(static_cast<std::streamoff>(absolute));
+        if (!stream) {
+            streams.erase(found);
+            throw std::runtime_error(
+                "failed seeking MFQ expert source: " + record.name);
+        }
+        if (request.destination.empty()) return;
+        stream.read(
+            reinterpret_cast<char*>(request.destination.data()),
+            static_cast<std::streamsize>(request.destination.size()));
+        if (stream.gcount() !=
+                static_cast<std::streamsize>(request.destination.size())) {
+            streams.erase(found);
+            throw std::runtime_error(
+                "failed reading exact MFQ expert range: " + record.name);
+        }
     }
 
     void worker() {
+        StreamCache streams;
         while (true) {
             Task task;
             {
@@ -368,8 +432,9 @@ struct NintMxfp4ReadPool::Impl {
                 task = std::move(tasks.front());
                 tasks.pop_front();
             }
+            bool opened = false;
             try {
-                execute(task.request);
+                execute(task.request, streams, opened);
             } catch (...) {
                 std::lock_guard<std::mutex> guard(task.batch->mutex);
                 if (!task.batch->error) {
@@ -378,6 +443,7 @@ struct NintMxfp4ReadPool::Impl {
             }
             {
                 std::lock_guard<std::mutex> guard(task.batch->mutex);
+                if (opened) ++task.batch->file_opens;
                 if (task.batch->remaining == 0) {
                     std::terminate();
                 }
@@ -419,27 +485,24 @@ NintMxfp4ReadBatchStats NintMxfp4ReadPool::read(
     }
     result.calls = requests.size();
     const auto started = std::chrono::steady_clock::now();
-    if (impl_->worker_count == 1) {
-        for (const auto& request : requests) impl_->execute(request);
-    } else {
-        auto batch = std::make_shared<Impl::Batch>();
-        batch->remaining = requests.size();
-        {
-            std::lock_guard<std::mutex> guard(impl_->mutex);
-            if (impl_->stopping) {
-                throw std::runtime_error("exact-range read pool is stopping");
-            }
-            for (const auto& request : requests) {
-                impl_->tasks.push_back({request, batch});
-            }
+    auto batch = std::make_shared<Impl::Batch>();
+    batch->remaining = requests.size();
+    {
+        std::lock_guard<std::mutex> guard(impl_->mutex);
+        if (impl_->stopping) {
+            throw std::runtime_error("exact-range read pool is stopping");
         }
-        impl_->condition.notify_all();
-        std::unique_lock<std::mutex> lock(batch->mutex);
-        batch->condition.wait(lock, [&batch] {
-            return batch->remaining == 0;
-        });
-        if (batch->error) std::rethrow_exception(batch->error);
+        for (const auto& request : requests) {
+            impl_->tasks.push_back({request, batch});
+        }
     }
+    impl_->condition.notify_all();
+    std::unique_lock<std::mutex> lock(batch->mutex);
+    batch->condition.wait(lock, [&batch] {
+        return batch->remaining == 0;
+    });
+    result.file_opens = batch->file_opens;
+    if (batch->error) std::rethrow_exception(batch->error);
     result.wall_nanoseconds = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count());

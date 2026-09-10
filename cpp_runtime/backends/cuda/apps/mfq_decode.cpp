@@ -7960,6 +7960,7 @@ struct MoeCacheStats {
     int64_t mapped_gather_descriptors = 0;
     int64_t range_read_bytes = 0;
     int64_t range_read_calls = 0;
+    int64_t range_file_opens = 0;
     int64_t range_read_nanoseconds = 0;
 };
 
@@ -8363,6 +8364,8 @@ public:
                << stats_.range_read_bytes
                << " range_read_calls="
                << stats_.range_read_calls
+               << " range_file_opens="
+               << stats_.range_file_opens
                << " range_io_workers="
                << range_read_pool_->workers()
                << " range_read_ms="
@@ -8482,6 +8485,8 @@ private:
             const auto range_stats = range_read_pool_->read(range_requests);
             stats_.range_read_bytes += static_cast<int64_t>(range_stats.bytes);
             stats_.range_read_calls += static_cast<int64_t>(range_stats.calls);
+            stats_.range_file_opens +=
+                static_cast<int64_t>(range_stats.file_opens);
             stats_.range_read_nanoseconds +=
                 static_cast<int64_t>(range_stats.wall_nanoseconds);
             range_requests.clear();
@@ -9676,6 +9681,7 @@ void MoeExpertCache::prewarm() {
     const int64_t prewarm_h2d_bytes = stats_.h2d_bytes;
     const int64_t prewarm_range_read_bytes = stats_.range_read_bytes;
     const int64_t prewarm_range_read_calls = stats_.range_read_calls;
+    const int64_t prewarm_range_file_opens = stats_.range_file_opens;
     const double prewarm_range_read_ms =
         static_cast<double>(stats_.range_read_nanoseconds) / 1.0e6;
     const int64_t projection_entries =
@@ -9691,6 +9697,7 @@ void MoeExpertCache::prewarm() {
         << " h2d_bytes=" << prewarm_h2d_bytes
         << " range_read_bytes=" << prewarm_range_read_bytes
         << " range_read_calls=" << prewarm_range_read_calls
+        << " range_file_opens=" << prewarm_range_file_opens
         << " range_read_ms=" << prewarm_range_read_ms
         << " time_ms=" << elapsed_ms
         << " unfilled_bytes=" << unfilled_bytes

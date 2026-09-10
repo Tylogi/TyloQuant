@@ -3,8 +3,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <span>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -85,6 +85,7 @@ struct NintMxfp4ReadRequest {
 struct NintMxfp4ReadBatchStats {
     std::uint64_t bytes = 0;
     std::uint64_t calls = 0;
+    std::uint64_t file_opens = 0;
     std::uint64_t wall_nanoseconds = 0;
 };
 

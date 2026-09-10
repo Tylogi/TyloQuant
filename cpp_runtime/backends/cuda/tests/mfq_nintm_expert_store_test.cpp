@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -181,6 +182,8 @@ void test_parallel_read_batch() {
     require(pool.workers() == 3, "parallel worker count was lost");
     require(stats.calls == 6, "parallel range-call accounting is wrong");
     require(stats.bytes == 102, "parallel range-byte accounting is wrong");
+    require(stats.file_opens > 0 && stats.file_opens <= 3,
+            "parallel file-open accounting is wrong");
     require(stats.wall_nanoseconds > 0, "parallel read timing is missing");
     for (int expert = 0; expert < 3; ++expert) {
         require(values[expert].front() == 17 * expert,
@@ -188,6 +191,60 @@ void test_parallel_read_batch() {
         require(scales[expert].front() == 127 + expert,
                 "parallel expert scale range is wrong");
     }
+
+    mfq::cuda::NintMxfp4ReadPool serial(1);
+    const auto first = serial.read(requests);
+    const auto second = serial.read(requests);
+    require(first.file_opens == 1, "serial worker did not open its source once");
+    require(second.file_opens == 0, "serial worker did not reuse its file handle");
+}
+
+void test_concurrent_read_batches() {
+    const auto blob = make_record();
+    TempFile file(blob);
+    mfq::cuda::NintMxfp4ExpertStore store({
+        "experts.gate.weight", "NINTM", file.path.string(), 7, blob.size()});
+    std::array<std::uint8_t, 32> first_values{};
+    std::array<std::uint8_t, 2> first_scales{};
+    std::array<std::uint8_t, 32> second_values{};
+    std::array<std::uint8_t, 2> second_scales{};
+    const std::array<mfq::cuda::NintMxfp4ReadRequest, 2> first_requests{{
+        {
+            &store,
+            &store.part(0, mfq::cuda::NintMxfp4ExpertStore::values),
+            first_values,
+        },
+        {
+            &store,
+            &store.part(0, mfq::cuda::NintMxfp4ExpertStore::scales),
+            first_scales,
+        },
+    }};
+    const std::array<mfq::cuda::NintMxfp4ReadRequest, 2> second_requests{{
+        {
+            &store,
+            &store.part(1, mfq::cuda::NintMxfp4ExpertStore::values),
+            second_values,
+        },
+        {
+            &store,
+            &store.part(1, mfq::cuda::NintMxfp4ExpertStore::scales),
+            second_scales,
+        },
+    }};
+    mfq::cuda::NintMxfp4ReadPool pool(3);
+    auto first = std::async(std::launch::async, [&] {
+        return pool.read(first_requests);
+    });
+    auto second = std::async(std::launch::async, [&] {
+        return pool.read(second_requests);
+    });
+    require(first.get().calls == 2, "first concurrent batch was incomplete");
+    require(second.get().calls == 2, "second concurrent batch was incomplete");
+    require(first_values.front() == 0, "first concurrent values are wrong");
+    require(first_scales.front() == 127, "first concurrent scales are wrong");
+    require(second_values.front() == 17, "second concurrent values are wrong");
+    require(second_scales.front() == 128, "second concurrent scales are wrong");
 }
 
 } // namespace
@@ -197,7 +254,8 @@ int main() {
         test_exact_ranges();
         test_unsupported_cohort();
         test_parallel_read_batch();
-        std::cout << "cuda_nintm_expert_store_tests=3 passed=3\n";
+        test_concurrent_read_batches();
+        std::cout << "cuda_nintm_expert_store_tests=4 passed=4\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "cuda_nintm_expert_store_test failure="
