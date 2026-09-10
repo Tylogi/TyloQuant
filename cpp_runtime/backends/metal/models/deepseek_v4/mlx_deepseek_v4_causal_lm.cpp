@@ -1263,12 +1263,17 @@ void MlxDeepseekV4CausalLm::begin_speculative_target(
         throw std::runtime_error(
             "invalid DeepSeek-V4 target cache transaction");
     }
+    std::vector<array> checkpoints;
+    checkpoints.reserve(states_.size() * 11);
     for (auto& state : states_) {
         state.begin_speculative(confirmed_tokens, total_tokens);
-        // The target cache uses in-place ring writes. Resolve each compact
-        // checkpoint before verification can overwrite those physical rows.
-        materialize_state(state.speculative_checkpoint());
+        append_state_arrays(state.speculative_checkpoint(), checkpoints);
     }
+    // The target cache uses in-place ring writes. Resolve every compact
+    // checkpoint before verification can overwrite those physical rows, but
+    // submit the independent layer copies together instead of imposing one
+    // host synchronization per layer.
+    detail::eval_with_timing(std::move(checkpoints));
 }
 
 void MlxDeepseekV4CausalLm::commit_speculative_target() noexcept {
@@ -1286,11 +1291,16 @@ void MlxDeepseekV4CausalLm::rollback_speculative_target(
         throw std::runtime_error(
             "invalid DeepSeek-V4 target cache rollback");
     }
+    std::vector<array> restored;
+    restored.reserve(states_.size() * 11);
     for (std::size_t index = 0; index < layers_.size(); ++index) {
         layers_[index].rollback_speculative(
             states_[index], accepted_tokens);
-        materialize_state(states_[index]);
+        append_state_arrays(states_[index], restored);
     }
+    // Keep the restored cache materialized before the next decode cycle while
+    // avoiding one synchronization boundary per layer.
+    detail::eval_with_timing(std::move(restored));
     cache_position_ -= draft_tokens - accepted_tokens;
 }
 
@@ -2391,24 +2401,19 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     begin_speculative_target(1, draft_count + 1);
                 }
 
-                std::vector<std::int32_t> speculative_ids;
-                speculative_ids.reserve(
-                    static_cast<std::size_t>(draft_count + 1));
-                speculative_ids.push_back(pending_token);
-                if (draft_count > 0) {
-                    auto resolved_drafts = draft_tokens;
-                    resolved_drafts.eval();
-                    const auto* values =
-                        resolved_drafts.data<std::int32_t>();
-                    speculative_ids.insert(
-                        speculative_ids.end(),
-                        values,
-                        values + draft_count);
-                }
-                const array verify_ids(
-                    speculative_ids.begin(),
-                    Shape{1, draft_count + 1},
-                    mlx::core::int32);
+                const array pending_ids(
+                    {pending_token}, Shape{1}, mlx::core::int32);
+                auto verify_ids = mlx::core::reshape(
+                    draft_count > 0
+                        ? mlx::core::concatenate(
+                              {
+                                  pending_ids,
+                                  mlx::core::reshape(
+                                      draft_tokens, Shape{draft_count}),
+                              },
+                              0)
+                        : pending_ids,
+                    Shape{1, draft_count + 1});
                 array target_hidden(0.0f);
                 auto verified_logits = forward_chunk(
                     verify_ids,

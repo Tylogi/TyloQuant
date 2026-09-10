@@ -321,7 +321,11 @@ def describe_tensor(
     # Root-level predictor fusion/projection matrices are small, shared, and
     # outside the repeated decoder stack.  Preserve them without naming a
     # particular speculative architecture.
-    quantizable &= not (scope is TensorScope.PREDICTOR and source_layer_match is None)
+    quantizable &= not (
+        scope is TensorScope.PREDICTOR
+        and source_layer_match is None
+        and role is not TensorRole.ROUTED_EXPERT
+    )
     return TensorDescriptor(role, scope, layer_index, bool(quantizable))
 
 

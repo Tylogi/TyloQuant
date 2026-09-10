@@ -1396,6 +1396,10 @@ void MlxSampler::reset_seed(std::uint64_t seed) {
     rng_.seed(seed);
 }
 
+void MlxSampler::discard_random(std::uint64_t draws) {
+    rng_.discard(draws);
+}
+
 array MlxSampler::next_random(const array& logits) {
     const auto view = normalize_logits(logits);
     return make_cpu_random(rng_, view.rows);

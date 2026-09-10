@@ -22,18 +22,8 @@ struct MlxQwen35LinearAttentionCacheSnapshot {
     }
 };
 
-struct MlxQwen35LinearAttentionRollback {
-    mlx::core::array convolution_state;
-    mlx::core::array recurrent_state;
-    std::optional<mlx::core::array> qk;
-    std::optional<mlx::core::array> value;
-    std::optional<mlx::core::array> gate;
-    std::optional<mlx::core::array> beta;
-    int position = 0;
-    int batch = 0;
-    int confirmed_tokens = 0;
-    int total_tokens = 0;
-};
+using MlxQwen35LinearAttentionRollback =
+    MlxGatedDeltaSpeculativeState;
 
 // Qwen3.5/3.6 Gated DeltaNet decoder block.
 //

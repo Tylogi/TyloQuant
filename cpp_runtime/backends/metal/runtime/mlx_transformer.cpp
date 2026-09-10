@@ -706,6 +706,13 @@ std::pair<array, int> MlxSequenceCache::append(
     };
 }
 
+void MlxSequenceCache::trim(int tokens) {
+    if (tokens < 0 || tokens > position_) {
+        throw std::runtime_error("invalid MLX sequence-cache trim");
+    }
+    position_ -= tokens;
+}
+
 void MlxSequenceCache::clear() noexcept {
     values_.reset();
     batch_ = 0;

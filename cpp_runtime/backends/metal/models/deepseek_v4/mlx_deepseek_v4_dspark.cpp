@@ -129,6 +129,40 @@ array full_attention(
     const array& sinks) {
     const int heads = query.shape(2);
     const int dimension = query.shape(3);
+    if (heads == 64 && dimension == 512) {
+        // DSpark attends to every row in its bounded local window. Reuse the
+        // common fused selected-MLA kernel rather than materializing the
+        // [B,M,H,K,D] q*k product. Its selection width is 32-aligned; padded
+        // -1 indices are ignored by the kernel without extending the cache.
+        const int batch = query.shape(0);
+        const int queries = query.shape(1);
+        const int key_count = keys.shape(1);
+        const int selected = ((key_count + 31) / 32) * 32;
+        auto indices = mlx::core::arange(
+            0, key_count, 1, mlx::core::int32);
+        if (selected != key_count) {
+            indices = mlx::core::concatenate(
+                {
+                    indices,
+                    mlx::core::full(
+                        Shape{selected - key_count},
+                        -1,
+                        mlx::core::int32),
+                },
+                0);
+        }
+        indices = mlx::core::broadcast_to(
+            mlx::core::reshape(indices, Shape{1, 1, selected}),
+            Shape{batch, queries, selected});
+        auto mask = mlx::core::zeros(
+            Shape{batch, queries, selected}, mlx::core::float16);
+        return attention_dsv4_sparse(
+            mlx::core::transpose(query, {0, 2, 1, 3}),
+            keys,
+            indices,
+            mask,
+            sinks);
+    }
     auto q = mlx::core::astype(query, mlx::core::float32);
     auto k = mlx::core::astype(keys, mlx::core::float32);
     auto scores = mlx::core::sum(

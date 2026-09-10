@@ -14,6 +14,10 @@
 
 namespace mfq::metal {
 
+// Storage/statistics capacity of the common engine, not a model capability.
+// Each predictor adapter supplies its own maximum depth in the request.
+inline constexpr int kMlxMtpEngineMaximumDraftDepth = 5;
+
 struct MlxMtpVerification {
     std::size_t accepted_drafts = 0;
     std::int32_t next_token = -1;
@@ -60,6 +64,20 @@ struct MlxMtpDraftContext {
 using MlxMtpTokenSelector = std::function<mlx::core::array(
     const mlx::core::array& logits)>;
 
+// Fold teacher-forced (target_hidden[t], token[t + 1]) pairs into any
+// predictor cache.  Architecture adapters supply only the predictor forward;
+// slicing, alignment, chunking and graph materialization stay common.
+using MlxMtpHistoryFold = std::function<mlx::core::array(
+    const mlx::core::array& hidden_rows,
+    const mlx::core::array& shifted_token_ids,
+    int pair_offset)>;
+
+std::size_t mlx_prime_mtp_history(
+    const mlx::core::array& target_hidden,
+    const mlx::core::array& prompt_ids,
+    const MlxMtpHistoryFold& fold,
+    int chunk_size = 512);
+
 struct MlxMtpTargetBatch {
     // [drafts + 1, vocab], one target row for each draft and the bonus row.
     mlx::core::array logits;
@@ -103,6 +121,7 @@ struct MlxMtpEngineRequest {
     std::optional<mlx::core::array> token_counts;
     std::span<const std::int64_t> eos_token_ids;
     MlxGenerationTokenCallback callback;
+    std::uint64_t sampler_draws_consumed = 0;
 };
 
 // Avoid allocating a vocabulary-sized count vector on the common no-penalty
@@ -162,6 +181,8 @@ private:
     double milliseconds_since_probe_ = 0.0;
     double milliseconds_since_explore_ = 0.0;
     std::vector<double> acceptance_;
+    std::vector<int> warmup_accepts_;
+    std::vector<int> warmup_trials_;
     std::vector<std::optional<double>> cycle_ms_;
     std::vector<std::optional<double>> cycle_age_ms_;
     std::vector<int> warmup_;

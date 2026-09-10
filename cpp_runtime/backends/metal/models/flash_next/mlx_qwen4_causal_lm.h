@@ -3,6 +3,7 @@
 // Native Qwen4-Exp model graph and generation lifecycle.
 
 #include "mfq_container.h"
+#include "mlx_mtp.h"
 #include "mlx_sampling.h"
 
 #include "mfq/token_constraint.h"
@@ -107,7 +108,8 @@ public:
     const Qwen4Config& config() const noexcept;
     std::size_t layer_count() const noexcept;
     int cache_position() const noexcept;
-    bool supports_mtp() const noexcept { return false; }
+    bool supports_mtp() const noexcept;
+    const MlxMtpGenerationStats& last_mtp_stats() const noexcept;
     bool supports_multimodal() const noexcept { return false; }
     bool supports_text_session_state() const noexcept { return false; }
     MlxQwen4TextSessionState capture_text_session_state(

@@ -395,6 +395,77 @@ int main() {
                 normalized);
         }
 
+        const auto initial_recurrent = zeros(
+            Shape{1, 1, dimension, dimension}, float32);
+        mfq::metal::MlxGatedDeltaSpeculativeState transaction{
+            state,
+            initial_recurrent,
+            qk_values,
+            value_values,
+            gate,
+            beta,
+            7,
+            1,
+            1,
+            2,
+        };
+        auto restored =
+            mfq::metal::replay_gated_delta_speculative_prefix(
+                transaction,
+                0,
+                weights,
+                1,
+                1,
+                dimension,
+                dimension);
+        auto prefix_convolution = mfq::metal::linear_conv_qkv(
+            state,
+            slice(
+                qk_values,
+                Shape{0, 0, 0},
+                Shape{1, 1, qk_width}),
+            slice(
+                value_values,
+                Shape{0, 0, 0},
+                Shape{1, 1, value_width}),
+            weights,
+            1,
+            1,
+            dimension,
+            dimension);
+        auto prefix_recurrent = mfq::metal::gated_delta_net(
+            prefix_convolution.query,
+            prefix_convolution.key,
+            prefix_convolution.value,
+            slice(gate, Shape{0, 0, 0}, Shape{1, 1, 1}),
+            slice(beta, Shape{0, 0, 0}, Shape{1, 1, 1}),
+            initial_recurrent);
+        eval(
+            restored.convolution_state,
+            restored.recurrent_state,
+            prefix_convolution.state,
+            prefix_recurrent.state);
+        if (restored.position != 8) {
+            throw std::runtime_error(
+                "speculative recurrent replay position mismatch");
+        }
+        require_vector_close(
+            restored.convolution_state.data<float>(),
+            std::vector<float>(
+                prefix_convolution.state.data<float>(),
+                prefix_convolution.state.data<float>() +
+                    prefix_convolution.state.size()),
+            0.0f,
+            "speculative convolution replay");
+        require_vector_close(
+            restored.recurrent_state.data<float>(),
+            std::vector<float>(
+                prefix_recurrent.state.data<float>(),
+                prefix_recurrent.state.data<float>() +
+                    prefix_recurrent.state.size()),
+            2e-4f,
+            "speculative recurrent replay");
+
         std::cout
             << "MFQ C++ Gated DeltaNet Metal tests passed\n";
         return 0;

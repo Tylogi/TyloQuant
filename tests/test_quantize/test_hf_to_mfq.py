@@ -312,6 +312,29 @@ def test_standard_preset_quantizes_vision_and_predictor_only_with_opt_in() -> No
     assert by_name["mtp.fc.weight"].target_dtype == "BF16"
 
 
+def test_standard_preset_quantizes_stage_predictor_expert_banks_with_opt_in() -> None:
+    mapped = hf_to_mfq._apply_standard_preset(
+        [
+            TensorPlan(
+                name="predictor.stage.0.mlp.experts.gate.weight",
+                shard="model.safetensors",
+                shape=(16, 2048, 4096),
+                source_dtype="MXFP4",
+                target_dtype="NINTM",
+                expert_shape=(16, 2048, 4096),
+                expert_precisions=(ExpertPrecision("MXFP4"),) * 16,
+            )
+        ],
+        "S4-M",
+        {"num_hidden_layers": 43},
+        quantize_mtp=True,
+    )
+
+    assert mapped[0].target_dtype == "NINTM"
+    assert mapped[0].expert_shape == (16, 2048, 4096)
+    assert {value.family for value in mapped[0].expert_precisions or ()} == {"NINT4"}
+
+
 def test_normalize_hf_expert_storage_preserves_mixed_nintm_plan() -> None:
     precisions = (
         ExpertPrecision("NINT2", nint_spec=NintSpec(2, 16, 5)),

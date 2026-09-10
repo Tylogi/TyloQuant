@@ -1137,6 +1137,125 @@ void test_direct_decode_attention_path() {
         "direct sparse decode attention");
 }
 
+void test_direct_pool_attention_path(int queries) {
+    constexpr int heads = 64;
+    constexpr int dimension = 512;
+    constexpr int history = 2;
+    constexpr int query_offset = history;
+    constexpr int window = 4;
+    constexpr int ratio = 2;
+    constexpr int pool_len = 4;
+    constexpr int pool_capacity = 6;
+    constexpr int selected = 5;
+    require(
+        queries >= 2,
+        "direct pool test query count is unsupported");
+
+    std::vector<float> query(
+        static_cast<std::size_t>(heads) * queries * dimension,
+        0.0f);
+    for (int head = 0; head < heads; ++head) {
+        for (int token = 0; token < queries; ++token) {
+            const int base =
+                (head * queries + token) * dimension;
+            query[base] =
+                0.125f + static_cast<float>(head) / 192.0f;
+            query[base + 7] =
+                -0.25f + static_cast<float>(token) / 32.0f;
+        }
+    }
+
+    const int local_length = history + queries;
+    std::vector<float> local(
+        static_cast<std::size_t>(local_length) * dimension,
+        0.0f);
+    for (int row = 0; row < local_length; ++row) {
+        local[row * dimension] =
+            -0.75f + static_cast<float>(row) * 0.2f;
+        local[row * dimension + 7] =
+            0.5f - static_cast<float>(row) * 0.075f;
+    }
+    std::vector<float> pool(
+        static_cast<std::size_t>(pool_capacity) * dimension,
+        0.0f);
+    for (int row = 0; row < pool_capacity; ++row) {
+        pool[row * dimension] = row < pool_len
+            ? 0.875f + static_cast<float>(row) * 0.25f
+            : 64.0f;
+        pool[row * dimension + 7] = row < pool_len
+            ? -0.5f + static_cast<float>(row) * 0.125f
+            : -64.0f;
+    }
+    std::vector<std::int32_t> topk_values(
+        queries * selected);
+    for (int token = 0; token < queries; ++token) {
+        const int base = token * selected;
+        topk_values[base] = 3;
+        topk_values[base + 1] = 0;
+        topk_values[base + 2] = 2;
+        topk_values[base + 3] = 1;
+        topk_values[base + 4] = 5;
+    }
+    std::vector<float> sinks(heads);
+    for (int head = 0; head < heads; ++head) {
+        sinks[head] =
+            -0.625f + static_cast<float>(head) / 128.0f;
+    }
+
+    auto query_array = float_array(
+        query,
+        Shape{1, heads, queries, dimension});
+    auto local_array = float_array(
+        local,
+        Shape{1, local_length, dimension});
+    auto pool_array = float_array(
+        pool,
+        Shape{1, pool_capacity, dimension});
+    auto pool_prefix = float_array(
+        std::vector<float>(
+            pool.begin(),
+            pool.begin() + pool_len * dimension),
+        Shape{1, pool_len, dimension});
+    auto topk = int_array(
+        topk_values,
+        Shape{1, queries, selected});
+    auto sink_array = float_array(sinks, Shape{heads});
+    auto plan = mfq::metal::dsv4_build_prefill_plan(
+        topk,
+        query_offset,
+        history,
+        pool_len,
+        ratio,
+        window);
+    auto legacy = mfq::metal::attention_dsv4_sparse(
+        query_array,
+        mlx::core::concatenate(
+            {local_array, pool_prefix},
+            1),
+        plan.first,
+        plan.second,
+        sink_array);
+    auto direct = mfq::metal::attention_dsv4_sparse_multi(
+        query_array,
+        local_array,
+        pool_array,
+        pool_len,
+        topk,
+        sink_array,
+        query_offset,
+        ratio,
+        window);
+    require(
+        direct.shape() == Shape{1, queries, heads, dimension},
+        "direct pool sparse attention output shape mismatch");
+    require_close(
+        evaluated_float(std::move(direct)),
+        evaluated_float(std::move(legacy)),
+        4e-3f,
+        "direct pool sparse attention M=" +
+            std::to_string(queries));
+}
+
 void test_invalid_inputs() {
     require_invalid(
         [] {
@@ -1268,8 +1387,12 @@ int main() {
         test_sparse_plans();
         test_sparse_attention_path(1);
         test_sparse_attention_path(2);
+        test_sparse_attention_path(6);
         test_sparse_attention_path(32);
         test_direct_decode_attention_path();
+        test_direct_pool_attention_path(2);
+        test_direct_pool_attention_path(6);
+        test_direct_pool_attention_path(32);
         test_invalid_inputs();
         std::cout
             << "MFQ C++ DeepSeek-V4 sparse Metal tests passed\n";

@@ -24,6 +24,11 @@ namespace {
 using mlx::core::Shape;
 using mlx::core::array;
 
+// One predictor layer is recurrently chained; it does not limit the chain to
+// one token. This is the model-family capability consumed by the common MTP
+// scheduler, independently of the number of predictor layers in the file.
+constexpr int kQwen35MtpMaximumDraftDepth = 5;
+
 int checked_positive_int(
     std::int64_t value,
     const char* name) {
@@ -1308,47 +1313,41 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
         // Prime the predictor cache from teacher-forced prompt pairs. The
         // final prompt hidden row is reserved for the first live proposal.
         if (prompt_count > 1) {
-            auto hidden_prefix = mlx::core::slice(
+            mlx_prime_mtp_history(
                 *prefill_hidden,
-                Shape{0, 0, 0},
-                Shape{
-                    1,
-                    prompt_count - 1,
-                    static_cast<int>(config_.hidden_size),
-                });
-            auto shifted_ids = mlx::core::slice(
                 prompt_ids,
-                Shape{0, 1},
-                Shape{1, prompt_count});
-            auto primed = [&] {
-                if (!prepared.positions) {
+                [&](const array& hidden_rows,
+                    const array& shifted_ids,
+                    int pair_offset) {
+                    if (!prepared.positions) {
+                        return mtp_->forward(
+                            hidden_rows,
+                            shifted_ids,
+                            embedding_,
+                            true);
+                    }
+                    const int begin = pair_offset + 1;
+                    const int end = begin + shifted_ids.shape(1);
+                    const auto rank = prepared.positions->ndim();
+                    auto positions = rank == 1
+                        ? mlx::core::slice(
+                              *prepared.positions,
+                              Shape{begin},
+                              Shape{end})
+                        : mlx::core::slice(
+                              *prepared.positions,
+                              Shape{0, begin},
+                              Shape{
+                                  prepared.positions->shape(0),
+                                  end,
+                              });
                     return mtp_->forward(
-                        hidden_prefix,
+                        hidden_rows,
                         shifted_ids,
+                        positions,
                         embedding_,
                         true);
-                }
-                const auto rank = prepared.positions->ndim();
-                auto positions = rank == 1
-                    ? mlx::core::slice(
-                          *prepared.positions,
-                          Shape{1},
-                          Shape{prompt_count})
-                    : mlx::core::slice(
-                          *prepared.positions,
-                          Shape{0, 1},
-                          Shape{
-                              prepared.positions->shape(0),
-                              prompt_count,
-                          });
-                return mtp_->forward(
-                    hidden_prefix,
-                    shifted_ids,
-                    positions,
-                    embedding_,
-                    true);
-            }();
-            primed.eval();
+                });
         }
 
         auto initial_hidden = mlx::core::slice(
@@ -1515,7 +1514,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
                 vocab,
                 generation_limit,
                 maximum_sequence,
-                5,
+                kQwen35MtpMaximumDraftDepth,
                 logits,
                 sampling,
                 counts,

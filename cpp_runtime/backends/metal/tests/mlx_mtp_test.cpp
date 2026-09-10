@@ -1,6 +1,7 @@
 #include "mlx_mtp.h"
 
 #include <array>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -18,9 +19,11 @@ int main() {
                     "adaptive MTP controller did not start deep");
             }
             controller.observe(3, 3, 30.0);
-            controller.observe(2, 2, 25.0);
-            controller.observe(1, 1, 22.0);
-            if (controller.depth() != 0 ||
+            controller.observe(3, 3, 29.0);
+            controller.observe(0, 0, 22.0);
+            controller.observe(0, 0, 21.0);
+            controller.observe(0, 0, 23.0);
+            if (controller.depth() != 3 ||
                 !controller.measured_cycle_ms(3) ||
                 controller.conditional_acceptance(0) <= 0.6) {
                 throw std::runtime_error(
@@ -28,10 +31,22 @@ int main() {
             }
         }
         {
+            mfq::metal::MlxMtpDepthController controller(1);
+            controller.observe(1, 0, 80.0);
+            controller.observe(1, 0, 75.0);
+            controller.observe(0, 0, 40.0);
+            controller.observe(0, 0, 39.0);
+            controller.observe(0, 0, 41.0);
+            if (controller.depth() != 0 ||
+                !controller.measured_cycle_ms(0)) {
+                throw std::runtime_error(
+                    "depth-one MTP controller skipped plain warmup");
+            }
+        }
+        {
             mfq::metal::MlxMtpDepthController controller(3);
             controller.observe(3, 0, 70.0);
-            controller.observe(2, 0, 60.0);
-            controller.observe(1, 0, 50.0);
+            controller.observe(3, 0, 65.0);
             controller.observe(0, 0, 30.0);
             controller.observe(0, 0, 29.0);
             controller.observe(0, 0, 31.0);
@@ -55,14 +70,28 @@ int main() {
         {
             mfq::metal::MlxMtpDepthController controller(3);
             controller.observe(3, 3, 45.0);
-            controller.observe(2, 2, 40.0);
-            controller.observe(1, 1, 35.0);
+            controller.observe(3, 3, 44.0);
             controller.observe(0, 0, 30.0);
             controller.observe(0, 0, 30.0);
             controller.observe(0, 0, 30.0);
             if (controller.depth() < 2 || controller.should_exit()) {
                 throw std::runtime_error(
                     "adaptive MTP controller rejected profitable depth");
+            }
+        }
+        {
+            mfq::metal::MlxMtpDepthController controller(5);
+            controller.observe(5, 5, 1104.0);
+            controller.observe(5, 5, 235.0);
+            controller.observe(0, 0, 46.6);
+            controller.observe(0, 0, 46.6);
+            controller.observe(0, 0, 46.6);
+            if (controller.depth() != 5 ||
+                controller.conditional_acceptance(4) != 1.0 ||
+                !controller.measured_cycle_ms(5) ||
+                std::fabs(*controller.measured_cycle_ms(5) - 235.0) > 1e-9) {
+                throw std::runtime_error(
+                    "adaptive MTP warmup retained cold compile latency");
             }
         }
         const std::array<std::int32_t, 4> drafts{11, 12, 13, 14};

@@ -1193,6 +1193,50 @@ void MlxDeepseekV4PoolState::restore_snapshot(
 }
 
 MlxDeepseekV4PoolState
+MlxDeepseekV4PoolState::speculative_snapshot() const {
+    MlxDeepseekV4PoolState result(
+        ratio_,
+        head_dim_,
+        overlap_,
+        batch_,
+        capacity_,
+        dtype_,
+        pool_,
+        state_kv_,
+        state_gate_,
+        prev_kv_,
+        prev_gate_);
+    result.pool_len_ = pool_len_;
+    result.remainder_ = remainder_;
+    return result;
+}
+
+void MlxDeepseekV4PoolState::restore_speculative_snapshot(
+    MlxDeepseekV4PoolState snapshot) {
+    if (ratio_ != snapshot.ratio_ ||
+        head_dim_ != snapshot.head_dim_ ||
+        overlap_ != snapshot.overlap_ ||
+        batch_ != snapshot.batch_ ||
+        capacity_ != snapshot.capacity_ ||
+        dtype_ != snapshot.dtype_ ||
+        snapshot.pool_prefix_backup_) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 speculative pool snapshot mismatch");
+    }
+    // dsv4_decode_pool_step produces new state arrays. Pool writes are
+    // append-only, so the old handle still contains every live prefix row;
+    // restoring the old logical length hides any rejected appended rows.
+    pool_ = std::move(snapshot.pool_);
+    state_kv_ = std::move(snapshot.state_kv_);
+    state_gate_ = std::move(snapshot.state_gate_);
+    prev_kv_ = std::move(snapshot.prev_kv_);
+    prev_gate_ = std::move(snapshot.prev_gate_);
+    pool_prefix_backup_.reset();
+    pool_len_ = snapshot.pool_len_;
+    remainder_ = snapshot.remainder_;
+}
+
+MlxDeepseekV4PoolState
 MlxDeepseekV4PoolState::allocate(
     int ratio,
     int head_dim,
@@ -1507,17 +1551,79 @@ void MlxDeepseekV4LayerState::restore_snapshot(
     position_ = snapshot.position_;
 }
 
+void MlxDeepseekV4LayerState::restore_speculative_snapshot(
+    MlxDeepseekV4LayerState snapshot,
+    int start_position,
+    int total_tokens) {
+    if (static_cast<bool>(main_) !=
+            static_cast<bool>(snapshot.main_) ||
+        static_cast<bool>(indexer_) !=
+            static_cast<bool>(snapshot.indexer_) ||
+        snapshot.position_ != start_position ||
+        snapshot.local_.ndim() != 3 ||
+        snapshot.local_.shape(0) != batch() ||
+        snapshot.local_.shape(1) != total_tokens ||
+        snapshot.local_.shape(2) != local_.shape(2)) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 speculative layer snapshot mismatch");
+    }
+    const int window = local_.shape(1);
+    auto slots = mlx::core::remainder(
+        mlx::core::arange(
+            start_position,
+            start_position + total_tokens,
+            1,
+            mlx::core::int32),
+        array(window, mlx::core::int32));
+    auto rows = mlx::core::broadcast_to(
+        mlx::core::reshape(slots, Shape{1, total_tokens}),
+        Shape{batch(), total_tokens});
+    local_ = dsv4_cache_write_inplace(
+        local_,
+        snapshot.local_,
+        rows);
+    if (main_) {
+        main_->restore_speculative_snapshot(
+            std::move(*snapshot.main_));
+    }
+    if (indexer_) {
+        indexer_->restore_speculative_snapshot(
+            std::move(*snapshot.indexer_));
+    }
+    position_ = start_position;
+}
+
 void MlxDeepseekV4LayerState::begin_speculative(
     int confirmed_tokens,
     int total_tokens) {
+    const int window = local_.shape(1);
     if (speculative_ || confirmed_tokens <= 0 ||
-        total_tokens <= confirmed_tokens) {
+        total_tokens <= confirmed_tokens ||
+        total_tokens > window) {
         throw std::invalid_argument(
             "invalid DeepSeek-V4 speculative cache transaction");
     }
+    auto slots = mlx::core::remainder(
+        mlx::core::arange(
+            position_,
+            position_ + total_tokens,
+            1,
+            mlx::core::int32),
+        array(window, mlx::core::int32));
+    MlxDeepseekV4LayerState checkpoint(
+        detached_copy(mlx::core::take(local_, slots, 1)),
+        main_
+            ? std::optional<MlxDeepseekV4PoolState>(
+                  main_->speculative_snapshot())
+            : std::nullopt,
+        indexer_
+            ? std::optional<MlxDeepseekV4PoolState>(
+                  indexer_->speculative_snapshot())
+            : std::nullopt);
+    checkpoint.position_ = position_;
     speculative_ = std::make_shared<MlxDeepseekV4LayerSpeculation>(
         MlxDeepseekV4LayerSpeculation{
-            snapshot(),
+            std::move(checkpoint),
             std::nullopt,
             confirmed_tokens,
             total_tokens,
@@ -2634,6 +2740,7 @@ array MlxDeepseekV4Attention::operator()(
     array unified = state.local_;
     std::optional<std::pair<array, array>> plan;
     std::optional<array> direct_decode;
+    std::optional<array> direct_multi;
     if (tokens == 1) {
         const int slot = pos0 % window;
         auto local_index = mlx::core::full(
@@ -2709,37 +2816,61 @@ array MlxDeepseekV4Attention::operator()(
                 history_slots,
                 1);
         }
-        std::vector<array> parts{
-            history_values,
-            mlx::core::astype(
-                kv,
-                state.local_.dtype()),
-        };
-        if (state.main_.has_value()) {
-            parts.push_back(
-                pool_prefix(*state.main_));
-        }
-        unified = mlx::core::concatenate(
-            std::move(parts),
+        array local_values = mlx::core::concatenate(
+            std::vector<array>{
+                history_values,
+                mlx::core::astype(
+                    kv,
+                    state.local_.dtype()),
+            },
             1);
-        plan = visibility != nullptr
-            ? dsv4_build_prefill_plan_visible(
-                  topk,
-                  visibility->left,
-                  visibility->right,
-                  pos0,
-                  history,
-                  pool_len,
-                  impl_->ratio == 0 ? 1 : impl_->ratio,
-                  window,
-                  visibility->max_image_tokens)
-            : dsv4_build_prefill_plan(
-                  topk,
-                  pos0,
-                  history,
-                  pool_len,
-                  impl_->ratio == 0 ? 1 : impl_->ratio,
-                  window);
+        const bool use_direct_pool =
+            config.fast_attention() &&
+            visibility == nullptr &&
+            state.main_.has_value() &&
+            pool_len > 0 &&
+            topk.shape(2) > 0;
+        if (use_direct_pool) {
+            direct_multi = attention_dsv4_sparse_multi(
+                mlx::core::transpose(
+                    q,
+                    {0, 2, 1, 3}),
+                local_values,
+                state.main_->pool(),
+                pool_len,
+                topk,
+                impl_->components.sinks,
+                pos0,
+                impl_->ratio,
+                window);
+        } else {
+            std::vector<array> parts{local_values};
+            if (state.main_.has_value()) {
+                parts.push_back(
+                    pool_prefix(*state.main_));
+            }
+            unified = mlx::core::concatenate(
+                std::move(parts),
+                1);
+            plan = visibility != nullptr
+                ? dsv4_build_prefill_plan_visible(
+                      topk,
+                      visibility->left,
+                      visibility->right,
+                      pos0,
+                      history,
+                      pool_len,
+                      impl_->ratio == 0 ? 1 : impl_->ratio,
+                      window,
+                      visibility->max_image_tokens)
+                : dsv4_build_prefill_plan(
+                      topk,
+                      pos0,
+                      history,
+                      pool_len,
+                      impl_->ratio == 0 ? 1 : impl_->ratio,
+                      window);
+        }
         const int recent = std::min(tokens, window);
         auto recent_values = slice_axis(
             kv,
@@ -2769,23 +2900,25 @@ array MlxDeepseekV4Attention::operator()(
 
     array attended = direct_decode
         ? *direct_decode
-        : config.fast_attention()
-            ? attention_dsv4_sparse(
-                  mlx::core::transpose(
+        : direct_multi
+            ? *direct_multi
+            : config.fast_attention()
+                ? attention_dsv4_sparse(
+                      mlx::core::transpose(
+                          q,
+                          {0, 2, 1, 3}),
+                      unified,
+                      plan->first,
+                      plan->second,
+                      impl_->components.sinks)
+                : generic_sparse_attention(
                       q,
-                      {0, 2, 1, 3}),
-                  unified,
-                  plan->first,
-                  plan->second,
-                  impl_->components.sinks)
-            : generic_sparse_attention(
-                  q,
-                  unified,
-                  plan->first,
-                  plan->second,
-                  impl_->components.sinks);
+                      unified,
+                      plan->first,
+                      plan->second,
+                      impl_->components.sinks);
     if (detail::component_profile_active()) {
-        if (direct_decode) {
+        if (direct_decode || direct_multi) {
             detail::profile_eval(
                 profile_component("cache_update"),
                 std::vector<array>{state.local_});
@@ -2841,7 +2974,10 @@ void MlxDeepseekV4Attention::rollback_speculative(
             transaction->attention_input->shape(2),
         });
     const int start = transaction->start_position;
-    state.restore_snapshot(std::move(transaction->checkpoint));
+    state.restore_speculative_snapshot(
+        std::move(transaction->checkpoint),
+        start,
+        transaction->total_tokens);
     // Only the architecture-specific compressed attention cache is rebuilt.
     // Decoder blocks, routed experts, HC and the LM head are not replayed.
     (void)(*this)(input, state, start, nullptr);

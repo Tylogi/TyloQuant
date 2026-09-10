@@ -159,6 +159,7 @@ public:
     void reset(int batch, int initial_capacity = 16);
     std::pair<mlx::core::array, int> append(
         const mlx::core::array& value);
+    void trim(int tokens);
     void clear() noexcept;
 
     int position() const noexcept {

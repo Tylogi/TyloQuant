@@ -23,6 +23,29 @@ struct MlxCachedDepthwiseConvResult {
     mlx::core::array state;
 };
 
+// Architecture-neutral transaction payload for speculative verification over
+// a recurrent Gated DeltaNet cache.  The expensive input projections are
+// evaluated for the complete [confirmed, drafts...] window once; rollback
+// replays only the retained recurrent prefix from these projected values.
+struct MlxGatedDeltaSpeculativeState {
+    mlx::core::array convolution_state;
+    mlx::core::array recurrent_state;
+    std::optional<mlx::core::array> qk;
+    std::optional<mlx::core::array> value;
+    std::optional<mlx::core::array> gate;
+    std::optional<mlx::core::array> beta;
+    int position = 0;
+    int batch = 0;
+    int confirmed_tokens = 0;
+    int total_tokens = 0;
+};
+
+struct MlxGatedDeltaCacheState {
+    mlx::core::array convolution_state;
+    mlx::core::array recurrent_state;
+    int position = 0;
+};
+
 MlxGatedDeltaNetResult gated_delta_net(
     const mlx::core::array& query,
     const mlx::core::array& key,
@@ -57,5 +80,18 @@ MlxLinearConvQkvResult linear_conv_qkv(
     int value_head_dimension,
     const std::optional<mlx::core::array>& bias = std::nullopt,
     float eps = 1e-5f);
+
+MlxGatedDeltaCacheState replay_gated_delta_speculative_prefix(
+    const MlxGatedDeltaSpeculativeState& transaction,
+    int accepted_tokens,
+    const mlx::core::array& convolution_weight,
+    int key_heads,
+    int value_heads,
+    int key_head_dimension,
+    int value_head_dimension,
+    const std::optional<mlx::core::array>& convolution_bias = std::nullopt,
+    float eps = 1e-5f,
+    bool transposed_state = false,
+    bool tiled_heads = false);
 
 } // namespace mfq::metal

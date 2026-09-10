@@ -91,9 +91,9 @@ std::uint64_t checked_product(
     std::uint64_t item_size,
     const std::string& name) {
     std::uint64_t result = item_size;
-    if (shape.empty()) {
-        throw std::runtime_error("Safetensors tensor has empty shape: " + name);
-    }
+    // Safetensors represents a scalar with an empty shape. Its dense payload
+    // still contains exactly one item, so the multiplicative identity above
+    // is already the correct byte count.
     for (const auto dimension : shape) {
         if (dimension <= 0 ||
             static_cast<std::uint64_t>(dimension) >

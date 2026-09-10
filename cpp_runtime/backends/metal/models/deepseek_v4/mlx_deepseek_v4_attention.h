@@ -126,6 +126,14 @@ public:
     MlxDeepseekV4PoolState snapshot() const;
     void restore_snapshot(MlxDeepseekV4PoolState snapshot);
 
+    // Speculative verification only appends pool rows. Keep the immutable
+    // pre-transaction state arrays and metadata, but do not copy the live
+    // pool prefix: rejected rows are hidden by restoring pool_len and are
+    // overwritten by the next contiguous update.
+    MlxDeepseekV4PoolState speculative_snapshot() const;
+    void restore_speculative_snapshot(
+        MlxDeepseekV4PoolState snapshot);
+
 private:
     MlxDeepseekV4PoolState(
         int ratio,
@@ -204,6 +212,11 @@ private:
         mlx::core::array local,
         std::optional<MlxDeepseekV4PoolState> main,
         std::optional<MlxDeepseekV4PoolState> indexer);
+
+    void restore_speculative_snapshot(
+        MlxDeepseekV4LayerState snapshot,
+        int start_position,
+        int total_tokens);
 
     mlx::core::array local_;
     std::optional<MlxDeepseekV4PoolState> main_;

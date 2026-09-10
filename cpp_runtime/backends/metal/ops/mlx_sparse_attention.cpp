@@ -135,6 +135,19 @@ struct SparseSelectedMlaParams {
     float scale = 0.0f;
 };
 
+struct SparseCircularMlaParams {
+    std::int32_t batch = 0;
+    std::int32_t queries = 0;
+    std::int32_t local_length = 0;
+    std::int32_t pool_capacity = 0;
+    std::int32_t pool_length = 0;
+    std::int32_t topk = 0;
+    std::int32_t local_window = 0;
+    std::int32_t pool_ratio = 0;
+    std::int32_t query_offset = 0;
+    float scale = 0.0f;
+};
+
 class SparseBlockGqaPrimitive final
     : public mlx::core::UnaryPrimitive {
 public:
@@ -327,6 +340,103 @@ private:
     SparseSelectedMlaParams params_;
 };
 
+class SparseCircularMlaPrimitive final
+    : public mlx::core::UnaryPrimitive {
+public:
+    SparseCircularMlaPrimitive(
+        mlx::core::Stream stream,
+        SparseCircularMlaParams params)
+        : UnaryPrimitive(stream), params_(params) {}
+
+    void eval_cpu(const std::vector<array>&, array&) override {
+        throw std::runtime_error(
+            "circular sparse MLA has no CPU path");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        if (inputs.size() != 5) {
+            throw std::logic_error(
+                "circular sparse MLA input count mismatch");
+        }
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(selected_stream.device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            "mfq_sparse_attention_v1",
+            options,
+            [] {
+                std::string source;
+                source.reserve(
+                    sizeof(detail::kSteelAttentionSource)
+                    + sizeof(detail::kDsv4SparsePrefillSource)
+                    + sizeof(detail::kSparseBlockGqaSource)
+                    + 192);
+                source += "#include <metal_stdlib>\n";
+                source += "#include <metal_simdgroup>\n";
+                source += "#include <metal_simdgroup_matrix>\n";
+                source += "using namespace metal;\n";
+                source += "using bfloat16_t = bfloat;\n";
+                source += detail::kSteelAttentionSource;
+                source += detail::kDsv4SparsePrefillSource;
+                source += detail::kSparseBlockGqaSource;
+                return source;
+            });
+        auto* kernel = device.get_kernel(
+            "mfq_dsv4_sparse_circular_f16_bk256_dc32",
+            library);
+        auto& encoder =
+            mlx::core::metal::get_command_encoder(selected_stream);
+        encoder.set_compute_pipeline_state(kernel);
+        for (int index = 0; index < 5; ++index) {
+            encoder.set_input_array(
+                inputs[static_cast<std::size_t>(index)], index);
+        }
+        encoder.set_output_array(output, 5);
+        encoder.set_bytes(params_, 6);
+        encoder.dispatch_threadgroups(
+            MTL::Size(params_.queries, params_.batch, 1),
+            MTL::Size(32, 8, 1));
+    }
+
+    const char* name() const override {
+        return "SparseCircularMlaPrimitive";
+    }
+
+    bool is_equivalent(
+        const mlx::core::Primitive& other) const override {
+        const auto* primitive = dynamic_cast<
+            const SparseCircularMlaPrimitive*>(&other);
+        return primitive != nullptr
+            && primitive->params_.batch == params_.batch
+            && primitive->params_.queries == params_.queries
+            && primitive->params_.local_length == params_.local_length
+            && primitive->params_.pool_capacity == params_.pool_capacity
+            && primitive->params_.pool_length == params_.pool_length
+            && primitive->params_.topk == params_.topk
+            && primitive->params_.local_window == params_.local_window
+            && primitive->params_.pool_ratio == params_.pool_ratio
+            && primitive->params_.query_offset == params_.query_offset
+            && primitive->params_.scale == params_.scale;
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {Shape{
+            params_.batch,
+            params_.queries,
+            64,
+            512,
+        }};
+    }
+
+private:
+    SparseCircularMlaParams params_;
+};
+
 } // namespace
 
 array mlx_sparse_block_gqa_attention(
@@ -459,7 +569,7 @@ array mlx_sparse_selected_mla_attention(
         .selected = indices.shape(2),
         .scale = selected_scale,
     };
-    if (params.queries < 32) {
+    if (params.queries == 1) {
         const array scale_parameter({selected_scale}, mlx::core::float32);
         const Shape output_shape{
             params.batch,
@@ -473,17 +583,10 @@ array mlx_sparse_selected_mla_attention(
             {"MAX_SEQ", params.keys},
             {"SELECTED", params.selected},
         };
-        const bool decode = params.queries == 1;
-        const int grid = decode
-            ? checked_grid_product(
-                {params.batch, params.queries, 16, 128},
-                "selected-token sparse MLA decode grid")
-            : checked_grid_product(
-                {params.batch, params.queries, kHeads, 256},
-                "selected-token sparse MLA short-query grid");
-        auto outputs = (decode
-            ? sparse_selected_mla_decode_kernel()
-            : sparse_selected_mla_short_kernel())(
+        const int grid = checked_grid_product(
+            {params.batch, 16, 128},
+            "selected-token sparse MLA decode grid");
+        auto outputs = sparse_selected_mla_decode_kernel()(
                 {
                     selected_query,
                     selected_cache,
@@ -495,7 +598,7 @@ array mlx_sparse_selected_mla_attention(
                 {output_shape},
                 {mlx::core::float32},
                 {grid, 1, 1},
-                {decode ? 128 : 256, 1, 1},
+                {128, 1, 1},
                 templates,
                 std::nullopt,
                 false,
@@ -519,6 +622,78 @@ array mlx_sparse_selected_mla_attention(
             std::move(indices),
             std::move(mask),
             std::move(half_sinks),
+        });
+}
+
+array mlx_sparse_circular_mla_attention(
+    const array& query,
+    const array& local_kv,
+    const array& pooled_kv,
+    int pool_len,
+    const array& topk,
+    const array& sinks,
+    int query_offset,
+    int pool_ratio,
+    int local_window,
+    std::optional<float> scale) {
+    constexpr int kHeads = 64;
+    constexpr int kDimension = 512;
+    auto selected_query = typed_contiguous(query, mlx::core::float16);
+    auto local = typed_contiguous(local_kv, mlx::core::float16);
+    auto pool = typed_contiguous(pooled_kv, mlx::core::float16);
+    auto selected_topk = typed_contiguous(topk, mlx::core::int32);
+    auto sink_logits = typed_contiguous(sinks, mlx::core::float16);
+    if (selected_query.ndim() != 4 || selected_query.shape(0) <= 0 ||
+        selected_query.shape(1) != kHeads ||
+        selected_query.shape(2) < 2 ||
+        selected_query.shape(3) != kDimension || local.ndim() != 3 ||
+        local.shape(0) != selected_query.shape(0) ||
+        local.shape(1) < selected_query.shape(2) ||
+        local.shape(2) != kDimension || pool.ndim() != 3 ||
+        pool.shape(0) != selected_query.shape(0) ||
+        pool.shape(1) <= 0 || pool.shape(2) != kDimension ||
+        pool_len <= 0 || pool_len > pool.shape(1) ||
+        selected_topk.ndim() != 3 ||
+        selected_topk.shape(0) != selected_query.shape(0) ||
+        selected_topk.shape(1) != selected_query.shape(2) ||
+        selected_topk.shape(2) <= 0 || sink_logits.size() != kHeads ||
+        query_offset < 0 || pool_ratio <= 0 || local_window <= 0) {
+        throw std::invalid_argument(
+            "unsupported circular multi-query sparse MLA geometry");
+    }
+    const float selected_scale = scale.value_or(
+        1.0f / std::sqrt(static_cast<float>(kDimension)));
+    if (!std::isfinite(selected_scale) || selected_scale <= 0.0f) {
+        throw std::invalid_argument(
+            "circular multi-query sparse MLA scale must be finite and positive");
+    }
+    SparseCircularMlaParams params{
+        .batch = selected_query.shape(0),
+        .queries = selected_query.shape(2),
+        .local_length = local.shape(1),
+        .pool_capacity = pool.shape(1),
+        .pool_length = pool_len,
+        .topk = selected_topk.shape(2),
+        .local_window = local_window,
+        .pool_ratio = pool_ratio,
+        .query_offset = query_offset,
+        .scale = selected_scale,
+    };
+    auto stream = mlx::core::default_stream(mlx::core::default_device());
+    if (stream.device != mlx::core::Device::gpu) {
+        throw std::invalid_argument(
+            "circular multi-query sparse MLA requires Metal");
+    }
+    return array(
+        Shape{params.batch, params.queries, kHeads, kDimension},
+        mlx::core::float16,
+        std::make_shared<SparseCircularMlaPrimitive>(stream, params),
+        std::vector<array>{
+            std::move(selected_query),
+            std::move(local),
+            std::move(pool),
+            std::move(selected_topk),
+            std::move(sink_logits),
         });
 }
 
