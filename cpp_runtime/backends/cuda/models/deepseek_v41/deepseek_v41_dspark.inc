@@ -117,7 +117,7 @@ struct CudaDeepseekV41Dspark final : CudaMtpModule {
             prefix + "mlp.",
             config.n_layers + stage,
             config.dspark_top_k,
-            false);
+            true);
         result->rope = Dsv4RopeTable(runtime, 0);
         result->cuda_device = g_layer_placement.primary_device();
 

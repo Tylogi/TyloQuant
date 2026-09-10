@@ -19814,7 +19814,10 @@ struct Model {
             }
         } catch (...) {
             for (std::size_t index = 0; index < begun; ++index) {
-                try { blocks[index]->commit_speculative(); } catch (...) {}
+                try {
+                    MfqCudaGuard guard(blocks[index]->cuda_device);
+                    blocks[index]->commit_speculative();
+                } catch (...) {}
             }
             try { deepseek_v41_state->rollback_speculative(); } catch (...) {}
             speculative_start = -1;
@@ -20545,7 +20548,8 @@ struct Model {
 
 static Model load_model(const std::string & mfq_path, const std::string & config_path,
                         int64_t context_size_override = 0,
-                        bool load_blocks = true) {
+                        bool load_blocks = true,
+                        bool defer_moe_cache_finalize = false) {
     Model m;
     MfqFile mfq(mfq_path);
     m.c = load_config(mfq, config_path);
@@ -20740,7 +20744,8 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         g_layer_placement.primary_device();
     if (g_moe_expert_cache &&
             g_moe_expert_cache->has_sources() &&
-            !g_moe_expert_cache->finalized()) {
+            !g_moe_expert_cache->finalized() &&
+            !defer_moe_cache_finalize) {
         g_moe_expert_cache->finalize();
     }
     return m;
@@ -29509,10 +29514,23 @@ int main(int argc, char ** argv) {
             }
         }
         auto t0 = std::chrono::steady_clock::now();
-        Model model = load_model(mfq_path, config_path, context_size);
+        const bool load_optional_components =
+            server_mode || check_qwen35_mtp || check_flash_next_mtp ||
+            !bench_qwen35_mtp.empty();
+        Model model = load_model(
+            mfq_path,
+            config_path,
+            context_size,
+            true,
+            load_optional_components);
         CudaRuntimeComponents server_components =
             load_cuda_runtime_components(model, mfq_path,
-                server_mode || check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty(), config_path);
+                load_optional_components, config_path);
+        if (g_moe_expert_cache &&
+                g_moe_expert_cache->has_sources() &&
+                !g_moe_expert_cache->finalized()) {
+            g_moe_expert_cache->finalize();
+        }
         mfq_cuda_synchronize();
         auto t1 = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");
