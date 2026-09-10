@@ -1,7 +1,8 @@
 #pragma once
 
 // Appended predictors share the target's embedding and output projection.
-// Each depth selects one predictor layer with its own attention/position cache.
+// Generation reuses predictor block zero for every draft position, while the
+// explicit depth argument remains available for per-layer diagnostics.
 struct CudaFlashNextMtp final : CudaMtpModule {
     using Tensor=mfq_tensor_backend::Tensor;
     using Linear=mfq::flash_next::Linear;
@@ -131,6 +132,26 @@ struct CudaFlashNextMtp final : CudaMtpModule {
         return {output,multi};
     }
     Tensor forward(Model& main,Tensor hidden,Tensor ids) override {return evaluate(main,hidden,ids).first;}
-    bool teacher_forced_prompt_prime() const noexcept override {return false;}
+    CudaMtpStep step(Model& main,Tensor hidden,Tensor ids) override {
+        auto result=evaluate(main,hidden,ids);
+        return {std::move(result.first),std::move(result.second)};
+    }
+    int64_t cache_position() const noexcept override {
+        return lengths.empty()?0:lengths.front();
+    }
+    void trim_cache_to(int64_t position) override {
+        MFQ_RUNTIME_CHECK(position>=0 && position<=cache_position(),
+            "Flash-Next MTP cache trim position is invalid");
+        constexpr size_t index=0;
+        if (index<qwen_layers.size() && qwen_layers[index]->qsa)
+            qwen_layers[index]->qsa->truncate(position);
+        if (index<glm_layers.size() && glm_layers[index].attention)
+            glm_layers[index].attention->truncate(position);
+        if (positions[index].defined())
+            positions[index]=positions[index].narrow(-1,0,position);
+        lengths[index]=position;
+    }
+    bool teacher_forced_prompt_prime() const noexcept override {return c.is_qwen4();}
+    bool target_bootstrap_decode() const noexcept override {return true;}
     bool preserve_output_dtype() const noexcept override {return true;}
 };

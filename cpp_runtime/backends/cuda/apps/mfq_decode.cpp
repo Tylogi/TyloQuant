@@ -22364,11 +22364,15 @@ static int32_t generate_mtp_tokens(
         const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling,
         const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill) {
     using Tensor = mfq_tensor_backend::Tensor;
+    using Clock = std::chrono::steady_clock;
     namespace policy = mfq::cuda::mtp;
     MFQ_RUNTIME_CHECK(!prompt.empty() && prompt.size() <= static_cast<size_t>(model.c.max_position_embeddings),
         "invalid Qwen MTP prompt length");
     for (auto token : prompt) MFQ_RUNTIME_CHECK(token >= 0 && token < model.c.vocab_size,
         "Qwen MTP prompt token outside vocabulary");
+    mtp.last_stats = {};
+    mtp.last_stats.available = true;
+    mtp.last_stats.used = true;
     mtp.last_cycles = mtp.last_accepted = mtp.last_rejected = 0;
     const int32_t limit = static_cast<int32_t>(std::min<int64_t>(sampling.max_tokens,
         model.c.max_position_embeddings - static_cast<int64_t>(prompt.size())));
@@ -22393,13 +22397,15 @@ static int32_t generate_mtp_tokens(
         return static_cast<int32_t>(sample_server_logits(logits, sampling, token_counts,
             random_host, random_gpu, rng, {}).item<int64_t>());
     };
-    auto probabilities = [&](Tensor logits, Tensor token_counts) {
+    auto probabilities = [&](Tensor logits, Tensor token_counts,
+                             const MfqSamplingParams& parameters) {
         logits = logits.contiguous().reshape({1, -1});
         if (penalties) sample_apply_penalties_cuda(logits, token_counts,
-            sampling.presence_penalty, sampling.frequency_penalty, sampling.repetition_penalty);
+            parameters.presence_penalty, parameters.frequency_penalty,
+            parameters.repetition_penalty);
         auto host = logits.to(mfq_tensor_backend::kFloat32).cpu().contiguous();
         return policy::distribution(std::span<const float>(host.data_ptr<float>(), host.numel()),
-            sampling.temperature, sampling.top_k, sampling.top_p);
+            parameters.temperature, parameters.top_k, parameters.top_p);
     };
     auto logits_for = [&](Tensor normalized) {
         return model.logits_from_hidden((mtp.preserve_output_dtype()?normalized:
@@ -22412,15 +22418,25 @@ static int32_t generate_mtp_tokens(
         if (penalties) sample_token_counts_add_cuda(counts, ids_for({token}));
         return !on_token || on_token(token);
     };
-    struct Draft { int32_t token; std::vector<float> probabilities; };
-    auto make_draft = [&](Tensor raw_hidden, int32_t pending) {
-        auto hidden = mtp.forward(model, raw_hidden, ids_for({pending}));
-        auto logits = logits_for(hidden).reshape({1, -1});
-        if (greedy) return Draft{sample_normal(logits, counts), {}};
-        auto q = probabilities(logits, counts);
-        auto token = policy::sample(q, uniform(rng));
-        return Draft{token, std::move(q)};
+    struct DraftChain {
+        std::vector<int32_t> tokens;
+        std::vector<std::vector<float>> probabilities;
     };
+    const bool compact_stochastic =
+        !greedy && sampling.top_k > 0 && sampling.top_k <= 64;
+    auto draft_sampling = sampling;
+    if (compact_stochastic) {
+        draft_sampling.temperature = 0.6;
+        draft_sampling.top_p = 0.95;
+    }
+    const int maximum_depth = std::min(
+        mtp.maximum_draft_depth(),
+        (!greedy && !compact_stochastic)
+            ? 1
+            : std::clamp<int>(sampling.mtp_max_draft_tokens, 1,
+                              policy::kMaximumDraftDepth));
+    policy::DepthController depth_controller(maximum_depth);
+
     auto generate = [&]() {
         model.reset(1);
         mtp.reset(1);
@@ -22434,65 +22450,248 @@ static int32_t generate_mtp_tokens(
         const double prefill_ms = timer.elapsed_ms();
         if (on_prefill) on_prefill(MfqPrefillTiming{prompt.size(), prefill_ms, 0., prefill_ms});
         if (!emit(pending) || generated == limit) return generated;
-        if (!mtp.teacher_forced_prompt_prime()) {
-            // Flash-Next starts an empty draft cache after the first target
-            // decode. This differs from Qwen3.5's teacher-forced prompt prime.
-            auto next_hidden=model.hidden_forward(ids_for({pending}),mfq_nullopt,mfq_nullopt,
-                nullptr,mfq_nullopt,&raw);
-            pending=sample_normal(logits_for(next_hidden),counts);
-            if (!emit(pending) || generated==limit) return generated;
-        } else if (prompt.size() > 1) {
-            (void)mtp.forward(model, raw.narrow(1, 0, raw.size(1) - 1),
-                input_ids.narrow(1, 1, input_ids.size(1) - 1));
+
+        if (mtp.teacher_forced_prompt_prime() && prompt.size() > 1) {
+            constexpr int64_t chunk_size = 512;
+            const int64_t pairs = raw.size(1) - 1;
+            for (int64_t offset = 0; offset < pairs; offset += chunk_size) {
+                const int64_t count = std::min(chunk_size, pairs - offset);
+                (void)mtp.step(
+                    model,
+                    raw.narrow(1, offset, count),
+                    input_ids.narrow(1, offset + 1, count));
+            }
         }
-        auto draft = make_draft(raw.narrow(1, raw.size(1) - 1, 1), pending);
-        raw = Tensor{};
+
+        auto initial_hidden = raw.narrow(1, raw.size(1) - 1, 1);
+        if (mtp.target_bootstrap_decode()) {
+            if (mtp.teacher_forced_prompt_prime()) {
+                // Qwen4's predictor consumes the prompt/first-token seam
+                // before the target advances to hidden(first_token).
+                (void)mtp.step(model, initial_hidden, ids_for({pending}));
+            }
+            auto next_hidden = model.hidden_forward(
+                ids_for({pending}), mfq_nullopt, mfq_nullopt,
+                nullptr, mfq_nullopt, &raw);
+            pending = sample_normal(logits_for(next_hidden), counts);
+            if (!emit(pending) || generated == limit) return generated;
+            initial_hidden = raw.narrow(1, raw.size(1) - 1, 1);
+        }
+
+        int64_t predictor_history_position = mtp.cache_position();
+        auto bounded_depth = [&](int desired) {
+            const auto context_depth = std::max<int64_t>(
+                0, model.c.max_position_embeddings - model.cache_pos - 1);
+            const auto output_depth = std::max<int64_t>(
+                0, static_cast<int64_t>(limit - generated - 1));
+            return static_cast<int>(std::min<int64_t>(
+                desired, std::min(context_depth, output_depth)));
+        };
+        auto prepare_draft = [&](Tensor hidden_rows,
+                                 const std::vector<int32_t>& next_ids,
+                                 int requested_depth) {
+            MFQ_RUNTIME_CHECK(
+                hidden_rows.dim() == 3 && hidden_rows.size(0) == 1 &&
+                    hidden_rows.size(1) == static_cast<int64_t>(next_ids.size()) &&
+                    !next_ids.empty() && requested_depth >= 0 &&
+                    requested_depth <= maximum_depth,
+                "CUDA MTP committed history is incompatible");
+            mtp.trim_cache_to(predictor_history_position);
+            std::vector<int64_t> shifted(next_ids.begin(), next_ids.end());
+            auto head = mtp.step(model, hidden_rows, ids_for(std::move(shifted)));
+            predictor_history_position += static_cast<int64_t>(next_ids.size());
+            MFQ_RUNTIME_CHECK(
+                mtp.cache_position() == predictor_history_position,
+                "CUDA MTP predictor cache did not advance");
+            auto sample_hidden = head.sample_hidden.narrow(
+                1, head.sample_hidden.size(1) - 1, 1);
+            auto chain_hidden = head.chain_hidden.narrow(
+                1, head.chain_hidden.size(1) - 1, 1);
+            auto prospective_counts = penalties ? counts.clone() : Tensor{};
+            DraftChain result;
+            result.tokens.reserve(static_cast<size_t>(requested_depth));
+            result.probabilities.reserve(static_cast<size_t>(requested_depth));
+            for (int position = 0; position < requested_depth; ++position) {
+                auto draft_logits = logits_for(sample_hidden).reshape({1, -1});
+                int32_t token = -1;
+                if (greedy) {
+                    token = sample_normal(draft_logits, prospective_counts);
+                } else {
+                    auto proposal = probabilities(
+                        draft_logits, prospective_counts, draft_sampling);
+                    token = policy::sample(proposal, uniform(rng));
+                    result.probabilities.push_back(std::move(proposal));
+                }
+                result.tokens.push_back(token);
+                if (penalties) {
+                    sample_token_counts_add_cuda(
+                        prospective_counts, ids_for({token}));
+                }
+                if (position + 1 < requested_depth) {
+                    auto next = mtp.step(
+                        model, chain_hidden, ids_for({token}));
+                    sample_hidden = std::move(next.sample_hidden);
+                    chain_hidden = std::move(next.chain_hidden);
+                }
+            }
+            return result;
+        };
+
+        auto draft = prepare_draft(
+            initial_hidden, {pending}, bounded_depth(depth_controller.depth()));
         while (generated < limit) {
-            if (limit - generated == 1 || model.cache_pos + 2 > model.c.max_position_embeddings) {
-                auto next = sample_server_token(model, ids_for({pending}), sampling, counts,
-                    random_host, random_gpu, rng, {});
-                emit(static_cast<int32_t>(next.item<int64_t>()));
+            const auto cycle_started = Clock::now();
+            const int draft_count = static_cast<int>(draft.tokens.size());
+            Tensor verified_raw;
+            std::vector<int64_t> verify_ids{pending};
+            verify_ids.insert(
+                verify_ids.end(), draft.tokens.begin(), draft.tokens.end());
+            auto verified = model.hidden_forward(
+                ids_for(std::move(verify_ids)), mfq_nullopt, mfq_nullopt,
+                nullptr, mfq_nullopt, &verified_raw,
+                draft_count > 0 ? 1 : 0);
+            auto targets = logits_for(verified).reshape(
+                {draft_count + 1, model.c.vocab_size});
+
+            ++mtp.last_stats.cycles;
+            mtp.last_stats.drafted_tokens += static_cast<uint64_t>(draft_count);
+            ++mtp.last_stats.depth_cycles.at(static_cast<size_t>(draft_count));
+            for (int position = 0; position < draft_count; ++position) {
+                ++mtp.last_stats.position_drafted.at(static_cast<size_t>(position));
+            }
+
+            auto row_counts = penalties ? counts.clone() : Tensor{};
+            policy::ChainVerification result;
+            if (draft_count == 0) {
+                result = {
+                    0,
+                    greedy
+                        ? sample_normal(targets.narrow(0, 0, 1), row_counts)
+                        : policy::sample(
+                              probabilities(
+                                  targets.narrow(0, 0, 1), row_counts, sampling),
+                              uniform(rng)),
+                    true};
+            } else if (greedy) {
+                std::vector<int32_t> target_tokens;
+                target_tokens.reserve(static_cast<size_t>(draft_count + 1));
+                for (int row = 0; row <= draft_count; ++row) {
+                    target_tokens.push_back(sample_normal(
+                        targets.narrow(0, row, 1), row_counts));
+                    if (row < draft_count && penalties) {
+                        sample_token_counts_add_cuda(
+                            row_counts, ids_for({draft.tokens[static_cast<size_t>(row)]}));
+                    }
+                }
+                result = policy::verify_greedy(draft.tokens, target_tokens);
+            } else {
+                std::vector<std::vector<float>> target_probabilities;
+                target_probabilities.reserve(static_cast<size_t>(draft_count + 1));
+                for (int row = 0; row <= draft_count; ++row) {
+                    target_probabilities.push_back(probabilities(
+                        targets.narrow(0, row, 1), row_counts, sampling));
+                    if (row < draft_count && penalties) {
+                        sample_token_counts_add_cuda(
+                            row_counts, ids_for({draft.tokens[static_cast<size_t>(row)]}));
+                    }
+                }
+                std::vector<double> acceptance_uniforms(
+                    static_cast<size_t>(draft_count));
+                std::generate(
+                    acceptance_uniforms.begin(), acceptance_uniforms.end(),
+                    [&] { return uniform(rng); });
+                result = policy::verify_stochastic_chain(
+                    draft.tokens, draft.probabilities, target_probabilities,
+                    acceptance_uniforms, uniform(rng));
+            }
+
+            const int accepted = static_cast<int>(result.accepted_drafts);
+            MFQ_RUNTIME_CHECK(
+                accepted >= 0 && accepted <= draft_count &&
+                    result.next_token >= 0 && result.next_token < model.c.vocab_size,
+                "CUDA MTP verification returned invalid data");
+            mtp.last_stats.accepted_tokens += static_cast<uint64_t>(accepted);
+            for (int position = 0; position < accepted; ++position) {
+                ++mtp.last_stats.position_accepted.at(static_cast<size_t>(position));
+            }
+
+            int emitted_accepted = 0;
+            bool continue_generation = true;
+            for (int position = 0; position < accepted; ++position) {
+                ++emitted_accepted;
+                if (!emit(draft.tokens[static_cast<size_t>(position)])) {
+                    continue_generation = false;
+                    break;
+                }
+            }
+            if (draft_count > 0) {
+                if (emitted_accepted == draft_count) {
+                    model.commit_speculative();
+                } else {
+                    model.rollback_speculative();
+                    if (emitted_accepted > 0) {
+                        std::vector<int64_t> replay(
+                            draft.tokens.begin(),
+                            draft.tokens.begin() + emitted_accepted);
+                        (void)model.hidden_forward(ids_for(std::move(replay)));
+                    }
+                }
+            }
+            if (!continue_generation) return generated;
+            if (!emit(result.next_token)) return generated;
+
+            const double cycle_ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - cycle_started).count();
+            depth_controller.observe(draft_count, accepted, cycle_ms);
+            mtp.last_stats.selected_depth = depth_controller.depth();
+            for (int depth = 0; depth <= depth_controller.maximum_depth(); ++depth) {
+                if (const auto measured = depth_controller.measured_cycle_ms(depth)) {
+                    mtp.last_stats.measured_depth_ms.at(
+                        static_cast<size_t>(depth)) = *measured;
+                }
+            }
+
+            if (draft_count > 0) {
+                if (accepted == draft_count) {
+                    mtp.last_accepted += static_cast<uint64_t>(accepted);
+                } else {
+                    mtp.last_accepted += static_cast<uint64_t>(accepted);
+                    ++mtp.last_rejected;
+                }
+            }
+            ++mtp.last_cycles;
+            pending = result.next_token;
+            if (depth_controller.should_exit()) {
+                while (generated < limit) {
+                    auto next = sample_server_token(
+                        model, ids_for({pending}), sampling, counts,
+                        random_host, random_gpu, rng, {});
+                    pending = static_cast<int32_t>(next.item<int64_t>());
+                    if (!emit(pending)) break;
+                }
                 return generated;
             }
-            Tensor verified_raw;
-            auto verified = model.hidden_forward(ids_for({pending, draft.token}), mfq_nullopt,
-                mfq_nullopt, nullptr, mfq_nullopt, &verified_raw, 1);
-            auto targets = logits_for(verified).reshape({2, model.c.vocab_size});
-            ++mtp.last_cycles;
-            auto bonus_counts = penalties ? counts.clone() : Tensor{};
-            if (penalties) sample_token_counts_add_cuda(bonus_counts, ids_for({draft.token}));
-            policy::Verification result;
-            if (greedy) {
-                const auto expected = sample_normal(targets.narrow(0, 0, 1), counts);
-                const bool accepted = expected == draft.token;
-                result = {accepted, accepted ? sample_normal(targets.narrow(0, 1, 1), bonus_counts) : expected};
-            } else {
-                auto target = probabilities(targets.narrow(0, 0, 1), counts);
-                auto bonus = probabilities(targets.narrow(0, 1, 1), bonus_counts);
-                const double acceptance_uniform = uniform(rng);
-                const double sample_uniform = uniform(rng);
-                result = policy::verify(draft.token, draft.probabilities, target, bonus,
-                    acceptance_uniform, sample_uniform);
-            }
-            if (result.accepted) {
-                ++mtp.last_accepted;
-                model.commit_speculative();
-                if (!emit(draft.token) || generated == limit) return generated;
-                if (!emit(result.next_token) || generated == limit) return generated;
-            } else {
-                ++mtp.last_rejected;
-                model.rollback_speculative();
-                if (!emit(result.next_token) || generated == limit) return generated;
-            }
-            pending = result.next_token;
-            draft = make_draft(verified_raw.narrow(1, result.accepted ? 1 : 0, 1), pending);
+
+            std::vector<int32_t> next_ids;
+            next_ids.reserve(static_cast<size_t>(accepted + 1));
+            next_ids.insert(
+                next_ids.end(), draft.tokens.begin(),
+                draft.tokens.begin() + accepted);
+            next_ids.push_back(pending);
+            draft = prepare_draft(
+                verified_raw.narrow(1, 0, accepted + 1),
+                next_ids,
+                bounded_depth(depth_controller.depth()));
         }
         return generated;
     };
     try {
         const auto result = generate();
         std::cerr << "mtp generated=" << result << " cycles=" << mtp.last_cycles
-            << " accepted=" << mtp.last_accepted << " rejected=" << mtp.last_rejected << '\n';
+            << " drafted=" << mtp.last_stats.drafted_tokens
+            << " accepted=" << mtp.last_accepted
+            << " rejected=" << mtp.last_rejected
+            << " depth=" << mtp.last_stats.selected_depth << '\n';
         return result;
     } catch (...) {
         // A failed partial pass must never become the next request's history.

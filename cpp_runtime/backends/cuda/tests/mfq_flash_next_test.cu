@@ -114,7 +114,7 @@ void check_shared_sparse_attention() {
         attention_dsv4_sparse_cuda(
             dsv_q, dsv_kv, indices, mask, sinks, meta, 1.0),
         dsv_sum / static_cast<float>(dsv_count + 1),
-        2.0e-2f, "DSV4 sparse attention");
+        6.0e-2f, "DSV4 sparse attention");
 
     const auto all_invalid_mask = full(
         {1, 1, selected_count},

@@ -112,6 +112,19 @@ struct CudaQwen35Mtp final : CudaMtpModule {
         return output;
     }
 
+    int64_t cache_position() const noexcept override { return cache_pos; }
+
+    void trim_cache_to(int64_t position) override {
+        MFQ_RUNTIME_CHECK(
+            position >= 0 && position <= cache_pos,
+            "Qwen MTP cache trim position is invalid");
+        // Full-attention cache storage is position addressed. Lowering the
+        // logical boundary makes the next predictor pass overwrite the
+        // discarded draft suffix without copying history-sized tensors.
+        cache_pos = position;
+    }
+
     bool teacher_forced_prompt_prime() const noexcept override { return true; }
+    bool target_bootstrap_decode() const noexcept override { return false; }
     bool preserve_output_dtype() const noexcept override { return false; }
 };

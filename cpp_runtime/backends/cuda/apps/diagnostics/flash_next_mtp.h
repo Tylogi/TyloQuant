@@ -60,6 +60,9 @@ static int run_flash_next_mtp_check(Model& model,CudaFlashNextMtp& mtp) {
         "Flash-Next MTP greedy tokens disagree with incremental target");
     result["greedy"]=generated;result["cycles"]=mtp.last_cycles;
     result["accepted"]=mtp.last_accepted;result["rejected"]=mtp.last_rejected;
+    result["drafted"]=mtp.last_stats.drafted_tokens;
+    result["selected_depth"]=mtp.last_stats.selected_depth;
+    result["depth_cycles"]=mtp.last_stats.depth_cycles;
     generated.clear();
     const auto stopped=generate_mtp_tokens(model,mtp,prompt,sampling,
         [&](int64_t token) {generated.push_back(token);return generated.size()<3;},{});
