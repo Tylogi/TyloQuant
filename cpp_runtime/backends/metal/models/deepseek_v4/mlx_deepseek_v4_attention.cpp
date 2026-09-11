@@ -42,6 +42,21 @@ bool v41_fast_indexer_enabled() noexcept {
         && setting != "off";
 }
 
+bool v41_circular_prefill_enabled() noexcept {
+    // The direct long-prefill kernel consumes chronological local rows plus
+    // the capacity-backed CSA pool. It avoids rebuilding a unified cache and
+    // a dense index/mask plan on every V4.1 layer. Keep a parity escape hatch.
+    const char* value = std::getenv(
+        "MFQ_METAL_DSV41_CIRCULAR_PREFILL");
+    if (value == nullptr) {
+        return true;
+    }
+    const auto setting = std::string_view(value);
+    return setting != "0"
+        && setting != "false"
+        && setting != "off";
+}
+
 bool block32_inverse_rope_qmv_enabled() noexcept {
     const char* value = std::getenv(
         "MFQ_METAL_MXFP8_BLOCK32_INVERSE_ROPE");
@@ -1443,6 +1458,20 @@ void MlxDeepseekV4PoolState::restore_speculative_snapshot(
     remainder_ = snapshot.remainder_;
 }
 
+void MlxDeepseekV4PoolState::reset_v41() {
+    if (overlap_ || (ratio_ != 1 && ratio_ != 2)) {
+        throw std::logic_error(
+            "logical pool reset requires a DeepSeek-V4.1 cache");
+    }
+    // Old rows and partial state are unreachable once both logical lengths
+    // are zero. The next ratio-1 append overwrites row zero; ratio-2
+    // compress_v41 constructs fresh partial storage without reading the old
+    // arrays when remainder is zero.
+    pool_prefix_backup_.reset();
+    pool_len_ = 0;
+    remainder_ = 0;
+}
+
 MlxDeepseekV4PoolState
 MlxDeepseekV4PoolState::allocate(
     int ratio,
@@ -1936,6 +1965,13 @@ void MlxDeepseekV4LayerState::restore_snapshot(
     }
     speculative_.reset();
     position_ = snapshot.position_;
+}
+
+void MlxDeepseekV4LayerState::reset_v41() {
+    speculative_.reset();
+    if (main_) main_->reset_v41();
+    if (indexer_) indexer_->reset_v41();
+    position_ = 0;
 }
 
 void MlxDeepseekV4LayerState::restore_speculative_snapshot(
@@ -3159,6 +3195,7 @@ struct MlxDeepseekV4Attention::Impl {
         array unified = state.local_;
         std::optional<std::pair<array, array>> plan;
         std::optional<array> direct_decode;
+        std::optional<array> direct_prefill;
         if (tokens == 1 && !config.has_dspark()) {
             const int slot = pos0 % window;
             state.local_ = dsv4_cache_write_inplace(
@@ -3223,32 +3260,60 @@ struct MlxDeepseekV4Attention::Impl {
                         array(window, mlx::core::int32)),
                     1);
             }
-            std::vector<array> parts{
+            std::vector<array> local_parts{
                 history_values,
                 mlx::core::astype(kv, state.local_.dtype()),
             };
-            if (ratio != 0) {
-                parts.push_back(pool_prefix(*shared->compressed_kv));
+            auto chronological_local = mlx::core::concatenate(
+                std::move(local_parts), 1);
+            // V4.1 quantized verification is reproducible through its
+            // acceptance-only depth policy rather than by forcing every
+            // width onto the slower selected-attention reduction. Reuse the
+            // direct circular kernel for both long prefill and MTP rows.
+            const bool use_circular_prefill =
+                tokens > 1 &&
+                visibility == nullptr &&
+                ratio != 0 &&
+                pool_len > 0 &&
+                selected.shape(2) > 0 &&
+                config.fast_attention() &&
+                v41_circular_prefill_enabled();
+            if (use_circular_prefill) {
+                direct_prefill = attention_dsv4_sparse_prefill(
+                    mlx::core::transpose(q, {0, 2, 1, 3}),
+                    chronological_local,
+                    shared->compressed_kv->pool(),
+                    pool_len,
+                    selected,
+                    components.sinks,
+                    pos0,
+                    ratio,
+                    window);
+            } else {
+                std::vector<array> parts{chronological_local};
+                if (ratio != 0) {
+                    parts.push_back(pool_prefix(*shared->compressed_kv));
+                }
+                unified = mlx::core::concatenate(std::move(parts), 1);
+                plan = visibility != nullptr
+                    ? dsv4_build_prefill_plan_visible(
+                          selected,
+                          visibility->left,
+                          visibility->right,
+                          pos0,
+                          history,
+                          pool_len,
+                          ratio == 0 ? 1 : ratio,
+                          window,
+                          visibility->max_image_tokens)
+                    : dsv4_build_prefill_plan(
+                          selected,
+                          pos0,
+                          history,
+                          pool_len,
+                          ratio == 0 ? 1 : ratio,
+                          window);
             }
-            unified = mlx::core::concatenate(std::move(parts), 1);
-            plan = visibility != nullptr
-                ? dsv4_build_prefill_plan_visible(
-                      selected,
-                      visibility->left,
-                      visibility->right,
-                      pos0,
-                      history,
-                      pool_len,
-                      ratio == 0 ? 1 : ratio,
-                      window,
-                      visibility->max_image_tokens)
-                : dsv4_build_prefill_plan(
-                      selected,
-                      pos0,
-                      history,
-                      pool_len,
-                      ratio == 0 ? 1 : ratio,
-                      window);
             const int recent = std::min(tokens, window);
             auto recent_positions = mlx::core::arange(
                 pos0 + tokens - recent,
@@ -3271,7 +3336,7 @@ struct MlxDeepseekV4Attention::Impl {
         }
 
         if (detail::component_profile_active()) {
-            if (direct_decode) {
+            if (direct_decode || direct_prefill) {
                 detail::profile_eval(
                     profile_component("cache_update"),
                     std::vector<array>{state.local_});
@@ -3289,6 +3354,8 @@ struct MlxDeepseekV4Attention::Impl {
 
         auto attended = direct_decode
             ? *direct_decode
+            : direct_prefill
+                ? *direct_prefill
             : config.fast_attention()
                 ? attention_dsv4_sparse(
                       mlx::core::transpose(q, {0, 2, 1, 3}),

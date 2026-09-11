@@ -1344,6 +1344,30 @@ array attention_dsv4_sparse(
         scale);
 }
 
+array attention_dsv4_sparse_prefill(
+    const array& q,
+    const array& chronological_local_kv,
+    const array& pooled_kv,
+    int pool_len,
+    const array& topk,
+    const array& sinks,
+    int query_offset,
+    int ratio,
+    int window,
+    std::optional<float> scale) {
+    return mlx_sparse_circular_mla_attention(
+        q,
+        chronological_local_kv,
+        pooled_kv,
+        pool_len,
+        topk,
+        sinks,
+        query_offset,
+        ratio,
+        window,
+        scale);
+}
+
 array attention_dsv4_sparse_decode(
     const array& q,
     const array& local_kv,

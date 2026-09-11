@@ -147,9 +147,39 @@ array apply_tail_rope(
 array full_attention(
     const array& query,
     const array& keys,
-    const array& sinks) {
+    const array& sinks,
+    bool sparse_fast_path) {
     const int heads = query.shape(2);
     const int dimension = query.shape(3);
+    if (sparse_fast_path && heads == 64 && dimension == 512) {
+        const int batch = query.shape(0);
+        const int queries = query.shape(1);
+        const int key_count = keys.shape(1);
+        const int selected = ((key_count + 31) / 32) * 32;
+        auto indices = mlx::core::arange(
+            0, key_count, 1, mlx::core::int32);
+        if (selected != key_count) {
+            indices = mlx::core::concatenate(
+                {
+                    indices,
+                    mlx::core::full(
+                        Shape{selected - key_count},
+                        -1,
+                        mlx::core::int32),
+                },
+                0);
+        }
+        indices = mlx::core::broadcast_to(
+            mlx::core::reshape(indices, Shape{1, 1, selected}),
+            Shape{batch, queries, selected});
+        return attention_dsv4_sparse(
+            mlx::core::transpose(query, {0, 2, 1, 3}),
+            keys,
+            indices,
+            mlx::core::zeros(
+                Shape{batch, queries, selected}, mlx::core::float16),
+            sinks);
+    }
     auto q = mlx::core::astype(query, mlx::core::float32);
     auto k = mlx::core::astype(keys, mlx::core::float32);
     auto scores = mlx::core::sum(
@@ -377,6 +407,12 @@ int MlxDeepseekV4DSparkState::batch() const noexcept {
 
 int MlxDeepseekV4DSparkState::window() const noexcept {
     return rings_.empty() ? 0 : rings_.front().shape(1);
+}
+
+std::size_t MlxDeepseekV4DSparkState::nbytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const auto& ring : rings_) bytes += ring.nbytes();
+    return bytes;
 }
 
 const array& MlxDeepseekV4DSparkState::ring(std::size_t stage) const {
@@ -683,7 +719,10 @@ struct MlxDeepseekV4DSpark::Impl {
             1);
         trace_dspark_value("attention.keys", keys);
         auto attended = full_attention(
-            q, keys, stage.components.attention.sinks);
+            q,
+            keys,
+            stage.components.attention.sinks,
+            config.is_v41());
         trace_dspark_value("attention.output", attended);
         attended = apply_tail_rope(
             attended, rotary, cosine, sine, true);
@@ -1037,30 +1076,35 @@ void MlxDeepseekV4DSpark::append_context(
     state.position_ += source.shape(1);
 }
 
-MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft(
+std::optional<MlxDeepseekV4DSparkDraft>
+MlxDeepseekV4DSpark::draft_impl(
     const array& anchor_ids,
     MlxDeepseekV4DSparkState& state,
     const MlxMtpTokenSelector& select_token,
-    int width) const {
+    int width,
+    bool collect_diagnostics) const {
     auto anchors = anchor_ids;
     if (anchors.dtype() != mlx::core::int32) {
         anchors = mlx::core::astype(anchors, mlx::core::int32);
     }
     anchors = mlx::core::contiguous(anchors);
     const int requested = width == 0 ? block_size() : width;
-    // DSpark's attention over the draft block is intentionally non-causal.
-    // Earlier draft states therefore depend on every noise-filled slot in
-    // the checkpoint's fixed block, even when serving returns fewer drafts.
-    // Preserve that trained geometry and truncate only the head outputs.
-    const int physical_width = std::min(
+    const int available_width = std::min(
         block_size(),
         impl_->maximum_context - state.position_);
+    // V4.1 was released with variable-width DSpark proposals, so shrinking
+    // the physical block avoids evaluating unused attention, MoE and LM-head
+    // rows after the adaptive controller lowers its requested depth.  Keep
+    // the legacy V4 checkpoint's fixed non-causal block geometry unchanged.
+    const int physical_width = impl_->config.is_v41()
+        ? std::min(requested, available_width)
+        : available_width;
     const int vocab = checked_int(impl_->config.vocab, "vocabulary size");
     const int hidden_size = checked_int(impl_->config.hidden, "hidden size");
     if (anchors.ndim() != 2 || anchors.shape(0) != state.batch() ||
         anchors.shape(1) != 1 || requested <= 0 ||
         requested > block_size() || state.position_ <= 0 ||
-        requested > physical_width ||
+        requested > available_width ||
         state.stages() != impl_->stages.size()) {
         throw std::invalid_argument("invalid DeepSeek-V4 DSpark draft input");
     }
@@ -1133,10 +1177,15 @@ MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft(
         if (next.ndim() == 1) {
             next = mlx::core::reshape(next, Shape{state.batch(), 1});
         }
-        tokens.push_back(next);
-        logits.push_back(std::move(row));
-        markov_embeddings.push_back(std::move(markov));
-        previous = tokens.back();
+        if (collect_diagnostics) {
+            tokens.push_back(next);
+            logits.push_back(std::move(row));
+            markov_embeddings.push_back(std::move(markov));
+        }
+        previous = std::move(next);
+    }
+    if (!collect_diagnostics) {
+        return std::nullopt;
     }
     auto token_values = mlx::core::concatenate(tokens, 1);
     auto logit_values = mlx::core::concatenate(logits, 1);
@@ -1150,11 +1199,33 @@ MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft(
         confidence,
         Shape{state.batch(), requested});
     trace_dspark_value("confidence", confidence);
-    return {
+    return MlxDeepseekV4DSparkDraft{
         std::move(token_values),
         std::move(logit_values),
         std::move(confidence),
     };
+}
+
+MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft(
+    const array& anchor_ids,
+    MlxDeepseekV4DSparkState& state,
+    const MlxMtpTokenSelector& select_token,
+    int width) const {
+    auto result = draft_impl(
+        anchor_ids, state, select_token, width, true);
+    return std::move(*result);
+}
+
+void MlxDeepseekV4DSpark::propose(
+    const array& anchor_ids,
+    MlxDeepseekV4DSparkState& state,
+    const MlxMtpTokenSelector& select_token,
+    int width) const {
+    // Preserve the complete trace surface when explicit numerical tracing is
+    // enabled; normal serving avoids three unused concatenate/head graphs.
+    const bool trace = std::getenv("MFQ_MLX_MTP_TRACE") != nullptr;
+    (void)draft_impl(
+        anchor_ids, state, select_token, width, trace);
 }
 
 MlxDeepseekV4DSparkDraft MlxDeepseekV4DSpark::draft_greedy(

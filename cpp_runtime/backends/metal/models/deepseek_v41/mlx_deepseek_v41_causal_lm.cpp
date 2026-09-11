@@ -373,6 +373,7 @@ void MlxDeepseekV41CausalLm::reset_cache(int batch) {
     speculative_engram_snapshot_.reset();
     speculative_token_ids_.reset();
     speculative_cache_start_ = -1;
+    stable_cache_tokens_.clear();
     cache_position_ = 0;
     cache_batch_ = batch;
 }
@@ -385,8 +386,24 @@ void MlxDeepseekV41CausalLm::clear_cache() noexcept {
     speculative_token_ids_.reset();
     speculative_cache_start_ = -1;
     mtp_context_requested_ = false;
+    stable_cache_tokens_.clear();
     cache_position_ = 0;
     cache_batch_ = 0;
+}
+
+void MlxDeepseekV41CausalLm::materialize_states(
+    const std::vector<MlxDeepseekV41LayerState>& states) const {
+    std::vector<array> arrays;
+    arrays.reserve(states.size() * 5);
+    for (const auto& layer : states) {
+        const auto& state = layer.attention;
+        arrays.push_back(state.local_kv);
+        if (state.compressed_kv) arrays.push_back(*state.compressed_kv);
+        if (state.index_k) arrays.push_back(*state.index_k);
+        if (state.partial_kv) arrays.push_back(*state.partial_kv);
+        if (state.partial_score) arrays.push_back(*state.partial_score);
+    }
+    detail::eval_with_timing(std::move(arrays));
 }
 
 std::size_t
@@ -844,6 +861,8 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
                 counts,
                 std::span<const std::int64_t>(config_.eos_token_ids),
                 callback,
+                0,
+                MlxMtpDepthPolicy::AcceptanceOnly,
             },
             callbacks,
             last_mtp_stats_);
@@ -909,7 +928,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
     const MfqTokenConstraintPtr& token_constraint,
-    std::optional<std::size_t>,
+    std::optional<std::size_t> stable_prefix_tokens,
     int prefill_chunk_size) {
     if (prompt.empty() || max_tokens < 0 || prefill_chunk_size <= 0) {
         throw std::invalid_argument(
@@ -931,16 +950,160 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
     for (const auto token : prompt) {
         values.push_back(static_cast<std::int32_t>(token));
     }
-    const auto started = std::chrono::steady_clock::now();
-    mtp_context_requested_ = supports_mtp() && sampling.enable_mtp &&
+    const array prompt_ids(
+        values.begin(), Shape{1, static_cast<int>(values.size())},
+        mlx::core::int32);
+    const bool mtp_candidate = supports_mtp() && sampling.enable_mtp &&
         !token_constraint && max_tokens > 1;
+    const std::size_t requested_stable_count = stable_prefix_tokens
+        ? std::min(*stable_prefix_tokens, prompt.size())
+        : 0;
+    const bool retain_stable_prefix =
+        !mtp_candidate && requested_stable_count > 0;
+    const std::size_t stable_count = retain_stable_prefix
+        ? requested_stable_count
+        : 0;
+    std::size_t reused_tokens = 0;
+    if (retain_stable_prefix && cache_batch_ == 1 &&
+        cache_position_ == static_cast<int>(stable_cache_tokens_.size()) &&
+        !stable_cache_tokens_.empty() &&
+        stable_cache_tokens_.size() <= stable_count &&
+        stable_cache_tokens_.size() < prompt.size() &&
+        std::equal(
+            stable_cache_tokens_.begin(),
+            stable_cache_tokens_.end(),
+            prompt.begin())) {
+        reused_tokens = stable_cache_tokens_.size();
+    } else if (retain_stable_prefix) {
+        mtp_context_requested_ = false;
+        reset_cache(1);
+    }
+
+    struct StableCacheRestore {
+        std::vector<MlxDeepseekV41LayerState>& target_states;
+        MlxDeepseekV41EngramHashState& target_hash;
+        int& target_position;
+        int& target_batch;
+        std::vector<std::int64_t>& target_tokens;
+        std::optional<std::vector<MlxDeepseekV41LayerState>> saved_states;
+        std::optional<DeepseekV41EngramHashSnapshot> saved_hash;
+        std::vector<std::int64_t> saved_tokens;
+        int saved_position = 0;
+        int saved_batch = 0;
+
+        StableCacheRestore(
+            std::vector<MlxDeepseekV41LayerState>& states,
+            MlxDeepseekV41EngramHashState& hash,
+            int& position,
+            int& batch,
+            std::vector<std::int64_t>& tokens)
+            : target_states(states),
+              target_hash(hash),
+              target_position(position),
+              target_batch(batch),
+              target_tokens(tokens) {}
+
+        void capture(
+            const std::vector<std::int64_t>& prompt_tokens,
+            std::size_t count) {
+            std::vector<MlxDeepseekV41LayerState> snapshots;
+            snapshots.reserve(target_states.size());
+            for (const auto& state : target_states) {
+                snapshots.push_back({state.attention.snapshot()});
+            }
+            saved_states = std::move(snapshots);
+            saved_hash = target_hash.snapshot();
+            saved_tokens.assign(
+                prompt_tokens.begin(),
+                prompt_tokens.begin() + static_cast<std::ptrdiff_t>(count));
+            saved_position = static_cast<int>(count);
+            saved_batch = target_batch;
+        }
+
+        const std::vector<MlxDeepseekV41LayerState>& states() const {
+            return *saved_states;
+        }
+
+        ~StableCacheRestore() noexcept {
+            if (!saved_states || !saved_hash) return;
+            try {
+                if (target_states.size() != saved_states->size()) {
+                    throw std::runtime_error(
+                        "DeepSeek-V4.1 stable cache layer count changed");
+                }
+                for (std::size_t index = 0;
+                     index < target_states.size(); ++index) {
+                    target_states[index].attention.restore_snapshot(
+                        std::move((*saved_states)[index].attention));
+                }
+                target_hash.restore(std::move(*saved_hash));
+                target_position = saved_position;
+                target_batch = saved_batch;
+                target_tokens = std::move(saved_tokens);
+            } catch (...) {
+                target_states.clear();
+                target_hash.clear();
+                target_position = 0;
+                target_batch = 0;
+                target_tokens.clear();
+            }
+        }
+    } stable_restore(
+        states_,
+        engram_hash_,
+        cache_position_,
+        cache_batch_,
+        stable_cache_tokens_);
+
+    const auto started = std::chrono::steady_clock::now();
+    mtp_context_requested_ = mtp_candidate;
     array logits(0.0f);
     try {
-        logits = prefill(
-            array(values.begin(), Shape{1, static_cast<int>(values.size())},
-                  mlx::core::int32),
-            prefill_chunk_size,
-            false);
+        if (!retain_stable_prefix) {
+            logits = prefill(prompt_ids, prefill_chunk_size, false);
+        } else {
+            const auto prefill_range = [&](std::size_t begin, std::size_t end) {
+                std::optional<array> last;
+                for (std::size_t offset = begin; offset < end;
+                     offset += static_cast<std::size_t>(prefill_chunk_size)) {
+                    const auto stop = std::min(
+                        end,
+                        offset + static_cast<std::size_t>(prefill_chunk_size));
+                    last = forward_impl(
+                        slice_tokens(
+                            prompt_ids,
+                            static_cast<int>(offset),
+                            static_cast<int>(stop)),
+                        std::nullopt,
+                        true);
+                }
+                if (!last) {
+                    throw std::runtime_error(
+                        "DeepSeek-V4.1 stable prefill range is empty");
+                }
+                auto final = slice_tokens(
+                    *last, last->shape(1) - 1, last->shape(1));
+                return mlx::core::squeeze(std::move(final), 1);
+            };
+
+            std::optional<array> stable_logits;
+            if (reused_tokens < stable_count) {
+                stable_logits = prefill_range(reused_tokens, stable_count);
+            }
+            materialize_states(states_);
+            stable_restore.capture(prompt, stable_count);
+            // Resolve detached copies before suffix/decode kernels can write
+            // through the live in-place cache allocations.
+            materialize_states(stable_restore.states());
+            if (stable_count < prompt.size()) {
+                logits = prefill_range(stable_count, prompt.size());
+            } else if (stable_logits) {
+                logits = std::move(*stable_logits);
+            } else {
+                throw std::runtime_error(
+                    "DeepSeek-V4.1 stable cache has no logits for sampling");
+            }
+        }
     } catch (...) {
         mtp_context_requested_ = false;
         throw;
@@ -950,7 +1113,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
     mlx::core::synchronize();
     if (prefill_callback) {
         prefill_callback(
-            prompt.size(),
+            prompt.size() - reused_tokens,
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - started).count());
     }
@@ -1010,15 +1173,64 @@ std::int32_t MlxDeepseekV41CausalLm::generate_multimodal(
 
 MlxDeepseekV41TextSessionState
 MlxDeepseekV41CausalLm::capture_text_session_state(
-    const std::vector<std::int64_t>&) const {
-    throw std::runtime_error(
-        "DeepSeek-V4.1 persistent text-session snapshots are not enabled yet");
+    const std::vector<std::int64_t>& tokens) const {
+    if (cache_batch_ != 1 || cache_position_ <= 0 ||
+        static_cast<std::size_t>(cache_position_) != tokens.size() ||
+        states_.size() != layers_.size() || dspark_state_ ||
+        speculative_engram_snapshot_ || speculative_token_ids_ ||
+        speculative_cache_start_ >= 0) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 text session token count does not match cache");
+    }
+    auto hash = engram_hash_.snapshot();
+    if (hash.batch != cache_batch_ || hash.position != cache_position_) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 Engram state does not match attention cache");
+    }
+    MlxDeepseekV41TextSessionState state;
+    state.tokens = tokens;
+    state.engram_hash = std::move(hash);
+    state.cache_position = cache_position_;
+    state.cache_batch = cache_batch_;
+    state.layers.reserve(states_.size());
+    for (const auto& layer : states_) {
+        auto snapshot = layer.attention.snapshot();
+        state.bytes += snapshot.nbytes();
+        state.layers.push_back({std::move(snapshot)});
+    }
+    materialize_states(state.layers);
+    return state;
 }
 
 void MlxDeepseekV41CausalLm::restore_text_session_state(
-    const MlxDeepseekV41TextSessionState&) {
-    throw std::runtime_error(
-        "DeepSeek-V4.1 persistent text-session snapshots are not enabled yet");
+    const MlxDeepseekV41TextSessionState& state) {
+    if (state.cache_batch != 1 || state.cache_position <= 0 ||
+        static_cast<std::size_t>(state.cache_position) !=
+            state.tokens.size() ||
+        state.layers.size() != layers_.size() ||
+        state.engram_hash.batch != state.cache_batch ||
+        state.engram_hash.position != state.cache_position) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 text session state is incompatible");
+    }
+    try {
+        mtp_context_requested_ = false;
+        reset_cache(1);
+        for (std::size_t index = 0; index < states_.size(); ++index) {
+            // A second detached copy keeps the cached Agent checkpoint
+            // immutable while the restored runtime advances.
+            states_[index].attention.restore_snapshot(
+                state.layers[index].attention.snapshot());
+        }
+        materialize_states(states_);
+        engram_hash_.restore(state.engram_hash);
+        cache_position_ = state.cache_position;
+        cache_batch_ = state.cache_batch;
+        stable_cache_tokens_ = state.tokens;
+    } catch (...) {
+        clear_cache();
+        throw;
+    }
 }
 
 } // namespace mfq::metal

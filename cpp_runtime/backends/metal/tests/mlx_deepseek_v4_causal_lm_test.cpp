@@ -1531,6 +1531,112 @@ void test_dspark_generation_uses_common_mtp_engine() {
         "DeepSeek-V4 DSpark stochastic MTP is not deterministic");
 }
 
+void test_dspark_reuses_and_forks_stable_prefix() {
+    mfq::metal::MlxSamplingParams sampling;
+    sampling.temperature = 0.0;
+    sampling.mtp_max_draft_tokens = 2;
+
+    auto cached = make_dspark_model();
+    std::size_t initial_prefill_tokens = 0;
+    (void)cached.generate(
+        {1, 2, 3},
+        sampling,
+        6,
+        {},
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            initial_prefill_tokens = tokens;
+        },
+        2);
+    require(
+        initial_prefill_tokens == 3 && cached.cache_position() == 2 &&
+            cached.last_mtp_stats().used,
+        "DeepSeek-V4 DSpark did not retain its initial stable prefix");
+
+    const auto snapshot = cached.capture_text_session_state({1, 2});
+    require(
+        snapshot.dspark.has_value() && snapshot.dspark->position() == 2 &&
+            snapshot.dspark->batch() == 1 && snapshot.dspark->nbytes() > 0,
+        "DeepSeek-V4 text session omitted its DSpark prefix state");
+
+    std::size_t reused_prefill_tokens = 0;
+    std::vector<std::int64_t> cached_output;
+    (void)cached.generate(
+        {1, 2, 4},
+        sampling,
+        6,
+        [&](std::int64_t token) {
+            cached_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            reused_prefill_tokens = tokens;
+        },
+        2);
+    require(
+        reused_prefill_tokens == 1 && cached.cache_position() == 2 &&
+            cached.last_mtp_stats().used,
+        "DeepSeek-V4 DSpark did not reuse its in-process stable prefix");
+
+    auto restored = make_dspark_model();
+    restored.restore_text_session_state(snapshot);
+    std::size_t restored_prefill_tokens = 0;
+    std::vector<std::int64_t> restored_output;
+    (void)restored.generate(
+        {1, 2, 4},
+        sampling,
+        6,
+        [&](std::int64_t token) {
+            restored_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            restored_prefill_tokens = tokens;
+        },
+        2);
+
+    auto fresh = make_dspark_model();
+    std::vector<std::int64_t> fresh_output;
+    (void)fresh.generate(
+        {1, 2, 4},
+        sampling,
+        6,
+        [&](std::int64_t token) {
+            fresh_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    require(
+        restored_prefill_tokens == 1 && restored.cache_position() == 2 &&
+            restored.last_mtp_stats().used,
+        "DeepSeek-V4 restored DSpark session replayed the full prompt");
+    require(
+        cached_output == fresh_output && restored_output == fresh_output,
+        "DeepSeek-V4 DSpark prefix reuse changed verified generation");
+
+    restored.restore_text_session_state(snapshot);
+    std::size_t repeated_prefill_tokens = 0;
+    (void)restored.generate(
+        {1, 2, 5},
+        sampling,
+        3,
+        {},
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            repeated_prefill_tokens = tokens;
+        },
+        2);
+    require(
+        repeated_prefill_tokens == 1 && restored.last_mtp_stats().used,
+        "DeepSeek-V4 DSpark session snapshot was mutated by a fork");
+}
+
 void test_generation_stable_prefix_cache() {
     mfq::metal::MlxSamplingParams sampling;
     sampling.temperature = 0.0;
@@ -2061,6 +2167,7 @@ int main() {
         test_prefill_decode_and_chunking();
         test_generation_eos_and_callback();
         test_dspark_generation_uses_common_mtp_engine();
+        test_dspark_reuses_and_forks_stable_prefix();
         test_generation_stable_prefix_cache();
         test_text_session_snapshot_restore();
         test_mfq_container_load();

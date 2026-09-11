@@ -182,6 +182,7 @@ using MlxDeepseekV4TokenCallback = MlxGenerationTokenCallback;
 struct MlxDeepseekV4TextSessionState {
     std::vector<std::int64_t> tokens;
     std::vector<MlxDeepseekV4LayerState> layers;
+    std::optional<MlxDeepseekV4DSparkState> dspark;
     int cache_position = 0;
     int cache_batch = 0;
     std::size_t bytes = 0;
@@ -359,7 +360,8 @@ private:
         const MlxDeepseekV4ImageVisibility* visibility = nullptr,
         mlx::core::array* dspark_hidden = nullptr,
         std::vector<mlx::core::array>* debug_layer_hiddens = nullptr,
-        std::vector<mlx::core::array>* debug_layer0_stages = nullptr);
+        std::vector<mlx::core::array>* debug_layer0_stages = nullptr,
+        bool skip_lm_head = false);
     mlx::core::array prefill_impl(
         const mlx::core::array& token_ids,
         int chunk_size,
@@ -417,6 +419,10 @@ private:
     // a stable prompt checkpoint.  It is intentionally empty for cache state
     // produced through the public forward/prefill/decode APIs.
     std::vector<std::int64_t> stable_cache_tokens_;
+    // DSpark's committed prompt ring at the same stable checkpoint. Keeping it
+    // alongside the target cache lets MTP reuse/fork a cached agent prefix
+    // without replaying the entire prompt through the target model.
+    std::optional<MlxDeepseekV4DSparkState> stable_dspark_state_;
 };
 
 } // namespace mfq::metal
