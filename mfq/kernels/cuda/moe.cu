@@ -523,19 +523,25 @@ __global__ void scan_expert_counts_kernel(
         int32_t * __restrict__ expert_bounds,
         int32_t * __restrict__ tile_bounds,
         int32_t * __restrict__ secondary_tile_bounds,
+        int32_t * __restrict__ tertiary_tile_bounds,
         int experts,
         int tile_m,
-        int secondary_tile_m) {
+        int secondary_tile_m,
+        int tertiary_tile_m) {
     if (blockIdx.x != 0 || threadIdx.x != 0) {
         return;
     }
     int pair_offset = 0;
     int tile_offset = 0;
     int secondary_tile_offset = 0;
+    int tertiary_tile_offset = 0;
     expert_bounds[0] = 0;
     tile_bounds[0] = 0;
     if (secondary_tile_bounds != nullptr) {
         secondary_tile_bounds[0] = 0;
+    }
+    if (tertiary_tile_bounds != nullptr) {
+        tertiary_tile_bounds[0] = 0;
     }
     for (int expert = 0; expert < experts; ++expert) {
         const int count = counts[expert];
@@ -550,6 +556,11 @@ __global__ void scan_expert_counts_kernel(
                 (count + secondary_tile_m - 1) / secondary_tile_m;
             secondary_tile_bounds[expert + 1] = secondary_tile_offset;
         }
+        if (tertiary_tile_bounds != nullptr) {
+            tertiary_tile_offset +=
+                (count + tertiary_tile_m - 1) / tertiary_tile_m;
+            tertiary_tile_bounds[expert + 1] = tertiary_tile_offset;
+        }
     }
 }
 
@@ -558,6 +569,8 @@ __global__ void fill_tile_experts_kernel(
         int32_t * __restrict__ tile_experts,
         const int32_t * __restrict__ secondary_tile_bounds,
         int32_t * __restrict__ secondary_tile_experts,
+        const int32_t * __restrict__ tertiary_tile_bounds,
+        int32_t * __restrict__ tertiary_tile_experts,
         int experts) {
     for (int expert = blockIdx.x * blockDim.x + threadIdx.x;
             expert < experts;
@@ -569,6 +582,12 @@ __global__ void fill_tile_experts_kernel(
             for (int tile = secondary_tile_bounds[expert];
                     tile < secondary_tile_bounds[expert + 1]; ++tile) {
                 secondary_tile_experts[tile] = expert;
+            }
+        }
+        if (tertiary_tile_bounds != nullptr) {
+            for (int tile = tertiary_tile_bounds[expert];
+                    tile < tertiary_tile_bounds[expert + 1]; ++tile) {
+                tertiary_tile_experts[tile] = expert;
             }
         }
     }
@@ -3517,13 +3536,21 @@ void build_expert_map(
         cudaStream_t stream,
         mfq_tensor_backend::Tensor * secondary_tile_bounds = nullptr,
         mfq_tensor_backend::Tensor * secondary_tile_experts = nullptr,
-        int secondary_tile_m = 0) {
+        int secondary_tile_m = 0,
+        mfq_tensor_backend::Tensor * tertiary_tile_bounds = nullptr,
+        mfq_tensor_backend::Tensor * tertiary_tile_experts = nullptr,
+        int tertiary_tile_m = 0) {
     const int pairs = static_cast<int>(ids.numel());
     const bool has_secondary = secondary_tile_bounds != nullptr;
+    const bool has_tertiary = tertiary_tile_bounds != nullptr;
     MFQ_RUNTIME_CHECK(has_secondary == (secondary_tile_experts != nullptr),
         "secondary tile bounds and experts must be provided together");
     MFQ_RUNTIME_CHECK(!has_secondary || secondary_tile_m > 0,
         "secondary_tile_m must be positive");
+    MFQ_RUNTIME_CHECK(has_tertiary == (tertiary_tile_experts != nullptr),
+        "tertiary tile bounds and experts must be provided together");
+    MFQ_RUNTIME_CHECK(!has_tertiary || tertiary_tile_m > 0,
+        "tertiary_tile_m must be positive");
     MFQ_RUNTIME_CHECK(counts.is_cuda() && counts.is_contiguous() && counts.scalar_type() == mfq_tensor_backend::kInt32 &&
         counts.numel() >= experts, "counts workspace is too small");
     MFQ_RUNTIME_CHECK(cursors.is_cuda() && cursors.is_contiguous() && cursors.scalar_type() == mfq_tensor_backend::kInt32 &&
@@ -3551,6 +3578,18 @@ void build_expert_map(
             secondary_tile_experts->numel() >= pairs,
             "secondary tile_experts workspace is too small");
     }
+    if (has_tertiary) {
+        MFQ_RUNTIME_CHECK(tertiary_tile_bounds->is_cuda() &&
+            tertiary_tile_bounds->is_contiguous() &&
+            tertiary_tile_bounds->scalar_type() == mfq_tensor_backend::kInt32 &&
+            tertiary_tile_bounds->numel() >= experts + 1,
+            "tertiary tile_bounds workspace is too small");
+        MFQ_RUNTIME_CHECK(tertiary_tile_experts->is_cuda() &&
+            tertiary_tile_experts->is_contiguous() &&
+            tertiary_tile_experts->scalar_type() == mfq_tensor_backend::kInt32 &&
+            tertiary_tile_experts->numel() >= pairs,
+            "tertiary tile_experts workspace is too small");
+    }
     check_same_device(ids, counts, "counts");
     check_same_device(ids, cursors, "cursors");
     check_same_device(ids, ids_dst, "ids_dst");
@@ -3561,11 +3600,19 @@ void build_expert_map(
         check_same_device(ids, *secondary_tile_bounds, "secondary_tile_bounds");
         check_same_device(ids, *secondary_tile_experts, "secondary_tile_experts");
     }
+    if (has_tertiary) {
+        check_same_device(ids, *tertiary_tile_bounds, "tertiary_tile_bounds");
+        check_same_device(ids, *tertiary_tile_experts, "tertiary_tile_experts");
+    }
 
     int32_t * secondary_bounds_ptr = has_secondary
         ? secondary_tile_bounds->data_ptr<int32_t>() : nullptr;
     int32_t * secondary_experts_ptr = has_secondary
         ? secondary_tile_experts->data_ptr<int32_t>() : nullptr;
+    int32_t * tertiary_bounds_ptr = has_tertiary
+        ? tertiary_tile_bounds->data_ptr<int32_t>() : nullptr;
+    int32_t * tertiary_experts_ptr = has_tertiary
+        ? tertiary_tile_experts->data_ptr<int32_t>() : nullptr;
 
     MFQ_CUDA_CHECK(cudaMemsetAsync(counts.data_ptr<int32_t>(), 0, experts * sizeof(int32_t), stream));
     const int block = 256;
@@ -3575,10 +3622,12 @@ void build_expert_map(
     scan_expert_counts_kernel<<<1, 1, 0, stream>>>(
         counts.data_ptr<int32_t>(), cursors.data_ptr<int32_t>(),
         expert_bounds.data_ptr<int32_t>(), tile_bounds.data_ptr<int32_t>(),
-        secondary_bounds_ptr, experts, tile_m, secondary_tile_m);
+        secondary_bounds_ptr, tertiary_bounds_ptr, experts, tile_m,
+        secondary_tile_m, tertiary_tile_m);
     fill_tile_experts_kernel<<<(experts + 255) / 256, 256, 0, stream>>>(
         tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
-        secondary_bounds_ptr, secondary_experts_ptr, experts);
+        secondary_bounds_ptr, secondary_experts_ptr,
+        tertiary_bounds_ptr, tertiary_experts_ptr, experts);
     scatter_routes_kernel<<<grid, block, 0, stream>>>(
         ids.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(), cursors.data_ptr<int32_t>(),
         ids_dst.data_ptr<int32_t>(), pairs, experts);
@@ -4175,7 +4224,8 @@ std::vector<mfq_tensor_backend::Tensor> moe_build_expert_maps_cuda(
         mfq_tensor_backend::Tensor ids,
         int64_t n_experts,
         int64_t tile_m,
-        int64_t secondary_tile_m) {
+        int64_t secondary_tile_m,
+        int64_t tertiary_tile_m) {
     MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() &&
         ids.scalar_type() == mfq_tensor_backend::kInt32 && ids.dim() == 2,
         "ids must be contiguous CUDA int32 [tokens, routes]");
@@ -4184,6 +4234,8 @@ std::vector<mfq_tensor_backend::Tensor> moe_build_expert_maps_cuda(
     MFQ_RUNTIME_CHECK(tile_m > 0 && tile_m <= 1024 &&
         secondary_tile_m > 0 && secondary_tile_m <= 1024,
         "tile sizes must be in [1, 1024]");
+    MFQ_RUNTIME_CHECK(tertiary_tile_m >= 0 && tertiary_tile_m <= 1024,
+        "tertiary tile size must be zero or in [1, 1024]");
     const int experts = static_cast<int>(n_experts);
     const int pairs = static_cast<int>(ids.numel());
     auto options = ids.options();
@@ -4196,13 +4248,29 @@ std::vector<mfq_tensor_backend::Tensor> moe_build_expert_maps_cuda(
     auto secondary_tile_bounds = mfq_tensor_backend::empty(
         {experts + 1}, options);
     auto secondary_tile_experts = mfq_tensor_backend::empty({pairs}, options);
+    const bool has_tertiary = tertiary_tile_m > 0;
+    mfq_tensor_backend::Tensor tertiary_tile_bounds;
+    mfq_tensor_backend::Tensor tertiary_tile_experts;
+    if (has_tertiary) {
+        tertiary_tile_bounds = mfq_tensor_backend::empty({experts + 1}, options);
+        tertiary_tile_experts = mfq_tensor_backend::empty({pairs}, options);
+    }
     const cudaStream_t stream = mfq_current_cuda_stream();
     build_expert_map(ids, experts, static_cast<int>(tile_m), counts,
         cursors, ids_dst, expert_bounds, tile_bounds, tile_experts, stream,
         &secondary_tile_bounds, &secondary_tile_experts,
-        static_cast<int>(secondary_tile_m));
-    return {ids_dst, expert_bounds, tile_bounds, tile_experts, counts,
+        static_cast<int>(secondary_tile_m),
+        has_tertiary ? &tertiary_tile_bounds : nullptr,
+        has_tertiary ? &tertiary_tile_experts : nullptr,
+        static_cast<int>(tertiary_tile_m));
+    std::vector<mfq_tensor_backend::Tensor> result{
+        ids_dst, expert_bounds, tile_bounds, tile_experts, counts,
         secondary_tile_bounds, secondary_tile_experts};
+    if (has_tertiary) {
+        result.push_back(tertiary_tile_bounds);
+        result.push_back(tertiary_tile_experts);
+    }
+    return result;
 }
 
 void nint_moe_quantize_input_ws_cuda(

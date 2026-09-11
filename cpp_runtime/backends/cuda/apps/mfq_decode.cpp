@@ -249,7 +249,7 @@ std::vector<mfq_tensor_backend::Tensor> moe_build_expert_map_cuda(
     mfq_tensor_backend::Tensor ids, int64_t n_experts, int64_t tile_m);
 std::vector<mfq_tensor_backend::Tensor> moe_build_expert_maps_cuda(
     mfq_tensor_backend::Tensor ids, int64_t n_experts, int64_t tile_m,
-    int64_t secondary_tile_m);
+    int64_t secondary_tile_m, int64_t tertiary_tile_m);
 void nint_moe_quantize_input_ws_cuda(
     mfq_tensor_backend::Tensor x, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 void nint_moe_quantize_24_28_ws_cuda(
@@ -3652,10 +3652,13 @@ struct MoeRoutePlan {
     mfq_tensor_backend::Tensor tile_experts;
     mfq_tensor_backend::Tensor mma_tile_bounds;
     mfq_tensor_backend::Tensor mma_tile_experts;
+    mfq_tensor_backend::Tensor wide_tile_bounds;
+    mfq_tensor_backend::Tensor wide_tile_experts;
     mfq_tensor_backend::Tensor counts;
     mfq_tensor_backend::Tensor cursors;
     int n_experts = 0;
     int mma_tile_m = 8;
+    int wide_tile_m = 8;
     bool map_ready = false;
     uint64_t generation = 0;
     mutable std::shared_ptr<std::vector<int32_t>>
@@ -3729,10 +3732,21 @@ private:
             copy_tensor(destination.mma_tile_bounds, source.mma_tile_bounds, device);
             copy_tensor(destination.mma_tile_experts, source.mma_tile_experts, device);
         }
+        if (source.wide_tile_m == 8) {
+            destination.wide_tile_bounds = destination.tile_bounds;
+            destination.wide_tile_experts = destination.tile_experts;
+        } else if (source.wide_tile_m == source.mma_tile_m) {
+            destination.wide_tile_bounds = destination.mma_tile_bounds;
+            destination.wide_tile_experts = destination.mma_tile_experts;
+        } else {
+            copy_tensor(destination.wide_tile_bounds, source.wide_tile_bounds, device);
+            copy_tensor(destination.wide_tile_experts, source.wide_tile_experts, device);
+        }
         copy_tensor(destination.counts, source.counts, device);
         copy_tensor(destination.cursors, source.cursors, device);
         destination.n_experts = source.n_experts;
         destination.mma_tile_m = source.mma_tile_m;
+        destination.wide_tile_m = source.wide_tile_m;
         destination.map_ready = source.map_ready;
         destination.generation = source.generation;
         destination.host_unique_experts = source.host_unique_experts;
@@ -3764,12 +3778,14 @@ static MoeRoutePlan build_moe_route_plan(mfq_tensor_backend::Tensor ids, int n_e
     result.tile_experts = empty;
     result.mma_tile_bounds = empty;
     result.mma_tile_experts = empty;
+    result.wide_tile_bounds = empty;
+    result.wide_tile_experts = empty;
     result.counts = empty;
     result.cursors = empty;
     if (result.ids.size(0) > 8) {
         const bool use_coarse_mma = result.ids.numel() >= 8192;
         auto mapped = use_coarse_mma
-            ? moe_build_expert_maps_cuda(result.ids, n_experts, 8, 64)
+            ? moe_build_expert_maps_cuda(result.ids, n_experts, 8, 64, 128)
             : moe_build_expert_map_cuda(result.ids, n_experts, 8);
         result.ids_dst = mapped.at(0);
         result.expert_bounds = mapped.at(1);
@@ -3780,10 +3796,16 @@ static MoeRoutePlan build_moe_route_plan(mfq_tensor_backend::Tensor ids, int n_e
             result.mma_tile_bounds = mapped.at(5);
             result.mma_tile_experts = mapped.at(6);
             result.mma_tile_m = 64;
+            result.wide_tile_bounds = mapped.at(7);
+            result.wide_tile_experts = mapped.at(8);
+            result.wide_tile_m = 128;
         } else {
             result.mma_tile_bounds = result.tile_bounds;
             result.mma_tile_experts = result.tile_experts;
             result.mma_tile_m = 8;
+            result.wide_tile_bounds = result.tile_bounds;
+            result.wide_tile_experts = result.tile_experts;
+            result.wide_tile_m = 8;
         }
     }
     result.map_ready = result.ids.size(0) <= 8 ||
@@ -6836,9 +6858,9 @@ struct MixedMoeRuntime {
                 nvq_dispatch->expert_pool,
                 nvq_dispatch->expert_local,
                 x, n_experts, out_per_expert, neuron_len,
-                route.mma_tile_m, output,
+                route.wide_tile_m, output,
                 route.ids_dst, route.expert_bounds,
-                route.mma_tile_bounds, route.mma_tile_experts);
+                route.wide_tile_bounds, route.wide_tile_experts);
         }
 
         mfq_tensor_backend::Tensor shared_nint_qx;

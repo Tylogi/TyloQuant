@@ -309,6 +309,9 @@ class MoeRoutePlan:
     mma_tile_bounds: torch.Tensor
     mma_tile_experts: torch.Tensor
     mma_tile_m: int
+    wide_tile_bounds: torch.Tensor
+    wide_tile_experts: torch.Tensor
+    wide_tile_m: int
     counts: torch.Tensor
     cursors: torch.Tensor
 
@@ -332,18 +335,23 @@ class MoeRoutePlan:
         if int(ids.shape[0]) > 8:
             use_coarse_mma = ids.numel() >= 8192
             mapped = (
-                ext().moe_build_expert_maps_cuda(ids, int(n_experts), 8, 64)
+                ext().moe_build_expert_maps_cuda(ids, int(n_experts), 8, 64, 128)
                 if use_coarse_mma
                 else ext().moe_build_expert_map_cuda(ids, int(n_experts), 8)
             )
             ids_dst, expert_bounds, tile_bounds, tile_experts, counts = mapped[:5]
             if use_coarse_mma:
-                mma_tile_bounds, mma_tile_experts = mapped[5:]
+                mma_tile_bounds, mma_tile_experts = mapped[5:7]
                 mma_tile_m = 64
+                wide_tile_bounds, wide_tile_experts = mapped[7:9]
+                wide_tile_m = 128
             else:
                 mma_tile_bounds = tile_bounds
                 mma_tile_experts = tile_experts
                 mma_tile_m = 8
+                wide_tile_bounds = tile_bounds
+                wide_tile_experts = tile_experts
+                wide_tile_m = 8
             cursors = torch.empty(0, device=ids.device, dtype=torch.int32)
         else:
             empty = torch.empty(0, device=ids.device, dtype=torch.int32)
@@ -354,6 +362,9 @@ class MoeRoutePlan:
             mma_tile_bounds = empty
             mma_tile_experts = empty
             mma_tile_m = 8
+            wide_tile_bounds = empty
+            wide_tile_experts = empty
+            wide_tile_m = 8
             counts = empty
             cursors = empty
         return cls(
@@ -366,6 +377,9 @@ class MoeRoutePlan:
             mma_tile_bounds=mma_tile_bounds,
             mma_tile_experts=mma_tile_experts,
             mma_tile_m=mma_tile_m,
+            wide_tile_bounds=wide_tile_bounds,
+            wide_tile_experts=wide_tile_experts,
+            wide_tile_m=wide_tile_m,
             counts=counts,
             cursors=cursors,
         )

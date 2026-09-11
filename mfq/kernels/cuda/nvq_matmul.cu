@@ -5550,6 +5550,8 @@ struct __align__(16) NvqMoeF16SharedStorage {
     static constexpr int kBytes =
         kOperandBytes > kOutputBytes ? kOperandBytes : kOutputBytes;
     uint8_t bytes[kBytes];
+    int32_t pair_rows[BM];
+    int32_t source_rows[BM];
 };
 
 static_assert(sizeof(NvqMoeF16SharedStorage<64, 128, 4>) <= 48 * 1024);
@@ -5571,6 +5573,8 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
     __half * weight_tile,
     __half * activation_tile,
     float * output_tile,
+    int32_t * pair_rows,
+    int32_t * source_rows,
     int routes,
     int out_per_expert,
     int K,
@@ -5602,6 +5606,14 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
         NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kTileK;
     constexpr int kStrideK =
         NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kStrideK;
+    if (tid < BM) {
+        const int compact = first + tid;
+        const int pair_index = compact < last ? ids_dst[compact] : -1;
+        pair_rows[tid] = pair_index;
+        source_rows[tid] = pair_index < 0
+            ? -1 : (routed_input ? pair_index : pair_index / routes);
+    }
+    __syncthreads();
     FragmentC accumulators[kMFragments];
 #pragma unroll
     for (int m_fragment = 0; m_fragment < kMFragments; ++m_fragment) {
@@ -5672,13 +5684,10 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             const int m_local = index / (kTileK / 2);
             const int k_pair =
                 index - m_local * (kTileK / 2);
-            const int compact = first + m_local;
             const int k = k_base + k_pair * 2;
             __half2 values = __float2half2_rn(0.0f);
-            if (compact < last) {
-                const int pair_index = ids_dst[compact];
-                const int source_row = routed_input
-                    ? pair_index : pair_index / routes;
+            const int source_row = source_rows[m_local];
+            if (source_row >= 0) {
                 if (k + 1 < K) {
                     values = *reinterpret_cast<const __half2 *>(
                         x + static_cast<int64_t>(source_row) * K + k);
@@ -5737,10 +5746,9 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                 for (int element = lane; element < 16 * 16; element += 32) {
                     const int m_local = m_fragment * 16 + element / 16;
                     const int n_local = element % 16;
-                    const int compact = first + m_local;
                     const int local_row = n0 + warp * 16 + n_local;
-                    if (compact < last && local_row < out_per_expert) {
-                        const int pair_index = ids_dst[compact];
+                    const int pair_index = pair_rows[m_local];
+                    if (pair_index >= 0 && local_row < out_per_expert) {
                         output[
                             static_cast<int64_t>(pair_index) * out_per_expert +
                             local_row] = __float2half(
@@ -5768,10 +5776,9 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             for (int element = lane; element < BM * 16; element += 32) {
                 const int m_local = element / 16;
                 const int n_local = element % 16;
-                const int compact = first + m_local;
                 const int local_row = n0 + warp * 16 + n_local;
-                if (compact < last && local_row < out_per_expert) {
-                    const int pair_index = ids_dst[compact];
+                const int pair_index = pair_rows[m_local];
+                if (pair_index >= 0 && local_row < out_per_expert) {
                     output[
                         static_cast<int64_t>(pair_index) * out_per_expert +
                         local_row] = __float2half(
@@ -5844,7 +5851,8 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
             indices, indices_nbytes, aux, aux_nbytes,
             sub_scale, sub_scale_nbytes, neuron_scale, codebook,
             x, ids_dst, output, weight_tile,
-            activation_tile, output_tile, routes,
+            activation_tile, output_tile, shared.pair_rows,
+            shared.source_rows, routes,
             out_per_expert, K, ng, nvec, nsign, sub_bits, sign_mode,
             routed_input, local_expert, first, last,
             ntile * BN);
@@ -5931,7 +5939,8 @@ nvq_moe_grouped_hetero_f16_kernel(
                 FORMAT_VALUE, BM, BN, GROUPS_PER_CHUNK>(                        \
                 indices, sizes[0], aux, sizes[1], sub_scale, sizes[2],          \
                 neuron_scale, codebook, x, ids_dst, output,                     \
-                weight_tile, activation_tile, output_tile, routes,              \
+                weight_tile, activation_tile, output_tile,                     \
+                shared.pair_rows, shared.source_rows, routes,                   \
                 out_per_expert, K, ng, nvec,                                    \
                 nsign, sub_bits, sign_mode, routed_input, local_expert, first,  \
                 last, ntile * BN);                                              \
@@ -6225,8 +6234,8 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
             neuron_len > 0 && neuron_len <= INT_MAX,
         "NVQ heterogeneous dimensions must fit int32");
     MFQ_RUNTIME_CHECK(
-        route_tile_m == 8 || route_tile_m == 64,
-        "NVQ heterogeneous route tile must be 8 or 64");
+        route_tile_m == 8 || route_tile_m == 64 || route_tile_m == 128,
+        "NVQ heterogeneous route tile must be 8, 64, or 128");
     MFQ_RUNTIME_CHECK(
         weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
             weight_ptrs.scalar_type() == mfq_tensor_backend::kInt64 &&
@@ -6330,7 +6339,9 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         static_cast<int>(n_experts), pools,                                    \
         static_cast<int>(out_per_expert), static_cast<int>(neuron_len),        \
         max_tiles, routed_input)
-    if (tile_m == 64) {
+    if (tile_m == 128) {
+        NVQ_MOE_HETERO_F16_LAUNCH(128, 128, 2);
+    } else if (tile_m == 64) {
         NVQ_MOE_HETERO_F16_LAUNCH(128, 64, 2);
     } else if (fine_bm == 32) {
         NVQ_MOE_HETERO_F16_LAUNCH(32, 8, 4);
