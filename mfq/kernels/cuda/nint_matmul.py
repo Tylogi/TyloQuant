@@ -230,6 +230,35 @@ def nint_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
     q_packed = g.get("q_packed")
     bits = int(g.get("bits", 4))
     packed = q_packed is not None
+    if packed and g.get("mixed_q", False):
+        if M <= 8:
+            qx, xscale, xsum = _workspace(g, x)
+            return ext().nint_gemv_packed_mixed_q_ws_cuda(
+                q_packed,
+                g["row_q_bits"],
+                g["row_q_bit_offsets"],
+                g["sub_scale"],
+                g["sub_min"],
+                g["neuron_scale"],
+                g["neuron_min"],
+                x,
+                int(g["gs"]),
+                qx,
+                xscale,
+                xsum,
+            )
+        weight = ext().nint_dequant_full_packed_mixed_q_cuda(
+            q_packed,
+            g["row_q_bits"],
+            g["row_q_bit_offsets"],
+            g["sub_scale"],
+            g["sub_min"],
+            g["neuron_scale"],
+            g["neuron_min"],
+            int(g["neuron_len"]),
+            int(g["gs"]),
+        )
+        return x @ weight.T
     if packed and bits != 4 and g.get("sub_scale") is not None:
         if bits in {1, 7}:
             weight = ext().nint_dequant_full_packed_compact_bits_cuda(
@@ -452,6 +481,10 @@ def nint_backward_input(g: dict, output_gradient: torch.Tensor) -> torch.Tensor:
     """Compute ``dX = dY @ W`` directly from packed NINT storage."""
 
     gradient = output_gradient.reshape(-1, output_gradient.shape[-1]).contiguous()
+    if g.get("mixed_q", False):
+        from mfq.kernels.torch_backend import dequantize
+
+        return gradient.to(torch.float16) @ dequantize(g)
     return ext().nint_backward_input_cuda(
         g["q_packed"],
         g["sub_scale"],
@@ -519,6 +552,10 @@ def nint_matmul_input_mul(g: dict, x: torch.Tensor, gate: torch.Tensor, activati
 
     q_packed = g.get("q_packed")
     bits = int(g.get("bits", 4))
+    if g.get("mixed_q", False):
+        if activation == "sigmoid":
+            return nint_matmul(g, x * torch.sigmoid(gate))
+        return nint_matmul(g, x * torch.nn.functional.silu(gate))
     if q_packed is not None and bits != 4 and g.get("sub_scale") is not None:
         if activation == "sigmoid":
             return nint_matmul(g, x * torch.sigmoid(gate))

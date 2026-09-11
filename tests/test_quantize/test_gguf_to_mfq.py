@@ -238,6 +238,9 @@ def test_imatrix_binds_mixed_nint_experts(tmp_path):
             item.name: ImportanceEntry(
                 values=values,
                 counts=np.asarray([8, 8], dtype=np.int64),
+                row_importance=np.asarray(
+                    [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], dtype=np.float32
+                ),
             )
         },
         datasets=(),
@@ -248,8 +251,19 @@ def test_imatrix_binds_mixed_nint_experts(tmp_path):
 
     binding = _bind_imatrix(imatrix, [item])[item.name]
 
-    np.testing.assert_array_equal(binding.rows(2, 5), values[[0, 1, 1]])
-    np.testing.assert_array_equal(binding.selected(np.asarray([0, 3])), values)
+    np.testing.assert_array_equal(
+        binding.rows(2, 5),
+        values[[0, 1, 1]] * np.asarray([[3.0], [4.0], [5.0]]),
+    )
+    np.testing.assert_array_equal(
+        binding.selected(np.asarray([0, 3])),
+        values * np.asarray([[1.0], [4.0]]),
+    )
+    assert binding.neuron_rows is not None
+    np.testing.assert_array_equal(
+        binding.neuron_rows(1, 5),
+        [2.0, 3.0, 4.0, 5.0],
+    )
 
 
 def test_npq0_l_mode_only_replaces_nvq1_l_recipe_tensors():

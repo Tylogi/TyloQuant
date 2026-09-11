@@ -1546,6 +1546,9 @@ def test_hf_imatrix_binds_expert_wise_entries(tmp_path):
             "blk.4.ffn_down_exps.weight": ImportanceEntry(
                 values=values,
                 counts=np.asarray([8, 8], dtype=np.int64),
+                row_importance=np.asarray(
+                    [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], dtype=np.float32
+                ),
             )
         },
         datasets=(),
@@ -1556,8 +1559,14 @@ def test_hf_imatrix_binds_expert_wise_entries(tmp_path):
 
     binding = _bind_hf_imatrix(imatrix, [item])[item.name]
 
-    np.testing.assert_array_equal(binding.rows(2, 5), values[[0, 1, 1]])
-    np.testing.assert_array_equal(binding.selected(np.asarray([0, 3], dtype=np.int64)), values)
+    np.testing.assert_array_equal(
+        binding.rows(2, 5), values[[0, 1, 1]] * np.asarray([[3.0], [4.0], [5.0]])
+    )
+    np.testing.assert_array_equal(
+        binding.selected(np.asarray([0, 3], dtype=np.int64)),
+        values * np.asarray([[1.0], [4.0]]),
+    )
+    np.testing.assert_array_equal(binding.neuron_rows(1, 5), [2.0, 3.0, 4.0, 5.0])
 
 
 def test_hf_imatrix_binds_an_ordinary_vq_tensor(tmp_path):
@@ -1610,12 +1619,14 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
     imatrix_path = tmp_path / "imatrix.gguf"
     imatrix_path.write_bytes(b"test")
     importance = np.linspace(0.25, 2.0, 24, dtype=np.float32).reshape(1, 24)
+    neuron_importance = np.asarray([1.0, 2.0, 50.0, 100.0], dtype=np.float32)
     imatrix = ImportanceMatrix(
         path=imatrix_path,
         entries={
             "blk.0.ffn_down.weight": ImportanceEntry(
                 values=importance,
                 counts=np.asarray([16], dtype=np.int64),
+                row_importance=neuron_importance,
             )
         },
         datasets=("unit-test",),
@@ -1626,11 +1637,15 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
     monkeypatch.setattr(hf_to_mfq, "load_importance_matrix", lambda _path: imatrix)
     original_writer = hf_to_mfq._write_nint_axis0_blob
     captured: list[np.ndarray] = []
+    captured_neurons: list[np.ndarray] = []
 
     def recording_writer(*args, **kwargs):
         importance_rows = kwargs.get("importance_rows")
+        neuron_importance_rows = kwargs.get("neuron_importance_rows")
         assert importance_rows is not None
+        assert neuron_importance_rows is not None
         captured.append(np.asarray(importance_rows(0, 1)).copy())
+        captured_neurons.append(np.asarray(neuron_importance_rows(0, 4)).copy())
         return original_writer(*args, **kwargs)
 
     monkeypatch.setattr(hf_to_mfq, "_write_nint_axis0_blob", recording_writer)
@@ -1655,12 +1670,16 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
     convert(args)
 
     assert len(captured) == 1
-    np.testing.assert_array_equal(captured[0], importance[0])
+    np.testing.assert_array_equal(captured[0], importance)
+    np.testing.assert_array_equal(captured_neurons[0], neuron_importance)
     header, store = load_mmap(output)
     try:
         assert header.extra["imatrix"]["bindings"] == {
             "model.block.0.mlp.down.weight": "blk.0.ffn_down.weight"
         }
+        encoded = store["model.block.0.mlp.down.weight"]
+        assert encoded.has_mixed_sub_bits
+        np.testing.assert_array_equal(encoded.row_sub_bits, [5, 5, 7, 7])
     finally:
         store.close()
 

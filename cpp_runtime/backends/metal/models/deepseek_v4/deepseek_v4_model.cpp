@@ -512,7 +512,7 @@ bool is_mx_dtype(std::string_view dtype) {
 }
 
 bool is_nint_dtype(std::string_view dtype) {
-    if (dtype == "NINT") {
+    if (dtype == "NINT" || dtype == "NINTv2") {
         return true;
     }
     if (dtype.size() != 5 ||
@@ -1713,8 +1713,9 @@ inspect_deepseek_v4_tensor_metadata(
         result.packed = true;
         const auto bits =
             cursor.scalar<std::uint8_t>("NINT bits");
-        const auto sub_bits =
+        const auto raw_sub_bits =
             cursor.scalar<std::uint8_t>("NINT sub bits");
+        const auto sub_bits = raw_sub_bits & 0x7fu;
         const auto group_size =
             cursor.scalar<std::int32_t>("NINT group size");
         const auto axis =

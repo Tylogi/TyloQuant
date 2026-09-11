@@ -347,6 +347,7 @@ class ImatrixBinding:
     entry_name: str
     rows: ImportanceRows
     selected: ImportanceSelection
+    neuron_rows: ImportanceRows | None = None
 
 
 @dataclass(frozen=True)
@@ -418,7 +419,35 @@ def _bind_imatrix(
                 raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
             return resolved[1]
 
-        bindings[item.name] = ImatrixBinding(entry_name, rows, selected)
+        neuron_probe = imatrix.neuron_importance_for_rows(
+            names,
+            item.storage_shape,
+            slice(0, min(1, item.storage_shape[0])),
+        )
+        neuron_rows = None
+        if neuron_probe is not None:
+
+            def neuron_rows(
+                start: int,
+                end: int,
+                *,
+                _item=item,
+                _names=names,
+            ) -> np.ndarray:
+                resolved = imatrix.neuron_importance_for_rows(
+                    _names,
+                    _item.storage_shape,
+                    slice(start, end),
+                )
+                if resolved is None:
+                    raise RuntimeError(
+                        f"NAQ neuron binding disappeared for {_item.name}"
+                    )
+                return resolved[1]
+
+        bindings[item.name] = ImatrixBinding(
+            entry_name, rows, selected, neuron_rows
+        )
     if missing:
         preview = ", ".join(missing[:8])
         suffix = "" if len(missing) <= 8 else f" ... ({len(missing)} total)"
@@ -2497,11 +2526,16 @@ def convert(args: argparse.Namespace) -> None:
                 row_source = GgufRowSource(source_tensor, item, dequantize)
                 imatrix_binding = imatrix_bindings.get(item.name)
                 expert_importance = None
+                neuron_importance = None
                 if imatrix_binding is not None:
                     n_experts, rows_per_expert, _ = item.expert_shape
                     expert_importance = imatrix_binding.selected(
                         np.arange(n_experts, dtype=np.int64) * rows_per_expert
                     )
+                    if imatrix_binding.neuron_rows is not None:
+                        neuron_importance = imatrix_binding.neuron_rows(
+                            0, n_experts * rows_per_expert
+                        )
                 nbytes = _write_mixed_moe_axis0_blob(
                     row_source,
                     item.storage_shape,
@@ -2513,6 +2547,7 @@ def convert(args: argparse.Namespace) -> None:
                     quant_device,
                     expert_artifact_root,
                     importance=expert_importance,
+                    neuron_importance=neuron_importance,
                 )
             elif item.target_dtype == "NINT8-0":
                 row_source = GgufRowSource(source_tensor, item, dequantize)
@@ -2537,6 +2572,11 @@ def convert(args: argparse.Namespace) -> None:
                     quant_device,
                     importance_rows=(
                         None if imatrix_binding is None else imatrix_binding.rows
+                    ),
+                    neuron_importance_rows=(
+                        None
+                        if imatrix_binding is None
+                        else imatrix_binding.neuron_rows
                     ),
                 )
             elif item.target_dtype.startswith("NVQ"):

@@ -39,11 +39,11 @@ Run `uv run mfq calibrate STAGE --help` for stage-specific options.
 ## Activation imatrix
 
 The imatrix stage consumes a local full-precision HF model and a prepared MFQ
-calibration corpus. It uses AAQ by default: ordinary projections use input
-second moments, while attention and FFN gates use their nonlinear activation
-energy and downstream sensitivity. CUDA uses FP64 accumulation for ordinary
-statistics by default; Metal uses BF16 forward execution with FP32
-accumulation. AAQ coupled statistics use FP32 on both backends.
+calibration corpus. By default, NAQ-imatrix records two compact one-dimensional
+factors for each matrix: input-channel second moments and output-neuron
+importance. Layers with an activation function additionally account for that
+activation when estimating neuron importance. CUDA uses FP64 accumulation by
+default; Metal uses BF16 forward execution with FP32 accumulation.
 
 ### CUDA
 
@@ -63,8 +63,12 @@ uv run mfq calibrate imatrix \
 
 `--device` defaults to `cuda:0` for CUDA and `mps` for Metal.
 `--accumulation-dtype` overrides the backend default.
-Use `--objective linear` to produce a conventional llama.cpp-style input
-second-moment imatrix instead.
+Use `--objective linear` to collect only input second moments. NAQ-imatrix keeps
+one input vector and one neuron vector per dense projection, or per routed
+expert; it does not store a matrix with the same shape as the weight.
+For NINT tensors, the neuron factor also reallocates subgroup scale/minimum
+precision at the same mean subgroup-bit budget. Loaders expand that metadata
+into the existing runtime representation, so no new matmul kernel is required.
 
 ## Reuse during quantization
 

@@ -50,6 +50,11 @@ struct ScaledFixture {
     std::vector<std::uint8_t> sub_mins;
 };
 
+void require_close(
+    float actual,
+    float expected,
+    float tolerance = 1e-4f);
+
 Fixture make_nint_blob(int bits) {
     constexpr std::int32_t output_size = 2;
     constexpr std::int32_t group_size = 5;
@@ -210,6 +215,285 @@ ScaledFixture make_nint5_gs28_scaled_blob() {
     };
 }
 
+ScaledFixture make_mixed_sub_bits_blob() {
+    constexpr std::int32_t output_size = 4;
+    constexpr std::int32_t group_size = 5;
+    constexpr std::int32_t groups = 2;
+    constexpr std::int32_t input_size = 9;
+    constexpr int bits = 4;
+    constexpr int nominal_sub_bits = 6;
+    const std::vector<std::uint8_t> row_sub_bits{5, 6, 7, 8};
+    const std::vector<std::uint8_t> selectors{0, 1, 2, 3};
+    std::vector<std::uint8_t> quantized(
+        output_size * groups * group_size);
+    std::vector<std::uint8_t> sub_scales{
+        3, 4,
+        5, 6,
+        7, 8,
+        128, 192,
+    };
+    std::vector<std::uint8_t> sub_mins(sub_scales.size(), 0);
+    for (std::size_t index = 0; index < quantized.size(); ++index) {
+        quantized[index] = static_cast<std::uint8_t>((index * 3 + 1) & 15u);
+    }
+
+    std::vector<std::uint8_t> blob;
+    append<std::uint8_t>(blob, 0x80u | bits);
+    append<std::uint8_t>(blob, nominal_sub_bits);
+    append<std::int32_t>(blob, group_size);
+    append<std::int32_t>(blob, 0);
+    append<std::int32_t>(blob, input_size);
+    append<std::uint32_t>(blob, 2);
+    append<std::int64_t>(blob, output_size);
+    append<std::int64_t>(blob, input_size);
+    append<std::uint32_t>(blob, output_size);
+    append<std::uint32_t>(blob, groups);
+    for (int output = 0; output < output_size; ++output) {
+        append<std::uint16_t>(blob, 0x3c00);
+    }
+    for (int output = 0; output < output_size; ++output) {
+        append<std::uint16_t>(blob, 0);
+    }
+    const auto packed_selectors = pack_values(selectors, 2);
+    blob.insert(blob.end(), packed_selectors.begin(), packed_selectors.end());
+    for (int selector = 0; selector < 4; ++selector) {
+        std::vector<std::uint8_t> scales;
+        std::vector<std::uint8_t> minima;
+        for (int row = 0; row < output_size; ++row) {
+            if (selectors[static_cast<std::size_t>(row)] != selector) continue;
+            for (int group = 0; group < groups; ++group) {
+                const auto index = static_cast<std::size_t>(row * groups + group);
+                scales.push_back(sub_scales[index]);
+                minima.push_back(sub_mins[index]);
+            }
+        }
+        if (scales.empty()) continue;
+        const int row_bits = nominal_sub_bits - 1 + selector;
+        const auto packed_scales = pack_values(scales, row_bits);
+        const auto packed_mins = pack_values(minima, row_bits);
+        blob.insert(blob.end(), packed_scales.begin(), packed_scales.end());
+        blob.insert(blob.end(), packed_mins.begin(), packed_mins.end());
+    }
+    const std::vector<std::uint8_t> q_selectors(output_size, bits - 1);
+    const auto packed_q_selectors = pack_values(q_selectors, 3);
+    blob.insert(
+        blob.end(),
+        packed_q_selectors.begin(),
+        packed_q_selectors.end());
+    const auto packed_q = pack_values(quantized, bits);
+    blob.insert(blob.end(), packed_q.begin(), packed_q.end());
+    return {
+        std::move(blob),
+        std::move(quantized),
+        std::move(sub_scales),
+        std::move(sub_mins),
+    };
+}
+
+void test_mixed_sub_bits_loads_into_existing_kernel() {
+    constexpr int output_size = 4;
+    constexpr int group_size = 5;
+    constexpr int groups = 2;
+    constexpr int input_size = 9;
+    const auto fixture = make_mixed_sub_bits_blob();
+    const auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+    auto dense = mlx::core::astype(weight.dequantize(), mlx::core::float32);
+    dense.eval();
+    const auto* values = dense.data<float>();
+    for (int output = 0; output < output_size; ++output) {
+        for (int input = 0; input < input_size; ++input) {
+            const int group = input / group_size;
+            const auto metadata = static_cast<std::size_t>(output * groups + group);
+            const auto quantized = static_cast<std::size_t>(
+                output * groups * group_size + input);
+            const float expected =
+                static_cast<float>(fixture.sub_scales[metadata]) *
+                static_cast<float>(fixture.quantized[quantized]);
+            require_close(values[output * input_size + input], expected);
+        }
+    }
+}
+
+Fixture make_mixed_q_bits_blob(
+    std::int32_t output_size = 16,
+    std::int32_t group_size = 5,
+    std::int32_t groups = 2,
+    std::int32_t input_size = 9,
+    int minimum_q_bits = 1,
+    int q_bit_count = 8) {
+    constexpr int nominal_bits = 4;
+    constexpr int sub_bits = 6;
+    const int values_per_row = group_size * groups;
+    std::vector<std::uint8_t> row_q_bits(output_size);
+    std::vector<std::uint8_t> selectors(output_size);
+    std::vector<std::uint8_t> quantized(output_size * values_per_row);
+    for (int row = 0; row < output_size; ++row) {
+        const int bits = row % q_bit_count + minimum_q_bits;
+        row_q_bits[static_cast<std::size_t>(row)] =
+            static_cast<std::uint8_t>(bits);
+        selectors[static_cast<std::size_t>(row)] =
+            static_cast<std::uint8_t>(bits - 1);
+        const auto maximum = (1u << bits) - 1u;
+        for (int element = 0; element < values_per_row; ++element) {
+            quantized[static_cast<std::size_t>(
+                row * values_per_row + element)] =
+                static_cast<std::uint8_t>(
+                    (row * 7 + element * 3 + 1) & maximum);
+        }
+    }
+
+    std::vector<std::uint8_t> blob;
+    append<std::uint8_t>(blob, 0x80u | nominal_bits);
+    append<std::uint8_t>(blob, sub_bits);
+    append<std::int32_t>(blob, group_size);
+    append<std::int32_t>(blob, 0);
+    append<std::int32_t>(blob, input_size);
+    append<std::uint32_t>(blob, 2);
+    append<std::int64_t>(blob, output_size);
+    append<std::int64_t>(blob, input_size);
+    append<std::uint32_t>(blob, output_size);
+    append<std::uint32_t>(blob, groups);
+    for (int row = 0; row < output_size; ++row) {
+        append<std::uint16_t>(blob, 0x3c00);
+    }
+    for (int row = 0; row < output_size; ++row) {
+        append<std::uint16_t>(blob, 0);
+    }
+    const std::vector<std::uint8_t> sub_scales(
+        output_size * groups,
+        1);
+    const std::vector<std::uint8_t> sub_mins(
+        output_size * groups,
+        0);
+    const std::vector<std::uint8_t> sub_selectors(output_size, 1);
+    const auto packed_sub_selectors = pack_values(sub_selectors, 2);
+    blob.insert(
+        blob.end(),
+        packed_sub_selectors.begin(),
+        packed_sub_selectors.end());
+    const auto packed_scales = pack_values(sub_scales, sub_bits);
+    const auto packed_mins = pack_values(sub_mins, sub_bits);
+    blob.insert(blob.end(), packed_scales.begin(), packed_scales.end());
+    blob.insert(blob.end(), packed_mins.begin(), packed_mins.end());
+    const auto packed_selectors = pack_values(selectors, 3);
+    blob.insert(blob.end(), packed_selectors.begin(), packed_selectors.end());
+    for (int bits = 1; bits <= 8; ++bits) {
+        std::vector<std::uint8_t> cohort;
+        for (int row = 0; row < output_size; ++row) {
+            if (row_q_bits[static_cast<std::size_t>(row)] != bits) {
+                continue;
+            }
+            const auto begin = quantized.begin() +
+                static_cast<std::ptrdiff_t>(row * values_per_row);
+            cohort.insert(cohort.end(), begin, begin + values_per_row);
+        }
+        const auto packed = pack_values(cohort, bits);
+        blob.insert(blob.end(), packed.begin(), packed.end());
+    }
+    return {std::move(blob), std::move(quantized)};
+}
+
+void test_mixed_q_bits_gs24_small_m() {
+    constexpr int output_size = 32;
+    constexpr int input_size = 47;
+    constexpr int packed_row_size = 48;
+    const auto fixture = make_mixed_q_bits_blob(
+        output_size,
+        24,
+        2,
+        input_size,
+        3,
+        3);
+    const auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+
+    std::vector<float> input_values(6 * input_size);
+    for (std::size_t index = 0; index < input_values.size(); ++index) {
+        input_values[index] = static_cast<float>(
+            static_cast<int>((index * 11 + 7) % 31) - 15) / 32.0f;
+    }
+    auto result = mlx::core::astype(
+        weight.matmul(mlx::core::astype(
+            mlx::core::array(
+                input_values.begin(),
+                mlx::core::Shape{6, input_size}),
+            mlx::core::float16)),
+        mlx::core::float32);
+    result.eval();
+    for (int input_row = 0; input_row < 6; ++input_row) {
+        for (int output = 0; output < output_size; ++output) {
+            float expected = 0.0f;
+            for (int input = 0; input < input_size; ++input) {
+                expected += input_values[input_row * input_size + input] *
+                    fixture.quantized[output * packed_row_size + input];
+            }
+            require_close(
+                result.data<float>()[input_row * output_size + output],
+                expected,
+                0.08f);
+        }
+    }
+}
+
+void test_mixed_q_bits_inference() {
+    constexpr int output_size = 16;
+    constexpr int input_size = 9;
+    constexpr int packed_row_size = 10;
+    const auto fixture = make_mixed_q_bits_blob();
+    const auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+    if (!weight.is_nint_v2()) {
+        throw std::runtime_error("NINTv2 layout was not retained");
+    }
+
+    auto dense = mlx::core::astype(weight.dequantize(), mlx::core::float32);
+    dense.eval();
+    for (int output = 0; output < output_size; ++output) {
+        for (int input = 0; input < input_size; ++input) {
+            require_close(
+                dense.data<float>()[output * input_size + input],
+                fixture.quantized[output * packed_row_size + input]);
+        }
+    }
+
+    std::vector<float> input_values(6 * input_size);
+    for (std::size_t index = 0; index < input_values.size(); ++index) {
+        input_values[index] = static_cast<float>(
+            static_cast<int>((index * 5 + 3) % 19) - 9) / 16.0f;
+    }
+    auto result = mlx::core::astype(
+        weight.matmul(mlx::core::astype(
+            mlx::core::array(
+                input_values.begin(),
+                mlx::core::Shape{6, input_size}),
+            mlx::core::float16)),
+        mlx::core::float32);
+    result.eval();
+    for (int input_row = 0; input_row < 6; ++input_row) {
+        for (int output = 0; output < output_size; ++output) {
+            float expected = 0.0f;
+            for (int input = 0; input < input_size; ++input) {
+                expected += input_values[input_row * input_size + input] *
+                    fixture.quantized[output * packed_row_size + input];
+            }
+            require_close(
+                result.data<float>()[input_row * output_size + output],
+                expected,
+                0.05f);
+        }
+    }
+
+    const mlx::core::array token_ids({15, 0, 9}, mlx::core::Shape{3}, mlx::core::int32);
+    auto embeddings = weight.embedding(token_ids, mlx::core::float32);
+    embeddings.eval();
+    for (int token = 0; token < 3; ++token) {
+        const int source_row = token == 0 ? 15 : (token == 1 ? 0 : 9);
+        for (int input = 0; input < input_size; ++input) {
+            require_close(
+                embeddings.data<float>()[token * input_size + input],
+                fixture.quantized[source_row * packed_row_size + input]);
+        }
+    }
+}
+
 ScaledFixture make_nint_gs24_scaled_blob(
     int bits,
     std::int32_t output_size,
@@ -289,7 +573,7 @@ ScaledFixture make_nint_gs24_scaled_blob(
 void require_close(
     float actual,
     float expected,
-    float tolerance = 1e-4f) {
+    float tolerance) {
     if (std::fabs(actual - expected) > tolerance) {
         throw std::runtime_error(
             "NINT Metal result mismatch: actual=" +
@@ -777,6 +1061,9 @@ int main() {
         if (!mfq::metal::is_nint_dtype("NINT")) {
             throw std::runtime_error("legacy NINT dtype was rejected");
         }
+        if (!mfq::metal::is_nint_dtype("NINTv2")) {
+            throw std::runtime_error("NINTv2 dtype was rejected");
+        }
         for (int bits = 1; bits <= 8; ++bits) {
             if (!mfq::metal::is_nint_dtype(
                     "NINT" + std::to_string(bits))) {
@@ -933,6 +1220,9 @@ int main() {
         test_nint4_gs24_grouped_small_m();
         test_nint6_gs24_decode();
         test_nint4_swiglu();
+        test_mixed_sub_bits_loads_into_existing_kernel();
+        test_mixed_q_bits_inference();
+        test_mixed_q_bits_gs24_small_m();
         std::cout
             << "MFQ C++ NINT1-NINT8 matmul/embedding and "
                "NINT3/NINT4/NINT6 GS24 and NINT5 GS28 decode and "

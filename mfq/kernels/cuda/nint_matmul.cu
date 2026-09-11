@@ -135,6 +135,56 @@ __device__ __forceinline__ uint8_t unpack_qbits_one_dequant(const uint8_t* p, in
     }
 }
 
+__device__ __forceinline__ uint8_t unpack_mixed_qbits_one(
+    const uint8_t* stream,
+    uint64_t row_bit_offset,
+    int element,
+    int bits)
+{
+    const uint64_t bit = row_bit_offset + (uint64_t)element * (uint64_t)bits;
+    const uint64_t byte = bit >> 3;
+    const int shift = (int)(bit & 7u);
+    uint32_t word = (uint32_t)stream[byte];
+    if (shift + bits > 8) {
+        word |= (uint32_t)stream[byte + 1] << 8;
+    }
+    return (uint8_t)((word >> shift) & ((1u << bits) - 1u));
+}
+
+__global__ void dequant_full_packed_mixed_q_kernel(
+    const uint8_t* __restrict__ q_packed,
+    const uint8_t* __restrict__ row_q_bits,
+    const int64_t* __restrict__ row_q_bit_offsets,
+    const uint8_t* __restrict__ sub_scale,
+    const uint8_t* __restrict__ sub_min,
+    const float* __restrict__ neuron_scale,
+    const float* __restrict__ neuron_min,
+    __half* __restrict__ w,
+    int N,
+    int ng,
+    int gs,
+    int neuron_len)
+{
+    const size_t total = (size_t)N * (size_t)neuron_len;
+    for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < total;
+         index += (size_t)gridDim.x * blockDim.x) {
+        const int column = (int)(index % (size_t)neuron_len);
+        const int row = (int)(index / (size_t)neuron_len);
+        const int group = column / gs;
+        const size_t metadata = (size_t)row * (size_t)ng + (size_t)group;
+        const int bits = (int)row_q_bits[row];
+        const uint8_t quantized = unpack_mixed_qbits_one(
+            q_packed,
+            (uint64_t)row_q_bit_offsets[row],
+            column,
+            bits);
+        const float scale = neuron_scale[row] * (float)sub_scale[metadata];
+        const float minimum = neuron_min[row] * (float)sub_min[metadata];
+        w[index] = __float2half(scale * (float)quantized - minimum);
+    }
+}
+
 template <int BITS, int GS>
 __global__ void dequant_full_packed_compact_bits_kernel_early(
     const uint8_t* __restrict__ q_packed,
@@ -700,6 +750,71 @@ mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_bits_cuda(
     }
 #undef DQFULLBITS_GS_SWITCH
 #undef DQFULLBITSLAUNCH
+    return w;
+}
+
+mfq_tensor_backend::Tensor nint_dequant_full_packed_mixed_q_cuda(
+    mfq_tensor_backend::Tensor q_packed,
+    mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_min,
+    int64_t neuron_len,
+    int64_t gs)
+{
+    MFQ_RUNTIME_CHECK(
+        q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        q_packed.is_contiguous() && q_packed.dim() == 1,
+        "mixed-q q_packed must be CUDA contiguous uint8 rank-1");
+    MFQ_RUNTIME_CHECK(
+        row_q_bits.is_cuda() && row_q_bits.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        row_q_bits.is_contiguous() && row_q_bits.dim() == 1,
+        "mixed-q row widths must be CUDA contiguous uint8 rank-1");
+    MFQ_RUNTIME_CHECK(
+        row_q_bit_offsets.is_cuda() &&
+        row_q_bit_offsets.scalar_type() == mfq_tensor_backend::kInt64 &&
+        row_q_bit_offsets.is_contiguous() && row_q_bit_offsets.dim() == 1,
+        "mixed-q row offsets must be CUDA contiguous int64 rank-1");
+    MFQ_RUNTIME_CHECK(
+        sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        sub_scale.is_contiguous() && sub_scale.dim() == 2,
+        "mixed-q sub_scale must be CUDA contiguous uint8 rank-2");
+    MFQ_RUNTIME_CHECK(
+        sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        sub_min.is_contiguous() && sub_min.sizes() == sub_scale.sizes(),
+        "mixed-q sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK(
+        neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
+        neuron_scale.is_contiguous() && neuron_min.is_cuda() &&
+        neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
+        "mixed-q neuron metadata must be CUDA contiguous f32");
+    const int N = (int)sub_scale.size(0);
+    const int ng = (int)sub_scale.size(1);
+    MFQ_RUNTIME_CHECK(
+        row_q_bits.numel() == N && row_q_bit_offsets.numel() == N &&
+        neuron_scale.numel() == N && neuron_min.numel() == N,
+        "mixed-q row metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(
+        gs > 0 && neuron_len > 0 && neuron_len <= (int64_t)ng * gs,
+        "mixed-q dequant dimensions are invalid");
+    auto w = mfq_tensor_backend::empty(
+        {N, neuron_len}, neuron_scale.options().dtype(mfq_tensor_backend::kHalf));
+    const size_t total = (size_t)N * (size_t)neuron_len;
+    constexpr int block = 256;
+    const int grid = (int)std::min<size_t>((total + block - 1) / block, 65535);
+    dequant_full_packed_mixed_q_kernel<<<grid, block, 0, mfq_current_cuda_stream()>>>(
+        q_packed.data_ptr<uint8_t>(),
+        row_q_bits.data_ptr<uint8_t>(),
+        row_q_bit_offsets.data_ptr<int64_t>(),
+        sub_scale.data_ptr<uint8_t>(),
+        sub_min.data_ptr<uint8_t>(),
+        neuron_scale.data_ptr<float>(),
+        neuron_min.data_ptr<float>(),
+        reinterpret_cast<__half*>(w.data_ptr<mfq_half>()),
+        N, ng, (int)gs, (int)neuron_len);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return w;
 }
 
@@ -1513,6 +1628,146 @@ __global__ void __launch_bounds__(128 * MSPLIT) gemv_packed_bits_group4_batch_ke
             int gm = msplit * MPW + m;
             if (gm < M) {
                 out[(size_t)gm * N + row] = __float2half(acc[m]);
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ int unpack_mixed_qbits4(
+    const uint8_t* stream,
+    uint64_t bit_offset,
+    int bits)
+{
+    const uint64_t byte = bit_offset >> 3;
+    const int shift = (int)(bit_offset & 7u);
+    uint64_t packed = (uint64_t)stream[byte]
+        | ((uint64_t)stream[byte + 1] << 8)
+        | ((uint64_t)stream[byte + 2] << 16)
+        | ((uint64_t)stream[byte + 3] << 24)
+        | ((uint64_t)stream[byte + 4] << 32);
+    packed >>= shift;
+    const uint32_t mask = (1u << bits) - 1u;
+    return (int)(packed & mask)
+        | ((int)((packed >> bits) & mask) << 8)
+        | ((int)((packed >> (2 * bits)) & mask) << 16)
+        | ((int)((packed >> (3 * bits)) & mask) << 24);
+}
+
+template <int GS, int MAX_M>
+__global__ void __launch_bounds__(128) gemv_packed_mixed_q_group4_kernel(
+    const uint8_t* __restrict__ q_packed,
+    const uint8_t* __restrict__ row_q_bits,
+    const int64_t* __restrict__ row_q_bit_offsets,
+    const uint8_t* __restrict__ sub_scale,
+    const uint8_t* __restrict__ sub_min,
+    const float* __restrict__ neuron_scale,
+    const float* __restrict__ neuron_min,
+    const int8_t* __restrict__ qx,
+    const float* __restrict__ xscale,
+    __half* __restrict__ out,
+    int M,
+    int N,
+    int ng,
+    int K_pad)
+{
+    constexpr int WPB = 4;
+    constexpr int CHUNKS = (GS + 3) / 4;
+    constexpr int GPW = 32 / CHUNKS;
+    const int row = (int)blockIdx.x * WPB + (int)threadIdx.y;
+    const int lane = (int)threadIdx.x;
+    if (row >= N) {
+        return;
+    }
+
+    const int bits = (int)row_q_bits[row];
+    const uint64_t row_bit_offset = (uint64_t)row_q_bit_offsets[row];
+    const uint8_t* ssrow = sub_scale + (size_t)row * ng;
+    const uint8_t* smrow = sub_min + (size_t)row * ng;
+    const float ns = neuron_scale[row];
+    const float nm = neuron_min[row];
+    float accumulators[MAX_M];
+#pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        accumulators[m] = 0.0f;
+    }
+
+    const int relative_group = lane / CHUNKS;
+    const int chunk = lane - relative_group * CHUNKS;
+    const int element = chunk * 4;
+    const bool active_lane = relative_group < GPW;
+    const bool full = active_lane && element + 3 < GS;
+    const bool tail = active_lane && element < GS && !full;
+    for (int group_base = 0; group_base < ng; group_base += GPW) {
+        const int group = group_base + relative_group;
+        if (!active_lane || group >= ng) {
+            continue;
+        }
+        const uint8_t ss = ssrow[group];
+        const uint8_t sm = smrow[group];
+        const int column = group * GS + element;
+        if (full) {
+            const uint64_t bit_offset = row_bit_offset
+                + (uint64_t)column * (uint64_t)bits;
+            const int quantized = unpack_mixed_qbits4(
+                q_packed, bit_offset, bits);
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (m < M) {
+                    const int activation = load_i8x4_unaligned(
+                        qx + (size_t)m * K_pad + column);
+                    const int sum = __dp4a(0x01010101, activation, 0);
+                    const int dot = bits == 8
+                        ? __dp4a(quantized ^ (int)0x80808080u, activation, 0)
+                            + 128 * sum
+                        : __dp4a(quantized, activation, 0);
+                    const float xs = xscale[(size_t)m * ng + group];
+                    accumulators[m] += xs * (
+                        ns * (float)ss * (float)dot
+                        - nm * (float)sm * (float)sum);
+                }
+            }
+        } else if (tail) {
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (m < M) {
+                    int dot = 0;
+                    int sum = 0;
+#pragma unroll
+                    for (int component = 0; component < 4; ++component) {
+                        if (element + component < GS) {
+                            const int activation = (int)qx[
+                                (size_t)m * K_pad + column + component];
+                            const int quantized = (int)unpack_mixed_qbits_one(
+                                q_packed,
+                                row_bit_offset,
+                                column + component,
+                                bits);
+                            dot += quantized * activation;
+                            sum += activation;
+                        }
+                    }
+                    const float xs = xscale[(size_t)m * ng + group];
+                    accumulators[m] += xs * (
+                        ns * (float)ss * (float)dot
+                        - nm * (float)sm * (float)sum);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            accumulators[m] += __shfl_xor_sync(
+                0xffffffffu, accumulators[m], offset);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) {
+                out[(size_t)m * N + row] = __float2half(accumulators[m]);
             }
         }
     }
@@ -5388,6 +5643,125 @@ mfq_tensor_backend::Tensor nint_gemv_packed_bits_ws_cuda(
 #undef QPBITS_GS_SWITCH
 #undef QPBITSFASTLAUNCH
 #undef QPBITSLAUNCH
+    return out;
+}
+
+mfq_tensor_backend::Tensor nint_gemv_packed_mixed_q_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed,
+    mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor x,
+    int64_t gs,
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale,
+    mfq_tensor_backend::Tensor xsum)
+{
+    MFQ_RUNTIME_CHECK(
+        q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        q_packed.is_contiguous() && q_packed.dim() == 1,
+        "mixed-q q_packed must be CUDA contiguous uint8 rank-1");
+    MFQ_RUNTIME_CHECK(
+        row_q_bits.is_cuda() && row_q_bits.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        row_q_bits.is_contiguous() && row_q_bits.dim() == 1,
+        "mixed-q row widths must be CUDA contiguous uint8 rank-1");
+    MFQ_RUNTIME_CHECK(
+        row_q_bit_offsets.is_cuda() &&
+        row_q_bit_offsets.scalar_type() == mfq_tensor_backend::kInt64 &&
+        row_q_bit_offsets.is_contiguous() && row_q_bit_offsets.dim() == 1,
+        "mixed-q row offsets must be CUDA contiguous int64 rank-1");
+    MFQ_RUNTIME_CHECK(
+        sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        sub_scale.is_contiguous() && sub_scale.dim() == 2,
+        "mixed-q sub_scale must be CUDA contiguous uint8 rank-2");
+    MFQ_RUNTIME_CHECK(
+        sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        sub_min.is_contiguous() && sub_min.sizes() == sub_scale.sizes(),
+        "mixed-q sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK(
+        neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
+        neuron_scale.is_contiguous() && neuron_min.is_cuda() &&
+        neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
+        "mixed-q neuron metadata must be CUDA contiguous f32");
+    MFQ_RUNTIME_CHECK(
+        x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kHalf &&
+        x.is_contiguous() && x.dim() == 2,
+        "mixed-q input must be CUDA contiguous fp16 rank-2");
+    MFQ_RUNTIME_CHECK(
+        qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.is_contiguous() &&
+        xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
+        xscale.is_contiguous() && xsum.is_cuda() &&
+        xsum.scalar_type() == mfq_tensor_backend::kInt32 && xsum.is_contiguous(),
+        "mixed-q activation workspace is invalid");
+    const int N = (int)sub_scale.size(0);
+    const int ng = (int)sub_scale.size(1);
+    const int M = (int)x.size(0);
+    const int K_real = (int)x.size(1);
+    const int K_pad = ng * (int)gs;
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 8, "mixed-q GEMV supports M in [1,8]");
+    MFQ_RUNTIME_CHECK(
+        row_q_bits.numel() == N && row_q_bit_offsets.numel() == N &&
+        neuron_scale.numel() == N && neuron_min.numel() == N,
+        "mixed-q row metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(
+        K_real <= K_pad && qx.size(0) >= M && qx.size(1) >= K_pad &&
+        xscale.size(0) >= M && xscale.size(1) >= ng &&
+        xsum.size(0) >= M && xsum.size(1) >= ng,
+        "mixed-q activation workspace shape mismatch");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
+
+#define MIXED_Q_LAUNCH(GSVAL, MVAL)                                                   \
+    do {                                                                               \
+        constexpr int BD = ((GSVAL + 31) / 32) * 32;                                  \
+        quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(                  \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                   \
+            qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),                           \
+            xsum.data_ptr<int32_t>(), M, K_real, K_pad);                               \
+        gemv_packed_mixed_q_group4_kernel<GSVAL, MVAL>                                 \
+            <<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>(                           \
+                q_packed.data_ptr<uint8_t>(), row_q_bits.data_ptr<uint8_t>(),           \
+                row_q_bit_offsets.data_ptr<int64_t>(), sub_scale.data_ptr<uint8_t>(),   \
+                sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
+                neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                   \
+                xscale.data_ptr<float>(),                                               \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()),                   \
+                M, N, ng, K_pad);                                                       \
+    } while (0)
+
+#define MIXED_Q_M_SWITCH(GSVAL)                                                        \
+    do {                                                                               \
+        if (M == 1) MIXED_Q_LAUNCH(GSVAL, 1);                                          \
+        else if (M == 2) MIXED_Q_LAUNCH(GSVAL, 2);                                     \
+        else if (M == 3) MIXED_Q_LAUNCH(GSVAL, 3);                                     \
+        else if (M == 4) MIXED_Q_LAUNCH(GSVAL, 4);                                     \
+        else if (M == 5) MIXED_Q_LAUNCH(GSVAL, 5);                                     \
+        else if (M == 6) MIXED_Q_LAUNCH(GSVAL, 6);                                     \
+        else MIXED_Q_LAUNCH(GSVAL, 8);                                                 \
+    } while (0)
+
+    switch ((int)gs) {
+        case 16: MIXED_Q_M_SWITCH(16); break;
+        case 20: MIXED_Q_M_SWITCH(20); break;
+        case 22: MIXED_Q_M_SWITCH(22); break;
+        case 24: MIXED_Q_M_SWITCH(24); break;
+        case 26: MIXED_Q_M_SWITCH(26); break;
+        case 28: MIXED_Q_M_SWITCH(28); break;
+        case 30: MIXED_Q_M_SWITCH(30); break;
+        case 32: MIXED_Q_M_SWITCH(32); break;
+        case 34: MIXED_Q_M_SWITCH(34); break;
+        case 36: MIXED_Q_M_SWITCH(36); break;
+        case 40: MIXED_Q_M_SWITCH(40); break;
+        case 48: MIXED_Q_M_SWITCH(48); break;
+        case 64: MIXED_Q_M_SWITCH(64); break;
+        default: MFQ_RUNTIME_CHECK(false, "mixed-q GEMV unsupported gs ", gs);
+    }
+#undef MIXED_Q_M_SWITCH
+#undef MIXED_Q_LAUNCH
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 

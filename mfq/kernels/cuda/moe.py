@@ -158,6 +158,8 @@ class ExpertWiseNintWeight:
     @property
     def hetero_supported(self) -> bool:
         return all(
+            not bool(pool.weight.get("mixed_q", False))
+            and
             _hetero_profile_code(int(pool.weight.get("bits", 4)), int(pool.weight["gs"])) >= 0
             for pool in self.pools
         )
@@ -551,32 +553,54 @@ def _grouped_matmul_mixed(
         )
         input_quantized = activation_key in quantized
         if pool.family == "nint":
-            ext().nint_moe_grouped_matmul_pool_ws_cuda(
-                g["q_packed"],
-                g["sub_scale"],
-                g["sub_min"],
-                g["neuron_scale"],
-                g["neuron_min"],
-                value,
-                route.ids,
-                expert_local,
-                weight.n_experts,
-                len(pool.expert_ids),
-                weight.out_per_expert,
-                gs,
-                int(g.get("bits", 4)),
-                route.map_ready,
-                input_quantized,
-                out,
-                qx,
-                xscale,
-                route.counts,
-                route.cursors,
-                route.ids_dst,
-                route.expert_bounds,
-                route.tile_bounds,
-                route.tile_experts,
-            )
+            if g.get("mixed_q", False):
+                ext().nint_moe_grouped_matmul_pool_mixed_q_ws_cuda(
+                    g["q_packed"],
+                    g["row_q_bits"],
+                    g["row_q_bit_offsets"],
+                    g["sub_scale"],
+                    g["sub_min"],
+                    g["neuron_scale"],
+                    g["neuron_min"],
+                    value,
+                    route.ids,
+                    expert_local,
+                    weight.n_experts,
+                    len(pool.expert_ids),
+                    weight.out_per_expert,
+                    gs,
+                    input_quantized,
+                    out,
+                    qx,
+                    xscale,
+                )
+            else:
+                ext().nint_moe_grouped_matmul_pool_ws_cuda(
+                    g["q_packed"],
+                    g["sub_scale"],
+                    g["sub_min"],
+                    g["neuron_scale"],
+                    g["neuron_min"],
+                    value,
+                    route.ids,
+                    expert_local,
+                    weight.n_experts,
+                    len(pool.expert_ids),
+                    weight.out_per_expert,
+                    gs,
+                    int(g.get("bits", 4)),
+                    route.map_ready,
+                    input_quantized,
+                    out,
+                    qx,
+                    xscale,
+                    route.counts,
+                    route.cursors,
+                    route.ids_dst,
+                    route.expert_bounds,
+                    route.tile_bounds,
+                    route.tile_experts,
+                )
         elif pool.family == "nint8_zero":
             ext().nint8_zero_moe_grouped_matmul_pool_ws_cuda(
                 g["q"],
@@ -705,32 +729,54 @@ def grouped_matmul(
         groups = int(g["ng"])
         key = (gs, groups)
         qx, xscale = weight.activation_workspace(x, gs=gs, groups=groups, input_rows=input_rows)
-        ext().nint_moe_grouped_matmul_pool_ws_cuda(
-            g["q_packed"],
-            g["sub_scale"],
-            g["sub_min"],
-            g["neuron_scale"],
-            g["neuron_min"],
-            x,
-            route.ids,
-            pool.local_map(weight.n_experts, x.device),
-            weight.n_experts,
-            len(pool.expert_ids),
-            weight.out_per_expert,
-            gs,
-            int(g.get("bits", 4)),
-            route.map_ready,
-            key in quantized_groups,
-            out,
-            qx,
-            xscale,
-            route.counts,
-            route.cursors,
-            route.ids_dst,
-            route.expert_bounds,
-            route.tile_bounds,
-            route.tile_experts,
-        )
+        if g.get("mixed_q", False):
+            ext().nint_moe_grouped_matmul_pool_mixed_q_ws_cuda(
+                g["q_packed"],
+                g["row_q_bits"],
+                g["row_q_bit_offsets"],
+                g["sub_scale"],
+                g["sub_min"],
+                g["neuron_scale"],
+                g["neuron_min"],
+                x,
+                route.ids,
+                pool.local_map(weight.n_experts, x.device),
+                weight.n_experts,
+                len(pool.expert_ids),
+                weight.out_per_expert,
+                gs,
+                key in quantized_groups,
+                out,
+                qx,
+                xscale,
+            )
+        else:
+            ext().nint_moe_grouped_matmul_pool_ws_cuda(
+                g["q_packed"],
+                g["sub_scale"],
+                g["sub_min"],
+                g["neuron_scale"],
+                g["neuron_min"],
+                x,
+                route.ids,
+                pool.local_map(weight.n_experts, x.device),
+                weight.n_experts,
+                len(pool.expert_ids),
+                weight.out_per_expert,
+                gs,
+                int(g.get("bits", 4)),
+                route.map_ready,
+                key in quantized_groups,
+                out,
+                qx,
+                xscale,
+                route.counts,
+                route.cursors,
+                route.ids_dst,
+                route.expert_bounds,
+                route.tile_bounds,
+                route.tile_experts,
+            )
         quantized_groups.add(key)
     return out
 

@@ -18,7 +18,7 @@ from mfq.formats.io import (
 from mfq.formats.moe import NintMoePool, NintMoeTensor
 from mfq.formats.mx import MxTensor
 from mfq.formats.nepq import NEPQ0_S, NepqTensor
-from mfq.formats.nint import NintSpec
+from mfq.formats.nint import NintSpec, NintTensor
 from mfq.formats.npq0_s import pack_npq0_s_tables
 from mfq.quantize.nint_quant import dequantize as dequantize_nint
 from mfq.quantize.nint_quant import quantize as quantize_nint
@@ -274,6 +274,143 @@ def test_materialize_overlay_slices_nint_and_jsc_without_requantizing(
                     _pack_tensor(replacement_nint, allow_moe=False)[1],
                 )
             ),
+        )
+
+
+def test_materialize_overlay_slices_mixed_sub_bit_nint_without_requantizing(
+    tmp_path: Path,
+) -> None:
+    rng = np.random.default_rng(20260911)
+    n_experts = 3
+    rows = 5
+    width = 96
+    spec = NintSpec(4, 24, 6)
+    mixed = quantize_nint(
+        rng.normal(size=(2 * rows, width)).astype(np.float32),
+        spec,
+        row_sub_bits=np.array(
+            [5, 6, 7, 8, 5, 8, 7, 6, 5, 6], dtype=np.uint8
+        ),
+    )
+    ordinary = quantize_nint(
+        rng.normal(size=(rows, width)).astype(np.float32),
+        spec,
+    )
+    base = NintMoeTensor(
+        (n_experts, rows, width),
+        (
+            NintMoePool(np.array([0, 1], dtype=np.int32), mixed),
+            NintMoePool(np.array([2], dtype=np.int32), ordinary),
+        ),
+    )
+    base_path = tmp_path / "base-mixed-sub-bits.mfq"
+    save(
+        base_path,
+        FileHeader(version=2, model_arch="test", num_tensors=1),
+        {"experts": base},
+    )
+
+    replacement = quantize_nint(
+        rng.normal(size=(rows, width)).astype(np.float32),
+        spec,
+    )
+    overlay_path = tmp_path / "overlay-mixed-sub-bits.mfq"
+    _write_raw_mfq(
+        overlay_path,
+        arch="overlay",
+        records=[
+            (
+                "experts",
+                "NINTMD",
+                _pack_delta(
+                    n_experts=n_experts,
+                    out_per_expert=rows,
+                    neuron_len=width,
+                    pools=[([1], replacement)],
+                ),
+            )
+        ],
+    )
+
+    plan = build_materialization_plan(base_path, overlay_path)
+    output_path = tmp_path / "materialized-mixed-sub-bits.mfq"
+    from mfq.tools.materialize_mfq_overlay import BitRangesSegment, _stream_plan
+
+    with (
+        output_path.open("wb") as output,
+        base_path.open("rb") as base_handle,
+        overlay_path.open("rb") as overlay_handle,
+    ):
+        _stream_plan(
+            plan,
+            {"base": base_handle, "overlay": overlay_handle},
+            output,
+            start_offset=0,
+            length=None,
+            chunk_bytes=17,
+            progress_bytes=0,
+        )
+
+    bit_offset = 0
+    split = None
+    for segment in plan.segments:
+        if isinstance(segment, BitRangesSegment) and segment.nbytes > 1:
+            split = bit_offset + 1
+            break
+        bit_offset += segment.nbytes
+    assert split is not None
+    resumed_path = tmp_path / "resumed-mixed-sub-bits.mfq"
+    with (
+        resumed_path.open("wb") as output,
+        base_path.open("rb") as base_handle,
+        overlay_path.open("rb") as overlay_handle,
+    ):
+        _stream_plan(
+            plan,
+            {"base": base_handle, "overlay": overlay_handle},
+            output,
+            start_offset=0,
+            length=split,
+            chunk_bytes=11,
+            progress_bytes=0,
+        )
+    with (
+        resumed_path.open("ab") as output,
+        base_path.open("rb") as base_handle,
+        overlay_path.open("rb") as overlay_handle,
+    ):
+        _stream_plan(
+            plan,
+            {"base": base_handle, "overlay": overlay_handle},
+            output,
+            start_offset=split,
+            length=None,
+            chunk_bytes=11,
+            progress_bytes=0,
+        )
+    assert resumed_path.read_bytes() == output_path.read_bytes()
+
+    validate_materialized_mfq(
+        output_path,
+        expected_bytes=plan.total_bytes,
+            expected_family_expert_counts={"NINT4": 2, "NINTv2": 1},
+    )
+    with open_mmap(base_path) as base_store, open_mmap(output_path) as merged_store:
+        original = base_store["experts"]
+        merged = merged_store["experts"]
+        assert isinstance(original, NintMoeTensor)
+        assert isinstance(merged, NintMoeTensor)
+        kept_pool = next(
+            pool for pool in merged.pools if np.array_equal(pool.expert_ids, [0])
+        )
+        assert isinstance(kept_pool.tensor, NintTensor)
+        np.testing.assert_array_equal(
+            kept_pool.tensor.row_sub_bits,
+            np.array([5, 6, 7, 8, 5], dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            _expert_values(merged, 0),
+            _expert_values(original, 0),
         )
 
 

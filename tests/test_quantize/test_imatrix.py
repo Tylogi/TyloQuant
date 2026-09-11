@@ -23,6 +23,7 @@ def test_native_imatrix_round_trip_preserves_experts_and_metadata(tmp_path: Path
             "model.layers.0.experts.gate_up_proj": ImportanceEntry(
                 values=np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
                 counts=np.asarray([11, 7], dtype=np.int64),
+                row_importance=np.asarray([0.5, 0.75, 1.25, 1.5], dtype=np.float32),
             )
         },
         datasets=("balanced-corpus",),
@@ -47,6 +48,10 @@ def test_native_imatrix_round_trip_preserves_experts_and_metadata(tmp_path: Path
     np.testing.assert_array_equal(
         loaded.entries["model.layers.0.experts.gate_up_proj"].counts,
         [11, 7],
+    )
+    np.testing.assert_array_equal(
+        loaded.entries["model.layers.0.experts.gate_up_proj"].row_importance,
+        [0.5, 0.75, 1.25, 1.5],
     )
 
 
@@ -146,7 +151,7 @@ def test_expert_imatrix_selects_weights_by_flattened_row(tmp_path: Path):
     )
 
 
-def test_aaq_imatrix_selects_one_importance_vector_per_weight_row(tmp_path: Path):
+def test_legacy_dense_imatrix_selects_one_importance_vector_per_weight_row(tmp_path: Path):
     values = np.arange(1, 13, dtype=np.float32).reshape(4, 3)
     matrix = ImportanceMatrix(
         path=tmp_path / "unused.npz",
@@ -171,6 +176,40 @@ def test_aaq_imatrix_selects_one_importance_vector_per_weight_row(tmp_path: Path
 
     assert name == "blk.0.ffn_gate.weight"
     np.testing.assert_array_equal(selected, values[[3, 1]])
+
+
+def test_naq_imatrix_keeps_factors_compact_and_combines_only_for_selected_rows(
+    tmp_path: Path,
+):
+    matrix = ImportanceMatrix(
+        path=tmp_path / "unused.npz",
+        entries={
+            "proj.weight": ImportanceEntry(
+                values=np.asarray([[1.0, 2.0, 4.0]], dtype=np.float32),
+                counts=np.asarray([10], dtype=np.int64),
+                row_importance=np.asarray([0.5, 1.0, 2.0, 4.0], dtype=np.float32),
+            )
+        },
+        datasets=(),
+        chunk_count=0,
+        chunk_size=0,
+        legacy=False,
+    )
+    rows = np.asarray([3, 1], dtype=np.int64)
+
+    name, combined = matrix.for_rows(
+        ("proj.weight",), (4, 3), (4, 3), rows
+    )
+    neuron_name, neurons = matrix.neuron_importance_for_rows(
+        ("proj.weight",), (4, 3), rows
+    )
+
+    assert name == neuron_name == "proj.weight"
+    np.testing.assert_array_equal(
+        combined,
+        np.asarray([[4.0, 8.0, 16.0], [1.0, 2.0, 4.0]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(neurons, [4.0, 1.0])
 
 
 def test_gguf_imatrix_requires_llama_metadata(tmp_path: Path):

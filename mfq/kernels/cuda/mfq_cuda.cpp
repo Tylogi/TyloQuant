@@ -125,6 +125,15 @@ torch::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
     torch::Tensor out, torch::Tensor qx, torch::Tensor xscale,
     torch::Tensor counts, torch::Tensor cursors, torch::Tensor ids_dst,
     torch::Tensor expert_bounds, torch::Tensor tile_bounds, torch::Tensor tile_experts);
+torch::Tensor nint_moe_grouped_matmul_pool_mixed_q_ws_cuda(
+    torch::Tensor q_packed, torch::Tensor row_q_bits,
+    torch::Tensor row_q_bit_offsets, torch::Tensor sub_scale,
+    torch::Tensor sub_min, torch::Tensor neuron_scale,
+    torch::Tensor neuron_min, torch::Tensor x, torch::Tensor ids,
+    torch::Tensor expert_local, int64_t n_experts,
+    int64_t n_local_experts, int64_t out_per_expert, int64_t gs,
+    bool input_quantized, torch::Tensor out, torch::Tensor qx,
+    torch::Tensor xscale);
 torch::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
     torch::Tensor q, torch::Tensor scale, torch::Tensor x,
     torch::Tensor ids, torch::Tensor expert_local, int64_t n_experts,
@@ -160,6 +169,12 @@ torch::Tensor nint_embedding_lookup_packed_compact_bits_cuda(
     torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
     torch::Tensor neuron_scale, torch::Tensor neuron_min,
     torch::Tensor token_ids, int64_t neuron_len, int64_t gs, int64_t bits);
+torch::Tensor nint_embedding_lookup_packed_mixed_q_cuda(
+    torch::Tensor q_packed, torch::Tensor row_q_bits,
+    torch::Tensor row_q_bit_offsets, torch::Tensor sub_scale,
+    torch::Tensor sub_min, torch::Tensor neuron_scale,
+    torch::Tensor neuron_min, torch::Tensor token_ids,
+    int64_t neuron_len, int64_t gs);
 // sampling.cu
 torch::Tensor sample_greedy_cuda(torch::Tensor logits);
 torch::Tensor sample_softmax_cuda(torch::Tensor logits, torch::Tensor random, double temperature);
@@ -220,6 +235,12 @@ torch::Tensor nint_gemv_packed_batch_ws_cuda(
 torch::Tensor nint_gemv_packed_bits_ws_cuda(
     torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
     torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs, int64_t bits,
+    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
+torch::Tensor nint_gemv_packed_mixed_q_ws_cuda(
+    torch::Tensor q_packed, torch::Tensor row_q_bits,
+    torch::Tensor row_q_bit_offsets, torch::Tensor sub_scale,
+    torch::Tensor sub_min, torch::Tensor neuron_scale,
+    torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
     torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
 torch::Tensor nint_gemv_packed_bits_qx_ws_cuda(
     torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
@@ -304,6 +325,11 @@ torch::Tensor nint_dequant_full_packed_compact_cuda(
 torch::Tensor nint_dequant_full_packed_compact_bits_cuda(
     torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
     torch::Tensor neuron_scale, torch::Tensor neuron_min, int64_t neuron_len, int64_t gs, int64_t bits);
+torch::Tensor nint_dequant_full_packed_mixed_q_cuda(
+    torch::Tensor q_packed, torch::Tensor row_q_bits,
+    torch::Tensor row_q_bit_offsets, torch::Tensor sub_scale,
+    torch::Tensor sub_min, torch::Tensor neuron_scale,
+    torch::Tensor neuron_min, int64_t neuron_len, int64_t gs);
 torch::Tensor nint_dequant_full_packed_gs24_x2_cuda(
     torch::Tensor q_packed, torch::Tensor d_eff, torch::Tensor m_eff, int64_t neuron_len);
 torch::Tensor nint_dequant_full_packed_gs24_x2h2_cuda(
@@ -694,6 +720,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Heterogeneous expert-wise NINT grouped MMA prefill (CUDA)");
     m.def("nint_moe_grouped_matmul_pool_ws_cuda", &nint_moe_grouped_matmul_pool_ws_cuda,
           "Expert-wise NINT cohort mul_mat_id with caller workspace (CUDA)");
+    m.def("nint_moe_grouped_matmul_pool_mixed_q_ws_cuda",
+          &nint_moe_grouped_matmul_pool_mixed_q_ws_cuda,
+          "Expert-wise mixed-q NINT cohort mul_mat_id (CUDA)");
     m.def("nint8_zero_moe_grouped_matmul_pool_ws_cuda",
           &nint8_zero_moe_grouped_matmul_pool_ws_cuda,
           "Expert-wise NINT8-0 cohort mul_mat_id with caller workspace (CUDA)");
@@ -711,6 +740,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nint_embedding_lookup_packed_eff_cuda", &nint_embedding_lookup_packed_eff_cuda, "NINT selected-row embedding dequant, packed q + eff_pair (CUDA)");
     m.def("nint_embedding_lookup_packed_compact_cuda", &nint_embedding_lookup_packed_compact_cuda, "NINT selected-row embedding dequant, packed q + compact metadata (CUDA)");
     m.def("nint_embedding_lookup_packed_compact_bits_cuda", &nint_embedding_lookup_packed_compact_bits_cuda, "NINT selected-row embedding dequant, generic packed bits + compact metadata (CUDA)");
+    m.def("nint_embedding_lookup_packed_mixed_q_cuda", &nint_embedding_lookup_packed_mixed_q_cuda, "NINT mixed-q selected-row embedding dequant (CUDA)");
     m.def("sample_greedy_cuda", &sample_greedy_cuda, "Greedy logits sampling (CUDA)");
     m.def("sample_softmax_cuda", &sample_softmax_cuda, "Temperature softmax logits sampling (CUDA)");
     m.def("sample_top_k_top_p_cuda", &sample_top_k_top_p_cuda, "Top-k/top-p logits sampling (CUDA)");
@@ -734,6 +764,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nint_gemv_packed_geglu_ws_cuda", &nint_gemv_packed_geglu_ws_cuda, "NINT INT4-packed gate/up GEMV with fused GeGLU output (CUDA)");
     m.def("nint_gemv_packed_batch_ws_cuda", &nint_gemv_packed_batch_ws_cuda, "NINT INT4-packed batched GEMV/MMVQ with caller workspace (CUDA)");
     m.def("nint_gemv_packed_bits_ws_cuda", &nint_gemv_packed_bits_ws_cuda, "NINT generic packed-bits GEMV/MMVQ with caller workspace (CUDA)");
+    m.def("nint_gemv_packed_mixed_q_ws_cuda", &nint_gemv_packed_mixed_q_ws_cuda, "NINT mixed-q GEMV/MMVQ with caller workspace (CUDA)");
     m.def("nint_gemv_packed_bits_qx_ws_cuda", &nint_gemv_packed_bits_qx_ws_cuda, "NINT generic packed-bits GEMV from prequantized activation workspace (CUDA)");
     m.def("nint_gemv_packed_bits_gate_ws_cuda", &nint_gemv_packed_bits_gate_ws_cuda, "NINT generic packed-bits GEMV with fused input gate activation (CUDA)");
     m.def("nint_gemv_packed_bits_swiglu_ws_cuda", &nint_gemv_packed_bits_swiglu_ws_cuda, "NINT packed-bits gate/up GEMV with fused SwiGLU output (CUDA)");
@@ -756,6 +787,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nint_dequant_full_packed_cuda", &nint_dequant_full_packed_cuda, "NINT INT4-packed full dequantize W for prefill GEMM (CUDA)");
     m.def("nint_dequant_full_packed_compact_cuda", &nint_dequant_full_packed_compact_cuda, "NINT INT4-packed full dequantize W from compact metadata (CUDA)");
     m.def("nint_dequant_full_packed_compact_bits_cuda", &nint_dequant_full_packed_compact_bits_cuda, "NINT generic packed-bits full dequantize W from compact metadata (CUDA)");
+    m.def("nint_dequant_full_packed_mixed_q_cuda", &nint_dequant_full_packed_mixed_q_cuda, "NINT mixed-q full dequantize W from compact metadata (CUDA)");
     m.def("nint_dequant_full_packed_gs24_x2_cuda", &nint_dequant_full_packed_gs24_x2_cuda, "NINT gs24 full dequantize W with 2 qbytes per thread (CUDA)");
     m.def("nint_dequant_full_packed_gs24_x2h2_cuda", &nint_dequant_full_packed_gs24_x2h2_cuda, "NINT gs24 half2 metadata full dequantize W with 2 qbytes per thread (CUDA)");
     m.def("nint_dequant_full_packed_h2_cuda", &nint_dequant_full_packed_h2_cuda, "NINT INT4-packed half2 full dequantize W for prefill GEMM (CUDA)");

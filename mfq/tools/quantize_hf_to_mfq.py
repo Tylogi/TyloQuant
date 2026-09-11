@@ -102,7 +102,13 @@ from mfq.formats.nepq import (
 from mfq.formats.nepq import (
     _pack_bits as _pack_nepq_bits,
 )
-from mfq.formats.nint import NINT2_SPEC, NintSpec
+from mfq.formats.nint import (
+    NINT2_SPEC,
+    NINT_V2_FLAG,
+    NINT_V2_K_SELECTOR_BITS,
+    NINT_V2_Q_SELECTOR_BITS,
+    NintSpec,
+)
 from mfq.formats.npq0_l import (
     _HEADER as _NPQ0_L_HEADER,
 )
@@ -227,6 +233,7 @@ from mfq.quantize.nepq_a import (
     NepqAQuantConfig,
     quantize_nepq_a_fixed,
 )
+from mfq.quantize.nint_quant import allocate_row_sub_bits
 from mfq.quantize.nint_quant import quantize as nint_quantize
 from mfq.quantize.nint_quant_torch import quantize_axis0 as nint_quantize_axis0_torch
 from mfq.quantize.npq0_l import Npq0LConfig, Npq0LTables, quantize_npq0_l_fixed
@@ -1683,6 +1690,7 @@ class HfImatrixBinding:
     entry_name: str
     rows: ImportanceRows
     selected: ImportanceSelection
+    neuron_rows: ImportanceRows | None = None
 
 
 def _hf_imatrix_names(item: TensorPlan) -> tuple[str, ...]:
@@ -1799,7 +1807,36 @@ def _bind_hf_imatrix(
                 raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
             return resolved[1]
 
-        bindings[item.name] = HfImatrixBinding(entry_name, rows, selected)
+        neuron_probe = imatrix.neuron_importance_for_rows(
+            names,
+            storage_shape,
+            slice(0, min(1, storage_shape[0])),
+        )
+        neuron_rows = None
+        if neuron_probe is not None:
+
+            def neuron_rows(
+                start: int,
+                end: int,
+                *,
+                _names=names,
+                _storage_shape=storage_shape,
+                _item=item,
+            ) -> np.ndarray:
+                resolved = imatrix.neuron_importance_for_rows(
+                    _names,
+                    _storage_shape,
+                    slice(start, end),
+                )
+                if resolved is None:
+                    raise RuntimeError(
+                        f"NAQ neuron binding disappeared for {_item.name}"
+                    )
+                return resolved[1]
+
+        bindings[item.name] = HfImatrixBinding(
+            entry_name, rows, selected, neuron_rows
+        )
     if missing:
         preview = ", ".join(missing[:8])
         suffix = "" if len(missing) <= 8 else f" ... ({len(missing)} total)"
@@ -1817,6 +1854,18 @@ def _hf_expert_importance(
         raise ValueError(f"NINTM plan lacks expert shape: {item.name}")
     n_experts, rows_per_expert, _ = item.expert_shape
     return binding.selected(np.arange(n_experts, dtype=np.int64) * rows_per_expert)
+
+
+def _hf_neuron_importance(
+    item: TensorPlan,
+    binding: HfImatrixBinding | None,
+) -> np.ndarray | None:
+    if binding is None or binding.neuron_rows is None:
+        return None
+    if item.expert_shape is None:
+        raise ValueError(f"NINTM plan lacks expert shape: {item.name}")
+    n_experts, rows_per_expert, _ = item.expert_shape
+    return binding.neuron_rows(0, n_experts * rows_per_expert)
 
 
 def _dtype_for_recipe_type(gguf_type: str, dense_dtype: str) -> str:
@@ -3548,6 +3597,66 @@ def _write_native_mxfp8_blob(
     return blob_path.stat().st_size
 
 
+class _PackedBitRegionWriter:
+    """Append values to one preallocated packed-bit region without padding chunks."""
+
+    def __init__(self, stream, offset: int, bits: int, expected_values: int) -> None:
+        self.stream = stream
+        self.offset = int(offset)
+        self.bits = int(bits)
+        self.expected_values = int(expected_values)
+        self.quantum = 8 // math.gcd(self.bits, 8)
+        self.written_values = 0
+        self.pending = np.empty(0, dtype=np.uint8)
+
+    def append(self, values: np.ndarray) -> None:
+        incoming = np.ascontiguousarray(values, dtype=np.uint8).reshape(-1)
+        if not incoming.size:
+            return
+        if int(incoming.max(initial=0)) >= (1 << self.bits):
+            raise ValueError(f"value exceeds packed {self.bits}-bit region")
+        combined = (
+            incoming
+            if not self.pending.size
+            else np.concatenate((self.pending, incoming))
+        )
+        complete = combined.size - combined.size % self.quantum
+        if complete:
+            self.stream.seek(
+                self.offset + (self.written_values * self.bits) // 8
+            )
+            self.stream.write(pack_bits(combined[:complete], self.bits))
+            self.written_values += int(complete)
+        self.pending = np.ascontiguousarray(combined[complete:], dtype=np.uint8)
+
+    def finish(self) -> None:
+        total = self.written_values + int(self.pending.size)
+        if total != self.expected_values:
+            raise RuntimeError(
+                f"packed region received {total} values, expected {self.expected_values}"
+            )
+        if self.pending.size:
+            self.stream.seek(
+                self.offset + (self.written_values * self.bits) // 8
+            )
+            self.stream.write(pack_bits(self.pending, self.bits))
+        self.pending = np.empty(0, dtype=np.uint8)
+
+
+def _nint_blob_public_dtype(blob_path: Path) -> str:
+    with blob_path.open("rb") as stream:
+        header = stream.read(2)
+    if len(header) != 2:
+        raise ValueError(f"truncated NINT blob header: {blob_path}")
+    raw_bits, raw_sub_bits = header
+    bits = raw_bits & ~NINT_V2_FLAG
+    if not 1 <= bits <= 8:
+        raise ValueError(f"invalid NINT primary width {bits}: {blob_path}")
+    if not 1 <= raw_sub_bits <= 8:
+        raise ValueError(f"invalid NINT subgroup width {raw_sub_bits}: {blob_path}")
+    return "NINTv2" if raw_bits & NINT_V2_FLAG else f"NINT{bits}"
+
+
 def _write_nint_axis0_blob(
     sl,
     shape: tuple[int, ...],
@@ -3557,6 +3666,7 @@ def _write_nint_axis0_blob(
     quant_backend: str,
     device: str,
     importance_rows=None,
+    neuron_importance_rows=None,
     synthetic: bool = False,
 ) -> int:
     if len(shape) != 2:
@@ -3565,9 +3675,27 @@ def _write_nint_axis0_blob(
     gs = int(spec.groupsize)
     ng = (neuron_len + gs - 1) // gs
     scale_nbytes = out * np.dtype(np.float16).itemsize
-    sub_nbytes = (out * ng * spec.sub_bits + 7) // 8
     q_nbytes = (out * ng * gs * spec.bits + 7) // 8
-    if (row_chunk * ng * spec.sub_bits) % 8 != 0:
+    row_sub_bits = None
+    if neuron_importance_rows is not None:
+        neuron_importance = neuron_importance_rows(0, out)
+        if neuron_importance is not None:
+            if isinstance(neuron_importance, torch.Tensor):
+                neuron_importance = neuron_importance.detach().cpu().numpy()
+            neuron_importance = np.asarray(
+                neuron_importance, dtype=np.float32
+            ).reshape(-1)
+            if neuron_importance.shape != (out,):
+                raise ValueError(
+                    f"NAQ neuron importance shape {neuron_importance.shape} != {(out,)}"
+                )
+            candidate = allocate_row_sub_bits(
+                neuron_importance, int(spec.sub_bits)
+            )
+            if np.any(candidate != int(spec.sub_bits)):
+                row_sub_bits = candidate
+    is_nint_v2 = row_sub_bits is not None
+    if not is_nint_v2 and (row_chunk * ng * spec.sub_bits) % 8 != 0:
         raise ValueError(
             f"row_chunk={row_chunk} does not align sub_bits={spec.sub_bits}, ng={ng} to byte boundary"
         )
@@ -3577,16 +3705,54 @@ def _write_nint_axis0_blob(
         )
 
     with blob_path.open("wb+") as f:
-        f.write(_NINT_HDR.pack(spec.bits, spec.sub_bits, spec.groupsize, 0, neuron_len))
+        raw_bits = int(spec.bits) | (NINT_V2_FLAG if is_nint_v2 else 0)
+        f.write(_NINT_HDR.pack(raw_bits, spec.sub_bits, spec.groupsize, 0, neuron_len))
         f.write(struct.pack("<I", len(shape)))
         f.write(struct.pack(f"<{len(shape)}q", *shape))
         f.write(struct.pack("<II", out, ng))
         scale_off = f.tell()
         min_off = scale_off + scale_nbytes
-        sub_scale_off = min_off + scale_nbytes
-        sub_min_off = sub_scale_off + sub_nbytes
-        q_off = sub_min_off + sub_nbytes
+        metadata_off = min_off + scale_nbytes
+        packed_writers: dict[int, tuple[_PackedBitRegionWriter, _PackedBitRegionWriter]] = {}
+        if is_nint_v2:
+            k_selectors = np.ascontiguousarray(
+                row_sub_bits.astype(np.int16) - (int(spec.sub_bits) - 1),
+                dtype=np.uint8,
+            )
+            selector_nbytes = (
+                out * NINT_V2_K_SELECTOR_BITS + 7
+            ) // 8
+            cursor = metadata_off + selector_nbytes
+            for selector in range(1 << NINT_V2_K_SELECTOR_BITS):
+                bits = int(spec.sub_bits) - 1 + selector
+                rows = int(np.count_nonzero(k_selectors == selector))
+                count = rows * ng
+                if not count:
+                    continue
+                scale_stream_off = cursor
+                cursor += (count * bits + 7) // 8
+                min_stream_off = cursor
+                cursor += (count * bits + 7) // 8
+                packed_writers[selector] = (
+                    _PackedBitRegionWriter(f, scale_stream_off, bits, count),
+                    _PackedBitRegionWriter(f, min_stream_off, bits, count),
+                )
+            q_selector_off = cursor
+            q_selector_nbytes = (out * NINT_V2_Q_SELECTOR_BITS + 7) // 8
+            q_off = q_selector_off + q_selector_nbytes
+            sub_scale_off = sub_min_off = -1
+        else:
+            sub_nbytes = (out * ng * spec.sub_bits + 7) // 8
+            sub_scale_off = metadata_off
+            sub_min_off = sub_scale_off + sub_nbytes
+            q_off = sub_min_off + sub_nbytes
         f.truncate(q_off + q_nbytes)
+        if is_nint_v2:
+            f.seek(metadata_off)
+            f.write(pack_bits(k_selectors, NINT_V2_K_SELECTOR_BITS))
+            q_selectors = np.full(out, int(spec.bits) - 1, dtype=np.uint8)
+            f.seek(q_selector_off)
+            f.write(pack_bits(q_selectors, NINT_V2_Q_SELECTOR_BITS))
 
         if synthetic:
             return int(q_off + q_nbytes)
@@ -3599,13 +3765,20 @@ def _write_nint_axis0_blob(
             else:
                 chunk = sl[start:end]
             if quant_backend in ACCELERATOR_BACKENDS:
-                nt = nint_quantize_axis0_torch(chunk, spec, device=device, importance=importance)
+                nt = nint_quantize_axis0_torch(
+                    chunk,
+                    spec,
+                    device=device,
+                    importance=importance,
+                    row_sub_bits=(None if row_sub_bits is None else row_sub_bits[start:end]),
+                )
             elif quant_backend == "cpu":
                 nt = nint_quantize(
                     chunk.float().cpu().numpy(),
                     spec,
                     axis=0,
                     importance=importance,
+                    row_sub_bits=(None if row_sub_bits is None else row_sub_bits[start:end]),
                 )
             else:
                 raise ValueError(f"unsupported quant backend: {quant_backend}")
@@ -3618,13 +3791,23 @@ def _write_nint_axis0_blob(
             f.write(np.ascontiguousarray(nt.neuron_scale, dtype=np.float16).tobytes())
             f.seek(min_off + start * 2)
             f.write(np.ascontiguousarray(nt.neuron_min, dtype=np.float16).tobytes())
-            f.seek(sub_scale_off + (start * ng * spec.sub_bits) // 8)
-            f.write(pack_bits(nt.sub_scale, spec.sub_bits))
-            f.seek(sub_min_off + (start * ng * spec.sub_bits) // 8)
-            f.write(pack_bits(nt.sub_min, spec.sub_bits))
+            if is_nint_v2:
+                chunk_selectors = k_selectors[start:end]
+                for selector, (scale_writer, min_writer) in packed_writers.items():
+                    local_rows = np.flatnonzero(chunk_selectors == selector)
+                    scale_writer.append(nt.sub_scale[local_rows])
+                    min_writer.append(nt.sub_min[local_rows])
+            else:
+                f.seek(sub_scale_off + (start * ng * spec.sub_bits) // 8)
+                f.write(pack_bits(nt.sub_scale, spec.sub_bits))
+                f.seek(sub_min_off + (start * ng * spec.sub_bits) // 8)
+                f.write(pack_bits(nt.sub_min, spec.sub_bits))
             f.seek(q_off + (start * ng * gs * spec.bits) // 8)
             f.write(pack_bits(nt.q, spec.bits))
             del chunk, nt, importance
+        for scale_writer, min_writer in packed_writers.values():
+            scale_writer.finish()
+            min_writer.finish()
     return blob_path.stat().st_size
 
 
@@ -4038,6 +4221,7 @@ def _write_nint_moe_axis0_blob(
     quant_backend: str,
     device: str,
     importance: np.ndarray | torch.Tensor | None = None,
+    neuron_importance: np.ndarray | torch.Tensor | None = None,
     synthetic: bool = False,
 ) -> int:
     """Stream a mixed-profile expert tensor into the ``NINTM`` container."""
@@ -4048,6 +4232,16 @@ def _write_nint_moe_axis0_blob(
     cohorts: dict[NintSpec, list[int]] = {}
     for expert, profile in enumerate(expert_specs):
         cohorts.setdefault(profile, []).append(expert)
+    all_neuron_importance = None
+    if neuron_importance is not None:
+        all_neuron_importance = (
+            neuron_importance.detach().cpu().numpy()
+            if isinstance(neuron_importance, torch.Tensor)
+            else np.asarray(neuron_importance)
+        )
+        all_neuron_importance = np.asarray(
+            all_neuron_importance, dtype=np.float32
+        ).reshape(n_experts, rows_per_expert)
 
     pool_paths: list[Path] = []
     try:
@@ -4089,6 +4283,26 @@ def _write_nint_moe_axis0_blob(
                     expert_rows = np.arange(start, end, dtype=np.int64) // rows_per_expert
                     return np.ascontiguousarray(_importance[expert_rows])
 
+                pool_neuron_importance = (
+                    None
+                    if all_neuron_importance is None
+                    else np.ascontiguousarray(
+                        all_neuron_importance[
+                            np.asarray(expert_ids, dtype=np.int64)
+                        ].reshape(-1)
+                    )
+                )
+
+                def neuron_importance_rows(
+                    start: int,
+                    end: int,
+                    *,
+                    _importance=pool_neuron_importance,
+                ) -> np.ndarray | None:
+                    if _importance is None:
+                        return None
+                    return np.ascontiguousarray(_importance[start:end])
+
                 pool_source = _ExpertPoolRowSource(source, source_shape, expert_shape, expert_ids)
                 pool_path = blob_path.with_name(f"{blob_path.name}.pool{pool_index}.tmp")
                 pool_paths.append(pool_path)
@@ -4102,9 +4316,10 @@ def _write_nint_moe_axis0_blob(
                     quant_backend,
                     device,
                     importance_rows=(importance_rows if profile.bits in {2, 3, 4, 5, 6} else None),
+                    neuron_importance_rows=neuron_importance_rows,
                     synthetic=synthetic,
                 )
-                dtype = f"NINT{profile.bits}".encode("ascii")
+                dtype = _nint_blob_public_dtype(pool_path).encode("ascii")
                 output.write(
                     _NINT_MOE_POOL_V2_HDR.pack(
                         len(expert_ids),
@@ -4734,6 +4949,7 @@ def _write_mixed_moe_axis0_blob(
     device: str,
     artifact_root: str | Path | None,
     importance: np.ndarray | torch.Tensor | None = None,
+    neuron_importance: np.ndarray | torch.Tensor | None = None,
     synthetic: bool = False,
 ) -> int:
     """Stream all supported precision families into one NIM2 container."""
@@ -4755,6 +4971,22 @@ def _write_mixed_moe_axis0_blob(
             "mixed MoE importance must have shape "
             f"[{columns}] or [{n_experts},{columns}], got {importance_shape}"
         )
+    neuron_importance_array = None
+    if neuron_importance is not None:
+        neuron_importance_array = (
+            neuron_importance.detach().cpu().numpy()
+            if isinstance(neuron_importance, torch.Tensor)
+            else np.asarray(neuron_importance)
+        )
+        if neuron_importance_array.size != n_experts * rows_per_expert:
+            raise ValueError(
+                "mixed MoE NAQ neuron importance must contain "
+                f"{n_experts * rows_per_expert} values, got "
+                f"{neuron_importance_array.size}"
+            )
+        neuron_importance_array = np.asarray(
+            neuron_importance_array, dtype=np.float32
+        ).reshape(n_experts, rows_per_expert)
     if all(value.nint_spec is not None for value in expert_precisions):
         specs = tuple(value.nint_spec for value in expert_precisions if value.nint_spec is not None)
         return _write_nint_moe_axis0_blob(
@@ -4767,6 +4999,7 @@ def _write_mixed_moe_axis0_blob(
             quant_backend,
             device,
             importance=importance,
+            neuron_importance=neuron_importance_array,
             synthetic=synthetic,
         )
 
@@ -4806,6 +5039,15 @@ def _write_mixed_moe_axis0_blob(
                 pool_path = blob_path.with_name(f"{blob_path.name}.pool{pool_index}.tmp")
                 pool_paths.append(pool_path)
                 if precision.nint_spec is not None:
+                    pool_neuron_importance = (
+                        None
+                        if neuron_importance_array is None
+                        else np.ascontiguousarray(
+                            neuron_importance_array[
+                                np.asarray(expert_ids, dtype=np.int64)
+                            ].reshape(-1)
+                        )
+                    )
 
                     def importance_rows(
                         start: int,
@@ -4828,6 +5070,16 @@ def _write_mixed_moe_axis0_blob(
                             )
                         return np.ascontiguousarray(_importance[expert_rows])
 
+                    def neuron_importance_rows(
+                        start: int,
+                        end: int,
+                        *,
+                        _importance=pool_neuron_importance,
+                    ) -> np.ndarray | None:
+                        if _importance is None:
+                            return None
+                        return np.ascontiguousarray(_importance[start:end])
+
                     pool_nbytes = _write_nint_axis0_blob(
                         pool_source,
                         (len(expert_ids) * rows_per_expert, columns),
@@ -4839,6 +5091,7 @@ def _write_mixed_moe_axis0_blob(
                         importance_rows=(
                             importance_rows if precision.nint_spec.bits in {2, 3, 4, 5, 6} else None
                         ),
+                        neuron_importance_rows=neuron_importance_rows,
                         synthetic=synthetic,
                     )
                     runtime_payload = b""
@@ -4882,7 +5135,11 @@ def _write_mixed_moe_axis0_blob(
                         synthetic=synthetic,
                     )
                     runtime_payload = b""
-                dtype = precision.family.encode("ascii")
+                dtype = (
+                    _nint_blob_public_dtype(pool_path)
+                    if precision.nint_spec is not None
+                    else precision.family
+                ).encode("ascii")
                 output.write(
                     _NINT_MOE_POOL_V2_HDR.pack(
                         len(expert_ids),
@@ -5709,6 +5966,14 @@ def convert(args: argparse.Namespace) -> None:
                     "NVQ2",
                     "NVQ3",
                 }
+                imatrix_binding = imatrix_bindings.get(item.name)
+                if (
+                    imatrix_binding is not None
+                    and imatrix_binding.neuron_rows is not None
+                    and item.target_dtype.startswith("NINT")
+                    and item.target_dtype != "NINT8-0"
+                ):
+                    variable_codebook_size = True
                 if (
                     resume_temp
                     and blob_path.is_file()
@@ -5716,8 +5981,14 @@ def convert(args: argparse.Namespace) -> None:
                     and (variable_codebook_size or blob_path.stat().st_size == expected_nbytes)
                 ):
                     reused_nbytes = blob_path.stat().st_size
+                    reused_dtype = (
+                        _nint_blob_public_dtype(blob_path)
+                        if item.target_dtype.startswith("NINT")
+                        and item.target_dtype not in {"NINT8-0", "NINTM"}
+                        else item.target_dtype
+                    )
                     records.append(
-                        BlobRecord(item.name, item.target_dtype, reused_nbytes, blob_path)
+                        BlobRecord(item.name, reused_dtype, reused_nbytes, blob_path)
                     )
                     print(
                         json.dumps(
@@ -5725,7 +5996,7 @@ def convert(args: argparse.Namespace) -> None:
                                 "done": done,
                                 "total": len(plan),
                                 "name": item.name,
-                                "dtype": item.target_dtype,
+                                "dtype": reused_dtype,
                                 "blob_mb": round(reused_nbytes / 1e6, 2),
                                 "status": "reused",
                             },
@@ -5773,6 +6044,9 @@ def convert(args: argparse.Namespace) -> None:
                             expert_importance = _hf_expert_importance(
                                 item, imatrix_bindings.get(item.name)
                             )
+                            neuron_importance = _hf_neuron_importance(
+                                item, imatrix_bindings.get(item.name)
+                            )
                             flattened_shape = (
                                 item.expert_shape[0] * item.expert_shape[1],
                                 item.expert_shape[2],
@@ -5788,6 +6062,7 @@ def convert(args: argparse.Namespace) -> None:
                                 quant_device,
                                 artifact_root,
                                 importance=expert_importance,
+                                neuron_importance=neuron_importance,
                                 synthetic=synthetic_expert_weights,
                             )
                         elif item.target_dtype in {"BF16", "F16", "F32"}:
@@ -5852,6 +6127,9 @@ def convert(args: argparse.Namespace) -> None:
                         expert_importance = _hf_expert_importance(
                             item, imatrix_bindings.get(item.name)
                         )
+                        neuron_importance = _hf_neuron_importance(
+                            item, imatrix_bindings.get(item.name)
+                        )
                         nbytes = _write_mixed_moe_axis0_blob(
                             source,
                             item.shape,
@@ -5863,6 +6141,7 @@ def convert(args: argparse.Namespace) -> None:
                             quant_device,
                             artifact_root,
                             importance=expert_importance,
+                            neuron_importance=neuron_importance,
                             synthetic=synthetic_expert_weights,
                         )
                     elif preserve_raw_e4m3:
@@ -5919,6 +6198,11 @@ def convert(args: argparse.Namespace) -> None:
                                 None
                                 if item.name not in imatrix_bindings
                                 else imatrix_bindings[item.name].rows
+                            ),
+                            neuron_importance_rows=(
+                                None
+                                if item.name not in imatrix_bindings
+                                else imatrix_bindings[item.name].neuron_rows
                             ),
                         )
                     elif item.target_dtype.startswith("NVQ") or item.target_dtype == "NPQ0-L":
@@ -6063,7 +6347,13 @@ def convert(args: argparse.Namespace) -> None:
                     raise RuntimeError(
                         f"blob size mismatch for {item.name}: {nbytes} != {expected_nbytes}"
                     )
-                record = BlobRecord(item.name, item.target_dtype, nbytes, blob_path)
+                record_dtype = (
+                    _nint_blob_public_dtype(blob_path)
+                    if item.target_dtype.startswith("NINT")
+                    and item.target_dtype not in {"NINT8-0", "NINTM"}
+                    else item.target_dtype
+                )
+                record = BlobRecord(item.name, record_dtype, nbytes, blob_path)
                 records.append(record)
                 if stream_writer is not None:
                     stream_writer.append(record, consume=True)

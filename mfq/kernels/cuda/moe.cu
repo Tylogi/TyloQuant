@@ -1358,6 +1358,183 @@ __global__ void nint_moe_mmvq_kernel(
     }
 }
 
+__device__ __forceinline__ uint8_t unpack_mixed_q_one_moe(
+        const uint8_t * stream,
+        uint64_t row_bit_offset,
+        int element,
+        int bits) {
+    const uint64_t bit_offset =
+        row_bit_offset + static_cast<uint64_t>(element) * bits;
+    const uint64_t byte = bit_offset >> 3;
+    const int shift = static_cast<int>(bit_offset & 7u);
+    const uint32_t pair = static_cast<uint32_t>(stream[byte]) |
+        (static_cast<uint32_t>(stream[byte + 1]) << 8);
+    return static_cast<uint8_t>(
+        (pair >> shift) & ((1u << bits) - 1u));
+}
+
+__device__ __forceinline__ int unpack_mixed_q_four_moe(
+        const uint8_t * stream,
+        uint64_t bit_offset,
+        int bits) {
+    const uint64_t byte = bit_offset >> 3;
+    const int shift = static_cast<int>(bit_offset & 7u);
+    uint64_t packed = static_cast<uint64_t>(stream[byte]) |
+        (static_cast<uint64_t>(stream[byte + 1]) << 8) |
+        (static_cast<uint64_t>(stream[byte + 2]) << 16) |
+        (static_cast<uint64_t>(stream[byte + 3]) << 24) |
+        (static_cast<uint64_t>(stream[byte + 4]) << 32);
+    packed >>= shift;
+    const uint32_t mask = (1u << bits) - 1u;
+    return static_cast<int>(packed & mask) |
+        (static_cast<int>((packed >> bits) & mask) << 8) |
+        (static_cast<int>((packed >> (2 * bits)) & mask) << 16) |
+        (static_cast<int>((packed >> (3 * bits)) & mask) << 24);
+}
+
+template <int GS, int ITEMS_PER_BLOCK, bool ROUTE_PACKED = false>
+__global__ void nint_moe_mmvq_mixed_q_kernel(
+        const uint8_t * __restrict__ q_packed,
+        const uint8_t * __restrict__ row_q_bits,
+        const int64_t * __restrict__ row_q_bit_offsets,
+        const uint8_t * __restrict__ sub_scale,
+        const uint8_t * __restrict__ sub_min,
+        const float * __restrict__ neuron_scale,
+        const float * __restrict__ neuron_min,
+        const int8_t * __restrict__ qx,
+        const float * __restrict__ xscale,
+        const int32_t * __restrict__ ids,
+        const int32_t * __restrict__ expert_local,
+        __half * __restrict__ out,
+        int tokens,
+        int routes,
+        int experts,
+        int out_per_expert,
+        int groups,
+        int k_pad,
+        bool routed_input) {
+    constexpr int rows_per_warp = 2;
+    constexpr int chunks = (GS + 3) / 4;
+    constexpr int groups_per_warp = kWarpSize / chunks;
+    const int token = ROUTE_PACKED
+        ? static_cast<int>(blockIdx.z)
+        : static_cast<int>(blockIdx.z) * ITEMS_PER_BLOCK +
+            static_cast<int>(threadIdx.y);
+    const int route = ROUTE_PACKED
+        ? static_cast<int>(threadIdx.y)
+        : static_cast<int>(blockIdx.y);
+    const int lane = static_cast<int>(threadIdx.x);
+    const int row0 = static_cast<int>(blockIdx.x) * rows_per_warp;
+    if (token >= tokens || route >= routes) return;
+    const int pair = token * routes + route;
+    const int expert = ids[pair];
+    if (static_cast<unsigned int>(expert) >=
+            static_cast<unsigned int>(experts)) return;
+    const int local_expert = expert_local[expert];
+    if (local_expert < 0) return;
+    const int source_row = routed_input ? pair : token;
+
+    float acc[rows_per_warp] = {0.0f, 0.0f};
+    const int relative_group = lane / chunks;
+    const int chunk = lane - relative_group * chunks;
+    const int group_offset = chunk * 4;
+    const bool active_lane = relative_group < groups_per_warp;
+    float neuron_d[rows_per_warp] = {};
+    float neuron_m[rows_per_warp] = {};
+    int neuron_bits[rows_per_warp] = {};
+    uint64_t neuron_bit_offsets[rows_per_warp] = {};
+#pragma unroll
+    for (int r = 0; r < rows_per_warp; ++r) {
+        const int local_row = row0 + r;
+        if (local_row < out_per_expert) {
+            const int weight_row =
+                local_expert * out_per_expert + local_row;
+            neuron_d[r] = neuron_scale[weight_row];
+            neuron_m[r] = neuron_min[weight_row];
+            neuron_bits[r] = static_cast<int>(row_q_bits[weight_row]);
+            neuron_bit_offsets[r] = static_cast<uint64_t>(
+                row_q_bit_offsets[weight_row]);
+        }
+    }
+
+    for (int group_base = 0; group_base < groups;
+         group_base += groups_per_warp) {
+        const int group = group_base + relative_group;
+        if (!active_lane || group >= groups || group_offset >= GS) continue;
+        const int width = min(4, GS - group_offset);
+        const int column = group * GS + group_offset;
+        const int8_t * x_ptr = qx +
+            static_cast<size_t>(source_row) * k_pad + column;
+        int packed_x = 0;
+        int x_sum = 0;
+        if (width == 4) {
+            packed_x = load_i8x4(x_ptr);
+            x_sum = __dp4a(0x01010101, packed_x, 0);
+        } else {
+            for (int component = 0; component < width; ++component) {
+                const int value = static_cast<int>(x_ptr[component]);
+                packed_x |= (value & 255) << (8 * component);
+                x_sum += value;
+            }
+        }
+        const float activation_scale =
+            xscale[static_cast<size_t>(source_row) * groups + group];
+#pragma unroll
+        for (int r = 0; r < rows_per_warp; ++r) {
+            const int local_row = row0 + r;
+            if (local_row >= out_per_expert) continue;
+            const int weight_row =
+                local_expert * out_per_expert + local_row;
+            const size_t meta =
+                static_cast<size_t>(weight_row) * groups + group;
+            const int bits = neuron_bits[r];
+            int packed_weight = 0;
+            if (width == 4) {
+                const uint64_t bit_offset = neuron_bit_offsets[r] +
+                    static_cast<uint64_t>(column) * bits;
+                packed_weight = unpack_mixed_q_four_moe(
+                    q_packed, bit_offset, bits);
+            } else {
+                for (int component = 0; component < width; ++component) {
+                    packed_weight |= static_cast<int>(unpack_mixed_q_one_moe(
+                        q_packed, neuron_bit_offsets[r],
+                        column + component, bits)) << (8 * component);
+                }
+            }
+            const int dot = bits == 8
+                ? __dp4a(
+                    packed_weight ^ static_cast<int>(0x80808080u),
+                    packed_x, 0) + 128 * x_sum
+                : __dp4a(packed_weight, packed_x, 0);
+            const float weight_scale = neuron_d[r] *
+                static_cast<float>(sub_scale[meta]);
+            const float weight_min = neuron_m[r] *
+                static_cast<float>(sub_min[meta]);
+            acc[r] += activation_scale *
+                (weight_scale * static_cast<float>(dot) -
+                 weight_min * static_cast<float>(x_sum));
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < rows_per_warp; ++r) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], offset);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < rows_per_warp; ++r) {
+            const int local_row = row0 + r;
+            if (local_row < out_per_expert) {
+                out[static_cast<size_t>(pair) * out_per_expert + local_row] =
+                    __float2half(acc[r]);
+            }
+        }
+    }
+}
+
 template <int ITEMS_PER_BLOCK>
 __global__ void nint8_zero_moe_mmvq_kernel(
         const uint8_t * __restrict__ q,
@@ -5183,6 +5360,193 @@ mfq_tensor_backend::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
     }
 #undef MFQ_MOE_SWITCH_GS
 #undef MFQ_MOE_LAUNCH
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_pool_mixed_q_ws_cuda(
+        mfq_tensor_backend::Tensor q_packed,
+        mfq_tensor_backend::Tensor row_q_bits,
+        mfq_tensor_backend::Tensor row_q_bit_offsets,
+        mfq_tensor_backend::Tensor sub_scale,
+        mfq_tensor_backend::Tensor sub_min,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_min,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor ids,
+        mfq_tensor_backend::Tensor expert_local,
+        int64_t n_experts,
+        int64_t n_local_experts,
+        int64_t out_per_expert,
+        int64_t gs,
+        bool input_quantized,
+        mfq_tensor_backend::Tensor out,
+        mfq_tensor_backend::Tensor qx,
+        mfq_tensor_backend::Tensor xscale) {
+    MFQ_RUNTIME_CHECK(
+        n_experts > 0 && n_experts <= 4096,
+        "n_experts must be in [1, 4096]");
+    MFQ_RUNTIME_CHECK(
+        n_local_experts > 0 && n_local_experts <= n_experts,
+        "n_local_experts must be in [1, n_experts]");
+    MFQ_RUNTIME_CHECK(
+        out_per_expert > 0 && out_per_expert <= INT_MAX,
+        "out_per_expert must be positive");
+    MFQ_RUNTIME_CHECK(
+        gs == 16 || gs == 20 || gs == 22 || gs == 24 || gs == 26 ||
+        gs == 28 || gs == 30 || gs == 32 || gs == 34 || gs == 36 ||
+        gs == 40 || gs == 48 || gs == 64,
+        "mixed-q NINT MoE group size is unsupported");
+    const int experts = static_cast<int>(n_experts);
+    const int local_experts = static_cast<int>(n_local_experts);
+    const int output_width = static_cast<int>(out_per_expert);
+    const int weight_rows = local_experts * output_width;
+    MFQ_RUNTIME_CHECK(
+        q_packed.is_cuda() && q_packed.is_contiguous() &&
+        q_packed.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        q_packed.dim() == 1,
+        "mixed-q MoE values must be contiguous CUDA uint8 rank-1");
+    MFQ_RUNTIME_CHECK(
+        row_q_bits.is_cuda() && row_q_bits.is_contiguous() &&
+        row_q_bits.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        row_q_bits.numel() == weight_rows,
+        "mixed-q MoE row widths must be contiguous CUDA uint8");
+    MFQ_RUNTIME_CHECK(
+        row_q_bit_offsets.is_cuda() && row_q_bit_offsets.is_contiguous() &&
+        row_q_bit_offsets.scalar_type() == mfq_tensor_backend::kInt64 &&
+        row_q_bit_offsets.numel() == weight_rows,
+        "mixed-q MoE row offsets must be contiguous CUDA int64");
+    MFQ_RUNTIME_CHECK(
+        sub_scale.is_cuda() && sub_scale.is_contiguous() &&
+        sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        sub_scale.dim() == 2 && sub_scale.size(0) == weight_rows,
+        "mixed-q MoE subgroup scales must be CUDA uint8 [rows,groups]");
+    MFQ_RUNTIME_CHECK(
+        sub_min.is_cuda() && sub_min.is_contiguous() &&
+        sub_min.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        sub_min.sizes() == sub_scale.sizes(),
+        "mixed-q MoE subgroup minima shape mismatch");
+    const int groups = static_cast<int>(sub_scale.size(1));
+    MFQ_RUNTIME_CHECK(
+        neuron_scale.is_cuda() && neuron_scale.is_contiguous() &&
+        neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
+        neuron_scale.numel() == weight_rows &&
+        neuron_min.is_cuda() && neuron_min.is_contiguous() &&
+        neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 &&
+        neuron_min.numel() == weight_rows,
+        "mixed-q MoE neuron metadata is invalid");
+    MFQ_RUNTIME_CHECK(
+        ids.is_cuda() && ids.is_contiguous() &&
+        ids.scalar_type() == mfq_tensor_backend::kInt32 && ids.dim() == 2,
+        "ids must be contiguous CUDA int32 [tokens,routes]");
+    MFQ_RUNTIME_CHECK(
+        expert_local.is_cuda() && expert_local.is_contiguous() &&
+        expert_local.scalar_type() == mfq_tensor_backend::kInt32 &&
+        expert_local.numel() == experts,
+        "expert_local must be contiguous CUDA int32 [experts]");
+    MFQ_RUNTIME_CHECK(
+        x.is_cuda() && x.is_contiguous() &&
+        x.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        (x.dim() == 2 || x.dim() == 3),
+        "mixed-q MoE input must be contiguous CUDA float16");
+    const int tokens = static_cast<int>(ids.size(0));
+    const int routes = static_cast<int>(ids.size(1));
+    MFQ_RUNTIME_CHECK(tokens > 0 && routes > 0, "ids dimensions must be nonzero");
+    const bool routed_input = x.dim() == 3;
+    if (routed_input) {
+        MFQ_RUNTIME_CHECK(
+            x.size(0) == tokens && x.size(1) == routes,
+            "routed input must have [tokens,routes,K] leading dimensions");
+    } else {
+        MFQ_RUNTIME_CHECK(
+            x.size(0) == tokens,
+            "shared input must have one row per token");
+    }
+    const int input_rows = routed_input ? tokens * routes : tokens;
+    const int k_pad = groups * static_cast<int>(gs);
+    const int k_real = input_quantized
+        ? k_pad : static_cast<int>(x.size(-1));
+    MFQ_RUNTIME_CHECK(k_real <= k_pad, "input width exceeds mixed-q NINT width");
+    MFQ_RUNTIME_CHECK(
+        qx.is_cuda() && qx.is_contiguous() &&
+        qx.scalar_type() == mfq_tensor_backend::kInt8 &&
+        qx.dim() == 2 && qx.size(0) >= input_rows && qx.size(1) >= k_pad,
+        "mixed-q MoE qx workspace is too small");
+    MFQ_RUNTIME_CHECK(
+        xscale.is_cuda() && xscale.is_contiguous() &&
+        xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
+        xscale.dim() == 2 && xscale.size(0) >= input_rows &&
+        xscale.size(1) >= groups,
+        "mixed-q MoE xscale workspace is too small");
+    MFQ_RUNTIME_CHECK(
+        out.is_cuda() && out.is_contiguous() &&
+        out.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        out.sizes() == mfq_tensor_backend::IntArrayRef(
+            {tokens, routes, output_width}),
+        "mixed-q MoE output shape mismatch");
+    check_same_device(q_packed, row_q_bits, "row_q_bits");
+    check_same_device(q_packed, row_q_bit_offsets, "row_q_bit_offsets");
+    check_same_device(q_packed, sub_scale, "sub_scale");
+    check_same_device(q_packed, sub_min, "sub_min");
+    check_same_device(q_packed, neuron_scale, "neuron_scale");
+    check_same_device(q_packed, neuron_min, "neuron_min");
+    check_same_device(q_packed, x, "x");
+    check_same_device(q_packed, ids, "ids");
+    check_same_device(q_packed, expert_local, "expert_local");
+    check_same_device(q_packed, qx, "qx");
+    check_same_device(q_packed, xscale, "xscale");
+    check_same_device(q_packed, out, "out");
+    const cudaStream_t stream = mfq_current_cuda_stream();
+
+#define MFQ_MIXED_Q_MOE_LAUNCH(GS_VALUE, ITEMS_VALUE) \
+    do { \
+        if (!input_quantized) { \
+            launch_quantize<GS_VALUE>( \
+                x.reshape({input_rows, k_real}), qx, xscale, \
+                input_rows, k_real, k_pad, groups, stream); \
+        } \
+        nint_moe_mmvq_mixed_q_kernel<GS_VALUE, ITEMS_VALUE><<< \
+            dim3((output_width + 1) / 2, routes, \
+                (tokens + ITEMS_VALUE - 1) / ITEMS_VALUE), \
+            dim3(32, ITEMS_VALUE), 0, stream>>>( \
+                q_packed.data_ptr<uint8_t>(), \
+                row_q_bits.data_ptr<uint8_t>(), \
+                row_q_bit_offsets.data_ptr<int64_t>(), \
+                sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
+                neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), \
+                ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(), \
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), \
+                tokens, routes, experts, output_width, groups, k_pad, \
+                routed_input); \
+    } while (0)
+
+#define MFQ_MIXED_Q_MOE_TOKEN_SWITCH(GS_VALUE) \
+    do { \
+        if (tokens <= 2) MFQ_MIXED_Q_MOE_LAUNCH(GS_VALUE, 2); \
+        else if (tokens <= 4) MFQ_MIXED_Q_MOE_LAUNCH(GS_VALUE, 4); \
+        else if (tokens <= 8) MFQ_MIXED_Q_MOE_LAUNCH(GS_VALUE, 8); \
+        else if (tokens <= 16) MFQ_MIXED_Q_MOE_LAUNCH(GS_VALUE, 16); \
+        else MFQ_MIXED_Q_MOE_LAUNCH(GS_VALUE, 32); \
+    } while (0)
+
+    switch (static_cast<int>(gs)) {
+        case 16: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(16); break;
+        case 20: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(20); break;
+        case 22: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(22); break;
+        case 24: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(24); break;
+        case 26: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(26); break;
+        case 28: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(28); break;
+        case 30: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(30); break;
+        case 32: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(32); break;
+        case 34: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(34); break;
+        case 36: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(36); break;
+        case 40: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(40); break;
+        case 48: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(48); break;
+        case 64: MFQ_MIXED_Q_MOE_TOKEN_SWITCH(64); break;
+    }
+#undef MFQ_MIXED_Q_MOE_TOKEN_SWITCH
+#undef MFQ_MIXED_Q_MOE_LAUNCH
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }

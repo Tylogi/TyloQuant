@@ -12,13 +12,65 @@ from __future__ import annotations
 
 import numpy as np
 
-from mfq.formats.nint import NintSpec, NintTensor, _uint_dtype, make_qkx2
+from mfq.formats.nint import (
+    NintSpec,
+    NintTensor,
+    _uint_dtype,
+    make_qkx2,
+    normalize_row_q_bits,
+    normalize_row_sub_bits,
+)
 
 _IMATRIX_SUPERBLOCK = 256
 _IMATRIX_PRIORITY_GROUPS = 64
 _IMATRIX_PRIORITY_RADIUS = 8
 _IMATRIX_PRIORITY_ROW_CHUNK = 64
 _IMATRIX_PRIORITY_PAIR_CHUNK = 64
+
+
+def allocate_row_sub_bits(
+    neuron_importance: np.ndarray,
+    nominal_sub_bits: int,
+    *,
+    min_gain_ratio: float = 4.0,
+) -> np.ndarray:
+    """Redistribute subgroup bits between neurons without changing their mean.
+
+    Under the usual high-resolution error model, each additional bit divides
+    metadata error by roughly ``min_gain_ratio``. Selecting the globally best
+    fixed number of marginal bit gains permits very important neurons to use
+    two extra bits while preserving the exact tensor-wide average.
+    """
+
+    values = np.asarray(neuron_importance, dtype=np.float64).reshape(-1)
+    if not values.size or not np.isfinite(values).all() or np.any(values < 0):
+        raise ValueError("NAQ neuron importance must be finite and non-negative")
+    if not 2 <= int(nominal_sub_bits) <= 7:
+        return np.full(values.size, int(nominal_sub_bits), dtype=np.uint8)
+    if not np.isfinite(min_gain_ratio) or min_gain_ratio <= 1:
+        raise ValueError("NINT v2 minimum gain ratio must be greater than one")
+    nominal = int(nominal_sub_bits)
+    minimum = nominal - 1
+    maximum = min(nominal + 2, 8)
+    increments = maximum - minimum
+    gains = np.stack(
+        [values / float(min_gain_ratio) ** level for level in range(increments)],
+        axis=1,
+    )
+    flat = gains.reshape(-1)
+    boundary = int(flat.size - values.size)
+    threshold = np.partition(flat, boundary)[boundary]
+    selected = gains > threshold
+    remaining = int(values.size - selected.sum())
+    if remaining:
+        ties = np.argwhere(gains == threshold)
+        order = np.lexsort((ties[:, 0], ties[:, 1]))
+        chosen = ties[order[:remaining]]
+        selected[chosen[:, 0], chosen[:, 1]] = True
+    result = minimum + selected.sum(axis=1, dtype=np.uint8)
+    if int(result.sum()) != nominal * values.size:
+        raise RuntimeError("NINT v2 allocator failed to preserve the subgroup-bit budget")
+    return np.ascontiguousarray(result, dtype=np.uint8)
 
 
 def _importance_as_rows(
@@ -730,6 +782,8 @@ def quantize(
     axis: int = 0,
     importance: np.ndarray | None = None,
     use_priority_group_refinement: bool = True,
+    row_sub_bits: np.ndarray | None = None,
+    row_q_bits: np.ndarray | None = None,
 ) -> NintTensor:
     """Slice ``weight`` into neuron rows along ``axis`` and apply neuron-anchored quantization in batches.
 
@@ -748,6 +802,60 @@ def quantize(
     out = Wt.shape[0]
     neuron_len = Wt.size // out
     W2 = Wt.reshape(out, neuron_len).copy()
+
+    selected_q_bits = normalize_row_q_bits(spec, row_q_bits, out)
+    selected_sub_bits = normalize_row_sub_bits(spec, row_sub_bits, out)
+    if (
+        np.any(selected_q_bits != int(spec.bits))
+        or np.any(selected_sub_bits != int(spec.sub_bits))
+    ):
+        importance_rows = (
+            None
+            if importance is None
+            else _importance_as_rows(importance, shape, axis, out, neuron_len)
+        )
+        ng = (neuron_len + int(spec.groupsize) - 1) // int(spec.groupsize)
+        q = np.empty(
+            (out, ng, int(spec.groupsize)),
+            dtype=_uint_dtype((1 << int(selected_q_bits.max())) - 1),
+        )
+        neuron_scale = np.empty(out, dtype=np.float32)
+        neuron_min = np.empty(out, dtype=np.float32)
+        sub_scale = np.empty((out, ng), dtype=np.uint8)
+        sub_min = np.empty((out, ng), dtype=np.uint8)
+        row_profiles = np.stack((selected_q_bits, selected_sub_bits), axis=1)
+        for q_bits, sub_width in np.unique(row_profiles, axis=0):
+            row_ids = np.flatnonzero(
+                (selected_q_bits == q_bits)
+                & (selected_sub_bits == sub_width)
+            )
+            cohort = quantize(
+                np.take(W, row_ids, axis=axis),
+                NintSpec(int(q_bits), spec.groupsize, int(sub_width)),
+                axis=axis,
+                importance=(
+                    None if importance_rows is None else importance_rows[row_ids]
+                ),
+                use_priority_group_refinement=use_priority_group_refinement,
+            )
+            q[row_ids] = cohort.q
+            neuron_scale[row_ids] = cohort.neuron_scale
+            neuron_min[row_ids] = cohort.neuron_min
+            sub_scale[row_ids] = cohort.sub_scale
+            sub_min[row_ids] = cohort.sub_min
+        return NintTensor(
+            spec=spec,
+            shape=shape,
+            axis=axis,
+            q=q,
+            neuron_scale=neuron_scale,
+            neuron_min=neuron_min,
+            sub_scale=sub_scale,
+            sub_min=sub_min,
+            neuron_len=neuron_len,
+            row_sub_bits=selected_sub_bits,
+            row_q_bits=selected_q_bits,
+        )
 
     gs = spec.groupsize
     nmax = spec.nmax

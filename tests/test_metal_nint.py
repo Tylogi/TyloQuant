@@ -589,6 +589,27 @@ def test_packed_nint_blob_upload_matches_tensor_upload(spec: NintSpec):
     np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
 
 
+def test_mixed_sub_bits_blob_expands_metadata_into_the_existing_metal_kernel():
+    row_sub_bits = np.resize(
+        np.asarray([5, 6, 7, 8], dtype=np.uint8), 21
+    )
+    tensor = nint_quant.quantize(
+        _random(60911, (21, 89)),
+        NintSpec(4, 24, 6),
+        row_sub_bits=row_sub_bits,
+    )
+    from_tensor = MetalNintWeight.from_tensor(tensor)
+    from_blob = MetalNintWeight.from_blob(io.pack_nint(tensor))
+    source = _random(60912, (5, 89))
+
+    np.testing.assert_allclose(
+        _array(nint_matmul(from_blob, source)),
+        _array(nint_matmul(from_tensor, source)),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_packed_nint_embedding_decodes_selected_rows():
     tensor = nint_quant.quantize(_random(21, (31, 73)), NintSpec(5, 28, 7))
     ids = np.asarray([[0, 7, 30], [3, 9, 4]], dtype=np.int32)

@@ -200,7 +200,7 @@ def _calibrate_imatrix(args: argparse.Namespace) -> int:
             work_dir=args.work_dir or None,
             keep_hidden=args.keep_hidden,
             accumulation_dtype=accumulation_dtype,
-            objective=getattr(args, "objective", "aaq"),
+            objective=getattr(args, "objective", "naq"),
         )
     return 0
 
@@ -806,9 +806,9 @@ def _add_calibration_parsers(sub: argparse._SubParsersAction) -> None:
     imatrix.add_argument("--attention", choices=("sdpa", "eager"), default="sdpa")
     imatrix.add_argument(
         "--objective",
-        choices=("aaq", "linear"),
-        default="aaq",
-        help="AAQ uses nonlinear activation energy for gate projections",
+        choices=("naq", "linear"),
+        default="naq",
+        help="NAQ-imatrix records input-channel and output-neuron importance; linear records only input second moments",
     )
     imatrix.add_argument("--window-length", type=int, default=16_384)
     imatrix.add_argument("--batch-size", type=int, default=1)

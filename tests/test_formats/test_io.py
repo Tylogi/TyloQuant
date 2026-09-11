@@ -63,6 +63,31 @@ def _mk(seed: int = 0, shape: tuple[int, ...] = (8, 96)) -> nint_quant.NintTenso
     return nint_quant.quantize(W, NintSpec(4, 24, 6), axis=0)
 
 
+def _mixed_sub_bits_tensor(
+    seed: int = 91,
+    shape: tuple[int, int] = (12, 53),
+) -> nint_quant.NintTensor:
+    rng = np.random.default_rng(seed)
+    weight = rng.normal(0, 0.05, size=shape).astype(np.float32)
+    candidates = {
+        bits: nint_quant.quantize(weight, NintSpec(4, 24, bits), axis=0)
+        for bits in (5, 6, 7, 8)
+    }
+    row_sub_bits = np.resize(
+        np.asarray([5, 5, 5, 6, 7, 8], dtype=np.uint8), shape[0]
+    )
+    result = candidates[6]
+    for row, bits in enumerate(row_sub_bits):
+        candidate = candidates[int(bits)]
+        result.q[row] = candidate.q[row]
+        result.neuron_scale[row] = candidate.neuron_scale[row]
+        result.neuron_min[row] = candidate.neuron_min[row]
+        result.sub_scale[row] = candidate.sub_scale[row]
+        result.sub_min[row] = candidate.sub_min[row]
+    result.row_sub_bits = row_sub_bits
+    return result
+
+
 def test_pack_roundtrip_fields():
     t = _mk()
     t2 = io.unpack_nint(io.pack_nint(t))
@@ -92,6 +117,97 @@ def test_pack_roundtrip_dequant():
     t = _mk(5)
     t2 = io.unpack_nint(io.pack_nint(t))
     np.testing.assert_allclose(nint_quant.dequantize(t2), nint_quant.dequantize(t))
+
+
+def test_pack_roundtrip_mixed_sub_bits_keeps_one_logical_nint_tensor():
+    tensor = _mixed_sub_bits_tensor()
+
+    dtype, payload = io.pack_tensor_payload(tensor)
+    blob = io.pack_nint(tensor)
+    restored = io.unpack_nint(blob)
+
+    assert dtype == "NINTv2"
+    assert payload == blob
+    assert blob[0] & 0x80
+    assert not blob[1] & 0x80
+    assert restored.spec == NintSpec(4, 24, 6)
+    assert restored.has_mixed_sub_bits
+    assert not restored.has_mixed_q_bits
+    assert restored.mean_sub_bits == pytest.approx(6.0)
+    np.testing.assert_array_equal(restored.row_sub_bits, tensor.row_sub_bits)
+    np.testing.assert_array_equal(restored.q, tensor.q)
+    np.testing.assert_array_equal(restored.sub_scale, tensor.sub_scale)
+    np.testing.assert_array_equal(restored.sub_min, tensor.sub_min)
+    np.testing.assert_allclose(
+        nint_quant.dequantize(restored),
+        nint_quant.dequantize(tensor),
+    )
+
+
+def test_legacy_k_only_nint_v2_header_is_rejected():
+    blob = bytearray(io.pack_nint(_mixed_sub_bits_tensor()))
+    blob[0] &= 0x7F
+    blob[1] |= 0x80
+
+    with pytest.raises(ValueError, match="invalid NINT bit widths"):
+        io.unpack_nint(blob)
+
+
+def test_pack_roundtrip_mixed_q_and_sub_bits_keeps_one_logical_nint_tensor():
+    rng = np.random.default_rng(92)
+    weight = rng.normal(0, 0.05, size=(10, 77)).astype(np.float32)
+    row_q_bits = np.asarray([2, 3, 4, 5, 6] * 2, dtype=np.uint8)
+    row_sub_bits = np.asarray([5, 5, 6, 6, 8] * 2, dtype=np.uint8)
+    tensor = nint_quant.quantize(
+        weight,
+        NintSpec(4, 24, 6),
+        row_q_bits=row_q_bits,
+        row_sub_bits=row_sub_bits,
+    )
+
+    blob = io.pack_nint(tensor)
+    restored = io.unpack_nint(blob)
+
+    assert blob[0] & 0x80
+    assert not blob[1] & 0x80
+    assert restored.spec == NintSpec(4, 24, 6)
+    assert restored.has_mixed_q_bits
+    assert restored.has_mixed_sub_bits
+    assert restored.mean_q_bits == pytest.approx(4.0)
+    assert restored.mean_sub_bits == pytest.approx(6.0)
+    np.testing.assert_array_equal(restored.row_q_bits, row_q_bits)
+    np.testing.assert_array_equal(restored.row_sub_bits, row_sub_bits)
+    np.testing.assert_array_equal(restored.q, tensor.q)
+    np.testing.assert_array_equal(restored.sub_scale, tensor.sub_scale)
+    np.testing.assert_array_equal(restored.sub_min, tensor.sub_min)
+    np.testing.assert_allclose(
+        nint_quant.dequantize(restored),
+        nint_quant.dequantize(tensor),
+        rtol=0,
+        atol=0,
+    )
+    assert tensor.bpw() == pytest.approx(
+        4.0 + 32.0 / 77.0 + 12.0 / 24.0 + 5.0 / 77.0
+    )
+
+
+def test_mixed_sub_bits_selector_overhead_stays_negligible_at_equal_average_bits():
+    tensor = _mixed_sub_bits_tensor(shape=(96, 5120))
+    uniform = nint_quant.quantize(
+        np.zeros((96, 5120), dtype=np.float32),
+        NintSpec(4, 24, 6),
+    )
+    uniform.q[...] = tensor.q
+    uniform.neuron_scale[...] = tensor.neuron_scale
+    uniform.neuron_min[...] = tensor.neuron_min
+
+    mixed_nbytes = len(io.pack_nint(tensor))
+    uniform_nbytes = len(io.pack_nint(uniform))
+
+    assert mixed_nbytes - uniform_nbytes <= 80
+    assert tensor.bpw() == pytest.approx(
+        4.0 + 32.0 / 5120.0 + 12.0 / 24.0 + 5.0 / 5120.0
+    )
 
 
 def test_dense_bfloat16_roundtrip_preserves_raw_bits():

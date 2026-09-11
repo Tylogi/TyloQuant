@@ -449,6 +449,39 @@ def test_mixed_nint_imatrix_changes_nint4_and_leaves_nint8_unchanged(tmp_path):
     )
 
 
+def test_nintm_stream_writer_keeps_per_neuron_sub_bits_inside_one_pool(tmp_path):
+    rng = np.random.default_rng(20260911)
+    shape = (2, 6, 73)
+    weight = rng.normal(0, 0.05, size=shape).astype(np.float32)
+    precision = ExpertPrecision("NINT4", nint_spec=NintSpec(4, 24, 6))
+    neuron_importance = np.asarray(
+        [1.0, 2.0, 3.0, 10.0, 50.0, 100.0] * 2,
+        dtype=np.float32,
+    )
+    path = tmp_path / "nintm-v2.blob"
+
+    _write_mixed_moe_axis0_blob(
+        weight,
+        shape,
+        shape,
+        (precision, precision),
+        path,
+        row_chunk=2,
+        quant_backend="cpu",
+        device="cpu",
+        artifact_root=tmp_path,
+        neuron_importance=neuron_importance,
+    )
+
+    restored = io.unpack_nint_moe(path.read_bytes())
+    pool = restored.pools[0].tensor
+    assert pool.has_mixed_sub_bits
+    assert pool.mean_sub_bits == 6.0
+    assert set(pool.row_sub_bits.tolist()) == {5, 6, 7, 8}
+    assert np.isfinite(dequantize_expertwise(restored)).all()
+    assert io.pack_nint_moe(restored) == path.read_bytes()
+
+
 def test_flat_nint_cohort_forwards_imatrix_to_nint_solver():
     rng = np.random.default_rng(20260802)
     rows = rng.normal(0, 0.08, size=(7, 113)).astype(np.float32)
