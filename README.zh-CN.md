@@ -42,19 +42,26 @@ MFQ 将面向实用率失真前沿设计的神经网络感知 SQ/VQ 格式、高
 > MFQ 容器。** 针对 Metal 优化的路径将主干网络与 MoE 专家完整常驻统一
 > 内存，仅把 Engram 存储卸载到 Mac 内置 SSD。
 
-| 模型 / 硬件 | 放置方式 | 模型加载 | 预填充（511 / 2,031 tokens） | 逐 token 生成 |
-| --- | --- | ---: | ---: | ---: |
-| DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra，512 GB | 全量常驻；仅 Engram 使用内置 SSD | **38.6 秒** | **285.6 / 338.4 tok/s** | **18.20 tok/s** |
+| 模型 / 硬件 | 放置方式 | 模型加载 | 预填充（511 / 2,031 tokens） | TG，关闭 MTP | TG，高接受率 MTP |
+| --- | --- | ---: | ---: | ---: | ---: |
+| DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra，512 GB | 全量常驻；仅 Engram 使用内置 SSD | **38.6 秒** | **293.8 / 384.0 tok/s** | **18.29 tok/s** | **33.46 tok/s**（**+83.0%**） |
 
-*本机实测口径：batch size 1、4,096-token context、512-token prefill
-chunk、temperature 0、热态执行、关闭 MTP。以上为本机运行时实测结果，
-macOS 内存压力可能造成一定波动。*
+*本机实测口径：batch size 1、4,096-token context、最大 2,048-token
+prefill chunk（511-token 测试可由单个 chunk 完成）、temperature 0、热态
+执行。表中吞吐量均取 3 次实测中位数。MTP 数据来自确定性的数字
+续写场景，草稿 token 接受数为 132/132，且输出与关闭 MTP 时完全一致；MTP
+收益取决于具体负载。另一个 1,965-token 重复型 raw-completion 提示的 prefill
+实测达到 **397.0 tok/s**。macOS 内存压力可能造成一定波动。*
+
+当推测不再有效时，MTP 会自适应退出：在一个接受率为 50% 的代码场景中，
+开启 MTP 为 **17.52 tok/s**，关闭 MTP 为 **17.59 tok/s**；连续两个低接受率
+周期后会退出 MTP，同时保持确定性输出。
 
 ### DeepSeek V4.1 TODO
 
-- [ ] **MTP 生产化支持与调优。** 继续优化草稿接受率、验证开销和自适应深度，
-  在不影响确定性输出的前提下，使 MTP 稳定超过当前非 MTP 的
-  **18.20 tok/s** 基线，达标后再默认启用。
+- [ ] **扩大 MTP 的生产场景收益。** MTP 现已支持确定性验证、状态快照、
+  自适应深度和低接受率回退。后续继续降低验证开销，并提升自然语言与代码
+  场景的接受率，使高接受率场景中的加速覆盖代表性负载，再考虑默认启用。
 - [ ] **继续优化 M3 Ultra。** 提升长提示 prefill 与逐 token 生成速度，降低
   模型加载和内存压力开销，并进一步用计算覆盖 Engram cache miss 的内置
   SSD I/O。

@@ -45,20 +45,31 @@ memory, storage, and latency limits.
 > experts resident in unified memory while offloading only Engram storage to
 > the Mac's internal SSD.
 
-| Model / hardware | Placement | Model load | Prefill, 511 / 2,031 tokens | Token generation |
-| --- | --- | ---: | ---: | ---: |
-| DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra, 512 GB | Full resident; Engram only on internal SSD | **38.6 s** | **285.6 / 338.4 tok/s** | **18.20 tok/s** |
+| Model / hardware | Placement | Model load | Prefill, 511 / 2,031 tokens | TG, MTP off | TG, high-acceptance MTP |
+| --- | --- | ---: | ---: | ---: | ---: |
+| DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra, 512 GB | Full resident; Engram only on internal SSD | **38.6 s** | **293.8 / 384.0 tok/s** | **18.29 tok/s** | **33.46 tok/s** (**+83.0%**) |
 
-*Measured locally at batch size 1 with a 4,096-token context, 512-token
-prefill chunks, temperature 0, warmed execution, and MTP disabled. These are
-observed local runtime results; OS memory pressure can affect them.*
+*Measured locally at batch size 1 with a 4,096-token context, a 2,048-token
+maximum prefill chunk (the 511-token case fits in one chunk), temperature 0,
+and warmed execution. Throughput values in the table are medians of three
+measured runs. The MTP result uses a deterministic numeric continuation and
+accepted 132/132 drafted tokens while producing exactly the same output as
+non-MTP decoding. MTP gains are workload-dependent. A 1,965-token repeated
+raw-completion prompt reached **397.0 tok/s** prefill. OS memory pressure can
+affect results.*
+
+MTP adapts when speculation is not useful: on a lower-acceptance code case
+(50% acceptance), it measured **17.52 tok/s** versus **17.59 tok/s** with MTP
+off, then exited after two low-acceptance cycles while preserving deterministic
+output.
 
 ### DeepSeek V4.1 TODO
 
-- [ ] **Production MTP support and tuning.** Improve draft acceptance,
-  verification, and adaptive depth until MTP consistently exceeds the current
-  non-MTP **18.20 tok/s** baseline without compromising deterministic output;
-  then enable it by default.
+- [ ] **Broaden production MTP gains.** MTP now provides deterministic
+  verification, state snapshots, adaptive depth, and a low-acceptance fallback.
+  Continue improving verifier efficiency and acceptance on prose and code so
+  the high-acceptance speedup extends to representative workloads before MTP
+  is enabled by default.
 - [ ] **Continue M3 Ultra optimization.** Improve long-prompt prefill and token
   generation, reduce model-load and memory-pressure overhead, and further
   overlap Engram cache misses with internal-SSD I/O.
