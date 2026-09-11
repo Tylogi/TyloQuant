@@ -20,8 +20,12 @@ namespace mfq::metal {
 // kernels without an intermediate MFQ file.
 class MlxHfTensorStore {
 public:
-    explicit MlxHfTensorStore(std::filesystem::path root);
-    explicit MlxHfTensorStore(std::shared_ptr<HfSafetensorStore> checkpoint);
+    explicit MlxHfTensorStore(
+        std::filesystem::path root,
+        std::string_view alias_architecture = {});
+    explicit MlxHfTensorStore(
+        std::shared_ptr<HfSafetensorStore> checkpoint,
+        std::string_view alias_architecture = {});
 
     const HfSafetensorStore& checkpoint() const noexcept;
     std::shared_ptr<HfSafetensorStore> shared_checkpoint() const noexcept;
@@ -33,7 +37,7 @@ public:
     MlxEmbedding load_embedding(const std::string& name) const;
 
 private:
-    void initialize_aliases();
+    void initialize_aliases(std::string_view alias_architecture);
 
     std::shared_ptr<HfSafetensorStore> checkpoint_;
     std::unordered_map<std::string, std::string> canonical_to_stored_;

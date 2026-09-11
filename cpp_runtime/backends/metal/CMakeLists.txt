@@ -200,6 +200,7 @@ configure_file(
     @ONLY)
 
 add_library(mfq-metal-runtime STATIC
+    storage/deepseek_v41_engram_store.cpp
     storage/hf_safetensors_store.cpp
     storage/mfq_container.cpp
     storage/nintm_expert_store.cpp
@@ -211,6 +212,8 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_mtp.cpp
     runtime/mlx_multimodal.cpp
     runtime/mlx_sampling.cpp
+    runtime/mlx_deepseek_v4_hf_ssd_expert_arena.cpp
+    runtime/mlx_deepseek_v4_hf_ssd_expert_cache.cpp
     runtime/mlx_ssd_expert_arena.cpp
     runtime/mlx_ssd_expert_cache.cpp
     runtime/mlx_tensor.cpp
@@ -236,6 +239,7 @@ add_library(mfq-metal-runtime STATIC
     models/deepseek_v4/mlx_deepseek_v4_moe.cpp
     models/deepseek_v4/mlx_deepseek_v4_sparse.cpp
     models/deepseek_v4/mlx_deepseek_v4_vision.cpp
+    models/deepseek_v4/mlx_deepseek_v41_engram.cpp
     models/deepseek_v41/mlx_deepseek_v41_attention.cpp
     models/deepseek_v41/mlx_deepseek_v41_causal_lm.cpp
     models/deepseek_v41/mlx_deepseek_v41_dspark.cpp
@@ -631,6 +635,24 @@ set_target_properties(
 add_test(
     NAME mfq-metal-deepseek-v4-model-test
     COMMAND mfq-metal-deepseek-v4-model-test
+)
+
+add_executable(mfq-metal-deepseek-v41-engram-store-test
+    tests/deepseek_v41_engram_store_test.cpp
+)
+target_link_libraries(
+    mfq-metal-deepseek-v41-engram-store-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-deepseek-v41-engram-store-test PRIVATE cxx_std_20)
+set_target_properties(
+    mfq-metal-deepseek-v41-engram-store-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-deepseek-v41-engram-store-test
+    COMMAND mfq-metal-deepseek-v41-engram-store-test
 )
 
 add_executable(mfq-metal-hf-safetensors-store-test

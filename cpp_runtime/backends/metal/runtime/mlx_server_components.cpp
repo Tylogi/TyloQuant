@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -514,13 +515,17 @@ MlxServerComponentCallbacks make_mlx_server_components(
                 throw std::runtime_error(
                     "DeepSeek-V4 runtime is unavailable after a failed reload");
             }
-            if (media.processor != MfqMultimodalProcessor::deepseek_v4) {
+            const auto& config = runtime_holder->value().config();
+            const bool v41 = config.is_v41();
+            const auto expected_processor = v41
+                ? MfqMultimodalProcessor::deepseek_v41
+                : MfqMultimodalProcessor::deepseek_v4;
+            if (media.processor != expected_processor) {
                 throw std::invalid_argument(
-                    "DeepSeek-V4 received a foreign multimodal payload");
+                    "DeepSeek runtime received a foreign multimodal payload");
             }
             mlx::core::set_default_device(mlx::core::Device::gpu);
             mlx::core::set_default_stream(runtime_stream);
-            const auto& config = runtime_holder->value().config();
             const auto pixel_shape = checked_shape(
                 media.pixel_shape, "pixel_values");
             if (pixel_shape.size() != 3 ||
@@ -565,15 +570,31 @@ MlxServerComponentCallbacks make_mlx_server_components(
                     mlx::core::Shape{active, pixel_shape[2]});
                 std::vector<std::int64_t> types;
                 types.reserve(static_cast<std::size_t>(end - begin));
-                for (int position = begin; position < end; ++position) {
-                    const auto type =
-                        prompt[static_cast<std::size_t>(position)] -
-                        config.vocab;
-                    if (type < 0 || type > 4) {
-                        throw std::invalid_argument(
-                            "DeepSeek-V4 image span contains a text token");
+                if (v41) {
+                    const int llm_h = media.vision_grid[4 * source + 2];
+                    const int llm_w = media.vision_grid[4 * source + 3];
+                    types.push_back(0);
+                    for (int row = 0; row < llm_h; ++row) {
+                        types.insert(
+                            types.end(), static_cast<std::size_t>(llm_w), 2);
+                        types.push_back(3);
                     }
-                    types.push_back(type);
+                    types.push_back(4);
+                    if (types.size() != static_cast<std::size_t>(end - begin)) {
+                        throw std::invalid_argument(
+                            "DeepSeek-V4.1 image span has invalid dimensions");
+                    }
+                } else {
+                    for (int position = begin; position < end; ++position) {
+                        const auto type =
+                            prompt[static_cast<std::size_t>(position)] -
+                            config.vocab;
+                        if (type < 0 || type > 4) {
+                            throw std::invalid_argument(
+                                "DeepSeek-V4 image span contains a text token");
+                        }
+                        types.push_back(type);
+                    }
                 }
                 const auto perm_begin =
                     media.image_permutation_offsets[source];
@@ -586,17 +607,25 @@ MlxServerComponentCallbacks make_mlx_server_components(
                         "DeepSeek-V4 image permutation offset is invalid");
                 }
                 std::vector<std::int32_t> permutation;
-                permutation.reserve(
-                    static_cast<std::size_t>(perm_end - perm_begin));
-                for (auto index = perm_begin; index < perm_end; ++index) {
-                    const auto value = media.image_permutation[
-                        static_cast<std::size_t>(index)];
-                    if (value < 0 ||
-                        value > std::numeric_limits<std::int32_t>::max()) {
-                        throw std::invalid_argument(
-                            "DeepSeek-V4 image permutation is invalid");
+                if (v41) {
+                    const int llm_h = media.vision_grid[4 * source + 2];
+                    const int llm_w = media.vision_grid[4 * source + 3];
+                    permutation.resize(
+                        static_cast<std::size_t>(llm_h * llm_w));
+                    std::iota(permutation.begin(), permutation.end(), 0);
+                } else {
+                    permutation.reserve(
+                        static_cast<std::size_t>(perm_end - perm_begin));
+                    for (auto index = perm_begin; index < perm_end; ++index) {
+                        const auto value = media.image_permutation[
+                            static_cast<std::size_t>(index)];
+                        if (value < 0 ||
+                            value > std::numeric_limits<std::int32_t>::max()) {
+                            throw std::invalid_argument(
+                                "DeepSeek-V4 image permutation is invalid");
+                        }
+                        permutation.push_back(static_cast<std::int32_t>(value));
                     }
-                    permutation.push_back(static_cast<std::int32_t>(value));
                 }
                 images.push_back({
                     std::move(image_pixels),

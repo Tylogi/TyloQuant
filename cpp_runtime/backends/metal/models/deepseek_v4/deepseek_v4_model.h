@@ -51,12 +51,29 @@ struct DeepseekV4Config {
     std::int64_t index_n_heads = 64;
     std::int64_t index_head_dim = 128;
     std::int64_t index_topk = 512;
+    std::vector<std::int64_t> kv_source_layer_ids;
+    std::vector<std::int64_t> index_source_layer_ids;
+    std::int64_t candidate_source_layer_id = -1;
+    std::int64_t candidate_topk_blocks = 0;
+    std::int64_t candidate_block_size = 0;
     std::int64_t max_position_embeddings = 1'048'576;
     std::int64_t hc_mult = 4;
     double hc_eps = 1e-6;
     std::int64_t hc_sinkhorn_iters = 20;
     double compress_rope_theta = 160'000.0;
     std::vector<std::int64_t> compress_ratios;
+
+    // V4.1 sparse n-gram memory. The two checkpoint embedding tables remain
+    // on SSD; only the rows selected for the current request are admitted to
+    // a bounded host/UMA cache.
+    std::vector<std::int64_t> engram_layer_ids;
+    std::vector<std::int64_t> engram_num_embeddings;
+    std::int64_t engram_max_ngram_size = 1;
+    std::int64_t engram_vocab_size = 0;
+    std::int64_t engram_n_heads = 0;
+    std::int64_t engram_head_dim = 0;
+    std::int64_t engram_pad_token_id = 2;
+    std::int64_t engram_compressed_vocab_size = 0;
 
     // DSpark speculative decoder.  Unlike Qwen's dense MTP head, every stage
     // is a complete DeepSeek hyper-connection + attention + MoE block.
@@ -65,6 +82,8 @@ struct DeepseekV4Config {
     std::int64_t dspark_noise_token_id = 0;
     std::vector<std::int64_t> dspark_target_layer_ids;
     std::int64_t dspark_markov_rank = 256;
+    std::int64_t dspark_n_experts = 0;
+    std::int64_t dspark_top_k = 0;
     std::vector<std::int64_t> mtp_compress_ratios;
 
     // Optional native DeepSeek-V4 vision tower and aligner.
@@ -78,6 +97,7 @@ struct DeepseekV4Config {
     std::int64_t vision_max_n_token = 384;
     std::int64_t vision_min_pixels = 147'456;
     std::int64_t vision_max_wh_ratio = 8;
+    std::int64_t image_token_id = -1;
 
     // Accepts a normalized manifest config, a complete TPQ manifest, or a
     // Hugging Face config. Alias fields are normalized to the members above.
@@ -114,6 +134,19 @@ struct DeepseekV4Config {
     }
     bool has_dspark() const noexcept {
         return n_mtp_layers > 0 && dspark_block_size > 0;
+    }
+    bool is_v41() const noexcept {
+        return model_type == "deepseek_v41";
+    }
+    bool has_engram() const noexcept {
+        return !engram_layer_ids.empty();
+    }
+    bool is_kv_source(std::size_t layer) const noexcept;
+    bool is_index_source(std::size_t layer) const noexcept;
+    std::int64_t experts_for_layer(std::size_t layer) const noexcept {
+        return layer < static_cast<std::size_t>(n_layers) || dspark_n_experts <= 0
+            ? n_experts
+            : dspark_n_experts;
     }
 };
 

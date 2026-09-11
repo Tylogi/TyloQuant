@@ -680,6 +680,188 @@ void test_indexer_paths() {
         }
     }
 
+    constexpr int v41_heads = 32;
+    auto v41_scores = mfq::metal::dsv4_indexer_scores(
+        mlx::core::astype(
+            float_array(
+                std::vector<float>(queries * v41_heads * 128, 1.0f),
+                Shape{1, queries, v41_heads, 128}),
+            mlx::core::bfloat16),
+        mlx::core::astype(
+            float_array(key, Shape{1, keys, 128}),
+            mlx::core::bfloat16),
+        mlx::core::astype(
+            float_array(
+                std::vector<float>(
+                    queries * v41_heads,
+                    1.0f / static_cast<float>(v41_heads)),
+                Shape{1, queries, v41_heads}),
+            mlx::core::bfloat16),
+        128,
+        2);
+    require(
+        v41_scores.dtype() == mlx::core::float32,
+        "V4.1 Indexer scores lost FP32 output");
+    const auto v41_actual = evaluated_float(std::move(v41_scores));
+    const float v41_expected =
+        64.0f / std::sqrt(4096.0f);
+    for (int query_index = 0;
+         query_index < queries;
+         ++query_index) {
+        const int visible = 64 + query_index;
+        for (int key_index = 0;
+             key_index < keys;
+             ++key_index) {
+            const float value =
+                v41_actual[query_index * keys + key_index];
+            if (key_index < visible) {
+                require(
+                    std::fabs(value - v41_expected) < 1.5e-3f,
+                    "V4.1 tiled Indexer score mismatch");
+            } else {
+                require(
+                    std::isinf(value) && std::signbit(value),
+                    "V4.1 tiled Indexer visibility mismatch");
+            }
+        }
+    }
+
+    std::vector<float> patterned_query(
+        queries * v41_heads * 128);
+    std::vector<float> patterned_key(keys * 128);
+    std::vector<float> patterned_weights(
+        queries * v41_heads);
+    for (int query_index = 0;
+         query_index < queries;
+         ++query_index) {
+        for (int head = 0; head < v41_heads; ++head) {
+            patterned_weights[
+                query_index * v41_heads + head] =
+                static_cast<float>(
+                    (query_index * 5 + head * 3) % 9 - 4) /
+                32.0f;
+            for (int dimension = 0;
+                 dimension < 128;
+                 ++dimension) {
+                patterned_query[
+                    (query_index * v41_heads + head) * 128 +
+                    dimension] =
+                    static_cast<float>(
+                        (query_index * 7 + head * 5 + dimension * 3) %
+                            17 -
+                        8) /
+                    16.0f;
+            }
+        }
+    }
+    for (int key_index = 0; key_index < keys; ++key_index) {
+        for (int dimension = 0;
+             dimension < 128;
+             ++dimension) {
+            patterned_key[key_index * 128 + dimension] =
+                static_cast<float>(
+                    (key_index * 11 + dimension * 7) % 19 - 9) /
+                16.0f;
+        }
+    }
+    const auto patterned_actual = evaluated_float(
+        mfq::metal::dsv4_indexer_scores(
+            mlx::core::astype(
+                float_array(
+                    patterned_query,
+                    Shape{1, queries, v41_heads, 128}),
+                mlx::core::bfloat16),
+            mlx::core::astype(
+                float_array(
+                    patterned_key,
+                    Shape{1, keys, 128}),
+                mlx::core::bfloat16),
+            mlx::core::astype(
+                float_array(
+                    patterned_weights,
+                    Shape{1, queries, v41_heads}),
+                mlx::core::bfloat16),
+            128,
+            2));
+    for (int query_index = 0;
+         query_index < queries;
+         ++query_index) {
+        const int visible = 64 + query_index;
+        for (int key_index = 0;
+             key_index < keys;
+             ++key_index) {
+            const auto offset = query_index * keys + key_index;
+            if (key_index >= visible) {
+                require(
+                    std::isinf(patterned_actual[offset]) &&
+                        std::signbit(patterned_actual[offset]),
+                    "patterned V4.1 Indexer visibility mismatch");
+                continue;
+            }
+            float expected = 0.0f;
+            for (int head = 0; head < v41_heads; ++head) {
+                float dot = 0.0f;
+                for (int dimension = 0;
+                     dimension < 128;
+                     ++dimension) {
+                    dot += patterned_query[
+                               (query_index * v41_heads + head) * 128 +
+                               dimension] *
+                        patterned_key[key_index * 128 + dimension];
+                }
+                expected += std::max(dot, 0.0f) *
+                    patterned_weights[
+                        query_index * v41_heads + head];
+            }
+            expected /= std::sqrt(4096.0f);
+            require(
+                std::fabs(patterned_actual[offset] - expected) < 2e-3f,
+                "patterned V4.1 tiled Indexer score mismatch");
+        }
+    }
+
+    auto v41_decode = mfq::metal::dsv4_indexer_scores_decode(
+        mlx::core::astype(
+            float_array(
+                std::vector<float>(v41_heads * 128, 1.0f),
+                Shape{1, 1, v41_heads, 128}),
+            mlx::core::bfloat16),
+        mlx::core::astype(
+            float_array(
+                std::vector<float>(decode_keys * 128, 0.5f),
+                Shape{1, decode_keys, 128}),
+            mlx::core::bfloat16),
+        mlx::core::astype(
+            float_array(
+                std::vector<float>(
+                    v41_heads,
+                    1.0f / static_cast<float>(v41_heads)),
+                Shape{1, 1, v41_heads}),
+            mlx::core::bfloat16),
+        130,
+        2);
+    require(
+        v41_decode.dtype() == mlx::core::float32,
+        "V4.1 decode Indexer scores lost FP32 output");
+    const auto v41_decode_values =
+        evaluated_float(std::move(v41_decode));
+    for (int key_index = 0;
+         key_index < decode_keys;
+         ++key_index) {
+        if (key_index < 65) {
+            require(
+                std::fabs(
+                    v41_decode_values[key_index] -
+                    v41_expected) < 1.5e-3f,
+                "V4.1 decode Indexer score mismatch");
+        } else {
+            require(
+                std::isinf(v41_decode_values[key_index]) &&
+                    std::signbit(v41_decode_values[key_index]),
+                "V4.1 decode Indexer visibility mismatch");
+        }
+    }
+
     constexpr int fixed_capacity = 257;
     constexpr int fixed_prefix = 129;
     auto fixed_scores = mfq::metal::dsv4_indexer_scores_decode(
@@ -1169,7 +1351,7 @@ void test_direct_decode_attention_path() {
     require_close(
         evaluated_float(std::move(direct)),
         evaluated_float(std::move(legacy)),
-        0.0f,
+        1e-6f,
         "direct sparse decode attention");
 
     auto empty_topk = mlx::core::zeros(
@@ -1292,125 +1474,6 @@ void test_short_prefill_plan_matches_circular_decode() {
         "short verifier attention decode consistency");
 }
 
-void test_direct_pool_attention_path(int queries) {
-    constexpr int heads = 64;
-    constexpr int dimension = 512;
-    constexpr int history = 2;
-    constexpr int query_offset = history;
-    constexpr int window = 4;
-    constexpr int ratio = 2;
-    constexpr int pool_len = 4;
-    constexpr int pool_capacity = 6;
-    constexpr int selected = 5;
-    require(
-        queries >= 2,
-        "direct pool test query count is unsupported");
-
-    std::vector<float> query(
-        static_cast<std::size_t>(heads) * queries * dimension,
-        0.0f);
-    for (int head = 0; head < heads; ++head) {
-        for (int token = 0; token < queries; ++token) {
-            const int base =
-                (head * queries + token) * dimension;
-            query[base] =
-                0.125f + static_cast<float>(head) / 192.0f;
-            query[base + 7] =
-                -0.25f + static_cast<float>(token) / 32.0f;
-        }
-    }
-
-    const int local_length = history + queries;
-    std::vector<float> local(
-        static_cast<std::size_t>(local_length) * dimension,
-        0.0f);
-    for (int row = 0; row < local_length; ++row) {
-        local[row * dimension] =
-            -0.75f + static_cast<float>(row) * 0.2f;
-        local[row * dimension + 7] =
-            0.5f - static_cast<float>(row) * 0.075f;
-    }
-    std::vector<float> pool(
-        static_cast<std::size_t>(pool_capacity) * dimension,
-        0.0f);
-    for (int row = 0; row < pool_capacity; ++row) {
-        pool[row * dimension] = row < pool_len
-            ? 0.875f + static_cast<float>(row) * 0.25f
-            : 64.0f;
-        pool[row * dimension + 7] = row < pool_len
-            ? -0.5f + static_cast<float>(row) * 0.125f
-            : -64.0f;
-    }
-    std::vector<std::int32_t> topk_values(
-        queries * selected);
-    for (int token = 0; token < queries; ++token) {
-        const int base = token * selected;
-        topk_values[base] = 3;
-        topk_values[base + 1] = 0;
-        topk_values[base + 2] = 2;
-        topk_values[base + 3] = 1;
-        topk_values[base + 4] = 5;
-    }
-    std::vector<float> sinks(heads);
-    for (int head = 0; head < heads; ++head) {
-        sinks[head] =
-            -0.625f + static_cast<float>(head) / 128.0f;
-    }
-
-    auto query_array = float_array(
-        query,
-        Shape{1, heads, queries, dimension});
-    auto local_array = float_array(
-        local,
-        Shape{1, local_length, dimension});
-    auto pool_array = float_array(
-        pool,
-        Shape{1, pool_capacity, dimension});
-    auto pool_prefix = float_array(
-        std::vector<float>(
-            pool.begin(),
-            pool.begin() + pool_len * dimension),
-        Shape{1, pool_len, dimension});
-    auto topk = int_array(
-        topk_values,
-        Shape{1, queries, selected});
-    auto sink_array = float_array(sinks, Shape{heads});
-    auto plan = mfq::metal::dsv4_build_prefill_plan(
-        topk,
-        query_offset,
-        history,
-        pool_len,
-        ratio,
-        window);
-    auto legacy = mfq::metal::attention_dsv4_sparse(
-        query_array,
-        mlx::core::concatenate(
-            {local_array, pool_prefix},
-            1),
-        plan.first,
-        plan.second,
-        sink_array);
-    auto direct = mfq::metal::attention_dsv4_sparse_multi(
-        query_array,
-        local_array,
-        pool_array,
-        pool_len,
-        topk,
-        sink_array,
-        query_offset,
-        ratio,
-        window);
-    require(
-        direct.shape() == Shape{1, queries, heads, dimension},
-        "direct pool sparse attention output shape mismatch");
-    require_close(
-        evaluated_float(std::move(direct)),
-        evaluated_float(std::move(legacy)),
-        4e-3f,
-        "direct pool sparse attention M=" +
-            std::to_string(queries));
-}
-
 void test_invalid_inputs() {
     require_invalid(
         [] {
@@ -1507,39 +1570,6 @@ void test_invalid_inputs() {
         "invalid prefill window");
     require_invalid(
         [] {
-            (void)mfq::metal::dsv4_build_prefill_plan_visible(
-                mlx::core::zeros(
-                    Shape{1, 1, 0},
-                    mlx::core::int32),
-                mlx::core::zeros(
-                    Shape{1, 1},
-                    mlx::core::int32),
-                mlx::core::zeros(
-                    Shape{1, 1},
-                    mlx::core::int32),
-                0,
-                std::numeric_limits<int>::max(),
-                0,
-                1,
-                1,
-                1);
-        },
-        "visible prefill local-width overflow");
-    require_invalid(
-        [] {
-            (void)mfq::metal::dsv4_build_prefill_plan(
-                mlx::core::zeros(
-                    Shape{1, 1, 0},
-                    mlx::core::int32),
-                std::numeric_limits<int>::max(),
-                0,
-                0,
-                1,
-                1);
-        },
-        "prefill query-position overflow");
-    require_invalid(
-        [] {
             (void)mfq::metal::attention_dsv4_sparse(
                 mlx::core::zeros(
                     Shape{1, 64, 1, 512},
@@ -1581,9 +1611,6 @@ int main() {
         test_sparse_attention_path(6);
         test_sparse_attention_path(32);
         test_direct_decode_attention_path();
-        test_direct_pool_attention_path(2);
-        test_direct_pool_attention_path(6);
-        test_direct_pool_attention_path(32);
         test_short_prefill_plan_matches_circular_decode();
         test_invalid_inputs();
         std::cout

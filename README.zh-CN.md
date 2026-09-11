@@ -23,6 +23,7 @@ MFQ 将面向实用率失真前沿设计的神经网络感知 SQ/VQ 格式、高
 </p>
 
 <p>
+  <a href="#deepseek-v41-raw-hf">DeepSeek V4.1</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#功能特性">功能特性</a> ·
   <a href="#模型">模型</a> ·
@@ -31,6 +32,32 @@ MFQ 将面向实用率失真前沿设计的神经网络感知 SQ/VQ 格式、高
 </p>
 
 </div>
+
+<a id="deepseek-v41-raw-hf"></a>
+
+## 单台 Mac Studio 直跑 DeepSeek V4.1 raw-HF
+
+> **在一台配备 512 GB 统一内存的 Apple M3 Ultra 上，直接加载并运行
+> 476 GB 的 DeepSeek V4.1 Flash Hugging Face Safetensors，无需先转换为
+> MFQ 容器。** 针对 Metal 优化的路径将主干网络与 MoE 专家完整常驻统一
+> 内存，仅把 Engram 存储卸载到 Mac 内置 SSD。
+
+| 模型 / 硬件 | 放置方式 | 模型加载 | 预填充（511 / 2,031 tokens） | 逐 token 生成 |
+| --- | --- | ---: | ---: | ---: |
+| DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra，512 GB | 全量常驻；仅 Engram 使用内置 SSD | **38.6 秒** | **285.6 / 338.4 tok/s** | **18.20 tok/s** |
+
+*本机实测口径：batch size 1、4,096-token context、512-token prefill
+chunk、temperature 0、热态执行、关闭 MTP。以上为本机运行时实测结果，
+macOS 内存压力可能造成一定波动。*
+
+### DeepSeek V4.1 TODO
+
+- [ ] **MTP 生产化支持与调优。** 继续优化草稿接受率、验证开销和自适应深度，
+  在不影响确定性输出的前提下，使 MTP 稳定超过当前非 MTP 的
+  **18.20 tok/s** 基线，达标后再默认启用。
+- [ ] **继续优化 M3 Ultra。** 提升长提示 prefill 与逐 token 生成速度，降低
+  模型加载和内存压力开销，并进一步用计算覆盖 Engram cache miss 的内置
+  SSD I/O。
 
 MFQ 覆盖从源模型到可部署打包模型的完整流程。它测量激活与损失敏感度，
 在精确的序列化大小预算内，按张量、专家和投影粒度分配精度，将结果保存为

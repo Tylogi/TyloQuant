@@ -34,7 +34,7 @@ json parse_json(
     }
 }
 
-json config_object(const json& root) {
+json outer_config_object(const json& root) {
     json value = root;
     auto embedded = value.find("tpq_manifest");
     if (embedded != value.end()) {
@@ -57,6 +57,11 @@ json config_object(const json& root) {
         }
         value = *manifest_config;
     }
+    return value;
+}
+
+json config_object(const json& root) {
+    json value = outer_config_object(root);
     const auto text_config = value.find("text_config");
     if (text_config != value.end() &&
         !value.contains("n_layers") &&
@@ -295,7 +300,18 @@ DeepseekV4RopeScaling rope_scaling(const json& object) {
 
 bool valid_model_type(std::string_view value) {
     return value == "deepseek_v4" ||
-        value == "deepseek-v4";
+        value == "deepseek-v4" ||
+        value == "deepseek_v41" ||
+        value == "deepseek-v41" ||
+        value == "deepseek_v41_text" ||
+        value == "deepseek-v41-text";
+}
+
+bool v41_model_type(std::string_view value) {
+    return value == "deepseek_v41" ||
+        value == "deepseek-v41" ||
+        value == "deepseek_v41_text" ||
+        value == "deepseek-v41-text";
 }
 
 std::int64_t checked_product(
@@ -555,11 +571,12 @@ DeepseekV4Config DeepseekV4Config::from_json(
     std::string_view payload) {
     const auto root =
         parse_json(payload, "DeepSeek-V4 config JSON");
+    const auto outer = outer_config_object(root);
     const auto object = config_object(root);
 
     DeepseekV4Config config;
     const auto outer_model_type =
-        optional_string(root, {"model_type"});
+        optional_string(outer, {"model_type"});
     const auto inner_model_type =
         optional_string(object, {"model_type"});
     if ((!outer_model_type.empty() &&
@@ -572,7 +589,10 @@ DeepseekV4Config DeepseekV4Config::from_json(
                  ? inner_model_type
                  : outer_model_type));
     }
-    config.model_type = "deepseek_v4";
+    config.model_type =
+        v41_model_type(outer_model_type) || v41_model_type(inner_model_type)
+        ? "deepseek_v41"
+        : "deepseek_v4";
     config.n_layers = required_integer(
         object,
         {"n_layers", "num_hidden_layers"});
@@ -643,12 +663,25 @@ DeepseekV4Config DeepseekV4Config::from_json(
     config.rope_scaling =
         ::mfq::metal::rope_scaling(object);
     config.eos_token_id = eos_tokens(object);
+    if (config.eos_token_id.empty()) {
+        config.eos_token_id = eos_tokens(outer);
+    }
     config.index_n_heads =
         optional_integer(object, {"index_n_heads"}, 64);
     config.index_head_dim =
         optional_integer(object, {"index_head_dim"}, 128);
     config.index_topk =
         optional_integer(object, {"index_topk"}, 512);
+    config.kv_source_layer_ids =
+        integer_array(object, "kv_source_layer_ids");
+    config.index_source_layer_ids =
+        integer_array(object, "index_source_layer_ids");
+    config.candidate_source_layer_id = optional_integer(
+        object, {"candidate_source_layer_id"}, -1);
+    config.candidate_topk_blocks = optional_integer(
+        object, {"candidate_topk_blocks"}, 0);
+    config.candidate_block_size = optional_integer(
+        object, {"candidate_block_size"}, 0);
     config.max_position_embeddings = optional_integer(
         object,
         {"max_position_embeddings"},
@@ -663,6 +696,24 @@ DeepseekV4Config DeepseekV4Config::from_json(
         object,
         {"compress_rope_theta"},
         160'000.0);
+    config.engram_layer_ids =
+        integer_array(object, "engram_layer_ids");
+    config.engram_num_embeddings =
+        integer_array(object, "engram_num_embeddings");
+    config.engram_max_ngram_size = optional_integer(
+        object, {"engram_max_ngram_size"}, 1);
+    config.engram_vocab_size = optional_integer(
+        object, {"engram_vocab_size"}, 0);
+    config.engram_n_heads = optional_integer(
+        object, {"engram_n_heads"}, 0);
+    config.engram_head_dim = optional_integer(
+        object, {"engram_head_dim"}, 0);
+    config.engram_pad_token_id = optional_integer(
+        object,
+        {"engram_pad_token_id", "engram_pad_id"},
+        2);
+    config.engram_compressed_vocab_size = optional_integer(
+        object, {"engram_compressed_vocab_size"}, 0);
     config.n_mtp_layers = optional_integer(
         object,
         {"n_mtp_layers"},
@@ -675,26 +726,68 @@ DeepseekV4Config DeepseekV4Config::from_json(
         integer_array(object, "dspark_target_layer_ids");
     config.dspark_markov_rank = optional_integer(
         object, {"dspark_markov_rank"}, 256);
+    config.dspark_n_experts = optional_integer(
+        object, {"dspark_n_routed_experts"}, config.n_experts);
+    config.dspark_top_k = optional_integer(
+        object, {"dspark_num_experts_per_tok"}, config.top_k);
+    const auto vision_found = outer.find("vision_config");
+    const json vision =
+        vision_found != outer.end() && vision_found->is_object()
+        ? *vision_found
+        : json::object();
     config.vision_n_layers = optional_integer(
-        object, {"vision_n_layers"}, 0);
+        vision,
+        {"num_hidden_layers", "depth"},
+        optional_integer(object, {"vision_n_layers"}, 0));
     config.vision_dim = optional_integer(
-        object, {"vision_dim"}, 1024);
+        vision,
+        {"hidden_size"},
+        optional_integer(object, {"vision_dim"}, 1024));
     config.vision_n_heads = optional_integer(
-        object, {"vision_n_heads"}, 16);
+        vision,
+        {"num_attention_heads"},
+        optional_integer(object, {"vision_n_heads"}, 16));
     config.vision_inter_dim = optional_integer(
-        object, {"vision_inter_dim"}, 2816);
+        vision,
+        {"intermediate_size"},
+        optional_integer(object, {"vision_inter_dim"}, 2816));
     config.vision_patch_size = optional_integer(
-        object, {"vision_patch_size"}, 14);
+        vision,
+        {"patch_size"},
+        optional_integer(object, {"vision_patch_size"}, 14));
     config.vision_rope_theta = optional_number(
-        object, {"vision_rope_theta"}, 10'000.0);
+        vision,
+        {"rope_theta"},
+        optional_number(object, {"vision_rope_theta"}, 10'000.0));
     config.vision_downsample_ratio = optional_integer(
-        object, {"vision_downsample_ratio"}, 3);
+        vision,
+        {"downsample_ratio"},
+        optional_integer(object, {"vision_downsample_ratio"}, 3));
     config.vision_max_n_token = optional_integer(
-        object, {"vision_max_n_token"}, 384);
+        vision,
+        {"max_image_tokens"},
+        optional_integer(
+            object,
+            {"vision_max_n_token"},
+            config.is_v41() ? 1024 : 384));
     config.vision_min_pixels = optional_integer(
-        object, {"vision_min_pixels"}, 147'456);
+        vision,
+        {"min_pixels"},
+        optional_integer(
+            object,
+            {"vision_min_pixels"},
+            config.is_v41() ? 295'936 : 147'456));
     config.vision_max_wh_ratio = optional_integer(
-        object, {"vision_max_wh_ratio"}, 8);
+        vision,
+        {"max_wh_ratio"},
+        optional_integer(
+            object,
+            {"vision_max_wh_ratio"},
+            config.is_v41() ? 0 : 8));
+    config.image_token_id = optional_integer(
+        outer,
+        {"image_token_id"},
+        optional_integer(object, {"image_token_id"}, -1));
     config.compress_ratios =
         integer_array(object, "compress_ratios");
     if (config.compress_ratios.empty()) {
@@ -899,6 +992,18 @@ void DeepseekV4Config::validate() const {
     if (n_mtp_layers > 0) {
         positive(n_mtp_layers, "n_mtp_layers");
         positive(dspark_markov_rank, "dspark_markov_rank");
+        // V4.1 gives the predictor its own expert topology. Legacy V4 uses
+        // the backbone expert count/top-k and legitimately leaves these
+        // V4.1-only fields unset.
+        if (is_v41()) {
+            positive(dspark_n_experts, "dspark_n_experts");
+            positive(dspark_top_k, "dspark_top_k");
+            if (dspark_top_k >
+                std::min<std::int64_t>(16, dspark_n_experts)) {
+                throw std::runtime_error(
+                    "DeepSeek-V4 DSpark top_k exceeds the Metal router limit");
+            }
+        }
         if (mtp_compress_ratios.size() !=
             static_cast<std::size_t>(n_mtp_layers)) {
             throw std::runtime_error(
@@ -906,9 +1011,12 @@ void DeepseekV4Config::validate() const {
                 "num_nextn_predict_layers");
         }
         for (const auto ratio : mtp_compress_ratios) {
-            if (ratio != 0 && ratio != 4 && ratio != 128) {
+            const bool valid_ratio = is_v41()
+                ? ratio == 0
+                : (ratio == 0 || ratio == 4 || ratio == 128);
+            if (!valid_ratio) {
                 throw std::runtime_error(
-                    "DeepSeek-V4 MTP compression ratios must be 0, 4, or 128");
+                    "DeepSeek-V4 MTP compression schedule is invalid");
             }
         }
     } else if (!mtp_compress_ratios.empty()) {
@@ -938,7 +1046,14 @@ void DeepseekV4Config::validate() const {
         positive(vision_downsample_ratio, "vision_downsample_ratio");
         positive(vision_max_n_token, "vision_max_n_token");
         positive(vision_min_pixels, "vision_min_pixels");
-        positive(vision_max_wh_ratio, "vision_max_wh_ratio");
+        if (vision_max_wh_ratio < 0) {
+            throw std::runtime_error(
+                "DeepSeek-V4 vision_max_wh_ratio cannot be negative");
+        }
+        if ((is_v41() && image_token_id < 0) || image_token_id >= vocab) {
+            throw std::runtime_error(
+                "DeepSeek-V4 image_token_id is outside the vocabulary");
+        }
         if (vision_dim % vision_n_heads != 0 ||
             (vision_dim / vision_n_heads) % 4 != 0 ||
             !std::isfinite(vision_rope_theta) || vision_rope_theta <= 0.0) {
@@ -976,10 +1091,91 @@ void DeepseekV4Config::validate() const {
             "entry per layer");
     }
     for (const auto ratio : compress_ratios) {
-        if (ratio != 0 && ratio != 4 && ratio != 128) {
-            throw std::runtime_error(
-                "DeepSeek-V4 compression ratios must be 0, 4, or 128");
+        const bool valid_ratio = is_v41()
+            ? (ratio == 0 || ratio == 1 || ratio == 2)
+            : (ratio == 0 || ratio == 4 || ratio == 128);
+        if (!valid_ratio) {
+            throw std::runtime_error(is_v41()
+                ? "DeepSeek-V4.1 compression ratios must be 0, 1, or 2"
+                : "DeepSeek-V4 compression ratios must be 0, 4, or 128");
         }
+    }
+    const auto validate_layer_ids = [this](
+        const std::vector<std::int64_t>& layers,
+        const char* name,
+        bool require_compression) {
+        std::int64_t previous = -1;
+        for (const auto layer : layers) {
+            if (layer < 0 || layer >= n_layers || layer <= previous ||
+                (require_compression && compress_ratios[layer] <= 0)) {
+                throw std::runtime_error(
+                    std::string("DeepSeek-V4 invalid ") + name);
+            }
+            previous = layer;
+        }
+    };
+    validate_layer_ids(
+        kv_source_layer_ids,
+        "kv_source_layer_ids",
+        true);
+    validate_layer_ids(
+        index_source_layer_ids,
+        "index_source_layer_ids",
+        true);
+    if (is_v41()) {
+        if (kv_source_layer_ids.empty() || index_source_layer_ids.empty()) {
+            throw std::runtime_error(
+                "DeepSeek-V4.1 requires KV and Indexer source layers");
+        }
+        for (const auto layer : kv_source_layer_ids) {
+            if (!std::binary_search(
+                    index_source_layer_ids.begin(),
+                    index_source_layer_ids.end(),
+                    layer)) {
+                throw std::runtime_error(
+                    "DeepSeek-V4.1 KV sources must also be Indexer sources");
+            }
+        }
+        if (candidate_source_layer_id >= 0 &&
+            (!std::binary_search(
+                 index_source_layer_ids.begin(),
+                 index_source_layer_ids.end(),
+                 candidate_source_layer_id) ||
+             candidate_topk_blocks <= 0 || candidate_block_size <= 0)) {
+            throw std::runtime_error(
+                "DeepSeek-V4.1 candidate Indexer configuration is invalid");
+        }
+    } else if (!kv_source_layer_ids.empty() ||
+               !index_source_layer_ids.empty() ||
+               candidate_source_layer_id >= 0) {
+        throw std::runtime_error(
+            "DeepSeek-V4 source-layer sharing is only valid for V4.1");
+    }
+    if (has_engram()) {
+        validate_layer_ids(engram_layer_ids, "engram_layer_ids", false);
+        if (!is_v41() ||
+            engram_num_embeddings.size() != engram_layer_ids.size()) {
+            throw std::runtime_error(
+                "DeepSeek-V4.1 Engram layer/table schedule is invalid");
+        }
+        positive(engram_max_ngram_size, "engram_max_ngram_size");
+        positive(engram_vocab_size, "engram_vocab_size");
+        positive(engram_n_heads, "engram_n_heads");
+        positive(engram_head_dim, "engram_head_dim");
+        positive(
+            engram_compressed_vocab_size,
+            "engram_compressed_vocab_size");
+        if (engram_max_ngram_size < 2 ||
+            engram_pad_token_id < 0 || engram_pad_token_id >= vocab) {
+            throw std::runtime_error(
+                "DeepSeek-V4.1 Engram n-gram or padding configuration is invalid");
+        }
+        for (const auto rows : engram_num_embeddings) {
+            positive(rows, "engram_num_embeddings");
+        }
+    } else if (!engram_num_embeddings.empty()) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 has Engram tables but no Engram layers");
     }
     for (const auto token : eos_token_id) {
         if (token < 0 || token >= vocab) {
@@ -1016,6 +1212,29 @@ void DeepseekV4Config::validate() const {
         2,
         index_head_dim,
         "Indexer compressor width");
+    if (has_engram()) {
+        (void)checked_product(
+            checked_product(
+                engram_max_ngram_size - 1,
+                engram_n_heads,
+                "Engram hash columns"),
+            engram_head_dim,
+            "Engram projection width");
+    }
+}
+
+bool DeepseekV4Config::is_kv_source(std::size_t layer) const noexcept {
+    return std::binary_search(
+        kv_source_layer_ids.begin(),
+        kv_source_layer_ids.end(),
+        static_cast<std::int64_t>(layer));
+}
+
+bool DeepseekV4Config::is_index_source(std::size_t layer) const noexcept {
+    return std::binary_search(
+        index_source_layer_ids.begin(),
+        index_source_layer_ids.end(),
+        static_cast<std::int64_t>(layer));
 }
 
 std::string DeepseekV4TensorNames::layer(
@@ -1086,21 +1305,23 @@ deepseek_v4_required_bindings(
         names.output,
         {config.vocab, config.hidden},
         DeepseekV4TensorKind::linear);
-    add_binding(
-        result,
-        names.hc_head_fn,
-        {config.hc_mult, hc_width},
-        DeepseekV4TensorKind::linear);
-    add_binding(
-        result,
-        names.hc_head_base,
-        {config.hc_mult},
-        DeepseekV4TensorKind::dense_float);
-    add_binding(
-        result,
-        names.hc_head_scale,
-        {1},
-        DeepseekV4TensorKind::dense_float);
+    if (!config.is_v41()) {
+        add_binding(
+            result,
+            names.hc_head_fn,
+            {config.hc_mult, hc_width},
+            DeepseekV4TensorKind::linear);
+        add_binding(
+            result,
+            names.hc_head_base,
+            {config.hc_mult},
+            DeepseekV4TensorKind::dense_float);
+        add_binding(
+            result,
+            names.hc_head_scale,
+            {1},
+            DeepseekV4TensorKind::dense_float);
+    }
 
     for (std::size_t layer = 0;
          layer < config.compress_ratios.size();
@@ -1250,36 +1471,53 @@ deepseek_v4_required_bindings(
                 {config.n_experts},
                 DeepseekV4TensorKind::dense_float);
         }
+        if (config.has_vision()) {
+            add_binding(
+                result,
+                name("mlp.router.vision_bias"),
+                {config.n_experts},
+                DeepseekV4TensorKind::dense_float);
+        }
 
         const auto ratio = config.compress_ratios[layer];
-        if (ratio != 0) {
+        const bool owns_kv = !config.is_v41()
+            ? ratio != 0
+            : config.is_kv_source(layer);
+        if (owns_kv) {
             const auto compressor_width =
                 checked_product(
                     config.head_dim,
-                    ratio == 4 ? 2 : 1,
+                    !config.is_v41() && ratio == 4 ? 2 : 1,
                     "main compressor width");
             add_binding(
                 result,
                 name("attention.compressor.key_value.weight"),
                 {compressor_width, config.hidden},
                 DeepseekV4TensorKind::linear);
-            add_binding(
-                result,
-                name("attention.compressor.gate.weight"),
-                {compressor_width, config.hidden},
-                DeepseekV4TensorKind::linear);
-            add_binding(
-                result,
-                name("attention.compressor.position"),
-                {ratio, compressor_width},
-                DeepseekV4TensorKind::dense_float);
+            if (!config.is_v41() || ratio > 1) {
+                add_binding(
+                    result,
+                    name("attention.compressor.gate.weight"),
+                    {compressor_width, config.hidden},
+                    DeepseekV4TensorKind::linear);
+            }
+            if (!config.is_v41()) {
+                add_binding(
+                    result,
+                    name("attention.compressor.position"),
+                    {ratio, compressor_width},
+                    DeepseekV4TensorKind::dense_float);
+            }
             add_binding(
                 result,
                 name("attention.compressor.norm.weight"),
                 {config.head_dim},
                 DeepseekV4TensorKind::dense_float);
         }
-        if (ratio == 4) {
+        const bool owns_index = !config.is_v41()
+            ? ratio == 4
+            : config.is_index_source(layer);
+        if (owns_index) {
             const auto index_width =
                 checked_product(
                     config.index_n_heads,
@@ -1300,25 +1538,75 @@ deepseek_v4_required_bindings(
                 name("attention.indexer.score.weight"),
                 {config.index_n_heads, config.hidden},
                 DeepseekV4TensorKind::linear);
+            if (config.is_v41()) {
+                if (owns_kv) {
+                    add_binding(
+                        result,
+                        name("attention.indexer.key.weight"),
+                        {config.index_head_dim, config.head_dim},
+                        DeepseekV4TensorKind::linear);
+                    add_binding(
+                        result,
+                        name("attention.indexer.key_norm.weight"),
+                        {config.index_head_dim},
+                        DeepseekV4TensorKind::dense_float);
+                }
+            } else {
+                add_binding(
+                    result,
+                    name("attention.indexer.compressor.key_value.weight"),
+                    {compressor_width, config.hidden},
+                    DeepseekV4TensorKind::linear);
+                add_binding(
+                    result,
+                    name("attention.indexer.compressor.gate.weight"),
+                    {compressor_width, config.hidden},
+                    DeepseekV4TensorKind::linear);
+                add_binding(
+                    result,
+                    name("attention.indexer.compressor.position"),
+                    {4, compressor_width},
+                    DeepseekV4TensorKind::dense_float);
+                add_binding(
+                    result,
+                    name("attention.indexer.compressor.norm.weight"),
+                    {config.index_head_dim},
+                    DeepseekV4TensorKind::dense_float);
+            }
+        }
+        const auto engram = std::find(
+            config.engram_layer_ids.begin(),
+            config.engram_layer_ids.end(),
+            static_cast<std::int64_t>(layer));
+        if (engram != config.engram_layer_ids.end()) {
+            const auto hash_columns = checked_product(
+                config.engram_max_ngram_size - 1,
+                config.engram_n_heads,
+                "Engram hash columns");
+            const auto embedding_width = checked_product(
+                hash_columns,
+                config.engram_head_dim,
+                "Engram embedding width");
             add_binding(
                 result,
-                name("attention.indexer.compressor.key_value.weight"),
-                {compressor_width, config.hidden},
+                name("engram.key_value.weight"),
+                {
+                    checked_product(
+                        config.hidden,
+                        config.hc_mult + 1,
+                        "Engram KV width"),
+                    embedding_width,
+                },
                 DeepseekV4TensorKind::linear);
             add_binding(
                 result,
-                name("attention.indexer.compressor.gate.weight"),
-                {compressor_width, config.hidden},
-                DeepseekV4TensorKind::linear);
-            add_binding(
-                result,
-                name("attention.indexer.compressor.position"),
-                {4, compressor_width},
+                name("engram.query.weight"),
+                {config.hc_mult, config.hidden},
                 DeepseekV4TensorKind::dense_float);
             add_binding(
                 result,
-                name("attention.indexer.compressor.norm.weight"),
-                {config.index_head_dim},
+                name("engram.key.weight"),
+                {config.hc_mult, config.hidden},
                 DeepseekV4TensorKind::dense_float);
         }
     }

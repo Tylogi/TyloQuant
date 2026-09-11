@@ -91,6 +91,9 @@ constexpr const char* kHcPreSource = R"METAL(
         if (lane < CONNECTIONS) {
             pre[lane] = pre_value;
             metadata[row * 20u + lane] = post_value;
+            metadata[
+                uint(ROWS) * 20u + row * CONNECTIONS + lane
+            ] = pre_value;
         }
 
         float4 normalized_values =
@@ -232,24 +235,30 @@ constexpr const char* kHcPostSource = R"METAL(
     uint destination_row = index / uint(HIDDEN);
     uint destination = destination_row % 4u;
     uint row = destination_row / 4u;
-    float residual_sum = 0.0f;
+    float residual_products[4];
     for (uint source = 0u; source < 4u; ++source) {
         uint combination_index =
             (row * 4u + source) * 4u + destination;
         float mixing = PACKED_META != 0
             ? metadata[row * 20u + 4u + source * 4u + destination]
             : combination[combination_index];
-        residual_sum += mixing * float(residual[
+        residual_products[source] = mixing * float(residual[
             (row * 4u + source) * uint(HIDDEN) + feature
         ]);
     }
+    float residual_sum =
+        ((residual_products[0] + residual_products[1])
+            + residual_products[2])
+        + residual_products[3];
     float branch_value = float(
         branch[row * uint(HIDDEN) + feature]
     );
     if (ADD_BRANCH != 0) {
-        branch_value += float(
-            branch2[row * uint(HIDDEN) + feature]
-        );
+        branch_value = float(output_activation_t(
+            branch_value + float(
+                branch2[row * uint(HIDDEN) + feature]
+            )
+        ));
     }
     float post_value = PACKED_META != 0
         ? metadata[row * 20u + destination]
@@ -259,13 +268,200 @@ constexpr const char* kHcPostSource = R"METAL(
     output[index] = output_activation_t(direct + residual_sum);
 )METAL";
 
+// Exact V4.1 carried-pre collapse followed by MLX's 5120-wide RMSNorm
+// schedule. The BF16 threadgroup store preserves the graph boundary between
+// collapse and RMSNorm; 1024 threads with four reads each mirrors
+// rms_looped<float> for this width.
+constexpr const char* kV41HcCollapseNormSource = R"METAL(
+    constexpr uint CONNECTIONS = 4u;
+    constexpr uint READS = 4u;
+    constexpr uint THREADS = 1024u;
+    constexpr uint SIMD_SIZE = 32u;
+    uint row = threadgroup_position_in_grid.x;
+    uint local_thread = thread_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    if (row >= uint(ROWS)) {
+        return;
+    }
+
+    threadgroup volatile bfloat collapsed[HIDDEN];
+    threadgroup float local_inverse[1];
+    threadgroup float local_sums[SIMD_SIZE];
+    float accumulator = 0.0f;
+    uint residual_base = row * CONNECTIONS * uint(HIDDEN);
+    uint pre_base = row * CONNECTIONS;
+    uint first_feature = local_thread * READS;
+    for (uint offset = 0u;
+         offset < uint(HIDDEN);
+         offset += THREADS * READS) {
+        for (uint local = 0u; local < READS; ++local) {
+            uint feature = first_feature + offset + local;
+            if (feature < uint(HIDDEN)) {
+                float product0 = pre[pre_base]
+                    * float(residual[residual_base + feature]);
+                float product1 = pre[pre_base + 1u]
+                    * float(residual[
+                        residual_base + uint(HIDDEN) + feature]);
+                float product2 = pre[pre_base + 2u]
+                    * float(residual[
+                        residual_base + 2u * uint(HIDDEN) + feature]);
+                float product3 = pre[pre_base + 3u]
+                    * float(residual[
+                        residual_base + 3u * uint(HIDDEN) + feature]);
+                // MLX col_reduce_small combines the four source rows as
+                // row3 + (row2 + (row1 + row0)).
+                bfloat value = bfloat(
+                    product3 + (product2 + (product1 + product0)));
+                collapsed[feature] = value;
+                float x = float(value);
+                accumulator += x * x;
+            }
+        }
+    }
+
+    accumulator = simd_sum(accumulator);
+    if (simd_group == 0u) {
+        local_sums[lane] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        local_sums[simd_group] = accumulator;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0u) {
+        accumulator = simd_sum(local_sums[lane]);
+        if (lane == 0u) {
+            local_inverse[0] = metal::precise::rsqrt(
+                accumulator / float(HIDDEN) + params[0]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inverse = local_inverse[0];
+    for (uint offset = 0u;
+         offset < uint(HIDDEN);
+         offset += THREADS * READS) {
+        for (uint local = 0u; local < READS; ++local) {
+            uint feature = first_feature + offset + local;
+            if (feature < uint(HIDDEN)) {
+                float normalized = float(collapsed[feature]) * inverse;
+                output[row * uint(HIDDEN) + feature] = bfloat(
+                    norm[feature] * normalized);
+            }
+        }
+    }
+)METAL";
+
+// V4.1 decode has a single HC row. Keeping the 4x4 Sinkhorn state in one
+// thread preserves the generic FP32 operation order and replaces dozens of
+// launch-bound elementwise/reduction kernels with one dispatch. The affine
+// logits are materialized by MLX before this kernel so their rounding remains
+// identical to the generic graph.
+constexpr const char* kV41HcMetadataExactSource = R"METAL(
+    uint row = threadgroup_position_in_grid.x;
+    uint local_thread = thread_index_in_threadgroup;
+    if (row >= uint(ROWS) || local_thread != 0u) {
+        return;
+    }
+
+    constexpr uint CONNECTIONS = 4u;
+    uint value_base = row * 16u;
+    float epsilon = params[0];
+
+    float probabilities[16];
+    for (uint source = 0u; source < CONNECTIONS; ++source) {
+        uint source_base = source * CONNECTIONS;
+        float values[4];
+        for (uint destination = 0u;
+             destination < CONNECTIONS;
+             ++destination) {
+            values[destination] =
+                logits[value_base + source_base + destination];
+        }
+        float maximum = max(max(values[0], values[1]),
+                            max(values[2], values[3]));
+        float exponentials[4];
+        for (uint destination = 0u;
+             destination < CONNECTIONS;
+             ++destination) {
+            exponentials[destination] = metal::precise::exp(
+                values[destination] - maximum);
+        }
+        float denominator =
+            exponentials[3] +
+            (exponentials[2] +
+             (exponentials[1] + exponentials[0]));
+        for (uint destination = 0u;
+             destination < CONNECTIONS;
+             ++destination) {
+            probabilities[source_base + destination] =
+                exponentials[destination] / denominator + epsilon;
+        }
+    }
+
+    for (uint destination = 0u;
+         destination < CONNECTIONS;
+         ++destination) {
+        float denominator =
+            probabilities[12u + destination] +
+            (probabilities[8u + destination] +
+             (probabilities[4u + destination] +
+              probabilities[destination]));
+        denominator = denominator + epsilon;
+        for (uint source = 0u; source < CONNECTIONS; ++source) {
+            uint index = source * CONNECTIONS + destination;
+            probabilities[index] = probabilities[index] / denominator;
+        }
+    }
+
+    for (uint iteration = 1u;
+         iteration < uint(SINKHORN_ITERATIONS);
+         ++iteration) {
+        for (uint source = 0u; source < CONNECTIONS; ++source) {
+            uint source_base = source * CONNECTIONS;
+            float denominator =
+                probabilities[source_base + 3u] +
+                (probabilities[source_base + 2u] +
+                 (probabilities[source_base + 1u] +
+                  probabilities[source_base]));
+            denominator = denominator + epsilon;
+            for (uint destination = 0u;
+                 destination < CONNECTIONS;
+                 ++destination) {
+                uint index = source_base + destination;
+                probabilities[index] = probabilities[index] / denominator;
+            }
+        }
+        for (uint destination = 0u;
+             destination < CONNECTIONS;
+             ++destination) {
+            float denominator =
+                probabilities[12u + destination] +
+                (probabilities[8u + destination] +
+                 (probabilities[4u + destination] +
+                  probabilities[destination]));
+            denominator = denominator + epsilon;
+            for (uint source = 0u; source < CONNECTIONS; ++source) {
+                uint index = source * CONNECTIONS + destination;
+                probabilities[index] = probabilities[index] / denominator;
+            }
+        }
+    }
+
+    for (uint index = 0u; index < 16u; ++index) {
+        combination[value_base + index] = probabilities[index];
+    }
+)METAL";
+
 mlx::core::fast::CustomKernelFunction make_kernel(
     const char* name,
     std::vector<std::string> inputs,
     std::vector<std::string> outputs,
-    std::string source) {
+    std::string source,
+    mlx::core::MathMode math_mode = mlx::core::MathMode::Fast) {
     CompileOptions options;
-    options.math_mode = mlx::core::MathMode::Fast;
+    options.math_mode = math_mode;
     return mlx::core::fast::metal_kernel(
         name,
         std::move(inputs),
@@ -316,7 +512,8 @@ const mlx::core::fast::CustomKernelFunction& hc_post_kernel(
         },
         {"output"},
         std::string("using output_activation_t = half;\n") +
-            kHcPostSource);
+            kHcPostSource,
+        mlx::core::MathMode::Safe);
     static const auto bf16_kernel = make_kernel(
         "mfq_cpp_dsv4_hc_post_bf16",
         {
@@ -329,10 +526,33 @@ const mlx::core::fast::CustomKernelFunction& hc_post_kernel(
         },
         {"output"},
         std::string("using output_activation_t = bfloat;\n") +
-            kHcPostSource);
+            kHcPostSource,
+        mlx::core::MathMode::Safe);
     return dtype == mlx::core::bfloat16
         ? bf16_kernel
         : fp16_kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+v41_hc_collapse_norm_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_dsv41_hc_collapse_norm_bf16_h5120",
+        {"residual", "pre", "norm", "params"},
+        {"output"},
+        kV41HcCollapseNormSource,
+        mlx::core::MathMode::Safe);
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+v41_hc_metadata_exact_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_dsv41_hc_metadata_exact_f32",
+        {"logits", "params"},
+        {"combination"},
+        kV41HcMetadataExactSource,
+        mlx::core::MathMode::Safe);
+    return kernel;
 }
 
 int checked_int(std::size_t value, const char* name) {
@@ -509,10 +729,14 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre(
     const int reduced_bytes = checked_int(
         static_cast<std::size_t>(rows) * hidden * reduced_item_size,
         "packed reduced bytes");
+    const int metadata_bytes = checked_int(
+        static_cast<std::size_t>(rows) *
+            (kMixWidth - kConnections) * sizeof(float),
+        "packed metadata bytes");
     const int packed_bytes = checked_int(
         static_cast<std::size_t>(reduced_bytes) +
-            static_cast<std::size_t>(rows) *
-                (kMixWidth - kConnections) * sizeof(float),
+            metadata_bytes + static_cast<std::size_t>(rows) *
+                kConnections * sizeof(float),
         "packed output bytes");
     const array params({eps, eps, eps}, mlx::core::float32);
     auto outputs = hc_pre_kernel(residual_values.dtype())(
@@ -556,9 +780,17 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre(
             mlx::core::slice(
                 packed,
                 Shape{reduced_bytes},
-                Shape{packed_bytes}),
+                Shape{reduced_bytes + metadata_bytes}),
             mlx::core::float32),
         Shape{batch, tokens, kMixWidth - kConnections});
+    auto pre = mlx::core::reshape(
+        mlx::core::view(
+            mlx::core::slice(
+                packed,
+                Shape{reduced_bytes + metadata_bytes},
+                Shape{packed_bytes}),
+            mlx::core::float32),
+        Shape{batch, tokens, kConnections});
     auto post = mlx::core::contiguous(mlx::core::slice(
         metadata,
         Shape{0, 0, 0},
@@ -574,6 +806,7 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre(
         std::move(post),
         std::move(combination),
         std::move(metadata),
+        std::move(pre),
     };
 }
 
@@ -629,10 +862,14 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre_norm(
     const int reduced_bytes = checked_int(
         static_cast<std::size_t>(rows) * hidden * reduced_item_size,
         "packed reduced bytes");
+    const int metadata_bytes = checked_int(
+        static_cast<std::size_t>(rows) *
+            (kMixWidth - kConnections) * sizeof(float),
+        "packed metadata bytes");
     const int packed_bytes = checked_int(
         static_cast<std::size_t>(reduced_bytes) +
-            static_cast<std::size_t>(rows) *
-                (kMixWidth - kConnections) * sizeof(float),
+            metadata_bytes + static_cast<std::size_t>(rows) *
+                kConnections * sizeof(float),
         "packed output bytes");
     const array params(
         {hc_eps, norm_eps, norm_eps},
@@ -681,9 +918,17 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre_norm(
             mlx::core::slice(
                 packed,
                 Shape{reduced_bytes},
-                Shape{packed_bytes}),
+                Shape{reduced_bytes + metadata_bytes}),
             mlx::core::float32),
         Shape{batch, tokens, kMixWidth - kConnections});
+    auto pre = mlx::core::reshape(
+        mlx::core::view(
+            mlx::core::slice(
+                packed,
+                Shape{reduced_bytes + metadata_bytes},
+                Shape{packed_bytes}),
+            mlx::core::float32),
+        Shape{batch, tokens, kConnections});
     auto post = mlx::core::contiguous(mlx::core::slice(
         metadata,
         Shape{0, 0, 0},
@@ -699,6 +944,150 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre_norm(
         std::move(post),
         std::move(combination),
         std::move(metadata),
+        std::move(pre),
+    };
+}
+
+array deepseek_v41_hc_collapse_norm(
+    const array& residual,
+    const array& pre,
+    const array& norm,
+    float norm_eps) {
+    auto residual_values = activation16_contiguous(residual);
+    auto pre_values = float32_contiguous(pre);
+    auto norm_values = float32_contiguous(norm);
+    if (residual_values.dtype() != mlx::core::bfloat16 ||
+        residual_values.ndim() != 4 ||
+        residual_values.shape(0) <= 0 ||
+        residual_values.shape(1) <= 0 ||
+        residual_values.shape(2) != kConnections ||
+        residual_values.shape(3) != 5120 ||
+        pre_values.shape() != Shape{
+            residual_values.shape(0),
+            residual_values.shape(1),
+            kConnections,
+        } ||
+        norm_values.shape() != Shape{5120} ||
+        !std::isfinite(norm_eps) || norm_eps <= 0.0f) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4.1 exact HC collapse/RMSNorm input");
+    }
+    const int rows = checked_int(
+        static_cast<std::size_t>(residual_values.shape(0)) *
+            residual_values.shape(1),
+        "V4.1 collapse row count");
+    if (rows > std::numeric_limits<int>::max() / 1024) {
+        throw std::invalid_argument(
+            "DeepSeek-V4.1 HC collapse grid exceeds Metal limits");
+    }
+    const array params({norm_eps}, mlx::core::float32);
+    auto outputs = v41_hc_collapse_norm_kernel()(
+        {residual_values, pre_values, norm_values, params},
+        {Shape{
+            residual_values.shape(0),
+            residual_values.shape(1),
+            5120,
+        }},
+        {mlx::core::bfloat16},
+        {rows * 1024, 1, 1},
+        {1024, 1, 1},
+        {
+            {"ROWS", rows},
+            {"HIDDEN", 5120},
+        },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
+MlxDeepseekV41HcMetadataResult deepseek_v41_hc_metadata_exact(
+    const array& normalized_mixes,
+    const array& scale,
+    const array& base,
+    int sinkhorn_iterations,
+    float eps) {
+    auto mix_values = float32_contiguous(normalized_mixes);
+    auto scale_values = float32_contiguous(scale);
+    auto base_values = float32_contiguous(base);
+    if (mix_values.ndim() != 3 ||
+        mix_values.shape(0) <= 0 ||
+        mix_values.shape(1) <= 0 ||
+        mix_values.shape(2) != kMixWidth ||
+        mix_values.shape(0) * mix_values.shape(1) != 1 ||
+        scale_values.size() != 3 ||
+        base_values.size() != kMixWidth ||
+        sinkhorn_iterations != kSinkhornIterations ||
+        !std::isfinite(eps) || eps <= 0.0f) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4.1 exact HC metadata input");
+    }
+    scale_values = mlx::core::reshape(scale_values, Shape{3});
+    base_values = mlx::core::reshape(base_values, Shape{kMixWidth});
+    const int batch = mix_values.shape(0);
+    const int tokens = mix_values.shape(1);
+    const int rows = batch * tokens;
+    const auto last_slice = [](const array& input, int begin, int end) {
+        Shape start(input.ndim(), 0);
+        Shape stop = input.shape();
+        start.back() = begin;
+        stop.back() = end;
+        return mlx::core::slice(
+            input,
+            std::move(start),
+            std::move(stop));
+    };
+    auto pre = mlx::core::sigmoid(
+        last_slice(mix_values, 0, kConnections) *
+            last_slice(scale_values, 0, 1) +
+        last_slice(base_values, 0, kConnections)) +
+        eps;
+    auto post = 2.0f * mlx::core::sigmoid(
+        last_slice(mix_values, kConnections, 2 * kConnections) *
+            last_slice(scale_values, 1, 2) +
+        last_slice(
+            base_values,
+            kConnections,
+            2 * kConnections));
+    const Shape matrix_shape{
+        batch,
+        tokens,
+        kConnections,
+        kConnections,
+    };
+    auto logits = float32_contiguous(
+        mlx::core::reshape(
+            last_slice(
+                mix_values,
+                2 * kConnections,
+                kMixWidth),
+            matrix_shape) *
+            last_slice(scale_values, 2, 3) +
+        mlx::core::reshape(
+            last_slice(
+                base_values,
+                2 * kConnections,
+                kMixWidth),
+            Shape{kConnections, kConnections}));
+    const array params({eps}, mlx::core::float32);
+    auto outputs = v41_hc_metadata_exact_kernel()(
+        {logits, params},
+        {matrix_shape},
+        {mlx::core::float32},
+        {rows * 32, 1, 1},
+        {32, 1, 1},
+        {
+            {"ROWS", rows},
+            {"SINKHORN_ITERATIONS", sinkhorn_iterations},
+        },
+        std::nullopt,
+        false,
+        {});
+    auto combination = std::move(outputs.front());
+    return {
+        std::move(post),
+        std::move(combination),
+        std::move(pre),
     };
 }
 

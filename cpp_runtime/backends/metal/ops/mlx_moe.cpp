@@ -242,6 +242,40 @@ bool mxfp4_nax_smallm_preferred(
     return false;
 }
 
+bool mxfp4_decode_down_reduce_enabled() noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_NINTM_DECODE_DOWN_REDUCE");
+    if (value == nullptr) {
+        return true;
+    }
+    const auto setting = std::string_view(value);
+    return setting != "0"
+        && setting != "false"
+        && setting != "off";
+}
+
+int mxfp4_decode_down_reduce_rows() noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_NINTM_DECODE_DOWN_REDUCE_ROWS");
+    if (value != nullptr) {
+        const auto setting = std::string_view(value);
+        if (setting == "1") return 1;
+        if (setting == "4") return 4;
+    }
+    return 2;
+}
+
+int mxfp4_decode_rows_per_simd() noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD");
+    if (value != nullptr) {
+        const auto setting = std::string_view(value);
+        if (setting == "1") return 1;
+        if (setting == "4") return 4;
+    }
+    return 2;
+}
+
 bool routed_sort_enabled(int tokens) noexcept {
     if (tokens <= 1) {
         return false;
@@ -658,7 +692,7 @@ constexpr const char* kMoeSource = R"METAL(
     constexpr uint SIMD_GROUPS = 2u;
     constexpr uint K_LANES = uint(K_LANES_VALUE);
     constexpr uint LANE_GROUPS = 32u / K_LANES;
-    constexpr uint ROWS_PER_SIMD = 1u;
+    constexpr uint ROWS_PER_SIMD = uint(ROWS_PER_SIMD_VALUE);
     constexpr uint MATRIX_ROWS =
         uint(FUSED_SWIGLU) != 0u
             ? 2u * ROWS_PER_SIMD
@@ -2841,6 +2875,7 @@ struct NativeMoeConfig {
     int fused_swiglu = 0;
     int input_width = 0;
     int k_lanes = 0;
+    int rows_per_simd = 1;
     int descriptor_size = 0;
     int variant_stride = 0;
     int shared_input = 0;
@@ -2852,6 +2887,18 @@ struct NativeMoeConfig {
     int sorted_routes = 0;
     int expert_map_size = 0;
     int packed_expert_ids = 0;
+    int workgroups = 0;
+};
+
+struct Mxfp4DecodeReduceConfig {
+    Dtype dtype;
+    Shape output_shape;
+    int routes = 0;
+    int experts = 0;
+    int output_width = 0;
+    int input_width = 0;
+    int descriptor_size = 0;
+    int rows_per_lane_group = 2;
     int workgroups = 0;
 };
 
@@ -3193,6 +3240,7 @@ std::string native_moe_kernel_name(
         << "_sw" << config.fused_swiglu
         << "_k" << config.input_width
         << "_kl" << config.k_lanes
+        << "_rs" << config.rows_per_simd
         << "_vs" << config.variant_stride
         << "_si" << config.shared_input
         << "_jl" << config.jsc_execution_layout
@@ -3271,6 +3319,8 @@ std::string make_native_moe_source(
         << "constexpr int K = " << config.input_width << ";\n"
         << "constexpr int K_LANES_VALUE = "
         << config.k_lanes << ";\n"
+        << "constexpr int ROWS_PER_SIMD_VALUE = "
+        << config.rows_per_simd << ";\n"
         << "constexpr int DESCRIPTOR_SIZE = "
         << config.descriptor_size << ";\n"
         << "constexpr int VARIANT_STRIDE = "
@@ -3398,6 +3448,278 @@ array native_moe_dispatch(
         std::move(shape),
         dtype,
         std::make_shared<NativeNintMoePrimitive>(
+            stream,
+            std::move(config)),
+        std::move(inputs));
+}
+
+std::string mxfp4_decode_reduce_kernel_name(
+    const Mxfp4DecodeReduceConfig& config) {
+    std::ostringstream name;
+    name
+        << "mfq_mxfp4_decode_down_reduce_"
+        << (config.dtype == mlx::core::float16 ? "f16" : "f32")
+        << "_r" << config.routes
+        << "_e" << config.experts
+        << "_o" << config.output_width
+        << "_k" << config.input_width
+        << "_rr" << config.rows_per_lane_group;
+    return name.str();
+}
+
+std::string make_mxfp4_decode_reduce_source(
+    const Mxfp4DecodeReduceConfig& config,
+    const std::string& kernel_name) {
+    std::ostringstream source;
+    source
+        << "#include <metal_stdlib>\n"
+        << "using namespace metal;\n"
+        << "using T = "
+        << (config.dtype == mlx::core::float16 ? "half" : "float")
+        << ";\n"
+        << "constant constexpr float MXFP4_LUT[16] = {\n"
+           "    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,\n"
+           "    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,\n"
+           "};\n"
+        << "kernel void " << kernel_name << "(\n"
+        << "device const int* descriptors [[buffer(0)]],\n"
+        << "device const uchar* mx_values [[buffer(1)]],\n"
+        << "device const uchar* mx_scales [[buffer(2)]],\n"
+        << "device const T* x [[buffer(3)]],\n"
+        << "device const int* expert_ids [[buffer(4)]],\n"
+        << "device const float* route_weights [[buffer(5)]],\n"
+        << "device T* y [[buffer(6)]],\n"
+        << "uint thread_index_in_simdgroup "
+           "[[thread_index_in_simdgroup]],\n"
+        << "uint simdgroup_index_in_threadgroup "
+           "[[simdgroup_index_in_threadgroup]],\n"
+        << "uint3 threadgroup_position_in_grid "
+           "[[threadgroup_position_in_grid]]) {\n"
+        << "constexpr uint ROUTES = " << config.routes << "u;\n"
+        << "constexpr uint EXPERTS = " << config.experts << "u;\n"
+        << "constexpr uint OUT = " << config.output_width << "u;\n"
+        << "constexpr uint K = " << config.input_width << "u;\n"
+        << "constexpr uint DESCRIPTOR_SIZE = "
+        << config.descriptor_size << "u;\n"
+        << "constexpr uint ROWS_PER_LANE_GROUP = "
+        << config.rows_per_lane_group << "u;\n"
+        << R"METAL(
+    constexpr uint K_LANES = 8u;
+    constexpr uint LANE_GROUPS = 32u / K_LANES;
+    constexpr uint OUTPUTS_PER_TG = LANE_GROUPS * ROWS_PER_LANE_GROUP;
+    threadgroup float route_outputs[ROUTES * OUTPUTS_PER_TG];
+
+    const uint lane = thread_index_in_simdgroup;
+    const uint k_lane = lane & (K_LANES - 1u);
+    const uint lane_group = lane / K_LANES;
+    const uint route = simdgroup_index_in_threadgroup;
+    const uint output_base = threadgroup_position_in_grid.x * OUTPUTS_PER_TG
+        + lane_group * ROWS_PER_LANE_GROUP;
+    uint bounded_outputs[ROWS_PER_LANE_GROUP];
+    float accumulators[ROWS_PER_LANE_GROUP] = {0.0f};
+    for (uint row = 0u; row < ROWS_PER_LANE_GROUP; ++row) {
+        bounded_outputs[row] = min(output_base + row, OUT - 1u);
+    }
+
+    const int expert = expert_ids[route];
+    if (expert >= 0 && expert < int(EXPERTS)) {
+        const uint descriptor_base = uint(expert) * DESCRIPTOR_SIZE;
+        // This primitive is selected only for a pure MXFP4 projection.
+        const uint local_expert = uint(descriptors[descriptor_base + 1u]);
+        const uint groups = uint(descriptors[descriptor_base + 4u]);
+        const uint value_offset = uint(descriptors[descriptor_base + 5u]);
+        const uint scale_offset = uint(descriptors[descriptor_base + 6u]);
+
+        for (uint group = k_lane; group < groups; group += K_LANES) {
+            const uint column_base = group * 32u;
+            ulong pool_outputs[ROWS_PER_LANE_GROUP];
+            float scales[ROWS_PER_LANE_GROUP];
+            for (uint row = 0u; row < ROWS_PER_LANE_GROUP; ++row) {
+                pool_outputs[row] = ulong(local_expert) * ulong(OUT)
+                    + ulong(bounded_outputs[row]);
+                const uchar raw_scale = mx_scales[
+                    ulong(scale_offset)
+                        + pool_outputs[row] * ulong(groups)
+                        + ulong(group)];
+                const uint scale_bits = raw_scale == 0u
+                    ? 0x00400000u
+                    : uint(raw_scale) << 23u;
+                scales[row] = raw_scale == 255u
+                    ? NAN
+                    : as_type<float>(scale_bits);
+            }
+
+            for (uint component = 0u; component < 32u; component += 16u) {
+                const uint column = column_base + component;
+                const vec<T, 4> source0 = *reinterpret_cast<
+                    device const vec<T, 4>*>(x + route * K + column);
+                const vec<T, 4> source1 = *reinterpret_cast<
+                    device const vec<T, 4>*>(x + route * K + column + 4u);
+                const vec<T, 4> source2 = *reinterpret_cast<
+                    device const vec<T, 4>*>(x + route * K + column + 8u);
+                const vec<T, 4> source3 = *reinterpret_cast<
+                    device const vec<T, 4>*>(x + route * K + column + 12u);
+                const float activations[16] = {
+                    float(source0.x), float(source0.y),
+                    float(source0.z), float(source0.w),
+                    float(source1.x), float(source1.y),
+                    float(source1.z), float(source1.w),
+                    float(source2.x), float(source2.y),
+                    float(source2.z), float(source2.w),
+                    float(source3.x), float(source3.y),
+                    float(source3.z), float(source3.w),
+                };
+                for (uint row = 0u; row < ROWS_PER_LANE_GROUP; ++row) {
+                    const ulong packed_offset = ulong(value_offset)
+                        + pool_outputs[row] * (ulong(K) >> 1u)
+                        + (ulong(column) >> 1u);
+                    const uint2 packed = *reinterpret_cast<
+                        device const uint2*>(mx_values + packed_offset);
+                    for (uint pair = 0u; pair < 8u; ++pair) {
+                        const uint word = pair < 4u ? packed.x : packed.y;
+                        const uchar codes = uchar(
+                            word >> ((pair & 3u) * 8u));
+                        accumulators[row] = fma(
+                            activations[pair * 2u],
+                            scales[row] * MXFP4_LUT[uint(codes & 15u)],
+                            accumulators[row]);
+                        accumulators[row] = fma(
+                            activations[pair * 2u + 1u],
+                            scales[row] * MXFP4_LUT[uint(codes >> 4u)],
+                            accumulators[row]);
+                    }
+                }
+            }
+        }
+        for (uint offset = K_LANES >> 1u; offset > 0u; offset >>= 1u) {
+            for (uint row = 0u; row < ROWS_PER_LANE_GROUP; ++row) {
+                accumulators[row] += simd_shuffle_down(
+                    accumulators[row], offset);
+            }
+        }
+    }
+    if (k_lane == 0u) {
+        for (uint row = 0u; row < ROWS_PER_LANE_GROUP; ++row) {
+            // Preserve the original two-dispatch contract: each down result
+            // first rounds to the activation dtype before route weighting.
+            const float down = expert >= 0 && expert < int(EXPERTS)
+                ? float(T(accumulators[row]))
+                : 0.0f;
+            route_outputs[
+                route * OUTPUTS_PER_TG
+                    + lane_group * ROWS_PER_LANE_GROUP + row
+            ] = down * route_weights[route];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // One SIMD group performs the tiny deterministic Top-6 reduction while
+    // the other route groups finish together at the same barrier.
+    if (simdgroup_index_in_threadgroup == 0u && lane < OUTPUTS_PER_TG) {
+        const uint output = threadgroup_position_in_grid.x * OUTPUTS_PER_TG
+            + lane;
+        float total = 0.0f;
+        for (uint selected = 0u; selected < ROUTES; ++selected) {
+            total += route_outputs[selected * OUTPUTS_PER_TG + lane];
+        }
+        if (output < OUT) {
+            y[output] = T(total);
+        }
+    }
+}
+)METAL";
+    return source.str();
+}
+
+class Mxfp4DecodeReducePrimitive final
+    : public mlx::core::UnaryPrimitive {
+public:
+    Mxfp4DecodeReducePrimitive(
+        mlx::core::Stream stream,
+        Mxfp4DecodeReduceConfig config)
+        : UnaryPrimitive(stream),
+          config_(std::move(config)),
+          kernel_name_(mxfp4_decode_reduce_kernel_name(config_)) {}
+
+    void eval_cpu(
+        const std::vector<array>&,
+        array&) override {
+        throw std::runtime_error(
+            "MXFP4 decode down-reduce has no CPU path");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        if (inputs.size() != 6) {
+            throw std::logic_error(
+                "MXFP4 decode down-reduce input count mismatch");
+        }
+        output.set_data(
+            mlx::core::allocator::malloc(output.nbytes()));
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        CompileOptions compile_options;
+        compile_options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_,
+            compile_options,
+            [config = config_, name = kernel_name_] {
+                return make_mxfp4_decode_reduce_source(config, name);
+            });
+        auto* kernel = device.get_kernel(kernel_name_, library);
+        auto& encoder = mlx::core::metal::get_command_encoder(
+            selected_stream);
+        encoder.set_compute_pipeline_state(kernel);
+        for (int index = 0; index < 6; ++index) {
+            encoder.set_input_array(
+                inputs[static_cast<std::size_t>(index)],
+                index);
+        }
+        encoder.set_output_array(output, 6);
+        encoder.dispatch_threadgroups(
+            MTL::Size(config_.workgroups, 1, 1),
+            MTL::Size(config_.routes * 32, 1, 1));
+    }
+
+    const char* name() const override {
+        return "Mxfp4DecodeReducePrimitive";
+    }
+
+    bool is_equivalent(
+        const mlx::core::Primitive& other) const override {
+        const auto* primitive =
+            dynamic_cast<const Mxfp4DecodeReducePrimitive*>(&other);
+        return primitive != nullptr
+            && primitive->kernel_name_ == kernel_name_;
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {config_.output_shape};
+    }
+
+private:
+    Mxfp4DecodeReduceConfig config_;
+    std::string kernel_name_;
+};
+
+array mxfp4_decode_reduce_dispatch(
+    std::vector<array> inputs,
+    Mxfp4DecodeReduceConfig config) {
+    auto stream = mlx::core::default_stream(
+        mlx::core::default_device());
+    if (stream.device != mlx::core::Device::gpu) {
+        throw std::invalid_argument(
+            "MXFP4 decode down-reduce requires the Metal device");
+    }
+    auto shape = config.output_shape;
+    const auto dtype = config.dtype;
+    return array(
+        std::move(shape),
+        dtype,
+        std::make_shared<Mxfp4DecodeReducePrimitive>(
             stream,
             std::move(config)),
         std::move(inputs));
@@ -7985,6 +8307,88 @@ array MlxNintMoeWeight::routed_swiglu_packed(
         true);
 }
 
+array MlxNintMoeWeight::routed_matmul_reduce(
+    const array& input,
+    const array& expert_ids,
+    const array& route_weights) const {
+    const auto fallback = [&]() {
+        return moe_weighted_reduce(
+            routed_matmul(input, expert_ids),
+            route_weights);
+    };
+    if (!mxfp4_decode_down_reduce_enabled()
+        || mlx_reference_enabled()
+        || !impl_->native_primitive
+        || impl_->family_mask
+            != (std::uint32_t{1} << kFamilyMxfp4)
+        || impl_->projections != 1
+        || !impl_->rotations.empty()
+        || (impl_->k_lanes_override != 0
+            && impl_->k_lanes_override != 8)
+        || input.ndim() != 3
+        || expert_ids.ndim() != 2
+        || route_weights.ndim() != 2
+        || input.shape(0) != 1
+        || expert_ids.shape(0) != 1
+        || route_weights.shape(0) != 1
+        || input.shape(1) != expert_ids.shape(1)
+        || route_weights.shape(1) != expert_ids.shape(1)
+        || input.shape(2) != impl_->neuron_len
+        || expert_ids.shape(1) <= 0
+        || expert_ids.shape(1) > 16
+        || impl_->out_per_expert <= 0
+        || impl_->neuron_len <= 0
+        || impl_->neuron_len % 32 != 0
+        || impl_->descriptor_values.size()
+            != static_cast<std::size_t>(impl_->experts)
+                * kDescriptorSize) {
+        return fallback();
+    }
+
+    auto source = input;
+    if (source.dtype() != mlx::core::float16
+        && source.dtype() != mlx::core::float32) {
+        source = mlx::core::astype(source, mlx::core::float16);
+    }
+    source = mlx::core::contiguous(std::move(source));
+    auto ids = mlx::core::contiguous(
+        mlx::core::astype(expert_ids, mlx::core::int32));
+    auto weights = mlx::core::contiguous(
+        mlx::core::astype(route_weights, mlx::core::float32));
+    const int routes = ids.shape(1);
+    const int rows_per_lane_group =
+        mxfp4_decode_down_reduce_rows();
+    const int outputs_per_workgroup =
+        4 * rows_per_lane_group;
+    const int workgroups = checked_int(
+        (static_cast<std::size_t>(impl_->out_per_expert)
+             + static_cast<std::size_t>(outputs_per_workgroup) - 1u)
+            / static_cast<std::size_t>(outputs_per_workgroup),
+        "MXFP4 decode down-reduce workgroups");
+    return mxfp4_decode_reduce_dispatch(
+        {
+            impl_->descriptors,
+            impl_->mx_values,
+            impl_->mx_scales,
+            std::move(source),
+            std::move(ids),
+            std::move(weights),
+        },
+        Mxfp4DecodeReduceConfig{
+            .dtype = input.dtype() == mlx::core::float32
+                ? mlx::core::float32
+                : mlx::core::float16,
+            .output_shape = Shape{1, impl_->out_per_expert},
+            .routes = routes,
+            .experts = impl_->experts,
+            .output_width = impl_->out_per_expert,
+            .input_width = impl_->neuron_len,
+            .descriptor_size = kDescriptorSize,
+            .rows_per_lane_group = rows_per_lane_group,
+            .workgroups = workgroups,
+        });
+}
+
 bool MlxNintMoeWeight::supports_grouped_mmq() const noexcept {
     // The block-list builder uses one Metal thread and one threadgroup-array
     // entry per addressable expert. Large shared SSD arenas can expose more
@@ -8666,8 +9070,17 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 (std::uint32_t{1} << kFamilyMxfp4)
             ? 16
             : 8);
+    const int rows_per_simd =
+        tokens == 1
+            && impl_->projections == 1
+            && impl_->family_mask
+                == (std::uint32_t{1} << kFamilyMxfp4)
+            && impl_->rotations.empty()
+            && k_lanes == 8
+        ? mxfp4_decode_rows_per_simd()
+        : 1;
     const auto rows_per_workgroup =
-        static_cast<std::size_t>(64 / k_lanes);
+        static_cast<std::size_t>(64 / k_lanes * rows_per_simd);
     const auto output_tiles =
         (
             static_cast<std::size_t>(
@@ -8817,6 +9230,7 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .fused_swiglu = static_cast<int>(fused_swiglu),
                 .input_width = impl_->neuron_len,
                 .k_lanes = k_lanes,
+                .rows_per_simd = rows_per_simd,
                 .descriptor_size = kDescriptorSize,
                 .variant_stride = variant_stride,
                 .shared_input = static_cast<int>(shared_input),
@@ -8873,6 +9287,7 @@ array MlxNintMoeWeight::routed_matmul_impl(
             },
             {"K", impl_->neuron_len},
             {"K_LANES_VALUE", k_lanes},
+            {"ROWS_PER_SIMD_VALUE", rows_per_simd},
             {"DESCRIPTOR_SIZE", kDescriptorSize},
             {"VARIANT_STRIDE", variant_stride},
             {
@@ -9138,8 +9553,9 @@ array MlxRoutedLinear::combine(
     const array& input,
     const array& expert_ids,
     const array& route_weights) const {
-    return moe_weighted_reduce(
-        forward(input, expert_ids),
+    return weight_.routed_matmul_reduce(
+        input,
+        expert_ids,
         route_weights);
 }
 

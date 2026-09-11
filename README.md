@@ -25,6 +25,7 @@ memory, storage, and latency limits.
 </p>
 
 <p>
+  <a href="#deepseek-v41-raw-hf">DeepSeek V4.1</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#features">Features</a> ·
   <a href="#models">Models</a> ·
@@ -33,6 +34,34 @@ memory, storage, and latency limits.
 </p>
 
 </div>
+
+<a id="deepseek-v41-raw-hf"></a>
+
+## DeepSeek V4.1 raw-HF on one Mac Studio
+
+> **Run a 476 GB DeepSeek V4.1 Flash checkpoint directly from Hugging Face
+> Safetensors on a single 512 GB Apple M3 Ultra—without converting it to an
+> MFQ container first.** The tuned Metal path keeps the backbone and MoE
+> experts resident in unified memory while offloading only Engram storage to
+> the Mac's internal SSD.
+
+| Model / hardware | Placement | Model load | Prefill, 511 / 2,031 tokens | Token generation |
+| --- | --- | ---: | ---: | ---: |
+| DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra, 512 GB | Full resident; Engram only on internal SSD | **38.6 s** | **285.6 / 338.4 tok/s** | **18.20 tok/s** |
+
+*Measured locally at batch size 1 with a 4,096-token context, 512-token
+prefill chunks, temperature 0, warmed execution, and MTP disabled. These are
+observed local runtime results; OS memory pressure can affect them.*
+
+### DeepSeek V4.1 TODO
+
+- [ ] **Production MTP support and tuning.** Improve draft acceptance,
+  verification, and adaptive depth until MTP consistently exceeds the current
+  non-MTP **18.20 tok/s** baseline without compromising deterministic output;
+  then enable it by default.
+- [ ] **Continue M3 Ultra optimization.** Improve long-prompt prefill and token
+  generation, reduce model-load and memory-pressure overhead, and further
+  overlap Engram cache misses with internal-SSD I/O.
 
 MFQ handles the full path from a source checkpoint to a deployable packed
 model. It measures activation and loss sensitivity, assigns precision at

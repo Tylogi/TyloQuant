@@ -300,6 +300,23 @@ int main() {
                 "mtp.0.markov_head.embed.weight",
             "legacy DeepSeek-V4.1 aliases were not canonicalized");
 
+        const auto v41_raw_hf_aliases = mfq::make_legacy_tensor_aliases(
+            "deepseek_v4_raw_hf",
+            R"json({"model_type":"deepseek_v41"})json",
+            {
+                "layers.0.attn.wkv.weight",
+                "layers.0.attn.kv_norm.weight",
+            });
+        require(
+            v41_raw_hf_aliases.canonical_to_stored.at(
+                "model.block.0.attention.key_value_a.weight") ==
+                "layers.0.attn.wkv.weight" &&
+            v41_raw_hf_aliases.canonical_to_stored.at(
+                "model.block.0.attention.key_value_a_norm.weight") ==
+                "layers.0.attn.kv_norm.weight",
+            "raw-HF DeepSeek-V4.1 aliases did not preserve the tuned "
+            "Metal contract");
+
         const auto gemma_aliases = mfq::make_legacy_tensor_aliases(
             "gemma4",
             R"json({"model_type":"gemma4","num_hidden_layers":1})json",

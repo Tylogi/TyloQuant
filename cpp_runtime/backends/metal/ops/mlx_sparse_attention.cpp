@@ -645,9 +645,10 @@ array mlx_sparse_selected_mla_attention(
             {"MAX_SEQ", params.keys},
             {"SELECTED", params.selected},
         };
-        // Speculative verification must preserve the M=1 reduction order.
-        // Even a small short-prefill rounding difference can change a greedy
-        // target token and make MTP diverge from ordinary decode.
+        // The decode kernel already maps query rows independently and keeps
+        // the same 32-lane dot/softmax/value reduction as M=1. Use it for
+        // DSpark's M=2..6 verifier blocks as well; the former short-prefill
+        // kernel used eight times as many threads and changed reduction order.
         const bool decode_consistent = params.queries <= 6;
         const int grid = decode_consistent
             ? checked_grid_product(

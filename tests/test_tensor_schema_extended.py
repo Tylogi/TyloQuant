@@ -118,6 +118,70 @@ def test_deepseek_v4_graph_composes_vision_and_dspark() -> None:
     "source,canonical,component",
     [
         (
+            "layers.8.attn.indexer.wk.weight",
+            "model.block.8.attention.indexer.key.weight",
+            TensorComponent.MODEL,
+        ),
+        (
+            "layers.14.engram.embed.scale",
+            "model.block.14.associative_memory.embedding.weight_scale",
+            TensorComponent.MODEL,
+        ),
+        (
+            "layers.14.engram.q_weight",
+            "model.block.14.associative_memory.query.weight",
+            TensorComponent.MODEL,
+        ),
+        (
+            "mtp.2.markov_head.embed.weight",
+            "predictor.stage.2.markov.embedding.weight",
+            TensorComponent.PREDICTOR,
+        ),
+    ],
+)
+def test_deepseek_v41_source_names_and_graph(
+    source: str,
+    canonical: str,
+    component: TensorComponent,
+) -> None:
+    config = {
+        "model_type": "deepseek_v41",
+        "text_config": {
+            "model_type": "deepseek_v41_text",
+            "num_hidden_layers": 40,
+            "num_nextn_predict_layers": 3,
+        },
+        "vision_config": {"num_hidden_layers": 32},
+    }
+    mapped = map_source_tensor_name(source, config, require_registered=True)
+    assert mapped is not None
+    assert (mapped.canonical_name, mapped.component) == (canonical, component)
+    graph = graph_spec_for_plan(
+        config,
+        [
+            "model.token_embedding.weight",
+            "vision.patch_embedding.weight",
+            "predictor.stage.2.markov.output.weight",
+        ],
+    )
+    assert graph is not None
+    payload = graph.as_dict()
+    assert payload["architecture"] == "deepseek_v41"
+    assert payload["graph"]["backbone"] == "deepseek_v41"
+    components = {item["kind"]: item for item in payload["components"]}
+    assert components["vision"]["implementation"] == "deepseek_v41_vision"
+    assert components["predictor"]["implementation"] == "deepseek_v41_dspark"
+    assert payload["topology"] == {
+        "text_layers": 40,
+        "vision_layers": 32,
+        "predictor_layers": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    "source,canonical,component",
+    [
+        (
             "llm.model.layers.4.self_attn.q_proj.weight",
             "model.block.4.attention.query.weight",
             TensorComponent.MODEL,

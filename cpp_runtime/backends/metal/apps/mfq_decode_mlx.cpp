@@ -53,6 +53,8 @@ constexpr std::size_t kMinimumServerCacheLimitBytes =
     std::size_t{1} << 30;
 constexpr std::size_t kMaximumServerCacheLimitBytes =
     std::size_t{8} << 30;
+constexpr std::size_t kDeepseekV41AutomaticExpertCacheLimitBytes =
+    std::size_t{128} << 30;
 
 void release_model_load_staging_memory() {
     // Model conversion and NINTM repacking leave large, now-unused buffers in
@@ -335,6 +337,53 @@ std::size_t requested_cache_bytes(
     return std::max<std::size_t>(
         std::uint64_t{1} << 30,
         physical_memory_bytes() * 2 / 3);
+}
+
+std::size_t resident_hf_wired_limit_bytes(
+    const std::filesystem::path& model_root) {
+    constexpr std::size_t gib = std::size_t{1} << 30;
+    if (const char* value = std::getenv("MFQ_HF_RESIDENT_WIRED_GIB")) {
+        const auto requested = std::stoull(value);
+        if (requested > std::numeric_limits<std::size_t>::max() / gib) {
+            throw std::invalid_argument(
+                "resident HF wired limit exceeds addressable memory");
+        }
+        return static_cast<std::size_t>(requested) * gib;
+    }
+
+    std::size_t checkpoint_bytes = 0;
+    std::error_code error;
+    for (std::filesystem::directory_iterator entries(model_root, error), end;
+         !error && entries != end;
+         entries.increment(error)) {
+        if (!entries->is_regular_file(error) || error ||
+            entries->path().extension() != ".safetensors") {
+            continue;
+        }
+        const auto bytes = entries->file_size(error);
+        if (error || bytes > std::numeric_limits<std::size_t>::max() -
+                checkpoint_bytes) {
+            throw std::runtime_error(
+                "cannot size resident HF checkpoint for its wired budget");
+        }
+        checkpoint_bytes += static_cast<std::size_t>(bytes);
+    }
+    if (error || checkpoint_bytes == 0) {
+        throw std::runtime_error(
+            "cannot discover resident HF safetensor payload");
+    }
+    const auto memory = physical_memory_bytes();
+    const auto reserve = std::max<std::size_t>(32 * gib, memory / 4);
+    if (memory <= reserve || checkpoint_bytes > memory - reserve) {
+        throw std::runtime_error(
+            "resident HF checkpoint does not fit the safe UMA budget");
+    }
+    const auto headroom = std::max<std::size_t>(32 * gib, checkpoint_bytes / 8);
+    return std::min(
+        memory - reserve,
+        checkpoint_bytes > std::numeric_limits<std::size_t>::max() - headroom
+            ? memory - reserve
+            : checkpoint_bytes + headroom);
 }
 
 std::filesystem::path executable_path() {
@@ -1652,7 +1701,7 @@ int serve_loaded_runtime(
                                 ? 0.0
                                 : static_cast<double>(
                                       stats.position_accepted[position]) /
-                                      stats.position_drafted[position]);
+                                  stats.position_drafted[position]);
                     }
                     for (std::size_t depth = 0;
                          depth < stats.measured_depth_ms.size();
@@ -1688,6 +1737,15 @@ int serve_loaded_runtime(
                             "ssd_expert_hits",
                             static_cast<double>(stats->hits));
                         metrics.emplace_back(
+                            "ssd_expert_misses",
+                            static_cast<double>(stats->misses));
+                        metrics.emplace_back(
+                            "ssd_expert_evictions",
+                            static_cast<double>(stats->evictions));
+                        metrics.emplace_back(
+                            "ssd_expert_loads",
+                            static_cast<double>(stats->loads));
+                        metrics.emplace_back(
                             "ssd_expert_hit_rate",
                             stats->hit_rate());
                         metrics.emplace_back(
@@ -1700,13 +1758,184 @@ int serve_loaded_runtime(
                             "ssd_expert_resident_count",
                             static_cast<double>(stats->resident_experts));
                         metrics.emplace_back(
+                            "ssd_expert_cache_slots",
+                            static_cast<double>(stats->cache_slots));
+                        metrics.emplace_back(
+                            "ssd_expert_cache_limit_bytes",
+                            static_cast<double>(
+                                runtime_holder->value()
+                                    .expert_cache_limit_bytes()));
+                        metrics.emplace_back(
+                            "ssd_expert_io_seconds",
+                            stats->io_seconds);
+                        metrics.emplace_back(
                             "ssd_expert_wait_seconds",
                             stats->wait_seconds);
                     }
                 }
             }
+            if constexpr (requires(Runtime& value) {
+                    value.engram_ssd_stats();
+                }) {
+                if (lock.owns_lock() && runtime_holder->has_value()) {
+                    const auto stats =
+                        runtime_holder->value().engram_ssd_stats();
+                    if (stats.has_value()) {
+                        metrics.emplace_back(
+                            "engram_row_requests",
+                            static_cast<double>(stats->row_requests));
+                        metrics.emplace_back(
+                            "engram_cache_hits",
+                            static_cast<double>(stats->cache_hits));
+                        metrics.emplace_back(
+                            "engram_cache_misses",
+                            static_cast<double>(stats->cache_misses));
+                        metrics.emplace_back(
+                            "engram_hit_rate",
+                            stats->hit_rate());
+                        metrics.emplace_back(
+                            "engram_rows_loaded",
+                            static_cast<double>(stats->rows_loaded));
+                        metrics.emplace_back(
+                            "engram_bytes_read",
+                            static_cast<double>(stats->bytes_read));
+                        metrics.emplace_back(
+                            "engram_read_calls",
+                            static_cast<double>(stats->read_calls));
+                        metrics.emplace_back(
+                            "engram_io_seconds",
+                            stats->io_seconds);
+                        metrics.emplace_back(
+                            "engram_resident_rows",
+                            static_cast<double>(stats->resident_rows));
+                        metrics.emplace_back(
+                            "engram_resident_bytes",
+                            static_cast<double>(
+                                stats->resident_payload_bytes));
+                        metrics.emplace_back(
+                            "engram_cache_limit_bytes",
+                            static_cast<double>(stats->cache_limit_bytes));
+                    }
+                }
+            }
+            if constexpr (requires(Runtime& value) {
+                    value.fused_hyper_connections_active();
+                }) {
+                if (lock.owns_lock() && runtime_holder->has_value()) {
+                    metrics.emplace_back(
+                        "fused_hyper_connections",
+                        runtime_holder->value()
+                                .fused_hyper_connections_active()
+                            ? 1.0
+                            : 0.0);
+                }
+            }
             return metrics;
         });
+}
+
+int run_native_hf_server(const Arguments& arguments) {
+    if (arguments.tokenizer_gguf.empty()) {
+        throw std::runtime_error(
+            "HF model directories currently require --tokenizer-gguf PATH");
+    }
+    const auto config = mfq::metal::DeepseekV4Config::from_json(
+        read_text(arguments.mfq / "config.json"));
+    const int context = static_cast<int>(
+        std::min<std::int64_t>(
+            arguments.context_size,
+            config.max_position_embeddings));
+    auto expert_cache_bytes = requested_cache_bytes(
+        arguments.expert_cache_gb, true);
+    // V4.1's large routed pool makes the generic two-thirds-of-UMA default
+    // needlessly reserve 341 GiB on a 512-GiB Mac. A 128-GiB arena retains
+    // the complete measured 128-token working set while leaving ample UMA
+    // for a concurrent model server. Explicit CLI values still win.
+    if (config.is_v41() && !arguments.expert_cache_gb.has_value()) {
+        expert_cache_bytes = std::min(
+            expert_cache_bytes,
+            kDeepseekV41AutomaticExpertCacheLimitBytes);
+    }
+    std::size_t resident_wired_limit = 0;
+    if (expert_cache_bytes == 0) {
+        resident_wired_limit = resident_hf_wired_limit_bytes(arguments.mfq);
+        mlx::core::set_wired_limit(resident_wired_limit);
+    }
+    constexpr std::size_t prefill_buffers_minimum =
+        std::size_t{7} << 30;
+    constexpr std::size_t v41_prefill_buffers_minimum =
+        std::size_t{16} << 30;
+    const bool prefill_overlap =
+        expert_cache_bytes >= (config.is_v41()
+            ? v41_prefill_buffers_minimum
+            : prefill_buffers_minimum);
+    const auto runtime_stream = mlx::core::new_thread_unsafe_stream(
+        mlx::core::Device::gpu);
+    mlx::core::set_default_stream(runtime_stream);
+    const auto started = std::chrono::steady_clock::now();
+    std::cout
+        << "Loading native-format DeepSeek-V4 HF weights on Apple UMA: "
+        << (expert_cache_bytes == 0
+                ? "fully resident"
+                : "SSD expert streaming")
+        << (resident_wired_limit == 0
+                ? ""
+                : " (wired budget GiB=" + std::to_string(
+                      static_cast<double>(resident_wired_limit) /
+                      static_cast<double>(std::uint64_t{1} << 30)) + ")")
+        << std::endl;
+    auto runtime = mfq::metal::MlxDeepseekV4CausalLm::load_hf(
+        arguments.mfq,
+        context,
+        expert_cache_bytes,
+        8,
+        prefill_overlap);
+    runtime.prewarm_ssd_expert_arena();
+    release_model_load_staging_memory();
+    const auto load_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    constexpr double gib = static_cast<double>(std::uint64_t{1} << 30);
+    std::cout
+        << "Loaded " << runtime.layer_count()
+        << " DeepSeek-V4 layers in " << load_seconds << " s"
+        << " expert_backing="
+        << (expert_cache_bytes == 0
+                ? "hf-native-resident"
+                : "hf-safetensors-ssd")
+        << " expert_cache_gib="
+        << static_cast<double>(runtime.expert_cache_limit_bytes()) / gib
+        << " prefill_double_buffer="
+        << static_cast<int>(prefill_overlap)
+        << std::endl;
+    const auto model_root = arguments.mfq;
+    const auto load_runtime =
+        [model_root, expert_cache_bytes, prefill_overlap](
+            std::int64_t requested_context) {
+            if (requested_context < 1 ||
+                requested_context > std::numeric_limits<int>::max()) {
+                throw std::invalid_argument(
+                    "Metal runtime context is out of range");
+            }
+            return mfq::metal::MlxDeepseekV4CausalLm::load_hf(
+                model_root,
+                static_cast<int>(requested_context),
+                expert_cache_bytes,
+                8,
+                prefill_overlap);
+        };
+    return serve_loaded_runtime(
+        arguments,
+        nullptr,
+        std::move(runtime),
+        load_runtime,
+        config.has_vision()
+            ? std::string(config.is_v41()
+                  ? "deepseek_v41_vision"
+                  : "deepseek_v4_vision")
+            : config.model_type,
+        config.max_position_embeddings,
+        config.vocab,
+        runtime_stream);
 }
 
 int run_native_server(
@@ -1854,7 +2083,9 @@ int run_native_server(
             std::move(runtime),
             load_runtime,
             config.has_vision()
-                ? std::string("deepseek_v4_vision")
+                ? std::string(config.is_v41()
+                      ? "deepseek_v41_vision"
+                      : "deepseek_v4_vision")
                 : config.model_type,
             config.max_position_embeddings,
             config.vocab,
@@ -2008,6 +2239,28 @@ int main(int argc, char** argv) {
                 usage_error("--mfq is required");
             }
             return EXIT_SUCCESS;
+        }
+
+        // Raw Hugging Face DeepSeek checkpoints use the M3 Ultra tuned path:
+        // native Safetensors streaming, SSD Engram, and the exact fused HC
+        // kernels. Converted MFQ containers continue through the portable
+        // architecture-specific runtimes below.
+        if (std::filesystem::is_directory(arguments.mfq)) {
+            if (arguments.server) {
+                configure_mlx_metal();
+#ifdef MFQ_METAL_SERVER
+                const auto config_path = arguments.mfq / "config.json";
+                const auto config = nlohmann::json::parse(read_text(config_path));
+                const auto model_type = config.value("model_type", std::string{});
+                if (model_type.rfind("deepseek_v4", 0) == 0) {
+                    return run_native_hf_server(arguments);
+                }
+#else
+                throw std::runtime_error(
+                    "this build has no C++ server support; configure with "
+                    "-DMFQ_BUILD_CPP_SERVER=ON");
+#endif
+            }
         }
 
         const mfq::metal::MfqContainer model(arguments.mfq);

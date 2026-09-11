@@ -1,9 +1,11 @@
 #include "mlx_moe_ops.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -354,6 +356,140 @@ void test_fused_dense_router_topk() {
             bfloat_fused_weights[route],
             bfloat_reference_weights[route],
             2e-3f);
+    }
+
+    // DeepSeek-V4.1 widens the router from 256 to 384 experts. Exercise the
+    // final reduction groups explicitly; the highest-scoring live experts
+    // all sit above ID 255 in this fixture.
+    constexpr int v41_experts = 384;
+    constexpr int v41_width = 5120;
+    std::vector<float> v41_input_values(v41_width);
+    for (int column = 0; column < v41_width; ++column) {
+        v41_input_values[column] =
+            static_cast<float>((column % 17) + 1) / 64.0f;
+    }
+    std::vector<float> v41_weight_values(
+        static_cast<std::size_t>(v41_experts) * v41_width);
+    for (int expert = 0; expert < v41_experts; ++expert) {
+        for (int column = 0; column < v41_width; ++column) {
+            v41_weight_values[
+                static_cast<std::size_t>(expert) * v41_width + column
+            ] = static_cast<float>(expert) / 8192.0f
+                + static_cast<float>((column + expert) % 7 - 3)
+                    / 32768.0f;
+        }
+    }
+    std::vector<float> v41_bias(v41_experts, 0.0f);
+    std::vector<std::uint8_t> v41_available(v41_experts, 1);
+    v41_available[383] = 0;
+    v41_available[379] = 0;
+    auto v41_input = mlx::core::contiguous(
+        mlx::core::astype(
+            array(v41_input_values.begin(), Shape{1, v41_width}),
+            mlx::core::float16));
+    auto v41_weight = mlx::core::contiguous(
+        mlx::core::astype(
+            array(
+                v41_weight_values.begin(),
+                Shape{v41_experts, v41_width}),
+            mlx::core::float16));
+    auto v41_bias_array = array(v41_bias.begin(), Shape{v41_experts});
+    auto v41_available_array = mlx::core::astype(
+        array(v41_available.begin(), Shape{v41_experts}),
+        mlx::core::bool_);
+    require(
+        mfq::metal::moe_dense_router_topk_supported(
+            v41_input,
+            v41_weight),
+        "valid 384-expert fused dense router shape was rejected");
+    auto v41_logits = mlx::core::matmul(
+        mlx::core::astype(v41_input, mlx::core::float32),
+        mlx::core::transpose(
+            mlx::core::astype(v41_weight, mlx::core::float32)));
+    auto v41_reference = mfq::metal::moe_topk(
+        v41_logits,
+        routes,
+        false,
+        true,
+        true,
+        false,
+        v41_bias_array,
+        v41_available_array,
+        1e-20f,
+        1.5f);
+    auto v41_fused = mfq::metal::moe_dense_router_topk(
+        v41_input,
+        v41_weight,
+        v41_bias_array,
+        v41_available_array,
+        1e-20f,
+        1.5f);
+    const auto v41_reference_ids = integers(v41_reference.ids);
+    const auto v41_fused_ids = integers(v41_fused.ids);
+    require(
+        v41_fused_ids == v41_reference_ids,
+        "384-expert fused dense router selected different experts");
+    require(
+        std::all_of(
+            v41_fused_ids.begin(),
+            v41_fused_ids.end(),
+            [](std::int32_t expert) { return expert > 255; }),
+        "384-expert fused dense router did not exercise widened IDs");
+    const auto v41_reference_weights = floats(v41_reference.weights);
+    const auto v41_fused_weights = floats(v41_fused.weights);
+    for (int route = 0; route < routes; ++route) {
+        require_close(
+            v41_fused_weights[route],
+            v41_reference_weights[route],
+            2e-3f);
+    }
+
+    if (std::getenv("MFQ_METAL_MOE_ROUTER_BENCH") != nullptr) {
+        constexpr int warmup = 20;
+        constexpr int iterations = 200;
+        const auto benchmark = [&](const char* name, const auto& operation) {
+            for (int iteration = 0; iteration < warmup; ++iteration) {
+                auto output = operation();
+                mlx::core::eval({output.ids, output.weights});
+            }
+            const auto begin = std::chrono::steady_clock::now();
+            for (int iteration = 0; iteration < iterations; ++iteration) {
+                auto output = operation();
+                mlx::core::eval({output.ids, output.weights});
+            }
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - begin).count();
+            std::cout << "router_bench name=" << name
+                      << " ms_per_call=" << elapsed_ms / iterations
+                      << "\n";
+        };
+        benchmark("generic", [&]() {
+            auto values = mlx::core::matmul(
+                mlx::core::astype(v41_input, mlx::core::float32),
+                mlx::core::transpose(
+                    mlx::core::astype(v41_weight, mlx::core::float32)));
+            return mfq::metal::moe_topk(
+                values,
+                routes,
+                false,
+                true,
+                true,
+                false,
+                v41_bias_array,
+                v41_available_array,
+                1e-20f,
+                1.5f);
+        });
+        benchmark("fused", [&]() {
+            return mfq::metal::moe_dense_router_topk(
+                v41_input,
+                v41_weight,
+                v41_bias_array,
+                v41_available_array,
+                1e-20f,
+                1.5f);
+        });
     }
 }
 

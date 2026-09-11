@@ -692,7 +692,9 @@ void add_deepseek_v4_aliases(
             {"attention.compressor.position", "attn.compressor.ape"},
             {"attention.compressor.norm.weight", "attn.compressor.norm.weight"},
             {"attention.indexer.query.weight", "attn.indexer.wq_b.weight"},
+            {"attention.indexer.key.weight", "attn.indexer.wk.weight"},
             {"attention.indexer.score.weight", "attn.indexer.weights_proj.weight"},
+            {"attention.indexer.key_norm.weight", "attn.indexer.k_norm.weight"},
             {"attention.indexer.compressor.key_value.weight", "attn.indexer.compressor.wkv.weight"},
             {"attention.indexer.compressor.gate.weight", "attn.indexer.compressor.wgate.weight"},
             {"attention.indexer.compressor.position", "attn.indexer.compressor.ape"},
@@ -708,6 +710,10 @@ void add_deepseek_v4_aliases(
             {"mlp.shared_expert.gate.weight", "ffn.shared_experts.w1.weight"},
             {"mlp.shared_expert.up.weight", "ffn.shared_experts.w3.weight"},
             {"mlp.shared_expert.down.weight", "ffn.shared_experts.w2.weight"},
+            {"engram.embedding.weight", "engram.embed.weight"},
+            {"engram.key_value.weight", "engram.wkv.weight"},
+            {"engram.query.weight", "engram.q_weight"},
+            {"engram.key.weight", "engram.k_weight"},
         };
     const auto dynamic_expert_suffix = [](std::string_view suffix)
             -> std::optional<std::string> {
@@ -780,6 +786,8 @@ void add_deepseek_v4_aliases(
             {"confidence_head.proj.weight", "confidence.projection.weight"},
             {"markov_head.markov_w1.weight", "markov.input.weight"},
             {"markov_head.markov_w2.weight", "markov.output.weight"},
+            {"markov_head.embed.weight", "markov.embedding.weight"},
+            {"markov_head.head.weight", "markov.output.weight"},
         };
     for (const auto& stored : names) {
         if (!starts_with(stored, "mtp.")) continue;
@@ -1068,6 +1076,14 @@ MfqLegacyTensorAliases make_legacy_tensor_aliases(
     const std::unordered_set<std::string> names(
         stored_names.begin(), stored_names.end());
     MfqLegacyTensorAliases result;
+    // The tuned raw-HF Metal runtime intentionally retains the older V4
+    // canonical tensor contract.  Keep this source-format choice explicit so
+    // a V4.1 config cannot redirect it to the portable MFQ V4.1 contract.
+    if (identity(artifact_architecture) == "deepseek_v4_raw_hf") {
+        add_deepseek_v4_aliases(result, names);
+        add_derived_aliases(result, names);
+        return result;
+    }
     if (gemma4_family(artifact_architecture, config)) {
         add_gemma4_aliases(result, config, names);
         add_derived_aliases(result, names);

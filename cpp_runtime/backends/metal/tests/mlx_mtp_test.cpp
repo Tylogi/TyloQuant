@@ -50,21 +50,9 @@ int main() {
             controller.observe(0, 0, 30.0);
             controller.observe(0, 0, 29.0);
             controller.observe(0, 0, 31.0);
-            if (controller.depth() != 0) {
+            if (controller.depth() != 0 || !controller.should_exit()) {
                 throw std::runtime_error(
-                    "adaptive MTP controller did not select plain decode");
-            }
-            for (int cycle = 0; cycle < 15; ++cycle) {
-                controller.observe(0, 0, 30.0);
-            }
-            if (controller.should_exit()) {
-                throw std::runtime_error(
-                    "adaptive MTP controller exited before its streak gate");
-            }
-            controller.observe(0, 0, 30.0);
-            if (!controller.should_exit()) {
-                throw std::runtime_error(
-                    "adaptive MTP controller did not park losing speculation");
+                    "adaptive MTP controller did not hand off a measured loss");
             }
         }
         {

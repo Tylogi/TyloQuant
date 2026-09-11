@@ -7,6 +7,7 @@
 #include "mlx_deepseek_v4_hc.h"
 #include "mlx_deepseek_v4_moe.h"
 #include "mlx_deepseek_v4_vision.h"
+#include "mlx_deepseek_v41_engram.h"
 #include "mlx_mtp.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
@@ -59,8 +60,6 @@ public:
         std::pair<mlx::core::array, mlx::core::array>
             rope_compressed,
         std::shared_ptr<MlxNintMoeOffloadCache> offload =
-            nullptr,
-        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache =
             nullptr);
 
     static MlxDeepseekV4Layer load(
@@ -72,7 +71,7 @@ public:
             rope_base,
         std::pair<mlx::core::array, mlx::core::array>
             rope_compressed,
-        std::shared_ptr<MlxMoeSsdExpertCache>
+        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
             expert_cache,
         const std::optional<mlx::core::array>& available =
             std::nullopt);
@@ -96,17 +95,29 @@ public:
         const mlx::core::array& token_ids,
         MlxDeepseekV4LayerState& state,
         int pos0,
-        MlxSsdPrefetchedExpertLayer* prefetched) const;
+        MlxDeepseekV4SsdPrefetchedLayer* prefetched) const;
 
     mlx::core::array forward(
         const mlx::core::array& hidden,
         const mlx::core::array& token_ids,
         MlxDeepseekV4LayerState& state,
         int pos0,
-        MlxSsdPrefetchedExpertLayer* prefetched,
+        MlxDeepseekV4SsdPrefetchedLayer* prefetched,
         const MlxDeepseekV4ImageVisibility* visibility) const;
 
-    std::optional<MlxSsdPrefetchedExpertLayer>
+    mlx::core::array forward(
+        const mlx::core::array& hidden,
+        const mlx::core::array& token_ids,
+        MlxDeepseekV4LayerState& state,
+        int pos0,
+        MlxDeepseekV4SsdPrefetchedLayer* prefetched,
+        const MlxDeepseekV4ImageVisibility* visibility,
+        std::vector<mlx::core::array>* debug_stages,
+        const mlx::core::array* incoming_pre = nullptr,
+        mlx::core::array* outgoing_pre = nullptr,
+        MlxDeepseekV41HfSharedAttentionState* shared_attention = nullptr) const;
+
+    std::optional<MlxDeepseekV4SsdPrefetchedLayer>
     prefetch_routed(std::size_t rows) const {
         return components_.moe.prefetch_routed(rows);
     }
@@ -213,19 +224,21 @@ public:
         std::vector<MlxDeepseekV4Layer> layers,
         mlx::core::array output_norm,
         MlxLinear output,
-        MlxLinear hc_head_fn,
-        mlx::core::array hc_head_base,
-        mlx::core::array hc_head_scale,
+        std::optional<MlxLinear> hc_head_fn,
+        std::optional<mlx::core::array> hc_head_base,
+        std::optional<mlx::core::array> hc_head_scale,
         int max_context,
         mlx::core::Dtype activation_dtype =
             mlx::core::float16,
         std::shared_ptr<MlxNintMoeOffloadCache>
             expert_offload = nullptr,
-        std::shared_ptr<MlxMoeSsdExpertCache>
+        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
             ssd_expert_cache = nullptr,
         std::optional<MlxDeepseekV4Vision> vision =
             std::nullopt,
         std::optional<MlxDeepseekV4DSpark> dspark =
+            std::nullopt,
+        std::optional<MlxDeepseekV41HfEngram> engram =
             std::nullopt);
 
     // Accepts [tokens] or [batch,tokens]. Like the Python reference,
@@ -308,8 +321,11 @@ public:
     std::size_t expert_cache_limit_bytes() const noexcept;
     std::size_t expert_resident_packed_bytes() const;
     std::size_t cached_expert_count() const;
-    std::optional<MlxSsdExpertCacheStats>
+    std::optional<MlxDeepseekV4SsdCacheStats>
     ssd_expert_cache_stats() const;
+    std::optional<DeepseekV41EngramSsdStats>
+    engram_ssd_stats() const;
+    bool fused_hyper_connections_active() const noexcept;
     void prewarm_ssd_expert_arena();
     void clear_expert_cache();
     MlxDeepseekV4TextSessionState capture_text_session_state(
@@ -341,14 +357,17 @@ private:
         const std::optional<mlx::core::array>& input_embeddings =
             std::nullopt,
         const MlxDeepseekV4ImageVisibility* visibility = nullptr,
-        mlx::core::array* dspark_hidden = nullptr);
+        mlx::core::array* dspark_hidden = nullptr,
+        std::vector<mlx::core::array>* debug_layer_hiddens = nullptr,
+        std::vector<mlx::core::array>* debug_layer0_stages = nullptr);
     mlx::core::array prefill_impl(
         const mlx::core::array& token_ids,
         int chunk_size,
         bool full_logits,
         bool reset);
     mlx::core::array head(
-        const mlx::core::array& hidden) const;
+        const mlx::core::array& hidden,
+        const mlx::core::array* pre = nullptr) const;
     void materialize_states(
         const std::vector<MlxDeepseekV4LayerState>& states) const;
     void append_state_arrays(
@@ -378,15 +397,16 @@ private:
     std::vector<MlxDeepseekV4Layer> layers_;
     MlxRmsNorm output_norm_;
     MlxLinear output_;
-    MlxLinear hc_head_fn_;
-    mlx::core::array hc_head_base_;
-    mlx::core::array hc_head_scale_;
+    std::optional<MlxLinear> hc_head_fn_;
+    std::optional<mlx::core::array> hc_head_base_;
+    std::optional<mlx::core::array> hc_head_scale_;
     std::shared_ptr<MlxNintMoeOffloadCache>
         expert_offload_;
-    std::shared_ptr<MlxMoeSsdExpertCache>
+    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
         ssd_expert_cache_;
     std::optional<MlxDeepseekV4Vision> vision_;
     std::optional<MlxDeepseekV4DSpark> dspark_;
+    std::optional<MlxDeepseekV41HfEngram> engram_;
     MlxMtpGenerationStats last_mtp_stats_;
     int max_context_;
     mlx::core::Dtype activation_dtype_;

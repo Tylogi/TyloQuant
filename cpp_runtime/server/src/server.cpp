@@ -761,6 +761,8 @@ static MfqRuntimeProfile architecture_runtime_profile(
     } else if (identity_matches(identities, "deepseek_v41")) {
         result.chat.temperature = 1.0;
         result.chat.top_p = 0.95;
+        result.chat.presence_penalty = 0.0;
+        result.chat.enable_mtp = false;
         result.chat.mtp_max_draft_tokens = 5;
         result.source = "architecture-registry:deepseek_v41";
     } else if (identity_matches(identities, "deepseek_v4")) {
@@ -2600,7 +2602,8 @@ static MfqMultimodalInput parse_deepseek_multimodal(
     const int64_t placeholder = single_special_token(
         tokenizer, "<｜deepseek_image｜>");
     std::vector<int64_t> expanded;
-    expanded.reserve(prompt.size() + static_cast<size_t>(images) * 384);
+    expanded.reserve(
+        prompt.size() + static_cast<size_t>(images) * (v41 ? 1024 : 384));
     result.image_permutation_offsets.push_back(0);
     int64_t source = 0;
     for (const int64_t token : prompt) {

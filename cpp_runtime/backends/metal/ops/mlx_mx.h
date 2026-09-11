@@ -47,6 +47,9 @@ public:
     int bits() const noexcept { return bits_; }
     int input_size() const noexcept { return input_size_; }
     int output_size() const noexcept { return output_size_; }
+    int scale_block_size() const noexcept {
+        return mxfp8_scale_block_size_;
+    }
     std::size_t packed_nbytes() const noexcept;
 
     // Read-only packed storage used by fused/grouped Metal kernels.
@@ -68,6 +71,7 @@ private:
     mlx::core::array values_;
     mlx::core::array scales_;
     std::optional<mlx::core::array> expanded_mxfp8_scales_;
+    int mxfp8_scale_block_size_ = 0;
     int bits_ = 0;
     int input_size_ = 0;
     int output_size_ = 0;

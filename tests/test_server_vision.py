@@ -159,6 +159,7 @@ def test_deepseek_v41_processor_uses_released_row_major_contract() -> None:
         _decode_tensor(result.tensors["vision_grid"]),
         [[3, 5, 1, 2]],
     )
+    # START + two image cells + NEWLINE + END.
     assert TinyProcessor._grid_tokens(42, 70) == (1, 2, 5)
 
 

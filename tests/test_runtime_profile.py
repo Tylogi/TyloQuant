@@ -29,6 +29,13 @@ def test_architecture_registry_is_partial() -> None:
     assert deepseek is not None
     assert deepseek["chat"]["mtp_max_draft_tokens"] == 5
 
+    deepseek_v41 = architecture_profile("DeepseekV41ForCausalLM")
+    assert deepseek_v41 is not None
+    assert deepseek_v41["chat"]["temperature"] == 1.0
+    assert deepseek_v41["chat"]["top_p"] == 0.95
+    assert deepseek_v41["chat"]["enable_mtp"] is False
+    assert "repetition_penalty" not in deepseek_v41["chat"]
+
 
 def test_exact_model_registry_matches_repository_identity() -> None:
     profile = model_profile("Tylogi/MiniCPM-o-4_5-MFQ")

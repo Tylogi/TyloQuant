@@ -94,7 +94,8 @@ MlxDsv4PoolUpdate dsv4_decode_pool_update(
     int quant_mode = 0,
     float eps = 1e-6f);
 
-// Compute the 64-head pooled-token indexer score.
+// Compute the pooled-token indexer score. The V4F 64-head path returns FP16;
+// the V4.1 32-head path retains FP32 scores for candidate/top-k selection.
 mlx::core::array dsv4_indexer_scores(
     const mlx::core::array& q,
     const mlx::core::array& k,
@@ -154,8 +155,8 @@ dsv4_build_decode_plan(
     int ratio,
     int window);
 
-// Selected-row DSV4 attention fallback. Direct circular-cache decode and M>1
-// kernels are exposed below. meta is intentionally accepted for API
+// Selected-row DSV4 attention.  Dispatches decode, short-query, or prefill-MMA
+// Metal kernels from the query count.  meta is intentionally accepted for API
 // parity with the CUDA/Python operator and has no numerical role.
 mlx::core::array attention_dsv4_sparse(
     const mlx::core::array& q,
@@ -164,21 +165,6 @@ mlx::core::array attention_dsv4_sparse(
     const mlx::core::array& mask,
     const mlx::core::array& sinks,
     const std::optional<mlx::core::array>& meta = std::nullopt,
-    std::optional<float> scale = std::nullopt);
-
-// M>1 specialization over chronological local values and a
-// capacity-backed compressed pool. Causality and pool visibility are derived
-// inside the common Metal sparse-attention operator.
-mlx::core::array attention_dsv4_sparse_multi(
-    const mlx::core::array& q,
-    const mlx::core::array& local_kv,
-    const mlx::core::array& pooled_kv,
-    int pool_len,
-    const mlx::core::array& topk,
-    const mlx::core::array& sinks,
-    int query_offset,
-    int ratio,
-    int window,
     std::optional<float> scale = std::nullopt);
 
 // Single-token specialization which addresses the circular local cache and

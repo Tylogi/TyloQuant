@@ -176,6 +176,15 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& packed_expert_ids,
         float limit = 0.0f) const;
+    // Decode-only MXFP4 fast path. For one token, project every selected
+    // expert and apply its routing weight in one Metal dispatch, avoiding
+    // the transient [1,routes,hidden] down-projection tensor. Unsupported
+    // shapes and representations transparently use the ordinary projection
+    // followed by moe_weighted_reduce().
+    mlx::core::array routed_matmul_reduce(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& route_weights) const;
     bool supports_grouped_mmq() const noexcept;
     bool supports_grouped_vq_mmq() const noexcept {
         return supports_grouped_mmq();

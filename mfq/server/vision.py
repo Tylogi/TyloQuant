@@ -1865,8 +1865,10 @@ class DeepseekV4VisionProcessor:
         if source_width <= 0 or source_height <= 0:
             raise VisionProcessingError("image dimensions must be positive")
         width, height = source_width, source_height
-        if (cls.maximum_width_height_ratio is not None and
-                width > height * cls.maximum_width_height_ratio):
+        if (
+            cls.maximum_width_height_ratio is not None
+            and width > height * cls.maximum_width_height_ratio
+        ):
             width = height * cls.maximum_width_height_ratio
         if width * height < cls.minimum_pixels:
             ratio = math.sqrt(cls.minimum_pixels / (width * height))
@@ -1882,8 +1884,10 @@ class DeepseekV4VisionProcessor:
         )
         n_vit_h = best_height // cls.patch_size
         n_vit_w = best_width // cls.patch_size
-        if (cls.maximum_width_height_ratio is not None and
-                source_width >= cls.maximum_width_height_ratio * source_height):
+        if (
+            cls.maximum_width_height_ratio is not None
+            and source_width >= cls.maximum_width_height_ratio * source_height
+        ):
             image = image.resize((best_width, best_height))
         else:
             image = ImageOps.pad(
@@ -2085,7 +2089,9 @@ class DeepseekV41VisionProcessor(DeepseekV4VisionProcessor):
         if count > cls.maximum_image_tokens:
             n_llm_h, n_llm_w, best_height, best_width, count = (
                 cls._solve_resize_ratio(
-                    height, width, cls.maximum_image_tokens
+                    height,
+                    width,
+                    cls.maximum_image_tokens,
                 )
             )
         if count > cls.maximum_image_tokens:

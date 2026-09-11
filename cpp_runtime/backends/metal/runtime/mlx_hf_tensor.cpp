@@ -84,21 +84,25 @@ array allocate_and_read(
 
 } // namespace
 
-MlxHfTensorStore::MlxHfTensorStore(std::filesystem::path root)
+MlxHfTensorStore::MlxHfTensorStore(
+    std::filesystem::path root,
+    std::string_view alias_architecture)
     : checkpoint_(std::make_shared<HfSafetensorStore>(std::move(root))) {
-    initialize_aliases();
+    initialize_aliases(alias_architecture);
 }
 
 MlxHfTensorStore::MlxHfTensorStore(
-    std::shared_ptr<HfSafetensorStore> checkpoint)
+    std::shared_ptr<HfSafetensorStore> checkpoint,
+    std::string_view alias_architecture)
     : checkpoint_(std::move(checkpoint)) {
     if (!checkpoint_) {
         throw std::invalid_argument("HF tensor checkpoint cannot be null");
     }
-    initialize_aliases();
+    initialize_aliases(alias_architecture);
 }
 
-void MlxHfTensorStore::initialize_aliases() {
+void MlxHfTensorStore::initialize_aliases(
+        std::string_view alias_architecture) {
     const auto config_path = checkpoint_->root() / "config.json";
     std::ifstream input(config_path, std::ios::binary);
     if (!input) return;
@@ -111,7 +115,7 @@ void MlxHfTensorStore::initialize_aliases() {
         names.push_back(name);
     }
     canonical_to_stored_ = mfq::make_legacy_tensor_aliases(
-        {}, config, names).canonical_to_stored;
+        alias_architecture, config, names).canonical_to_stored;
 }
 
 std::string MlxHfTensorStore::stored_name(std::string_view canonical) const {

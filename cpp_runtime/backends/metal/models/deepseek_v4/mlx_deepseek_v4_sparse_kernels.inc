@@ -569,7 +569,7 @@ constexpr const char* kFp4SimSource = R"MFQ_METAL(
 )MFQ_METAL";
 
 constexpr const char* kIndexerScoresSource = R"MFQ_METAL(
-    constexpr uint HEADS = 64u;
+    constexpr uint HEADS = uint(INDEX_HEADS);
     constexpr uint DIM = 128u;
     constexpr uint KEY_TILE = 64u;
 
@@ -610,7 +610,7 @@ constexpr const char* kIndexerScoresSource = R"MFQ_METAL(
     uint fragment_row = (quadrant & 4u) + ((lane / 2u) & 3u);
     uint fragment_col = (quadrant & 2u) * 2u + (lane & 1u) * 2u;
     uint local_key_base = (simd_group & 3u) * 16u;
-    for (uint head_pass = 0u; head_pass < 2u; ++head_pass) {
+    for (uint head_pass = 0u; head_pass < HEADS / 32u; ++head_pass) {
         uint head_base = head_pass * 32u + (simd_group / 4u) * 16u;
         metal::simdgroup_matrix<float, 8, 8> c00;
         metal::simdgroup_matrix<float, 8, 8> c01;
@@ -715,14 +715,14 @@ constexpr const char* kIndexerScoresSource = R"MFQ_METAL(
             );
             out[(batch * uint(M) + query) * uint(K) + key_index] =
                 key_index < visible
-                ? half(weighted_sum[local_thread] * params[0])
-                : half(-INFINITY);
+                ? weighted_sum[local_thread] * params[0]
+                : -INFINITY;
         }
     }
 )MFQ_METAL";
 
 constexpr const char* kIndexerDecodeScoresSource = R"MFQ_METAL(
-    constexpr uint HEADS = 64u;
+    constexpr uint HEADS = uint(INDEX_HEADS);
     constexpr uint DIM = 128u;
     constexpr uint HEADS_PER_TILE = 8u;
     constexpr uint KEYS_PER_SIMD = 8u;
@@ -875,8 +875,8 @@ constexpr const char* kIndexerDecodeScoresSource = R"MFQ_METAL(
                     uint(decode_params[1])
             );
             out[batch * uint(decode_params[3]) + key_index] = key_index < visible
-                ? half(score * params[0])
-                : half(-INFINITY);
+                ? score * params[0]
+                : -INFINITY;
         }
     }
 )MFQ_METAL";

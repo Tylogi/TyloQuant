@@ -6,6 +6,7 @@
 #include "mlx_tensor.h"
 
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -40,6 +41,10 @@ mlx::core::array deepseek_v4_kv_fp8_sim_prefix(
     const mlx::core::array& input,
     int rotary_dimension);
 
+// V4.1 quantizes the complete post-RoPE window KV vector in groups of 32.
+mlx::core::array deepseek_v41_kv_fp8_sim(
+    const mlx::core::array& input);
+
 class MlxDeepseekV4PoolState {
 public:
     static MlxDeepseekV4PoolState allocate(
@@ -49,6 +54,25 @@ public:
         int batch,
         int max_context,
         mlx::core::Dtype dtype = mlx::core::float16);
+
+    static MlxDeepseekV4PoolState allocate_v41(
+        int ratio,
+        int head_dim,
+        int batch,
+        int max_context,
+        mlx::core::Dtype cache_dtype = mlx::core::bfloat16);
+
+    // V4.1 keeps the ratio-2 pooling accumulators in FP32, exposes the
+    // unrotated latent to the Indexer, and only then writes the transformed
+    // value to its persistent cache.
+    mlx::core::array compress_v41(
+        const mlx::core::array& kv,
+        const std::optional<mlx::core::array>& gate,
+        const mlx::core::array& norm,
+        int start_position,
+        mlx::core::Dtype output_dtype,
+        float eps);
+    void append_v41(const mlx::core::array& values);
 
     void update(
         const mlx::core::array& kv_token,
@@ -173,7 +197,8 @@ public:
         int ratio,
         int batch,
         int max_context,
-        mlx::core::Dtype dtype = mlx::core::float16);
+        mlx::core::Dtype dtype = mlx::core::float16,
+        std::optional<std::size_t> layer = std::nullopt);
 
     int batch() const noexcept {
         return local_.shape(0);
@@ -248,12 +273,28 @@ struct MlxDeepseekV4AttentionComponents {
     std::optional<MlxLinear> index_weights;
     std::optional<mlx::core::array> index_ape;
     std::optional<mlx::core::array> index_norm;
+
+    // V4.1 derives one shared Indexer key from the compressor latent. These
+    // tensors only exist on KV-source layers.
+    std::optional<MlxLinear> index_key;
+    std::optional<mlx::core::array> index_key_norm;
 };
 
 struct MlxDeepseekV4ImageVisibility {
     mlx::core::array left;
     mlx::core::array right;
     int max_image_tokens = 0;
+};
+
+// V4.1 source layers publish one compressed KV cache, one Indexer-key cache,
+// and one selected-position tensor for the following consumers. Persistent
+// arrays remain owned by the source layer state; this object only carries
+// non-owning references plus per-forward selection tensors.
+struct MlxDeepseekV41HfSharedAttentionState {
+    const MlxDeepseekV4PoolState* compressed_kv = nullptr;
+    const MlxDeepseekV4PoolState* index_keys = nullptr;
+    std::optional<mlx::core::array> topk;
+    std::optional<mlx::core::array> candidates;
 };
 
 // Match the released get_image_visible() contract.  Alignment pads before
@@ -316,6 +357,14 @@ public:
         MlxDeepseekV4LayerState& state,
         int pos0,
         const MlxDeepseekV4ImageVisibility* visibility) const;
+
+    mlx::core::array operator()(
+        const mlx::core::array& input,
+        MlxDeepseekV4LayerState& state,
+        int pos0,
+        const MlxDeepseekV4ImageVisibility* visibility,
+        std::vector<mlx::core::array>* debug_stages,
+        MlxDeepseekV41HfSharedAttentionState* shared = nullptr) const;
 
     void commit_speculative(
         MlxDeepseekV4LayerState& state) const noexcept;

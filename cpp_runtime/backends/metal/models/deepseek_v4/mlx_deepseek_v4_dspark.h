@@ -76,9 +76,9 @@ struct MlxDeepseekV4DSparkStageComponents {
 
 struct MlxDeepseekV4DSparkHeadComponents {
     mlx::core::array norm;
-    MlxLinear hc_head_fn;
-    mlx::core::array hc_head_base;
-    mlx::core::array hc_head_scale;
+    std::optional<MlxLinear> hc_head_fn;
+    std::optional<mlx::core::array> hc_head_base;
+    std::optional<mlx::core::array> hc_head_scale;
     MlxEmbedding markov_embedding;
     MlxLinear markov_output;
     MlxLinear confidence;
@@ -107,9 +107,7 @@ public:
         int max_context,
         std::shared_ptr<MlxNintMoeOffloadCache> expert_offload =
             nullptr,
-        std::size_t expert_layer_base = 0,
-        std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache =
-            nullptr);
+        std::size_t expert_layer_base = 0);
 
     static MlxDeepseekV4DSpark load_hf(
         const MlxHfTensorStore& model,
@@ -117,7 +115,7 @@ public:
         const MlxEmbedding& embedding,
         const MlxLinear& output,
         int max_context,
-        std::shared_ptr<MlxMoeSsdExpertCache> expert_cache,
+        std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
         std::size_t expert_layer_base);
 
     MlxDeepseekV4DSpark(

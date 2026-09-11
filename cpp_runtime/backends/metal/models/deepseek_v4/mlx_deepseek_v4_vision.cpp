@@ -147,6 +147,10 @@ MlxDeepseekV4Vision MlxDeepseekV4Vision::load(
             MlxLinear::load(model, prefix + ".mlp.down.weight"),
         });
     }
+    auto image_start = mfq_dense(model, "vision.special_token.start");
+    auto image_pad = config.is_v41()
+        ? mlx::core::zeros_like(image_start)
+        : mfq_dense(model, "vision.special_token.pad");
     return MlxDeepseekV4Vision(
         config,
         mfq_affine(model, "vision.patch_embedding"),
@@ -154,8 +158,8 @@ MlxDeepseekV4Vision MlxDeepseekV4Vision::load(
         mfq_dense(model, "vision.output_norm.weight"),
         mfq_affine(model, "vision.aligner.input"),
         mfq_affine(model, "vision.aligner.output"),
-        mfq_dense(model, "vision.special_token.start"),
-        mfq_dense(model, "vision.special_token.pad"),
+        std::move(image_start),
+        std::move(image_pad),
         mfq_dense(model, "vision.special_token.newline"),
         mfq_dense(model, "vision.special_token.end"));
 }
@@ -181,6 +185,10 @@ MlxDeepseekV4Vision MlxDeepseekV4Vision::load(
             model.load_linear(prefix + ".mlp.down.weight"),
         });
     }
+    auto image_start = model.load_dense("vision.special_token.start");
+    auto image_pad = config.is_v41()
+        ? mlx::core::zeros_like(image_start)
+        : model.load_dense("vision.special_token.pad");
     return MlxDeepseekV4Vision(
         config,
         hf_affine(model, "vision.patch_embedding"),
@@ -188,8 +196,8 @@ MlxDeepseekV4Vision MlxDeepseekV4Vision::load(
         model.load_dense("vision.output_norm.weight"),
         hf_affine(model, "vision.aligner.input"),
         hf_affine(model, "vision.aligner.output"),
-        model.load_dense("vision.special_token.start"),
-        model.load_dense("vision.special_token.pad"),
+        std::move(image_start),
+        std::move(image_pad),
         model.load_dense("vision.special_token.newline"),
         model.load_dense("vision.special_token.end"));
 }
