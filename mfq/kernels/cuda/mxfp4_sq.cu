@@ -170,6 +170,61 @@ __global__ void sq_backward_input(
     }
 }
 
+template<int BITS, int Rows>
+__global__ void __launch_bounds__(128) sq_backward_matrix(
+        const std::uint8_t* blob,
+        const __half* output_gradient,
+        float* partials,
+        mfq::sq::Layout q,
+        int rows,
+        int output_tile) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int block = static_cast<int>(blockIdx.x) * 4 + warp;
+    const int column = block * 32 + lane;
+    if (column >= q.width) return;
+
+    const auto* symbols = blob + q.symbols;
+    const int split = static_cast<int>(blockIdx.y);
+    const int output0 = split * output_tile;
+    const int output_end = min(output0 + output_tile, q.outputs);
+    float accumulators[Rows] = {};
+    for (int output = output0; output < output_end; ++output) {
+        unsigned state_value = 0;
+        if (lane == 0) {
+            const auto block_index =
+                std::size_t(output) * (q.width / 32) + block;
+            const auto state = std::size_t(output) * 8 +
+                block_tag<BITS>(symbols, blob + q.selectors, block_index);
+            state_value =
+                (read_bits<5>(blob + q.palettes, state) << 8) |
+                (q.base + read_bits<2>(blob + q.scales, state));
+        }
+        state_value = __shfl_sync(0xffffffffu, state_value, 0);
+        const float weight = decode_value<BITS>(
+            state_value >> 8,
+            read_bits<BITS>(
+                symbols, std::size_t(output) * q.width + column),
+            state_value & 255);
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float gradient = lane == 0 && row < rows
+                ? __half2float(output_gradient[
+                    std::size_t(row) * q.outputs + output])
+                : 0.0f;
+            gradient = __shfl_sync(0xffffffffu, gradient, 0);
+            accumulators[row] = fmaf(gradient, weight, accumulators[row]);
+        }
+    }
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+        if (row < rows) {
+            partials[(std::size_t(split) * rows + row) * q.width + column] =
+                accumulators[row];
+        }
+    }
+}
+
 mfq::sq::Layout validate(const mfq_tensor_backend::Tensor& blob,
         std::int64_t bits, std::int64_t outputs, std::int64_t width, std::int64_t base) {
     const auto q = mfq::sq::layout(bits, outputs, width, base);
@@ -199,6 +254,47 @@ void dispatch_mmq(const std::uint8_t* blob, const T* x, T* y,
         default: launch_mmq<BITS, 8>(blob, x, y, q, rows, stream); break;
     }
 #undef MFQ_SQ_M_CASE
+}
+
+template<int BITS, int Rows>
+void launch_backward_matrix(
+        const std::uint8_t* blob,
+        const __half* output_gradient,
+        float* partials,
+        mfq::sq::Layout q,
+        int rows,
+        int output_tile,
+        cudaStream_t stream) {
+    const dim3 grid(
+        static_cast<unsigned>((q.width + 127) / 128),
+        static_cast<unsigned>((q.outputs + output_tile - 1) / output_tile));
+    sq_backward_matrix<BITS, Rows><<<
+        grid, 128, 0, stream>>>(
+        blob, output_gradient, partials, q, rows, output_tile);
+}
+
+template<int BITS>
+void dispatch_backward_matrix(
+        const std::uint8_t* blob,
+        const __half* output_gradient,
+        float* partials,
+        mfq::sq::Layout q,
+        int rows,
+        int output_tile,
+        cudaStream_t stream) {
+    if (rows == 1) {
+        launch_backward_matrix<BITS, 1>(
+            blob, output_gradient, partials, q, rows, output_tile, stream);
+    } else if (rows <= 2) {
+        launch_backward_matrix<BITS, 2>(
+            blob, output_gradient, partials, q, rows, output_tile, stream);
+    } else if (rows <= 4) {
+        launch_backward_matrix<BITS, 4>(
+            blob, output_gradient, partials, q, rows, output_tile, stream);
+    } else {
+        launch_backward_matrix<BITS, 8>(
+            blob, output_gradient, partials, q, rows, output_tile, stream);
+    }
 }
 
 } // namespace
@@ -284,6 +380,32 @@ mfq_tensor_backend::Tensor mxfp4_sq_backward_input_cuda(
     const auto stream = mfq_current_cuda_stream();
     const auto* data = blob.data_ptr<std::uint8_t>();
     const int rows = int(output_gradient.size(0));
+    if (output_gradient.scalar_type() == mfq_tensor_backend::kFloat16 &&
+            rows <= 8) {
+        const int output_tile = rows <= 4 ? 16 : 32;
+        const int splits = (int(outputs) + output_tile - 1) / output_tile;
+        auto partials = mfq_tensor_backend::empty(
+            {splits, rows, width},
+            output_gradient.options().dtype(mfq_tensor_backend::kFloat32));
+        const auto* gradient = reinterpret_cast<const __half*>(
+            output_gradient.data_ptr<mfq_half>());
+        auto* destination = reinterpret_cast<__half*>(
+            result.data_ptr<mfq_half>());
+        if (bits == 2) {
+            dispatch_backward_matrix<2>(
+                data, gradient, partials.data_ptr<float>(), q, rows,
+                output_tile, stream);
+        } else {
+            dispatch_backward_matrix<3>(
+                data, gradient, partials.data_ptr<float>(), q, rows,
+                output_tile, stream);
+        }
+        mfq_packed_backward::launch_split_float_reduce_to_half(
+            partials.data_ptr<float>(), destination,
+            rows, int(width), splits, stream);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return result;
+    }
     auto weight = mxfp4_sq_dequant_cuda(
         blob, bits, outputs, width, base, false);
     mfq_packed_backward::launch_dense_half_weight(

@@ -47,8 +47,9 @@ def test_packed_matmul(extension, bits, dtype):
 
 @pytest.mark.parametrize("bits", [2, 3])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-def test_packed_backward_input(extension, bits, dtype):
-    n, k, m = 33, 96, 3
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 8, 16])
+def test_packed_backward_input(extension, bits, dtype, m):
+    n, k = 33, 96
     blob, dense = tensors(bits, n, k)
     gradient = torch.randn(m, n, device="cuda", dtype=dtype)
     actual = extension.mxfp4_sq_backward_input_cuda(
