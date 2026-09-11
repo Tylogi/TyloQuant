@@ -1,6 +1,6 @@
 [package]
 name = "mfq-studio"
-version = "0.1.0"
+version = "0.3.1"
 description = "Desktop client for MFQ Server"
 edition = "2021"
 publish = false
