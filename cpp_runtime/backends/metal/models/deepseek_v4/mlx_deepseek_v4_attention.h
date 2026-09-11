@@ -158,6 +158,11 @@ public:
     void restore_speculative_snapshot(
         MlxDeepseekV4PoolState snapshot);
 
+    // V4.1's ratio-1/2 caches are append-only and every live row is guarded
+    // by pool_len/remainder. Reset their logical extent without reallocating
+    // and zeroing the context-sized backing arrays between text sessions.
+    void reset_v41();
+
 private:
     MlxDeepseekV4PoolState(
         int ratio,
@@ -221,6 +226,7 @@ public:
 
     MlxDeepseekV4LayerState snapshot() const;
     void restore_snapshot(MlxDeepseekV4LayerState snapshot);
+    void reset_v41();
 
     // Open a target-cache transaction before a speculative verify. The
     // attention adapter records its already-normalized input while the

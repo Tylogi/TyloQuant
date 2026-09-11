@@ -34,6 +34,7 @@ public:
     int batch() const noexcept;
     int window() const noexcept;
     std::size_t stages() const noexcept { return rings_.size(); }
+    std::size_t nbytes() const noexcept;
     const mlx::core::array& ring(std::size_t stage) const;
 
     MlxDeepseekV4DSparkState snapshot() const;
@@ -150,6 +151,14 @@ public:
         const MlxMtpTokenSelector& select_token,
         int width = 0) const;
 
+    // Generation only consumes the tokens passed to select_token. Avoid
+    // constructing the diagnostic logits/confidence result on that path.
+    void propose(
+        const mlx::core::array& anchor_ids,
+        MlxDeepseekV4DSparkState& state,
+        const MlxMtpTokenSelector& select_token,
+        int width = 0) const;
+
     // Test/reference convenience; production generation uses draft() so it
     // shares the runtime sampler with every other MTP implementation.
     MlxDeepseekV4DSparkDraft draft_greedy(
@@ -165,6 +174,13 @@ public:
     }
 
 private:
+    std::optional<MlxDeepseekV4DSparkDraft> draft_impl(
+        const mlx::core::array& anchor_ids,
+        MlxDeepseekV4DSparkState& state,
+        const MlxMtpTokenSelector& select_token,
+        int width,
+        bool collect_diagnostics) const;
+
     struct Impl;
     std::shared_ptr<Impl> impl_;
 };

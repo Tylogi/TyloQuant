@@ -82,6 +82,30 @@ int main() {
                     "adaptive MTP warmup retained cold compile latency");
             }
         }
+        {
+            mfq::metal::MlxMtpDepthController controller(
+                5,
+                mfq::metal::MlxMtpDepthPolicy::AcceptanceOnly);
+            controller.observe(5, 2, 900.0);
+            if (controller.depth() != 3 || controller.should_exit()) {
+                throw std::runtime_error(
+                    "acceptance-only MTP did not follow accepted depth");
+            }
+            controller.observe(3, 0, 1.0);
+            if (controller.depth() != 1 || !controller.should_exit()) {
+                throw std::runtime_error(
+                    "acceptance-only MTP missed deterministic handoff");
+            }
+            mfq::metal::MlxMtpDepthController profitable(
+                5,
+                mfq::metal::MlxMtpDepthPolicy::AcceptanceOnly);
+            profitable.observe(5, 5, 10000.0);
+            profitable.observe(5, 4, 1.0);
+            if (profitable.depth() != 5 || profitable.should_exit()) {
+                throw std::runtime_error(
+                    "acceptance-only MTP used timing for a profitable chain");
+            }
+        }
         const std::array<std::int32_t, 4> drafts{11, 12, 13, 14};
         {
             const std::array<std::int32_t, 5> targets{11, 12, 99, 14, 15};

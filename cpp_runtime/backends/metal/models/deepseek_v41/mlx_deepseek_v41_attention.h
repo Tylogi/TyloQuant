@@ -3,6 +3,7 @@
 #include "deepseek_v41_model.h"
 #include "mlx_tensor.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -36,6 +37,13 @@ struct MlxDeepseekV41AttentionState {
         int batch,
         int max_context,
         mlx::core::Dtype dtype = mlx::core::float16);
+
+    // Session snapshots own detached storage.  The live cache uses in-place
+    // Metal writes, so an ordinary array copy would let a later decode mutate
+    // a supposedly immutable Agent/session checkpoint.
+    MlxDeepseekV41AttentionState snapshot() const;
+    void restore_snapshot(MlxDeepseekV41AttentionState snapshot);
+    std::size_t nbytes() const noexcept;
 };
 
 struct MlxDeepseekV41SharedAttentionState {

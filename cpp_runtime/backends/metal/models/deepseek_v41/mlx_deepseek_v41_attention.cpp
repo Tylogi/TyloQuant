@@ -539,6 +539,77 @@ MlxDeepseekV41AttentionState MlxDeepseekV41AttentionState::allocate(
     return state;
 }
 
+MlxDeepseekV41AttentionState
+MlxDeepseekV41AttentionState::snapshot() const {
+    if (speculation) {
+        throw std::runtime_error(
+            "cannot snapshot a speculative DeepSeek-V4.1 attention cache");
+    }
+    const auto copy_optional = [](const std::optional<array>& value) {
+        return value
+            ? std::optional<array>(detached_copy(*value))
+            : std::nullopt;
+    };
+    MlxDeepseekV41AttentionState result;
+    result.local_kv = detached_copy(local_kv);
+    result.compressed_kv = copy_optional(compressed_kv);
+    result.index_k = copy_optional(index_k);
+    result.partial_kv = copy_optional(partial_kv);
+    result.partial_score = copy_optional(partial_score);
+    result.position = position;
+    result.compressed_length = compressed_length;
+    result.partial_length = partial_length;
+    return result;
+}
+
+void MlxDeepseekV41AttentionState::restore_snapshot(
+    MlxDeepseekV41AttentionState snapshot) {
+    const auto same_layout = [](
+        const std::optional<array>& live,
+        const std::optional<array>& saved) {
+        return live.has_value() == saved.has_value() &&
+            (!live || (live->shape() == saved->shape() &&
+                       live->dtype() == saved->dtype()));
+    };
+    if (snapshot.speculation ||
+        local_kv.shape() != snapshot.local_kv.shape() ||
+        local_kv.dtype() != snapshot.local_kv.dtype() ||
+        !same_layout(compressed_kv, snapshot.compressed_kv) ||
+        !same_layout(index_k, snapshot.index_k) ||
+        !same_layout(partial_kv, snapshot.partial_kv) ||
+        !same_layout(partial_score, snapshot.partial_score) ||
+        snapshot.position < 0 || snapshot.compressed_length < 0 ||
+        snapshot.partial_length < 0 ||
+        (snapshot.compressed_kv &&
+         snapshot.compressed_length > snapshot.compressed_kv->shape(1)) ||
+        (snapshot.partial_kv &&
+         snapshot.partial_length > snapshot.partial_kv->shape(1))) {
+        throw std::invalid_argument(
+            "DeepSeek-V4.1 attention snapshot topology mismatch");
+    }
+    local_kv = std::move(snapshot.local_kv);
+    compressed_kv = std::move(snapshot.compressed_kv);
+    index_k = std::move(snapshot.index_k);
+    partial_kv = std::move(snapshot.partial_kv);
+    partial_score = std::move(snapshot.partial_score);
+    position = snapshot.position;
+    compressed_length = snapshot.compressed_length;
+    partial_length = snapshot.partial_length;
+    speculation.reset();
+}
+
+std::size_t MlxDeepseekV41AttentionState::nbytes() const noexcept {
+    std::size_t bytes = local_kv.nbytes();
+    const auto append = [&bytes](const std::optional<array>& value) {
+        if (value) bytes += value->nbytes();
+    };
+    append(compressed_kv);
+    append(index_k);
+    append(partial_kv);
+    append(partial_score);
+    return bytes;
+}
+
 MlxDeepseekV41Attention MlxDeepseekV41Attention::load(
     const MfqContainer& model,
     const DeepseekV41Config& config,

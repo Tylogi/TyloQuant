@@ -167,6 +167,20 @@ mlx::core::array attention_dsv4_sparse(
     const std::optional<mlx::core::array>& meta = std::nullopt,
     std::optional<float> scale = std::nullopt);
 
+// Multi-token V4.1 specialization. Causal local/pool visibility is derived
+// inside the Metal kernel, avoiding a concatenated cache and plan tensors.
+mlx::core::array attention_dsv4_sparse_prefill(
+    const mlx::core::array& q,
+    const mlx::core::array& chronological_local_kv,
+    const mlx::core::array& pooled_kv,
+    int pool_len,
+    const mlx::core::array& topk,
+    const mlx::core::array& sinks,
+    int query_offset,
+    int ratio,
+    int window,
+    std::optional<float> scale = std::nullopt);
+
 // Single-token specialization which addresses the circular local cache and
 // compressed pool directly.  This avoids materializing a concatenated cache
 // and a separate indices/mask plan on every layer of every decode step.

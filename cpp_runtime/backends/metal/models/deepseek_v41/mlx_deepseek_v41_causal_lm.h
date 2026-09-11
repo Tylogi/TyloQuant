@@ -25,13 +25,17 @@
 
 namespace mfq::metal {
 
-struct MlxDeepseekV41TextSessionState {
-    std::vector<std::int64_t> tokens;
-    std::size_t bytes = 0;
-};
-
 struct MlxDeepseekV41LayerState {
     MlxDeepseekV41AttentionState attention;
+};
+
+struct MlxDeepseekV41TextSessionState {
+    std::vector<std::int64_t> tokens;
+    std::vector<MlxDeepseekV41LayerState> layers;
+    DeepseekV41EngramHashSnapshot engram_hash;
+    int cache_position = 0;
+    int cache_batch = 0;
+    std::size_t bytes = 0;
 };
 
 struct MlxDeepseekV41LayerResult {
@@ -178,7 +182,7 @@ public:
     const MlxMtpGenerationStats& last_mtp_stats() const noexcept {
         return last_mtp_stats_;
     }
-    bool supports_text_session_state() const noexcept { return false; }
+    bool supports_text_session_state() const noexcept { return true; }
     MlxDeepseekV41TextSessionState capture_text_session_state(
         const std::vector<std::int64_t>& tokens) const;
     void restore_text_session_state(
@@ -208,6 +212,8 @@ private:
         std::int32_t limit,
         const std::function<bool(std::int64_t)>& callback,
         const MfqTokenConstraintPtr& token_constraint);
+    void materialize_states(
+        const std::vector<MlxDeepseekV41LayerState>& states) const;
 
     DeepseekV41Config config_;
     MlxEmbedding embedding_;
@@ -223,6 +229,9 @@ private:
     int cache_position_ = 0;
     int cache_batch_ = 0;
     std::vector<MlxDeepseekV41LayerState> states_;
+    // Exact immutable prefix represented by states_ after a server request.
+    // Public forward/prefill/decode calls deliberately leave this empty.
+    std::vector<std::int64_t> stable_cache_tokens_;
     std::optional<DeepseekV41EngramHashSnapshot>
         speculative_engram_snapshot_;
     std::optional<mlx::core::array> speculative_token_ids_;

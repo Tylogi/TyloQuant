@@ -11,6 +11,30 @@ METAL_QWEN = (
 METAL_DSV4 = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
 ).read_text(encoding="utf-8")
+METAL_DSV41 = (
+    ROOT
+    / "cpp_runtime"
+    / "backends"
+    / "metal"
+    / "models/deepseek_v41"
+    / "mlx_deepseek_v41_causal_lm.cpp"
+).read_text(encoding="utf-8")
+METAL_DSV41_HEADER = (
+    ROOT
+    / "cpp_runtime"
+    / "backends"
+    / "metal"
+    / "models/deepseek_v41"
+    / "mlx_deepseek_v41_causal_lm.h"
+).read_text(encoding="utf-8")
+METAL_DSV41_ATTENTION = (
+    ROOT
+    / "cpp_runtime"
+    / "backends"
+    / "metal"
+    / "models/deepseek_v41"
+    / "mlx_deepseek_v41_attention.cpp"
+).read_text(encoding="utf-8")
 METAL_MINICPM = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp"
 ).read_text(encoding="utf-8")
@@ -109,10 +133,30 @@ def test_metal_server_bounds_and_explicitly_reclaims_allocator_cache() -> None:
 
 
 def test_all_metal_text_graphs_capture_and_restore_prefix_state() -> None:
-    for source in (METAL_QWEN, METAL_DSV4, METAL_MINICPM):
+    for source in (METAL_QWEN, METAL_DSV4, METAL_DSV41, METAL_MINICPM):
         assert "capture_text_session_state" in source
         assert "restore_text_session_state" in source
         assert "prompt.size() - reused_tokens" in source
+
+
+def test_native_deepseek_v41_snapshots_are_detached_and_engram_complete() -> None:
+    assert "supports_text_session_state() const noexcept { return true; }" in METAL_DSV41_HEADER
+    assert "stable_cache_tokens_" in METAL_DSV41_HEADER
+    assert "state.attention.snapshot()" in METAL_DSV41
+    assert "state.engram_hash" in METAL_DSV41
+    assert "materialize_states(stable_restore.states())" in METAL_DSV41
+    assert "detached_copy(local_kv)" in METAL_DSV41_ATTENTION
+    assert "restore_snapshot(" in METAL_DSV41_ATTENTION
+
+
+def test_raw_deepseek_v41_mtp_forks_include_dspark_prefix_state() -> None:
+    assert "stable_dspark_state_" in METAL_DSV4
+    assert "state.dspark.emplace(stable_dspark_state_->snapshot())" in METAL_DSV4
+    assert "const bool dspark_active = dspark_candidate;" in METAL_DSV4
+    assert "dspark_prefix_ready" in METAL_DSV4
+    assert "stable_dspark_state_->snapshot()" in METAL_DSV4
+    assert "mlx_mtp_verification_ids(" in METAL_DSV4
+    assert "resolved_drafts.eval()" not in METAL_DSV4
 
 
 def test_persistent_prefix_cache_is_content_addressed_and_restart_safe() -> None:

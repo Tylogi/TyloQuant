@@ -17,7 +17,7 @@ quantization recipe.
 | Qwen3.5 | HF/GGUF/full-precision MFQ | End-to-end | End-to-end | Full/linear hybrid CausalLM |
 | Qwen3.6 | HF/GGUF/full-precision MFQ | Partial | Partial | Routed-MoE components; no public end-to-end runtime |
 | Gemma4 | HF/GGUF and sharded MFQ | End-to-end | End-to-end | Mixed full/sliding attention |
-| DeepSeek-V4-Flash | HF/GGUF, Expert-Wise MFQ, and TPQ | End-to-end | End-to-end | Compression, indexer, and sparse-attention paths |
+| DeepSeek-V4-Flash | HF/GGUF, Expert-Wise MFQ, and TPQ | End-to-end | End-to-end | Compression, indexer, sparse attention, and raw-HF V4.1 DSpark/Engram paths |
 | MiniCPM-o 4.5 | Official composite HF graph to MFQ | End-to-end | End-to-end | Official model directory required at runtime |
 | GLM-MoE-DSA | Native MFQ and mixed precision | End-to-end | End-to-end | Dense/sparse MLA paths |
 | Kimi-K3 | TPQ/MFQ packaging | Dedicated | Dedicated | TPQ/MFQ execution path only |
@@ -66,13 +66,35 @@ optional migration A/B runtime.
 - MHA/GQA/MQA with dynamic and sliding-window KV caches.
 - Fused SSM/GDN kernels and GLM DSA/sparse MLA.
 - DeepSeek-V4 compression, indexer, sparse-attention, and HC kernels.
+- Raw-HF DeepSeek-V4.1 uses a direct circular sparse-attention path for text
+  prefill and multi-row verification. Logical cache resets retain the allocated
+  V4.1 backing storage, so a new request does not zero and recreate every
+  context-sized attention array. Engram remains independently eligible for SSD
+  offload.
+- DeepSeek-V4.1 DSpark MTP uses variable-width proposals and skips unused
+  diagnostic graphs during serving. Its depth schedule depends only on accepted
+  drafts, never wall-clock timing: after two cycles, cumulative acceptance of
+  60% or less hands the request back to ordinary decoding. Other model families
+  retain the general throughput-adaptive MTP policy.
+- Exact RAM-resident session snapshots and independent KV forks for hybrid
+  DeepSeek-V4/V4.1 caches. Raw-HF V4.1 snapshots also retain the committed
+  DSpark ring when MTP is active, so a fork can reuse the target and predictor
+  prefix together. This path does not yet serialize recurrent/compressed
+  snapshots to the paged SSD cache.
+- Content-addressed RAM/SSD prefix blocks, restart reuse, and shared immutable
+  fork payloads for runtimes with a paged-session codec.
 - Kimi-K3 KDA/MLA, Attention-Residual, SiTU MoE, cache, and generation graph.
 
 ## End-to-end runtime details
 
 - **Qwen3.5:** full/linear hybrid CausalLM prefill, decode, and generation.
-- **DeepSeek-V4:** native MFQ loading; compressed, local, and indexer caches;
-  mmap-backed bounded expert residency; prefill; decode; and generation.
+- **DeepSeek-V4:** native MFQ and raw-HF loading; compressed, local, and indexer
+  caches; mmap-backed bounded expert residency; Engram SSD offload; DSpark MTP;
+  prefill; decode; and generation. Repeated greedy V4.1 MTP requests use a
+  deterministic verifier-width sequence. Quantized verifier row widths can
+  still produce a different, valid greedy continuation between MTP-on and
+  MTP-off; use `enable_mtp: false` when strict token-for-token parity with
+  ordinary decoding is required.
 - **Gemma4:** self-contained sharded-MFQ loading; mixed full/sliding attention;
   fused norm/GeGLU/MoE; cache; and generation.
 - **GLM-MoE-DSA:** native loading, shared indexer state, dense/sparse MLA,

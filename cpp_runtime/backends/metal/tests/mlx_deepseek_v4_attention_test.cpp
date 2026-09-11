@@ -852,6 +852,47 @@ void test_pool_and_ratio_schedule() {
         "non-contiguous pool update was accepted");
 }
 
+void test_v41_pool_logical_reset() {
+    auto pool = MlxDeepseekV4PoolState::allocate_v41(
+        2,
+        32,
+        1,
+        8,
+        mlx::core::bfloat16);
+    const auto kv = mlx::core::ones(
+        Shape{1, 2, 32}, mlx::core::bfloat16);
+    const auto gate = mlx::core::zeros(
+        Shape{1, 2, 32}, mlx::core::bfloat16);
+    const auto norm = mlx::core::ones(
+        Shape{32}, mlx::core::float32);
+    auto compressed = pool.compress_v41(
+        kv,
+        gate,
+        norm,
+        0,
+        mlx::core::bfloat16,
+        1e-6f);
+    pool.append_v41(compressed);
+    require(
+        pool.pool_len() == 1 && pool.remainder() == 0,
+        "V4.1 pool setup did not emit a compressed row");
+    pool.reset_v41();
+    require(
+        pool.pool_len() == 0 && pool.remainder() == 0,
+        "V4.1 pool logical reset retained live rows");
+    auto partial = pool.compress_v41(
+        mlx::core::slice(kv, Shape{0, 0, 0}, Shape{1, 1, 32}),
+        mlx::core::slice(gate, Shape{0, 0, 0}, Shape{1, 1, 32}),
+        norm,
+        0,
+        mlx::core::bfloat16,
+        1e-6f);
+    require(
+        partial.shape() == Shape{1, 0, 32} &&
+            pool.pool_len() == 0 && pool.remainder() == 1,
+        "V4.1 pool did not restart from an empty logical cache");
+}
+
 void test_local_attention_cpu_reference() {
     const auto config = test_config();
     auto operation = attention(
@@ -1328,6 +1369,7 @@ int main() {
         test_image_visibility_starts_at_image_start();
         test_yarn_rope_and_rms();
         test_pool_and_ratio_schedule();
+        test_v41_pool_logical_reset();
         test_local_attention_cpu_reference();
         test_prefill_mma_cpu_reference();
         test_ratio_four_continuity();

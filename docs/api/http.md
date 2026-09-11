@@ -304,6 +304,23 @@ Keep the returned `id` and `revision`. Mutations reject a stale
 message, and an optional title. `RewindSessionRequest` requires the current
 revision, a target message, and whether to retain the target.
 
+Forking at the current session tip also asks the active inference backend to
+fork its resident KV snapshot. The source and branch then advance
+independently while immutable snapshot payloads may remain shared. A fork at
+an older message cannot inherit a later runtime snapshot; it is rebuilt or
+matched from an exact cached token prefix. Cache persistence depends on the
+loaded runtime: codec-enabled caches can survive a restart on SSD, while some
+hybrid/recurrent model caches are RAM-only.
+
+The raw-HF DeepSeek-V4.1 Metal runtime includes committed DSpark state in an
+MTP-enabled resident snapshot, allowing the target and predictor prefix to be
+restored together. Its MTP depth decisions are acceptance-based and independent
+of request timing, including a deterministic handoff to ordinary decoding after
+two low-yield cycles. Quantized multi-row verification can round differently
+from single-row ordinary decode; clients requiring strict MTP-on/off token
+parity should send `"enable_mtp": false` on the OpenAI-compatible completion
+request.
+
 Session export uses the `mfq-session-v1` archive format and includes the
 session, messages, referenced media, and document metadata. Import validates
 media digests, remaps identifiers, and creates a new session; it never
