@@ -273,6 +273,7 @@ def test_nint8_zero_native_matmul_matches_packed_reference(
     activation_rows: int,
 ):
     rng = np.random.default_rng(608)
+    torch.manual_seed(608 + activation_rows)
     rows, width = 13, 96
     tensor = Nint8ZeroTensor(
         shape=(rows, width),
