@@ -46,7 +46,28 @@ void compare(const Tensor& result, const std::vector<float>& expected,
     }
 }
 
-void check_fixture(const std::filesystem::path& path, int& matmuls, int& graphs) {
+void compare_backward(const Tensor& result, const std::vector<float>& expected,
+                      const std::vector<float>& gradient,
+                      const mfq::sq::Layout& q, int m) {
+    const auto host = result.to(kCPU, kFloat32).contiguous();
+    require(host.numel() == std::int64_t(m) * q.width, "backward shape mismatch");
+    for (int row = 0; row < m; ++row) {
+        for (int k = 0; k < q.width; ++k) {
+            double sum = 0;
+            for (int n = 0; n < q.outputs; ++n)
+                sum += double(gradient[row * q.outputs + n]) * expected[n * q.width + k];
+            const float actual = host.data_ptr<float>()[row * q.width + k];
+            if (!std::isfinite(actual) || std::abs(actual - sum) > .02 + .006 * std::abs(sum)) {
+                std::cerr << "backward M=" << m << " k=" << k
+                          << " actual=" << actual << " ref=" << sum << '\n';
+                throw std::runtime_error("SQ backward mismatch");
+            }
+        }
+    }
+}
+
+void check_fixture(const std::filesystem::path& path, int& matmuls,
+                   int& backwards, int& graphs) {
     const Device gpu{DeviceType::cuda, 0};
     auto raw = read(path);
     const auto q = mfq::sq::parse(raw.data(), raw.size());
@@ -98,6 +119,18 @@ void check_fixture(const std::filesystem::path& path, int& matmuls, int& graphs)
             auto invoke = [&] { return mxfp4_sq_matmul_cuda(blob, x, q.bits, q.outputs, q.width, q.base); };
             compare(invoke(), expected, values, q, m);
             ++matmuls;
+            std::vector<float> gradients(std::size_t(m) * q.outputs);
+            for (std::size_t i = 0; i < gradients.size(); ++i)
+                gradients[i] = float(int((i * 13 + 7) % 49) - 24) / 24;
+            auto gradient = from_blob(
+                gradients.data(), {m, q.outputs}, TensorOptions{}.dtype(kFloat32)
+            ).to(gpu).to(dtype);
+            auto invoke_backward = [&] {
+                return mxfp4_sq_backward_input_cuda(
+                    blob, gradient, q.bits, q.outputs, q.width, q.base);
+            };
+            compare_backward(invoke_backward(), expected, gradients, q, m);
+            ++backwards;
             if (m >= 2 && m <= 6 && q.outputs == 33 && q.width == 96) {
                 MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
                 auto stream = stream_from_pool(false, 0);
@@ -129,15 +162,18 @@ int main(int argc, char** argv) {
     const auto status = cudaGetDeviceCount(&devices);
     if (status != cudaSuccess || !devices) return 77;
     try {
-        int fixtures = 0, matmuls = 0, graphs = 0;
+        int fixtures = 0, matmuls = 0, backwards = 0, graphs = 0;
         for (const auto& entry : std::filesystem::directory_iterator(argv[1])) {
             if (entry.path().extension() != ".sq") continue;
-            check_fixture(entry.path(), matmuls, graphs);
+            check_fixture(entry.path(), matmuls, backwards, graphs);
             ++fixtures;
             std::cout << "PASS " << entry.path().filename().string() << std::endl;
         }
-        require(fixtures == 30 && matmuls == 576 && graphs == 20, "incomplete gate coverage");
-        std::cout << "PASS fixtures=" << fixtures << " matmuls=" << matmuls << " graphs=" << graphs << '\n';
+        require(
+            fixtures == 30 && matmuls == 576 && backwards == 576 && graphs == 20,
+            "incomplete gate coverage");
+        std::cout << "PASS fixtures=" << fixtures << " matmuls=" << matmuls
+                  << " backwards=" << backwards << " graphs=" << graphs << '\n';
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;
