@@ -7305,6 +7305,131 @@ __global__ void nvq_backward_input_kernel(
     }
 }
 
+template <int FORMAT, int Rows>
+__global__ void __launch_bounds__(32) nvq_backward_partial_kernel(
+        const uint8_t * indices,
+        int64_t indices_nbytes,
+        const uint8_t * aux,
+        int64_t aux_nbytes,
+        const uint8_t * sub_scale,
+        int64_t sub_scale_nbytes,
+        const float * neuron_scale,
+        const int8_t * codebook,
+        const __half * output_gradient,
+        float * partials,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int sub_bits,
+        int sign_mode,
+        int output_tile) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int chunk_linear = static_cast<int>(blockIdx.x) * 32 + lane;
+    const int k0 = chunk_linear * 4;
+    const bool valid = k0 < K;
+    const int group = k0 / kGroupSize;
+    const int chunk = (k0 - group * kGroupSize) / 4;
+    const int split = static_cast<int>(blockIdx.y);
+    const int output0 = split * output_tile;
+    const int output_end = min(output0 + output_tile, N);
+    float accumulators[Rows][4];
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+#pragma unroll
+        for (int component = 0; component < 4; ++component) {
+            accumulators[row][component] = 0.0f;
+        }
+    }
+    for (int output = output0; output < output_end; ++output) {
+        float anchor = lane == 0 ? neuron_scale[output] : 0.0f;
+        anchor = __shfl_sync(0xffffffffu, anchor, 0);
+        uint32_t state = 0;
+        int packed = 0;
+        float weight_scale = 0.0f;
+        if (valid) {
+            const int64_t state_index =
+                static_cast<int64_t>(output) * ng + group;
+            state = load_packed_bits(
+                sub_scale, state_index * sub_bits,
+                sub_bits, sub_scale_nbytes);
+            packed = decode_chunk4<FORMAT>(
+                indices, indices_nbytes, aux, aux_nbytes, codebook,
+                output, group, chunk, nvec, nsign, ng,
+                sign_mode, state);
+            weight_scale = format_scale<FORMAT>(anchor, state, codebook);
+        }
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float gradient = lane == 0 && row < M
+                ? __half2float(output_gradient[
+                    static_cast<int64_t>(row) * N + output])
+                : 0.0f;
+            gradient = __shfl_sync(0xffffffffu, gradient, 0);
+            const float factor = gradient * weight_scale;
+#pragma unroll
+            for (int component = 0; component < 4; ++component) {
+                const int value = static_cast<int>(static_cast<int8_t>(
+                    (packed >> (8 * component)) & 0xff));
+                accumulators[row][component] = fmaf(
+                    factor, static_cast<float>(value),
+                    accumulators[row][component]);
+            }
+        }
+    }
+    if (valid) {
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            if (row < M) {
+#pragma unroll
+                for (int component = 0; component < 4; ++component) {
+                    const int column = k0 + component;
+                    if (column < K) {
+                        partials[(static_cast<int64_t>(split) * M + row) *
+                            K + column] = accumulators[row][component];
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int FORMAT, int Rows>
+void launch_nvq_backward_small_m(
+        const mfq_tensor_backend::Tensor & indices,
+        const mfq_tensor_backend::Tensor & aux,
+        const mfq_tensor_backend::Tensor & sub_scale,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & codebook,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & partials,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int sub_bits,
+        int sign_mode,
+        int output_tile,
+        cudaStream_t stream) {
+    const dim3 grid(
+        static_cast<unsigned>((K + 127) / 128),
+        static_cast<unsigned>((N + output_tile - 1) / output_tile));
+    nvq_backward_partial_kernel<FORMAT, Rows><<<
+        grid, 32, 0, stream>>>(
+            indices.data_ptr<uint8_t>(), indices.numel(),
+            aux.data_ptr<uint8_t>(), aux.numel(),
+            sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
+            neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),
+            reinterpret_cast<const __half *>(
+                output_gradient.data_ptr<mfq_half>()),
+            partials.data_ptr<float>(), M, N, K, ng, nvec, nsign,
+            sub_bits, sign_mode, output_tile);
+}
+
 template <int FORMAT, typename T>
 __global__ void nepq_backward_input_kernel(
         const uint8_t * indices,
@@ -7359,6 +7484,137 @@ __global__ void nepq_backward_input_kernel(
         }
         input_gradient[logical] = nvq_backward_from_float<T>(accumulator);
     }
+}
+
+template <int FORMAT, int Rows>
+__global__ void __launch_bounds__(32) nepq_backward_partial_kernel(
+        const uint8_t * indices,
+        int64_t indices_nbytes,
+        const uint8_t * aux,
+        int64_t aux_nbytes,
+        const uint8_t * state_stream,
+        int64_t state_nbytes,
+        const float * neuron_scale,
+        const int8_t * table_pool,
+        const uint8_t * bank_ids,
+        const __half * output_gradient,
+        float * partials,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int nsuper,
+        int table_stride,
+        int state_bits,
+        int output_tile) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int chunk_linear = static_cast<int>(blockIdx.x) * 32 + lane;
+    const int k0 = chunk_linear * 4;
+    const bool valid = k0 < K;
+    const int group = k0 / kGroupSize;
+    const int chunk = (k0 - group * kGroupSize) / 4;
+    const int split = static_cast<int>(blockIdx.y);
+    const int output0 = split * output_tile;
+    const int output_end = min(output0 + output_tile, N);
+    float accumulators[Rows][4];
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+#pragma unroll
+        for (int component = 0; component < 4; ++component) {
+            accumulators[row][component] = 0.0f;
+        }
+    }
+    for (int output = output0; output < output_end; ++output) {
+        float anchor = lane == 0 ? neuron_scale[output] : 0.0f;
+        anchor = __shfl_sync(0xffffffffu, anchor, 0);
+        uint32_t state = 0;
+        int packed = 0;
+        float weight_scale = 0.0f;
+        if (valid) {
+            const int64_t state_index =
+                static_cast<int64_t>(output) * ng + group;
+            state = load_packed_bits(
+                state_stream, state_index * state_bits,
+                state_bits, state_nbytes);
+            const int8_t * table = nepq_active_table(
+                table_pool, bank_ids, output, group,
+                nsuper, table_stride);
+            packed = decode_nepq_chunk4<FORMAT>(
+                indices, indices_nbytes, aux, aux_nbytes, table,
+                output, group, chunk, nvec, nsign, ng, 0, state);
+            weight_scale = format_scale<FORMAT>(anchor, state, table);
+        }
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float gradient = lane == 0 && row < M
+                ? __half2float(output_gradient[
+                    static_cast<int64_t>(row) * N + output])
+                : 0.0f;
+            gradient = __shfl_sync(0xffffffffu, gradient, 0);
+            const float factor = gradient * weight_scale;
+#pragma unroll
+            for (int component = 0; component < 4; ++component) {
+                const int value = static_cast<int>(static_cast<int8_t>(
+                    (packed >> (8 * component)) & 0xff));
+                accumulators[row][component] = fmaf(
+                    factor, static_cast<float>(value),
+                    accumulators[row][component]);
+            }
+        }
+    }
+    if (valid) {
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            if (row < M) {
+#pragma unroll
+                for (int component = 0; component < 4; ++component) {
+                    const int column = k0 + component;
+                    if (column < K) {
+                        partials[(static_cast<int64_t>(split) * M + row) *
+                            K + column] = accumulators[row][component];
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int FORMAT, int Rows>
+void launch_nepq_backward_small_m(
+        const mfq_tensor_backend::Tensor & indices,
+        const mfq_tensor_backend::Tensor & aux,
+        const mfq_tensor_backend::Tensor & state_stream,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & table_pool,
+        const mfq_tensor_backend::Tensor & bank_ids,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & partials,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int nsuper,
+        int table_stride,
+        int state_bits,
+        int output_tile,
+        cudaStream_t stream) {
+    const dim3 grid(
+        static_cast<unsigned>((K + 127) / 128),
+        static_cast<unsigned>((N + output_tile - 1) / output_tile));
+    nepq_backward_partial_kernel<FORMAT, Rows><<<grid, 32, 0, stream>>>(
+        indices.data_ptr<uint8_t>(), indices.numel(),
+        aux.data_ptr<uint8_t>(), aux.numel(),
+        state_stream.data_ptr<uint8_t>(), state_stream.numel(),
+        neuron_scale.data_ptr<float>(), table_pool.data_ptr<int8_t>(),
+        bank_ids.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half *>(
+            output_gradient.data_ptr<mfq_half>()),
+        partials.data_ptr<float>(), M, N, K, ng, nvec, nsign,
+        nsuper, table_stride, state_bits, output_tile);
 }
 
 template <typename T, typename Launch>
@@ -7430,6 +7686,47 @@ mfq_tensor_backend::Tensor nvq_backward_input_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
+    if (dtype == mfq_tensor_backend::kFloat16 && M <= 8) {
+        const int output_tile = M <= 4 ? 16 : 32;
+        const int splits = (N + output_tile - 1) / output_tile;
+        auto partials = mfq_tensor_backend::empty(
+            {splits, M, K},
+            neuron_scale.options().dtype(mfq_tensor_backend::kFloat32));
+        launch_by_format(static_cast<int>(format), [&](auto tag) {
+            constexpr int F = decltype(tag)::value;
+            if (M == 1) {
+                launch_nvq_backward_small_m<F, 1>(
+                    indices, aux, sub_scale, neuron_scale, codebook,
+                    output_gradient, partials, M, N, K, ng, nvec, nsign,
+                    static_cast<int>(sub_bits), static_cast<int>(sign_mode),
+                    output_tile, stream);
+            } else if (M <= 2) {
+                launch_nvq_backward_small_m<F, 2>(
+                    indices, aux, sub_scale, neuron_scale, codebook,
+                    output_gradient, partials, M, N, K, ng, nvec, nsign,
+                    static_cast<int>(sub_bits), static_cast<int>(sign_mode),
+                    output_tile, stream);
+            } else if (M <= 4) {
+                launch_nvq_backward_small_m<F, 4>(
+                    indices, aux, sub_scale, neuron_scale, codebook,
+                    output_gradient, partials, M, N, K, ng, nvec, nsign,
+                    static_cast<int>(sub_bits), static_cast<int>(sign_mode),
+                    output_tile, stream);
+            } else {
+                launch_nvq_backward_small_m<F, 8>(
+                    indices, aux, sub_scale, neuron_scale, codebook,
+                    output_gradient, partials, M, N, K, ng, nvec, nsign,
+                    static_cast<int>(sub_bits), static_cast<int>(sign_mode),
+                    output_tile, stream);
+            }
+        });
+        mfq_packed_backward::launch_split_float_reduce_to_half(
+            partials.data_ptr<float>(),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
+            M, K, splits, stream);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return result;
+    }
     auto weight = nvq_dequant_cuda(
         indices, aux, sub_scale, neuron_scale, codebook,
         neuron_len, gs, sub_bits, format, sign_mode);
@@ -7491,6 +7788,47 @@ mfq_tensor_backend::Tensor nepq_backward_input_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
+    if (dtype == mfq_tensor_backend::kFloat16 && M <= 8) {
+        const int output_tile = M <= 4 ? 16 : 32;
+        const int splits = (N + output_tile - 1) / output_tile;
+        auto partials = mfq_tensor_backend::empty(
+            {splits, M, K},
+            neuron_scale.options().dtype(mfq_tensor_backend::kFloat32));
+        launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {
+            constexpr int F = decltype(tag)::value;
+            if (M == 1) {
+                launch_nepq_backward_small_m<F, 1>(
+                    indices, aux, state_stream, neuron_scale, table_pool,
+                    bank_ids, output_gradient, partials, M, N, K, ng,
+                    nvec, nsign, nsuper, table_stride,
+                    static_cast<int>(state_bits), output_tile, stream);
+            } else if (M <= 2) {
+                launch_nepq_backward_small_m<F, 2>(
+                    indices, aux, state_stream, neuron_scale, table_pool,
+                    bank_ids, output_gradient, partials, M, N, K, ng,
+                    nvec, nsign, nsuper, table_stride,
+                    static_cast<int>(state_bits), output_tile, stream);
+            } else if (M <= 4) {
+                launch_nepq_backward_small_m<F, 4>(
+                    indices, aux, state_stream, neuron_scale, table_pool,
+                    bank_ids, output_gradient, partials, M, N, K, ng,
+                    nvec, nsign, nsuper, table_stride,
+                    static_cast<int>(state_bits), output_tile, stream);
+            } else {
+                launch_nepq_backward_small_m<F, 8>(
+                    indices, aux, state_stream, neuron_scale, table_pool,
+                    bank_ids, output_gradient, partials, M, N, K, ng,
+                    nvec, nsign, nsuper, table_stride,
+                    static_cast<int>(state_bits), output_tile, stream);
+            }
+        });
+        mfq_packed_backward::launch_split_float_reduce_to_half(
+            partials.data_ptr<float>(),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
+            M, K, splits, stream);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return result;
+    }
     auto weight = nepq_dequant_cuda(
         indices, aux, state_stream, neuron_scale, table_pool, bank_ids,
         neuron_len, state_bits, format);

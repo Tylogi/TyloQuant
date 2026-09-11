@@ -1154,6 +1154,85 @@ void launch_mx_backward(
     }
 }
 
+template <int Rows>
+__global__ void __launch_bounds__(32) mxfp8_backward_partial_kernel(
+        const uint8_t * __restrict__ values,
+        const uint8_t * __restrict__ scales,
+        const __half * __restrict__ output_gradient,
+        float * __restrict__ partials,
+        int rows,
+        int outputs,
+        int width) {
+    const int column = static_cast<int>(blockIdx.x) * 32 + threadIdx.x;
+    if (column >= width) {
+        return;
+    }
+    float accumulators[Rows];
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+        accumulators[row] = 0.0f;
+    }
+    const int output_group = static_cast<int>(blockIdx.y);
+    const int output0 = output_group * 128;
+    const int output_end = min(output0 + 128, outputs);
+    const int scale_columns = width >> 7;
+    const float scale = decode_e8m0(scales[
+        static_cast<int64_t>(output_group) * scale_columns +
+        (column >> 7)]);
+    const uint8_t * weight = values +
+        static_cast<int64_t>(output0) * width + column;
+    for (int output = output0; output < output_end; ++output) {
+        const float decoded = decode_e4m3fn(*weight) * scale;
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            if (row < rows) {
+                accumulators[row] = fmaf(
+                    __half2float(output_gradient[
+                        static_cast<int64_t>(row) * outputs + output]),
+                    decoded,
+                    accumulators[row]);
+            }
+        }
+        weight += width;
+    }
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+        if (row < rows) {
+            partials[(static_cast<int64_t>(output_group) * rows + row) *
+                width + column] = accumulators[row];
+        }
+    }
+}
+
+template <int Rows>
+void launch_mxfp8_backward_small_m(
+        const mfq_tensor_backend::Tensor & values,
+        const mfq_tensor_backend::Tensor & scales,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & result,
+        int rows,
+        int outputs,
+        int width,
+        cudaStream_t stream) {
+    const int output_groups = (outputs + 127) / 128;
+    auto partials = mfq_tensor_backend::empty(
+        {output_groups, rows, width},
+        values.options().dtype(mfq_tensor_backend::kFloat32));
+    const dim3 partial_grid(
+        static_cast<unsigned>((width + 31) / 32),
+        static_cast<unsigned>(output_groups));
+    mxfp8_backward_partial_kernel<Rows><<<partial_grid, 32, 0, stream>>>(
+        values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half *>(
+            output_gradient.data_ptr<mfq_half>()),
+        partials.data_ptr<float>(),
+        rows, outputs, width);
+    mfq_packed_backward::launch_split_float_reduce_to_half(
+        partials.data_ptr<float>(),
+        reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
+        rows, width, output_groups, stream);
+}
+
 }  // namespace
 
 mfq_tensor_backend::Tensor mx_backward_input_cuda(
@@ -1193,6 +1272,27 @@ mfq_tensor_backend::Tensor mx_backward_input_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
+    if (!mxfp4 && dtype == mfq_tensor_backend::kFloat16 && rows <= 8) {
+        if (rows == 1) {
+            launch_mxfp8_backward_small_m<1>(
+                values, scales, output_gradient, result,
+                rows, outputs, width, stream);
+        } else if (rows <= 2) {
+            launch_mxfp8_backward_small_m<2>(
+                values, scales, output_gradient, result,
+                rows, outputs, width, stream);
+        } else if (rows <= 4) {
+            launch_mxfp8_backward_small_m<4>(
+                values, scales, output_gradient, result,
+                rows, outputs, width, stream);
+        } else {
+            launch_mxfp8_backward_small_m<8>(
+                values, scales, output_gradient, result,
+                rows, outputs, width, stream);
+        }
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return result;
+    }
     auto weight = mxfp4
         ? mxfp4_dequant_cuda(values, scales)
         : mxfp8_dequant_cuda(values, scales);

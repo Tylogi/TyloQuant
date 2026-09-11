@@ -87,6 +87,44 @@ inline void launch_cast(
         source, destination, count);
 }
 
+static __global__ void split_float_reduce_to_half_kernel(
+        const float * __restrict__ partials,
+        __half * __restrict__ destination,
+        int rows,
+        int width,
+        int splits) {
+    const int64_t total = static_cast<int64_t>(rows) * width;
+    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+             threadIdx.x;
+         logical < total;
+         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(logical / width);
+        const int column = static_cast<int>(logical -
+            static_cast<int64_t>(row) * width);
+        float accumulator = 0.0f;
+        for (int split = 0; split < splits; ++split) {
+            accumulator += partials[
+                (static_cast<int64_t>(split) * rows + row) * width + column];
+        }
+        destination[logical] = __float2half_rn(accumulator);
+    }
+}
+
+inline void launch_split_float_reduce_to_half(
+        const float * partials,
+        __half * destination,
+        int rows,
+        int width,
+        int splits,
+        cudaStream_t stream) {
+    constexpr int threads = 256;
+    const int64_t total = static_cast<int64_t>(rows) * width;
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (total + threads - 1) / threads, 65535));
+    split_float_reduce_to_half_kernel<<<blocks, threads, 0, stream>>>(
+        partials, destination, rows, width, splits);
+}
+
 inline void launch_float_gemm_nn(
         const float * output_gradient,
         const float * weight,
