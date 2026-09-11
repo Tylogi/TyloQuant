@@ -7306,7 +7306,7 @@ __global__ void nvq_backward_input_kernel(
 }
 
 template <int FORMAT, int Rows>
-__global__ void __launch_bounds__(32) nvq_backward_partial_kernel(
+__global__ void __launch_bounds__(32) nvq_backward_quad_partial_kernel(
         const uint8_t * indices,
         int64_t indices_nbytes,
         const uint8_t * aux,
@@ -7397,7 +7397,7 @@ __global__ void __launch_bounds__(32) nvq_backward_partial_kernel(
 }
 
 template <int FORMAT, int Rows>
-void launch_nvq_backward_small_m(
+void launch_nvq_backward_quad_small_m(
         const mfq_tensor_backend::Tensor & indices,
         const mfq_tensor_backend::Tensor & aux,
         const mfq_tensor_backend::Tensor & sub_scale,
@@ -7418,7 +7418,141 @@ void launch_nvq_backward_small_m(
     const dim3 grid(
         static_cast<unsigned>((K + 127) / 128),
         static_cast<unsigned>((N + output_tile - 1) / output_tile));
-    nvq_backward_partial_kernel<FORMAT, Rows><<<
+    nvq_backward_quad_partial_kernel<FORMAT, Rows><<<
+        grid, 32, 0, stream>>>(
+            indices.data_ptr<uint8_t>(), indices.numel(),
+            aux.data_ptr<uint8_t>(), aux.numel(),
+            sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
+            neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),
+            reinterpret_cast<const __half *>(
+                output_gradient.data_ptr<mfq_half>()),
+            partials.data_ptr<float>(), M, N, K, ng, nvec, nsign,
+            sub_bits, sign_mode, output_tile);
+}
+
+template <int FORMAT, int Rows>
+__global__ void __launch_bounds__(32) nvq_backward_vec8_partial_kernel(
+        const uint8_t * indices,
+        int64_t indices_nbytes,
+        const uint8_t * aux,
+        int64_t aux_nbytes,
+        const uint8_t * sub_scale,
+        int64_t sub_scale_nbytes,
+        const float * neuron_scale,
+        const int8_t * codebook,
+        const __half * output_gradient,
+        float * partials,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int sub_bits,
+        int sign_mode,
+        int output_tile) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int segment = static_cast<int>(blockIdx.x) * 32 + lane;
+    const int k0 = segment * 8;
+    const bool valid = k0 < K;
+    const int group = k0 / kGroupSize;
+    const int split = static_cast<int>(blockIdx.y);
+    const int row0 = static_cast<int>(blockIdx.z) * Rows;
+    const int output0 = split * output_tile;
+    const int output_end = min(output0 + output_tile, N);
+    float accumulators[Rows][8];
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+#pragma unroll
+        for (int component = 0; component < 8; ++component) {
+            accumulators[row][component] = 0.0f;
+        }
+    }
+    for (int output = output0; output < output_end; ++output) {
+        float anchor = lane == 0 ? neuron_scale[output] : 0.0f;
+        anchor = __shfl_sync(0xffffffffu, anchor, 0);
+        uint32_t state = 0;
+        NvqVec8Values<FORMAT> decoded = {make_int2(0, 0), 0, false};
+        float weight_scale = 0.0f;
+        if (valid) {
+            const int64_t state_index =
+                static_cast<int64_t>(output) * ng + group;
+            state = load_packed_bits(
+                sub_scale, state_index * sub_bits,
+                sub_bits, sub_scale_nbytes);
+            decoded = load_nvq_vec8<FORMAT>(
+                indices, indices_nbytes, aux, aux_nbytes, codebook,
+                output, segment, group, ng, nvec, nsign,
+                sign_mode, state);
+            weight_scale = format_scale<FORMAT>(anchor, state, codebook);
+        }
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float gradient = lane == 0 && row0 + row < M
+                ? __half2float(output_gradient[
+                    static_cast<int64_t>(row0 + row) * N + output])
+                : 0.0f;
+            gradient = __shfl_sync(0xffffffffu, gradient, 0);
+            const float factor = gradient * weight_scale;
+#pragma unroll
+            for (int component = 0; component < 8; ++component) {
+                const int packed = component < 4
+                    ? decoded.values.x : decoded.values.y;
+                const int raw = static_cast<int>(static_cast<int8_t>(
+                    (packed >> (8 * (component & 3))) & 0xff));
+                int value = raw;
+                if constexpr (FORMAT == kNvq1L) {
+                    value = 8 * raw + decoded.delta;
+                } else if constexpr (FORMAT == kNvq1S) {
+                    value = 32 * raw + 5 * decoded.delta;
+                }
+                accumulators[row][component] = fmaf(
+                    factor, static_cast<float>(value),
+                    accumulators[row][component]);
+            }
+        }
+    }
+    if (valid) {
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            if (row0 + row < M) {
+#pragma unroll
+                for (int component = 0; component < 8; ++component) {
+                    const int column = k0 + component;
+                    if (column < K) {
+                        partials[(static_cast<int64_t>(split) * M + row0 + row) *
+                            K + column] = accumulators[row][component];
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int FORMAT, int Rows>
+void launch_nvq_backward_vec8_small_m(
+        const mfq_tensor_backend::Tensor & indices,
+        const mfq_tensor_backend::Tensor & aux,
+        const mfq_tensor_backend::Tensor & sub_scale,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & codebook,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & partials,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int sub_bits,
+        int sign_mode,
+        int output_tile,
+        cudaStream_t stream) {
+    const dim3 grid(
+        static_cast<unsigned>((K + 255) / 256),
+        static_cast<unsigned>((N + output_tile - 1) / output_tile),
+        static_cast<unsigned>((M + Rows - 1) / Rows));
+    nvq_backward_vec8_partial_kernel<FORMAT, Rows><<<
         grid, 32, 0, stream>>>(
             indices.data_ptr<uint8_t>(), indices.numel(),
             aux.data_ptr<uint8_t>(), aux.numel(),
@@ -7695,29 +7829,37 @@ mfq_tensor_backend::Tensor nvq_backward_input_cuda(
         launch_by_format(static_cast<int>(format), [&](auto tag) {
             constexpr int F = decltype(tag)::value;
             if (M == 1) {
-                launch_nvq_backward_small_m<F, 1>(
+                launch_nvq_backward_vec8_small_m<F, 1>(
                     indices, aux, sub_scale, neuron_scale, codebook,
                     output_gradient, partials, M, N, K, ng, nvec, nsign,
                     static_cast<int>(sub_bits), static_cast<int>(sign_mode),
                     output_tile, stream);
             } else if (M <= 2) {
-                launch_nvq_backward_small_m<F, 2>(
+                launch_nvq_backward_vec8_small_m<F, 2>(
                     indices, aux, sub_scale, neuron_scale, codebook,
                     output_gradient, partials, M, N, K, ng, nvec, nsign,
                     static_cast<int>(sub_bits), static_cast<int>(sign_mode),
                     output_tile, stream);
             } else if (M <= 4) {
-                launch_nvq_backward_small_m<F, 4>(
+                launch_nvq_backward_vec8_small_m<F, 4>(
                     indices, aux, sub_scale, neuron_scale, codebook,
                     output_gradient, partials, M, N, K, ng, nvec, nsign,
                     static_cast<int>(sub_bits), static_cast<int>(sign_mode),
                     output_tile, stream);
-            } else {
-                launch_nvq_backward_small_m<F, 8>(
-                    indices, aux, sub_scale, neuron_scale, codebook,
-                    output_gradient, partials, M, N, K, ng, nvec, nsign,
-                    static_cast<int>(sub_bits), static_cast<int>(sign_mode),
-                    output_tile, stream);
+            } else if (M <= 8) {
+                if constexpr (is_d4_format(F)) {
+                    launch_nvq_backward_quad_small_m<F, 8>(
+                        indices, aux, sub_scale, neuron_scale, codebook,
+                        output_gradient, partials, M, N, K, ng, nvec, nsign,
+                        static_cast<int>(sub_bits), static_cast<int>(sign_mode),
+                        output_tile, stream);
+                } else {
+                    launch_nvq_backward_vec8_small_m<F, 4>(
+                        indices, aux, sub_scale, neuron_scale, codebook,
+                        output_gradient, partials, M, N, K, ng, nvec, nsign,
+                        static_cast<int>(sub_bits), static_cast<int>(sign_mode),
+                        output_tile, stream);
+                }
             }
         });
         mfq_packed_backward::launch_split_float_reduce_to_half(

@@ -519,7 +519,8 @@ def test_nvq_cuda_direct_gemv_matches_dequant_matmul(format_id):
         ("nvq3j_1024", 15),
     ],
 )
-def test_nvq_packed_backward_and_autograd_match_dequant(case, format_id):
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
+def test_nvq_packed_backward_and_autograd_match_dequant(case, format_id, rows):
     if case == "npq0_l":
         tensor, reference = _npq0_l_quantized()
     elif case.startswith("nvq2j"):
@@ -553,7 +554,7 @@ def test_nvq_packed_backward_and_autograd_match_dequant(case, format_id):
     assert weight["format"] == format_id
     dense = torch.as_tensor(reference, device="cuda", dtype=torch.float16)
     output_gradient = torch.randn(
-        3, dense.shape[0], device="cuda", dtype=torch.float16
+        rows, dense.shape[0], device="cuda", dtype=torch.float16
     )
     expected = output_gradient @ dense
     torch.testing.assert_close(
@@ -563,7 +564,8 @@ def test_nvq_packed_backward_and_autograd_match_dequant(case, format_id):
         atol=0.004,
     )
     source = torch.randn(
-        3, dense.shape[1], device="cuda", dtype=torch.float16, requires_grad=True
+        rows, dense.shape[1], device="cuda", dtype=torch.float16,
+        requires_grad=True,
     )
     (nvq_matmul(weight, source) * output_gradient).sum().backward()
     torch.testing.assert_close(source.grad, expected, rtol=0.004, atol=0.004)
