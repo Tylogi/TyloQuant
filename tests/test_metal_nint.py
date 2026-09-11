@@ -228,6 +228,27 @@ def test_packed_nint_backward_and_custom_vjp(bits: int):
     )
 
 
+@pytest.mark.parametrize(
+    "spec",
+    [
+        NINT2_SPEC,
+        NintSpec(3, 24, 5),
+        NintSpec(4, 24, 6),
+        NintSpec(5, 28, 7),
+        NintSpec(6, 26, 7),
+        NintSpec(8, 48, 7),
+    ],
+)
+@pytest.mark.parametrize("rows", [1, 2, 4, 6, 16])
+def test_fp16_packed_nint_backward_paths(spec: NintSpec, rows: int):
+    tensor = nint_quant.quantize(_random(7400 + spec.bits, (67, 144)), spec)
+    packed = MetalNintWeight.from_tensor(tensor)
+    gradient = _random(7500 + spec.bits + rows, (rows, 67)).astype(np.float16)
+    actual = _array(nint_backward_input(packed, gradient))
+    expected = gradient.astype(np.float32) @ nint_quant.dequantize(tensor)
+    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
+
+
 def test_nint5_gs28_decode_subsimd_matches_two_level_dequant():
     spec = NintSpec(5, 28, 7)
     tensor = nint_quant.quantize(_random(151, (37, 111)), spec)

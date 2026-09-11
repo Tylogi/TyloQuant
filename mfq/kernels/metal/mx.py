@@ -129,6 +129,164 @@ _BACKWARD_INPUT_SOURCE = r"""
     }
 """
 
+_BACKWARD_QUAD_SOURCE = r"""
+    uint quad = thread_position_in_grid.x;
+    uint column = quad * 4u;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || first_row >= uint(M)) {
+        return;
+    }
+    float4 accumulators[TILE_M];
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        accumulators[local] = float4(0.0f);
+    }
+    for (uint output = 0u; output < uint(OUT); ++output) {
+        float4 weights;
+        if (MX_BITS == 4) {
+            uint packed_row = output * (uint(K) >> 1u);
+            uchar packed0 = values[packed_row + (column >> 1u)];
+            uchar packed1 = values[packed_row + (column >> 1u) + 1u];
+            uchar scale = scales[
+                output * (uint(K) >> 5u) + (column >> 5u)
+            ];
+            float multiplier = mfq_mx_e8m0(scale);
+            weights = multiplier * float4(
+                mfq_mx_fp4(packed0 & 15u),
+                mfq_mx_fp4(packed0 >> 4u),
+                mfq_mx_fp4(packed1 & 15u),
+                mfq_mx_fp4(packed1 >> 4u));
+        } else {
+            uint value_offset = output * uint(K) + column;
+            uint scale_row = output >> 7u;
+            uint scale_column = column >> 7u;
+            float multiplier = mfq_mx_e8m0(
+                scales[scale_row * (uint(K) >> 7u) + scale_column]
+            );
+            uchar4 codes = *((const device uchar4*)(values + value_offset));
+            weights = multiplier * float4(
+                mfq_mx_fp8(codes.x),
+                mfq_mx_fp8(codes.y),
+                mfq_mx_fp8(codes.z),
+                mfq_mx_fp8(codes.w));
+        }
+        for (uint local = 0u; local < uint(TILE_M); ++local) {
+            uint row = first_row + local;
+            if (row < uint(M)) {
+                float gradient = float(x[row * uint(OUT) + output]);
+                accumulators[local] = fma(
+                    float4(gradient),
+                    weights,
+                    accumulators[local]);
+            }
+        }
+    }
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        uint row = first_row + local;
+        if (row < uint(M)) {
+            for (uint component = 0u; component < 4u; ++component) {
+                if (column + component < uint(K)) {
+                    y[row * uint(K) + column + component] =
+                        T(accumulators[local][component]);
+                }
+            }
+        }
+    }
+"""
+
+_BACKWARD_MATRIX_SOURCE = r"""
+    constexpr uint BM = 8u;
+    constexpr uint BN = 64u;
+    constexpr uint BK = 128u;
+    constexpr uint BN_PAD = BN + 8u;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint local_thread = thread_index_in_threadgroup;
+    uint row_base = threadgroup_position_in_grid.y * BM;
+    uint column_base = threadgroup_position_in_grid.x * BK;
+    threadgroup half gradient_tile[BM * BN_PAD];
+    threadgroup half weight_tile[BN * BK];
+    metal::simdgroup_matrix<float, 8, 8> c0;
+    metal::simdgroup_matrix<float, 8, 8> c1;
+    c0.thread_elements()[0] = 0.0f;
+    c0.thread_elements()[1] = 0.0f;
+    c1.thread_elements()[0] = 0.0f;
+    c1.thread_elements()[1] = 0.0f;
+    uint quadrant = lane / 4u;
+    uint fragment_row = (quadrant & 4u) + ((lane / 2u) & 3u);
+    uint fragment_col = (quadrant & 2u) * 2u + (lane & 1u) * 2u;
+    uint simd_col = simd_group * 16u;
+    uint chunks = (uint(OUT) + BN - 1u) / BN;
+    for (uint chunk = 0u; chunk < chunks; ++chunk) {
+        uint output_base = chunk * BN;
+        for (uint index = local_thread; index < BM * BN; index += 256u) {
+            uint local_row = index / BN;
+            uint local_output = index - local_row * BN;
+            uint row = row_base + local_row;
+            uint output = output_base + local_output;
+            gradient_tile[local_row * BN_PAD + local_output] =
+                row < uint(M) && output < uint(OUT)
+                ? half(x[row * uint(OUT) + output])
+                : half(0.0f);
+        }
+        for (uint index = local_thread; index < BN * BK; index += 256u) {
+            uint local_output = index / BK;
+            uint local_column = index - local_output * BK;
+            uint output = output_base + local_output;
+            uint column = column_base + local_column;
+            float value = output < uint(OUT) && column < uint(K)
+                ? mfq_mx_weight(
+                    values,
+                    scales,
+                    output,
+                    column,
+                    uint(MX_BITS),
+                    uint(K))
+                : 0.0f;
+            weight_tile[local_output * BK + local_column] = half(value);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0u; kk < BN; kk += 8u) {
+            metal::simdgroup_matrix<half, 8, 8> a;
+            metal::simdgroup_matrix<half, 8, 8> b0;
+            metal::simdgroup_matrix<half, 8, 8> b1;
+            a.thread_elements()[0] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col];
+            a.thread_elements()[1] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col + 1u];
+            b0.thread_elements()[0] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + fragment_col];
+            b0.thread_elements()[1] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + fragment_col + 1u];
+            b1.thread_elements()[0] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + 8u + fragment_col];
+            b1.thread_elements()[1] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + 8u + fragment_col + 1u];
+            simdgroup_multiply_accumulate(c0, a, b0, c0);
+            simdgroup_multiply_accumulate(c1, a, b1, c1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint row = row_base + fragment_row;
+    uint local_col0 = simd_col + fragment_col;
+    uint local_col1 = local_col0 + 8u;
+    uint col0 = column_base + local_col0;
+    uint col1 = column_base + local_col1;
+    if (row < uint(M)) {
+        if (col0 < uint(K)) {
+            y[row * uint(K) + col0] = T(c0.thread_elements()[0]);
+        }
+        if (col0 + 1u < uint(K)) {
+            y[row * uint(K) + col0 + 1u] = T(c0.thread_elements()[1]);
+        }
+        if (col1 < uint(K)) {
+            y[row * uint(K) + col1] = T(c1.thread_elements()[0]);
+        }
+        if (col1 + 1u < uint(K)) {
+            y[row * uint(K) + col1 + 1u] = T(c1.thread_elements()[1]);
+        }
+    }
+"""
+
 _GEMV_SOURCE = r"""
     constexpr uint OUTPUTS_PER_SIMD = 4u;
     constexpr uint SIMD_GROUPS = 2u;
@@ -198,6 +356,24 @@ _BACKWARD_INPUT_KERNEL = mx.fast.metal_kernel(
     output_names=["y"],
     source=_BACKWARD_INPUT_SOURCE,
     header=_MX_HEADER,
+    ensure_row_contiguous=True,
+    compile_options={"math_mode": "fast"},
+)
+_BACKWARD_QUAD_KERNEL = mx.fast.metal_kernel(
+    name="mfq_mx_packed_backward_quad",
+    input_names=["values", "scales", "x"],
+    output_names=["y"],
+    source=_BACKWARD_QUAD_SOURCE,
+    header=_MX_HEADER,
+    ensure_row_contiguous=True,
+    compile_options={"math_mode": "fast"},
+)
+_BACKWARD_MATRIX_KERNEL = mx.fast.metal_kernel(
+    name="mfq_mx_packed_backward_matrix",
+    input_names=["values", "scales", "x"],
+    output_names=["y"],
+    source=_BACKWARD_MATRIX_SOURCE,
+    header="#include <metal_simdgroup_matrix>\n" + _MX_HEADER,
     ensure_row_contiguous=True,
     compile_options={"math_mode": "fast"},
 )
@@ -348,11 +524,52 @@ def mx_backward_input(
     if rows == 0:
         return mx.zeros((*prefix, weight.in_features), dtype=gradient.dtype)
     gradient = mx.contiguous(gradient.reshape((rows, weight.out)))
+    if gradient.dtype != mx.float16:
+        tile_rows = min(rows, 4)
+        result = _BACKWARD_INPUT_KERNEL(
+            inputs=[weight.values, weight.scales, gradient],
+            template=_templates(
+                weight,
+                gradient.dtype,
+                rows=rows,
+                tile_rows=tile_rows,
+            ),
+            grid=(
+                weight.in_features * 32,
+                (rows + tile_rows - 1) // tile_rows,
+                1,
+            ),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(rows, weight.in_features)],
+            output_dtypes=[gradient.dtype],
+        )[0]
+        return result.reshape((*prefix, weight.in_features))
+    if rows > 8:
+        dense = mx_dequantize(weight, dtype=gradient.dtype)
+        return (gradient @ dense).reshape((*prefix, weight.in_features))
+    if rows >= 5:
+        result = _BACKWARD_MATRIX_KERNEL(
+            inputs=[weight.values, weight.scales, gradient],
+            template=_templates(weight, gradient.dtype, rows=rows, tile_rows=8),
+            grid=(
+                ((weight.in_features + 127) // 128) * 256,
+                (rows + 7) // 8,
+                1,
+            ),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(rows, weight.in_features)],
+            output_dtypes=[gradient.dtype],
+        )[0]
+        return result.reshape((*prefix, weight.in_features))
     tile_rows = min(rows, 4)
-    result = _BACKWARD_INPUT_KERNEL(
+    result = _BACKWARD_QUAD_KERNEL(
         inputs=[weight.values, weight.scales, gradient],
         template=_templates(weight, gradient.dtype, rows=rows, tile_rows=tile_rows),
-        grid=(weight.in_features * 32, (rows + tile_rows - 1) // tile_rows, 1),
+        grid=(
+            ((weight.in_features + 127) // 128) * 32,
+            (rows + tile_rows - 1) // tile_rows,
+            1,
+        ),
         threadgroup=(32, 1, 1),
         output_shapes=[(rows, weight.in_features)],
         output_dtypes=[gradient.dtype],

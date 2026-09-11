@@ -83,6 +83,138 @@ _BACKWARD_INPUT_SOURCE = r"""
     }
 """
 
+_BACKWARD_VEC4_SOURCE = r"""
+    uint vector = thread_position_in_grid.x;
+    uint column = vector * 4u;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || first_row >= uint(M)) {
+        return;
+    }
+    uint group = column >> 5u;
+    float4 accumulators[TILE_M];
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        accumulators[local] = float4(0.0f);
+    }
+    for (uint output = 0u; output < uint(OUT); ++output) {
+        uint offset = output * uint(K) + column;
+        char4 codes = *((const device char4*)(q + offset));
+        float scale = float(scales[output * uint(NG) + group]);
+        float4 weights = scale * float4(codes);
+        for (uint local = 0u; local < uint(TILE_M); ++local) {
+            uint row = first_row + local;
+            if (row < uint(M)) {
+                float gradient = float(x[row * uint(OUT) + output]);
+                accumulators[local] = fma(
+                    float4(gradient),
+                    weights,
+                    accumulators[local]);
+            }
+        }
+    }
+    for (uint local = 0u; local < uint(TILE_M); ++local) {
+        uint row = first_row + local;
+        if (row < uint(M)) {
+            for (uint component = 0u; component < 4u; ++component) {
+                if (column + component < uint(K)) {
+                    y[row * uint(K) + column + component] =
+                        T(accumulators[local][component]);
+                }
+            }
+        }
+    }
+"""
+
+_BACKWARD_MATRIX_SOURCE = r"""
+    constexpr uint BM = 8u;
+    constexpr uint BN = 64u;
+    constexpr uint BK = 128u;
+    constexpr uint BN_PAD = BN + 8u;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint local_thread = thread_index_in_threadgroup;
+    uint row_base = threadgroup_position_in_grid.y * BM;
+    uint column_base = threadgroup_position_in_grid.x * BK;
+    threadgroup half gradient_tile[BM * BN_PAD];
+    threadgroup half weight_tile[BN * BK];
+    metal::simdgroup_matrix<float, 8, 8> c0;
+    metal::simdgroup_matrix<float, 8, 8> c1;
+    c0.thread_elements()[0] = 0.0f;
+    c0.thread_elements()[1] = 0.0f;
+    c1.thread_elements()[0] = 0.0f;
+    c1.thread_elements()[1] = 0.0f;
+    uint quadrant = lane / 4u;
+    uint fragment_row = (quadrant & 4u) + ((lane / 2u) & 3u);
+    uint fragment_col = (quadrant & 2u) * 2u + (lane & 1u) * 2u;
+    uint simd_col = simd_group * 16u;
+    uint chunks = (uint(OUT) + BN - 1u) / BN;
+    for (uint chunk = 0u; chunk < chunks; ++chunk) {
+        uint output_base = chunk * BN;
+        for (uint index = local_thread; index < BM * BN; index += 256u) {
+            uint local_row = index / BN;
+            uint local_output = index - local_row * BN;
+            uint row = row_base + local_row;
+            uint output = output_base + local_output;
+            gradient_tile[local_row * BN_PAD + local_output] =
+                row < uint(M) && output < uint(OUT)
+                ? half(x[row * uint(OUT) + output])
+                : half(0.0f);
+        }
+        for (uint index = local_thread; index < BN * BK; index += 256u) {
+            uint local_output = index / BK;
+            uint local_column = index - local_output * BK;
+            uint output = output_base + local_output;
+            uint column = column_base + local_column;
+            float value = 0.0f;
+            if (output < uint(OUT) && column < uint(K)) {
+                value = float(scales[
+                    output * uint(NG) + (column >> 5u)
+                ]) * float(q[output * uint(K) + column]);
+            }
+            weight_tile[local_output * BK + local_column] = half(value);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0u; kk < BN; kk += 8u) {
+            metal::simdgroup_matrix<half, 8, 8> a;
+            metal::simdgroup_matrix<half, 8, 8> b0;
+            metal::simdgroup_matrix<half, 8, 8> b1;
+            a.thread_elements()[0] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col];
+            a.thread_elements()[1] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col + 1u];
+            b0.thread_elements()[0] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + fragment_col];
+            b0.thread_elements()[1] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + fragment_col + 1u];
+            b1.thread_elements()[0] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + 8u + fragment_col];
+            b1.thread_elements()[1] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + 8u + fragment_col + 1u];
+            simdgroup_multiply_accumulate(c0, a, b0, c0);
+            simdgroup_multiply_accumulate(c1, a, b1, c1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint row = row_base + fragment_row;
+    uint local_col0 = simd_col + fragment_col;
+    uint local_col1 = local_col0 + 8u;
+    uint col0 = column_base + local_col0;
+    uint col1 = column_base + local_col1;
+    if (row < uint(M)) {
+        if (col0 < uint(K)) {
+            y[row * uint(K) + col0] = T(c0.thread_elements()[0]);
+        }
+        if (col0 + 1u < uint(K)) {
+            y[row * uint(K) + col0 + 1u] = T(c0.thread_elements()[1]);
+        }
+        if (col1 < uint(K)) {
+            y[row * uint(K) + col1] = T(c1.thread_elements()[0]);
+        }
+        if (col1 + 1u < uint(K)) {
+            y[row * uint(K) + col1 + 1u] = T(c1.thread_elements()[1]);
+        }
+    }
+"""
+
 _GEMV_SOURCE = r"""
     uint lane = thread_index_in_simdgroup;
     uint output = thread_position_in_grid.x >> 5;
@@ -318,6 +450,20 @@ _BACKWARD_INPUT_KERNEL = mx.fast.metal_kernel(
     input_names=["q", "scales", "x"],
     output_names=["y"],
     source=_BACKWARD_INPUT_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
+_BACKWARD_VEC4_KERNEL = mx.fast.metal_kernel(
+    name="mfq_nint8_zero_packed_backward_vec4",
+    input_names=["q", "scales", "x"],
+    output_names=["y"],
+    source=_BACKWARD_VEC4_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
+_BACKWARD_MATRIX_KERNEL = mx.fast.metal_kernel(
+    name="mfq_nint8_zero_packed_backward_matrix",
+    input_names=["q", "scales", "x"],
+    output_names=["y"],
+    source=_BACKWARD_MATRIX_SOURCE,
     compile_options={"math_mode": "fast"},
 )
 
@@ -590,8 +736,36 @@ def nint8_zero_backward_input(
     if rows == 0:
         return mx.zeros((*prefix, weight.neuron_len), dtype=gradient.dtype)
     gradient = mx.contiguous(gradient.reshape((rows, weight.out)))
+    if gradient.dtype == mx.float16 and rows > 8:
+        dense = nint8_zero_dequantize(weight, dtype=gradient.dtype)
+        return (gradient @ dense).reshape((*prefix, weight.neuron_len))
+    if gradient.dtype == mx.float16 and rows >= 5:
+        result = _BACKWARD_MATRIX_KERNEL(
+            inputs=[weight.q, weight.scales, gradient],
+            template=[
+                ("T", gradient.dtype),
+                ("OUT", weight.out),
+                ("K", weight.neuron_len),
+                ("NG", weight.groups),
+                ("M", rows),
+            ],
+            grid=(
+                ((weight.neuron_len + 127) // 128) * 256,
+                (rows + 7) // 8,
+                1,
+            ),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(rows, weight.neuron_len)],
+            output_dtypes=[gradient.dtype],
+        )[0]
+        return result.reshape((*prefix, weight.neuron_len))
     tile_rows = min(rows, 4)
-    result = _BACKWARD_INPUT_KERNEL(
+    kernel = (
+        _BACKWARD_VEC4_KERNEL
+        if gradient.dtype == mx.float16
+        else _BACKWARD_INPUT_KERNEL
+    )
+    result = kernel(
         inputs=[weight.q, weight.scales, gradient],
         template=[
             ("T", gradient.dtype),
@@ -601,7 +775,13 @@ def nint8_zero_backward_input(
             ("M", rows),
             ("TILE_M", tile_rows),
         ],
-        grid=(weight.neuron_len * 32, (rows + tile_rows - 1) // tile_rows, 1),
+        grid=(
+            ((weight.neuron_len + 127) // 128) * 32
+            if kernel is _BACKWARD_VEC4_KERNEL
+            else weight.neuron_len * 32,
+            (rows + tile_rows - 1) // tile_rows,
+            1,
+        ),
         threadgroup=(32, 1, 1),
         output_shapes=[(rows, weight.neuron_len)],
         output_dtypes=[gradient.dtype],

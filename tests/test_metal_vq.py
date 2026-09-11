@@ -48,8 +48,8 @@ from mfq.formats.nvq1_l import IQ1S_TERNARY_2048, NVQ1_L_T8_S3, Nvq1LTensor  # n
 from mfq.formats.nvq1_s import NVQ1_S, NVQ1_S_SYNTHETIC_BANKS, Nvq1STensor  # noqa: E402
 from mfq.kernels.metal.vq import (  # noqa: E402
     MetalVqWeight,
-    vq_backward_input,
     signed_hadamard,
+    vq_backward_input,
     vq_dequantize,
     vq_dequantize_matmul,
     vq_embedding,
@@ -308,6 +308,20 @@ def test_vq_packed_backward_and_custom_vjp(factory):
 
 
 @pytest.mark.parametrize("factory", _BASE_FACTORIES)
+@pytest.mark.parametrize("rows", [1, 2, 4, 6, 16])
+def test_vq_fp16_backward_paths(factory, rows: int):
+    tensor, decoded = factory()
+    gradient = np.random.default_rng(690 + rows).normal(
+        0.0, 0.03, size=(rows, tensor.shape[0])
+    ).astype(np.float16)
+    actual = _array(
+        vq_backward_input(MetalVqWeight.from_tensor(tensor), gradient)
+    )
+    expected = gradient.astype(np.float32) @ decoded
+    np.testing.assert_allclose(actual, expected, rtol=4e-3, atol=4e-3)
+
+
+@pytest.mark.parametrize("factory", _BASE_FACTORIES)
 def test_vq_temporary_dequant_dense_gemm(factory):
     tensor, decoded = factory()
     weight = MetalVqWeight.from_tensor(tensor)
@@ -504,7 +518,7 @@ def test_nepq_a_rejects_residual_unaware_vq_swiglu_fusion():
     assert not vq_swiglu_compatible(weight, weight)
 
 
-@pytest.mark.parametrize("spec", [NEPQ0_S, NEPQ0_A])
+@pytest.mark.parametrize("spec", [NEPQ0_S, NEPQ0_A, NEPQ1_A])
 def test_nepq_packed_backward_inverts_rotation_and_includes_residual(spec):
     tensor = _nepq_tensor(spec) if spec is NEPQ0_S else _nepq_a_tensor(spec)[0]
     packed = MetalVqWeight.from_tensor(tensor)
@@ -541,6 +555,39 @@ def test_nepq_packed_backward_inverts_rotation_and_includes_residual(spec):
     )(source)
     np.testing.assert_allclose(
         _array(differentiated), expected, rtol=4e-5, atol=4e-5
+    )
+
+
+@pytest.mark.parametrize("spec", [NEPQ0_S, NEPQ0_A, NEPQ1_A])
+@pytest.mark.parametrize("rows", [2, 6])
+def test_nepq_fp16_backward_inverts_rotation_and_includes_residual(spec, rows: int):
+    tensor = _nepq_tensor(spec) if spec is NEPQ0_S else _nepq_a_tensor(spec)[0]
+    packed = MetalVqWeight.from_tensor(tensor)
+    dense = dequantize_nepq(tensor).reshape(-1, tensor.neuron_len)
+    gradient = np.random.default_rng(20260930 + spec.profile_id).normal(
+        0.0,
+        0.03,
+        size=(rows, tensor.n_experts, tensor.out_per_expert),
+    ).astype(np.float16)
+    stored_gradient = gradient.astype(np.float32).reshape(rows, -1) @ dense
+    signs = rotation_signs(
+        tensor.neuron_len, tensor.rotation_block, tensor.rotation_seed
+    ).astype(np.float32)
+    expected = _fwht_reference(
+        stored_gradient,
+        tensor.rotation_block,
+        np.ones_like(signs),
+    ) * signs
+    if spec.is_residual:
+        assert int(packed.residual_transpose_offsets.size) == 1
+    actual = _array(vq_backward_input(packed, gradient))
+    if spec.is_residual:
+        assert int(packed.residual_transpose_offsets.size) == packed.vectors + 1
+    np.testing.assert_allclose(
+        actual,
+        expected,
+        rtol=4e-3,
+        atol=4e-3,
     )
 
 

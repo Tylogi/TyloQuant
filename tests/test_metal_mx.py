@@ -138,6 +138,18 @@ def test_mx_packed_backward_and_custom_vjp(dtype: str):
     )
 
 
+@pytest.mark.parametrize("dtype", ["MXFP4", "MXFP8"])
+@pytest.mark.parametrize("rows", [1, 2, 4, 6, 16])
+def test_mx_fp16_backward_paths(dtype: str, rows: int):
+    tensor, dense = _fixture(dtype, out=67)
+    gradient = np.random.default_rng(2100 + rows).normal(
+        0.0, 0.03, size=(rows, 67)
+    ).astype(np.float16)
+    actual = _array(mx_backward_input(MetalMxWeight.from_tensor(tensor), gradient))
+    expected = gradient.astype(np.float32) @ dense
+    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
+
+
 def test_mmap_model_constructs_native_mx_layers(tmp_path):
     tensor, dense = _fixture("MXFP4")
     path = tmp_path / "native-mx.mfq"

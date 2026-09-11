@@ -367,6 +367,10 @@ int main(int argc, char **argv) {
                 });
           }
         }
+        print_trial(kSq2Format, "backward_input_fp16", trial, input_rows,
+                    sq2.packed_nbytes(), output_nbytes, 2,
+                    multirow_repetitions,
+                    [&] { return sq2.backward_input(multirow_input); });
       }
     }
     return 0;

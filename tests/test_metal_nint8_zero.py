@@ -164,6 +164,23 @@ def test_nint8_zero_packed_backward_and_custom_vjp():
     )
 
 
+@pytest.mark.parametrize("rows", [1, 2, 4, 6, 16])
+def test_nint8_zero_fp16_backward_paths(rows: int):
+    dense = np.random.default_rng(492).normal(0.0, 0.1, size=(67, 96)).astype(
+        np.float32
+    )
+    tensor = quantize_nint8_zero(dense)
+    decoded = dequantize_nint8_zero(tensor)
+    gradient = np.random.default_rng(493 + rows).normal(
+        0.0, 0.03, size=(rows, 67)
+    ).astype(np.float16)
+    actual = _array(
+        nint8_zero_backward_input(MetalNint8ZeroWeight.from_tensor(tensor), gradient)
+    )
+    expected = gradient.astype(np.float32) @ decoded
+    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
+
+
 def test_nint8_zero_mmap_linear_and_embedding(tmp_path):
     tensor, decoded = _tensor()
     path = tmp_path / "nint8-zero.mfq"
