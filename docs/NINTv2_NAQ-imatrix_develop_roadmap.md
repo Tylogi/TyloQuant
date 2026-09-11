@@ -1,5 +1,8 @@
 # NINTv2 and NAQ-imatrix Development Roadmap
 
+The solver and artifact boundaries used to implement this roadmap are defined
+in [MFQ Core v2 Architecture](MFQ_Core_v2_architecure.md).
+
 NINTv2 and NAQ-imatrix are foundational explorations into using the structure
 and behavior of neural networks to push quantization closer to the
 rate–distortion frontier. They are likely to become a major development and
