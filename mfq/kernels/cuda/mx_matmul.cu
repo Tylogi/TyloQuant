@@ -1,6 +1,7 @@
 #include <cuda_fp16.h>
 #include "mfq_tensor_backend.h"
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -1155,6 +1156,111 @@ void launch_mx_backward(
 }
 
 template <int Rows>
+__global__ void __launch_bounds__(256) mxfp8_backward_mma_kernel(
+        const uint8_t * __restrict__ values,
+        const uint8_t * __restrict__ scales,
+        const __half * __restrict__ output_gradient,
+        __half * __restrict__ input_gradient,
+        int rows,
+        int outputs,
+        int width) {
+    using namespace nvcuda;
+    constexpr int kWarps = 8;
+    __shared__ __align__(16) __half gradient_tile[kWarps][16 * 16];
+    __shared__ __align__(16) __half weight_tile[kWarps][16 * 16];
+    __shared__ __align__(16) float result_tile[kWarps][16 * 16];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int column0 = static_cast<int>(blockIdx.x) * 16;
+    const int scale_columns = width >> 7;
+    for (int index = lane; index < 16 * 16; index += 32) {
+        gradient_tile[warp][index] = __float2half_rn(0.0f);
+    }
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
+    wmma::fill_fragment(accumulator, 0.0f);
+    for (int output_group = warp * 128;
+         output_group < outputs;
+         output_group += kWarps * 128) {
+        for (int output0 = output_group;
+             output0 < min(output_group + 128, outputs);
+             output0 += 16) {
+            for (int index = lane; index < Rows * 16; index += 32) {
+                const int row = index >> 4;
+                const int output = output0 + (index & 15);
+                gradient_tile[warp][index] = row < rows && output < outputs
+                    ? output_gradient[
+                        static_cast<int64_t>(row) * outputs + output]
+                    : __float2half_rn(0.0f);
+            }
+            float scale = lane == 0
+                ? decode_e8m0(scales[
+                    static_cast<int64_t>(output0 >> 7) * scale_columns +
+                    (column0 >> 7)])
+                : 0.0f;
+            scale = __shfl_sync(0xffffffffu, scale, 0);
+            for (int index = lane; index < 16 * 16; index += 32) {
+                const int output = output0 + (index >> 4);
+                const int column = column0 + (index & 15);
+                weight_tile[warp][index] = output < outputs
+                    ? __float2half_rn(
+                        decode_e4m3fn(values[
+                            static_cast<int64_t>(output) * width + column]) *
+                        scale)
+                    : __float2half_rn(0.0f);
+            }
+            __syncwarp();
+            wmma::fragment<
+                wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>
+                    gradient_fragment;
+            wmma::fragment<
+                wmma::matrix_b, 16, 16, 16, __half, wmma::row_major>
+                    weight_fragment;
+            wmma::load_matrix_sync(
+                gradient_fragment, gradient_tile[warp], 16);
+            wmma::load_matrix_sync(
+                weight_fragment, weight_tile[warp], 16);
+            wmma::mma_sync(
+                accumulator, gradient_fragment, weight_fragment, accumulator);
+            __syncwarp();
+        }
+    }
+    wmma::store_matrix_sync(
+        result_tile[warp], accumulator, 16, wmma::mem_row_major);
+    __syncthreads();
+    const int index = static_cast<int>(threadIdx.x);
+    if (index < rows * 16) {
+        const int row = index >> 4;
+        const int column = column0 + (index & 15);
+        float value = 0.0f;
+#pragma unroll
+        for (int source_warp = 0; source_warp < kWarps; ++source_warp) {
+            value += result_tile[source_warp][index];
+        }
+        input_gradient[static_cast<int64_t>(row) * width + column] =
+            __float2half_rn(value);
+    }
+}
+
+template <int Rows>
+void launch_mxfp8_backward_mma(
+        const mfq_tensor_backend::Tensor & values,
+        const mfq_tensor_backend::Tensor & scales,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & result,
+        int rows,
+        int outputs,
+        int width,
+        cudaStream_t stream) {
+    const int blocks = (width + 15) / 16;
+    mxfp8_backward_mma_kernel<Rows><<<blocks, 256, 0, stream>>>(
+        values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half *>(
+            output_gradient.data_ptr<mfq_half>()),
+        reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
+        rows, outputs, width);
+}
+
+template <int Rows>
 __global__ void __launch_bounds__(32) mxfp4_backward_vec4_partial_kernel(
         const uint8_t * __restrict__ values,
         const uint8_t * __restrict__ scales,
@@ -1490,6 +1596,13 @@ mfq_tensor_backend::Tensor mx_backward_input_cuda(
                 rows, outputs, width, stream);
         } else if (rows <= 4) {
             launch_mxfp8_backward_vec4_small_m<4>(
+                values, scales, output_gradient, result,
+                rows, outputs, width, stream);
+        // Wide down projections amortize the per-column WMMA reduction;
+        // square and output-wide projections keep the vector path.
+        } else if (static_cast<int64_t>(width) >=
+                2 * static_cast<int64_t>(outputs)) {
+            launch_mxfp8_backward_mma<8>(
                 values, scales, output_gradient, result,
                 rows, outputs, width, stream);
         } else {

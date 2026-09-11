@@ -71,12 +71,20 @@ def _mxfp4() -> tuple[MxTensor, np.ndarray]:
     return tensor, _dequant_mxfp4(tensor)
 
 
-def _mxfp8() -> tuple[MxTensor, np.ndarray]:
-    rng = np.random.default_rng(608)
-    rows, width = 11, 128
+def _mxfp8_shape(
+    rows: int,
+    width: int,
+    seed: int,
+) -> tuple[MxTensor, np.ndarray]:
+    rng = np.random.default_rng(seed)
     values = rng.integers(0, 255, (rows, width), dtype=np.uint8)
     values[(values & 127) == 127] = 126
-    scales = rng.integers(124, 130, (1, 1), dtype=np.uint8)
+    scales = rng.integers(
+        124,
+        130,
+        ((rows + 127) // 128, width // 128),
+        dtype=np.uint8,
+    )
     unsigned = values.astype(np.uint16)
     exponent = (unsigned >> 3) & 15
     mantissa = unsigned & 7
@@ -87,8 +95,13 @@ def _mxfp8() -> tuple[MxTensor, np.ndarray]:
     )
     dense = np.where((unsigned & 128) == 0, normal, -normal)
     dense = np.where(exponent == 0, np.sign(dense) * subnormal, dense)
-    dense *= np.exp2(scales.astype(np.int16)[0, 0] - 127)
+    tiled_scales = np.repeat(np.repeat(scales, 128, axis=0), 128, axis=1)
+    dense *= np.exp2(tiled_scales[:rows, :width].astype(np.int16) - 127)
     return MxTensor("MXFP8", (rows, width), values, scales), dense
+
+
+def _mxfp8() -> tuple[MxTensor, np.ndarray]:
+    return _mxfp8_shape(11, 128, 608)
 
 
 def _tpq_pq_tensor(
@@ -197,6 +210,46 @@ def test_mx_packed_backward_and_autograd_match_dequant(factory, rows):
     (mx_matmul(weight, source) * output_gradient).sum().backward()
     torch.testing.assert_close(
         source.grad.float(), expected, rtol=0.006, atol=0.03
+    )
+
+
+@pytest.mark.parametrize("rows", [5, 8])
+def test_mxfp8_wide_backward_matches_packed_reference(rows: int):
+    tensor, dense = _mxfp8_shape(257, 1024, 1608)
+    weight = to_gpu_mx(tensor)
+    output_gradient = torch.randn(
+        rows, tensor.shape[0], device="cuda", dtype=torch.float16
+    )
+    expected = output_gradient.float() @ torch.as_tensor(dense, device="cuda")
+    torch.testing.assert_close(
+        mx_backward_input(weight, output_gradient).float(),
+        expected,
+        rtol=0.006,
+        atol=0.03,
+    )
+
+
+def test_mxfp8_wide_backward_cuda_graph_replays():
+    tensor, dense = _mxfp8_shape(257, 1024, 2608)
+    weight = to_gpu_mx(tensor)
+    dense_gpu = torch.as_tensor(dense, device="cuda")
+    output_gradient = torch.randn(
+        8, tensor.shape[0], device="cuda", dtype=torch.float16
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            mx_backward_input(weight, output_gradient)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = mx_backward_input(weight, output_gradient)
+        output_gradient.add_(0.25)
+        graph.replay()
+    stream.synchronize()
+    expected = output_gradient.float() @ dense_gpu
+    torch.testing.assert_close(
+        actual.float(), expected, rtol=0.006, atol=0.03
     )
 
 
