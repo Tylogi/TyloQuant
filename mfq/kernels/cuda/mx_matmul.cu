@@ -1155,7 +1155,7 @@ void launch_mx_backward(
 }
 
 template <int Rows>
-__global__ void __launch_bounds__(32) mxfp8_backward_partial_kernel(
+__global__ void __launch_bounds__(32) mxfp8_backward_scalar_partial_kernel(
         const uint8_t * __restrict__ values,
         const uint8_t * __restrict__ scales,
         const __half * __restrict__ output_gradient,
@@ -1205,7 +1205,7 @@ __global__ void __launch_bounds__(32) mxfp8_backward_partial_kernel(
 }
 
 template <int Rows>
-void launch_mxfp8_backward_small_m(
+void launch_mxfp8_backward_scalar_small_m(
         const mfq_tensor_backend::Tensor & values,
         const mfq_tensor_backend::Tensor & scales,
         const mfq_tensor_backend::Tensor & output_gradient,
@@ -1221,7 +1221,101 @@ void launch_mxfp8_backward_small_m(
     const dim3 partial_grid(
         static_cast<unsigned>((width + 31) / 32),
         static_cast<unsigned>(output_groups));
-    mxfp8_backward_partial_kernel<Rows><<<partial_grid, 32, 0, stream>>>(
+    mxfp8_backward_scalar_partial_kernel<Rows><<<partial_grid, 32, 0, stream>>>(
+        values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half *>(
+            output_gradient.data_ptr<mfq_half>()),
+        partials.data_ptr<float>(),
+        rows, outputs, width);
+    mfq_packed_backward::launch_split_float_reduce_to_half(
+        partials.data_ptr<float>(),
+        reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
+        rows, width, output_groups, stream);
+}
+
+template <int Rows>
+__global__ void __launch_bounds__(32) mxfp8_backward_vec4_partial_kernel(
+        const uint8_t * __restrict__ values,
+        const uint8_t * __restrict__ scales,
+        const __half * __restrict__ output_gradient,
+        float * __restrict__ partials,
+        int rows,
+        int outputs,
+        int width) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int column0 = (static_cast<int>(blockIdx.x) * 32 + lane) * 4;
+    float accumulators[Rows][4];
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+#pragma unroll
+        for (int component = 0; component < 4; ++component) {
+            accumulators[row][component] = 0.0f;
+        }
+    }
+    const int output_group = static_cast<int>(blockIdx.y);
+    const int output0 = output_group * 32;
+    const int output_end = min(output0 + 32, outputs);
+    const int scale_columns = width >> 7;
+    float scale = lane == 0 ? decode_e8m0(scales[
+        static_cast<int64_t>(output0 >> 7) * scale_columns +
+        (column0 >> 7)]) : 0.0f;
+    scale = __shfl_sync(0xffffffffu, scale, 0);
+    const uint8_t * weight = values +
+        static_cast<int64_t>(output0) * width + column0;
+    for (int output = output0; output < output_end; ++output) {
+        const uint32_t packed = *reinterpret_cast<const uint32_t *>(weight);
+        float decoded[4];
+#pragma unroll
+        for (int component = 0; component < 4; ++component) {
+            decoded[component] = decode_e4m3fn(static_cast<uint8_t>(
+                packed >> (8 * component))) * scale;
+        }
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float gradient = lane == 0 && row < rows
+                ? __half2float(output_gradient[
+                    static_cast<int64_t>(row) * outputs + output])
+                : 0.0f;
+            gradient = __shfl_sync(0xffffffffu, gradient, 0);
+#pragma unroll
+            for (int component = 0; component < 4; ++component) {
+                accumulators[row][component] = fmaf(
+                    gradient, decoded[component],
+                    accumulators[row][component]);
+            }
+        }
+        weight += width;
+    }
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+        if (row < rows) {
+#pragma unroll
+            for (int component = 0; component < 4; ++component) {
+                partials[(static_cast<int64_t>(output_group) * rows + row) *
+                    width + column0 + component] = accumulators[row][component];
+            }
+        }
+    }
+}
+
+template <int Rows>
+void launch_mxfp8_backward_vec4_small_m(
+        const mfq_tensor_backend::Tensor & values,
+        const mfq_tensor_backend::Tensor & scales,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & result,
+        int rows,
+        int outputs,
+        int width,
+        cudaStream_t stream) {
+    const int output_groups = (outputs + 31) / 32;
+    auto partials = mfq_tensor_backend::empty(
+        {output_groups, rows, width},
+        values.options().dtype(mfq_tensor_backend::kFloat32));
+    const dim3 partial_grid(
+        static_cast<unsigned>((width + 127) / 128),
+        static_cast<unsigned>(output_groups));
+    mxfp8_backward_vec4_partial_kernel<Rows><<<partial_grid, 32, 0, stream>>>(
         values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(
             output_gradient.data_ptr<mfq_half>()),
@@ -1274,19 +1368,19 @@ mfq_tensor_backend::Tensor mx_backward_input_cuda(
     const cudaStream_t stream = mfq_current_cuda_stream();
     if (!mxfp4 && dtype == mfq_tensor_backend::kFloat16 && rows <= 8) {
         if (rows == 1) {
-            launch_mxfp8_backward_small_m<1>(
+            launch_mxfp8_backward_scalar_small_m<1>(
                 values, scales, output_gradient, result,
                 rows, outputs, width, stream);
         } else if (rows <= 2) {
-            launch_mxfp8_backward_small_m<2>(
+            launch_mxfp8_backward_scalar_small_m<2>(
                 values, scales, output_gradient, result,
                 rows, outputs, width, stream);
         } else if (rows <= 4) {
-            launch_mxfp8_backward_small_m<4>(
+            launch_mxfp8_backward_vec4_small_m<4>(
                 values, scales, output_gradient, result,
                 rows, outputs, width, stream);
         } else {
-            launch_mxfp8_backward_small_m<8>(
+            launch_mxfp8_backward_vec4_small_m<8>(
                 values, scales, output_gradient, result,
                 rows, outputs, width, stream);
         }

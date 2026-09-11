@@ -173,10 +173,10 @@ def test_mxfp8_matmul_matches_packed_reference(activation_rows: int):
 
 
 @pytest.mark.parametrize("factory", [_mxfp4, _mxfp8])
-def test_mx_packed_backward_and_autograd_match_dequant(factory):
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
+def test_mx_packed_backward_and_autograd_match_dequant(factory, rows):
     tensor, dense = factory()
     weight = to_gpu_mx(tensor)
-    rows = 3
     output_gradient = torch.randn(
         rows, tensor.shape[0], device="cuda", dtype=torch.float16
     )
