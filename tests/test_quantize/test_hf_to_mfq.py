@@ -34,6 +34,7 @@ from mfq.tools.quantize_hf_to_mfq import (
     _bind_hf_imatrix,
     _dtype_for_recipe_type,
     _GlmExpertRowSource,
+    _hf_expert_importance,
     _hf_to_gguf_name,
     _minicpmo45_quantizable_matrix,
     _Mxfp4TensorSlice,
@@ -1566,6 +1567,12 @@ def test_hf_imatrix_binds_expert_wise_entries(tmp_path):
         binding.selected(np.asarray([0, 3], dtype=np.int64)),
         values * np.asarray([[1.0], [4.0]]),
     )
+    assert binding.input_selected is not None
+    np.testing.assert_array_equal(
+        binding.input_selected(np.asarray([0, 3], dtype=np.int64)),
+        values,
+    )
+    np.testing.assert_array_equal(_hf_expert_importance(item, binding), values)
     np.testing.assert_array_equal(binding.neuron_rows(1, 5), [2.0, 3.0, 4.0, 5.0])
 
 
@@ -1679,7 +1686,14 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
         }
         encoded = store["model.block.0.mlp.down.weight"]
         assert encoded.has_mixed_sub_bits
-        np.testing.assert_array_equal(encoded.row_sub_bits, [5, 5, 7, 7])
+        assert encoded.has_mixed_q_bits
+        assert int(encoded.row_q_bits[-1]) > int(encoded.row_q_bits[0])
+        actual_variable_bits = (
+            int(encoded.row_q_bits.astype(np.int64).sum()) * 24
+            + 2 * int(encoded.row_sub_bits.astype(np.int64).sum())
+        )
+        uniform_variable_bits = 4 * (4 * 24 + 2 * 6)
+        assert actual_variable_bits <= uniform_variable_bits
     finally:
         store.close()
 

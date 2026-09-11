@@ -233,9 +233,13 @@ from mfq.quantize.nepq_a import (
     NepqAQuantConfig,
     quantize_nepq_a_fixed,
 )
-from mfq.quantize.nint_quant import allocate_row_sub_bits
 from mfq.quantize.nint_quant import quantize as nint_quantize
 from mfq.quantize.nint_quant_torch import quantize_axis0 as nint_quantize_axis0_torch
+from mfq.quantize.nint_v2 import (
+    allocate_row_profiles,
+    candidate_profiles as nint_v2_candidate_profiles,
+    measure_row_profile_losses,
+)
 from mfq.quantize.npq0_l import Npq0LConfig, Npq0LTables, quantize_npq0_l_fixed
 from mfq.quantize.npq0_s import Npq0SConfig, Npq0STables, quantize_npq0_s_fixed
 from mfq.quantize.nvq_jsc import NvqJscConfig, NvqJscTables, initial_jsc_tables
@@ -1691,6 +1695,7 @@ class HfImatrixBinding:
     rows: ImportanceRows
     selected: ImportanceSelection
     neuron_rows: ImportanceRows | None = None
+    input_selected: ImportanceSelection | None = None
 
 
 def _hf_imatrix_names(item: TensorPlan) -> tuple[str, ...]:
@@ -1807,6 +1812,24 @@ def _bind_hf_imatrix(
                 raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
             return resolved[1]
 
+        def input_selected(
+            row_ids: np.ndarray,
+            *,
+            _names=names,
+            _original_shape=original_shape,
+            _storage_shape=storage_shape,
+            _item=item,
+        ) -> np.ndarray:
+            resolved = imatrix.input_for_rows(
+                _names,
+                _original_shape,
+                _storage_shape,
+                np.asarray(row_ids, dtype=np.int64),
+            )
+            if resolved is None:
+                raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
+            return resolved[1]
+
         neuron_probe = imatrix.neuron_importance_for_rows(
             names,
             storage_shape,
@@ -1835,7 +1858,11 @@ def _bind_hf_imatrix(
                 return resolved[1]
 
         bindings[item.name] = HfImatrixBinding(
-            entry_name, rows, selected, neuron_rows
+            entry_name,
+            rows,
+            selected,
+            neuron_rows,
+            input_selected,
         )
     if missing:
         preview = ", ".join(missing[:8])
@@ -1853,7 +1880,13 @@ def _hf_expert_importance(
     if item.expert_shape is None:
         raise ValueError(f"NINTM plan lacks expert shape: {item.name}")
     n_experts, rows_per_expert, _ = item.expert_shape
-    return binding.selected(np.arange(n_experts, dtype=np.int64) * rows_per_expert)
+    row_ids = np.arange(n_experts, dtype=np.int64) * rows_per_expert
+    return np.ascontiguousarray(
+        binding.selected(row_ids)
+        if binding.input_selected is None
+        else binding.input_selected(row_ids),
+        dtype=np.float32,
+    )
 
 
 def _hf_neuron_importance(
@@ -3657,6 +3690,59 @@ def _nint_blob_public_dtype(blob_path: Path) -> str:
     return "NINTv2" if raw_bits & NINT_V2_FLAG else f"NINT{bits}"
 
 
+def _allocate_nint_v2_rows(
+    source,
+    shape: tuple[int, int],
+    spec: NintSpec,
+    row_chunk: int,
+    quant_backend: str,
+    device: str,
+    importance_rows,
+    neuron_importance_rows,
+):
+    """Measure and allocate one common NAQ-guided q+k profile map."""
+
+    out, neuron_len = shape
+    profiles = nint_v2_candidate_profiles(spec)
+    losses = np.empty((out, len(profiles)), dtype=np.float64)
+    for start in range(0, out, row_chunk):
+        end = min(start + row_chunk, out)
+        importance = None if importance_rows is None else importance_rows(start, end)
+        if quant_backend in ACCELERATOR_BACKENDS and hasattr(source, "read_rows"):
+            chunk = source.read_rows(start, end, device=device)
+        else:
+            chunk = source[start:end]
+        losses[start:end] = measure_row_profile_losses(
+            chunk,
+            spec,
+            profiles,
+            importance=importance,
+            device=(device if quant_backend in ACCELERATOR_BACKENDS else "cpu"),
+        )
+        if importance is None:
+            neuron_importance = neuron_importance_rows(start, end)
+            if isinstance(neuron_importance, torch.Tensor):
+                neuron_importance = neuron_importance.detach().cpu().numpy()
+            neuron_importance = np.asarray(
+                neuron_importance, dtype=np.float64
+            ).reshape(-1)
+            if neuron_importance.shape != (end - start,):
+                raise ValueError(
+                    "NAQ neuron importance does not match the NINTv2 row chunk"
+                )
+            losses[start:end] *= neuron_importance[:, None]
+        del chunk, importance
+
+    groups = (neuron_len + int(spec.groupsize) - 1) // int(spec.groupsize)
+    return allocate_row_profiles(
+        losses,
+        profiles,
+        spec,
+        values_per_row=groups * int(spec.groupsize),
+        groups_per_row=groups,
+    )
+
+
 def _write_nint_axis0_blob(
     sl,
     shape: tuple[int, ...],
@@ -3676,30 +3762,27 @@ def _write_nint_axis0_blob(
     ng = (neuron_len + gs - 1) // gs
     scale_nbytes = out * np.dtype(np.float16).itemsize
     q_nbytes = (out * ng * gs * spec.bits + 7) // 8
+    row_q_bits = None
     row_sub_bits = None
-    if neuron_importance_rows is not None:
-        neuron_importance = neuron_importance_rows(0, out)
-        if neuron_importance is not None:
-            if isinstance(neuron_importance, torch.Tensor):
-                neuron_importance = neuron_importance.detach().cpu().numpy()
-            neuron_importance = np.asarray(
-                neuron_importance, dtype=np.float32
-            ).reshape(-1)
-            if neuron_importance.shape != (out,):
-                raise ValueError(
-                    f"NAQ neuron importance shape {neuron_importance.shape} != {(out,)}"
-                )
-            candidate = allocate_row_sub_bits(
-                neuron_importance, int(spec.sub_bits)
-            )
-            if np.any(candidate != int(spec.sub_bits)):
-                row_sub_bits = candidate
-    is_nint_v2 = row_sub_bits is not None
+    if neuron_importance_rows is not None and not synthetic:
+        allocation = _allocate_nint_v2_rows(
+            sl,
+            (out, neuron_len),
+            spec,
+            row_chunk,
+            quant_backend,
+            device,
+            importance_rows,
+            neuron_importance_rows,
+        )
+        row_q_bits = allocation.row_q_bits
+        row_sub_bits = allocation.row_sub_bits
+    is_nint_v2 = row_q_bits is not None
     if not is_nint_v2 and (row_chunk * ng * spec.sub_bits) % 8 != 0:
         raise ValueError(
             f"row_chunk={row_chunk} does not align sub_bits={spec.sub_bits}, ng={ng} to byte boundary"
         )
-    if (row_chunk * ng * gs * spec.bits) % 8 != 0:
+    if not is_nint_v2 and (row_chunk * ng * gs * spec.bits) % 8 != 0:
         raise ValueError(
             f"row_chunk={row_chunk} does not align bits={spec.bits}, ng={ng}, gs={gs} to byte boundary"
         )
@@ -3713,7 +3796,10 @@ def _write_nint_axis0_blob(
         scale_off = f.tell()
         min_off = scale_off + scale_nbytes
         metadata_off = min_off + scale_nbytes
-        packed_writers: dict[int, tuple[_PackedBitRegionWriter, _PackedBitRegionWriter]] = {}
+        metadata_writers: dict[
+            int, tuple[_PackedBitRegionWriter, _PackedBitRegionWriter]
+        ] = {}
+        q_writers: dict[int, _PackedBitRegionWriter] = {}
         if is_nint_v2:
             k_selectors = np.ascontiguousarray(
                 row_sub_bits.astype(np.int16) - (int(spec.sub_bits) - 1),
@@ -3733,29 +3819,42 @@ def _write_nint_axis0_blob(
                 cursor += (count * bits + 7) // 8
                 min_stream_off = cursor
                 cursor += (count * bits + 7) // 8
-                packed_writers[selector] = (
+                metadata_writers[selector] = (
                     _PackedBitRegionWriter(f, scale_stream_off, bits, count),
                     _PackedBitRegionWriter(f, min_stream_off, bits, count),
                 )
             q_selector_off = cursor
             q_selector_nbytes = (out * NINT_V2_Q_SELECTOR_BITS + 7) // 8
-            q_off = q_selector_off + q_selector_nbytes
+            cursor = q_selector_off + q_selector_nbytes
+            q_selectors = np.ascontiguousarray(row_q_bits - 1, dtype=np.uint8)
+            for selector in range(1 << NINT_V2_Q_SELECTOR_BITS):
+                bits = selector + 1
+                rows = int(np.count_nonzero(q_selectors == selector))
+                count = rows * ng * gs
+                if not count:
+                    continue
+                q_writers[selector] = _PackedBitRegionWriter(
+                    f, cursor, bits, count
+                )
+                cursor += (count * bits + 7) // 8
+            blob_end = cursor
             sub_scale_off = sub_min_off = -1
+            q_off = -1
         else:
             sub_nbytes = (out * ng * spec.sub_bits + 7) // 8
             sub_scale_off = metadata_off
             sub_min_off = sub_scale_off + sub_nbytes
             q_off = sub_min_off + sub_nbytes
-        f.truncate(q_off + q_nbytes)
+            blob_end = q_off + q_nbytes
+        f.truncate(blob_end)
         if is_nint_v2:
             f.seek(metadata_off)
             f.write(pack_bits(k_selectors, NINT_V2_K_SELECTOR_BITS))
-            q_selectors = np.full(out, int(spec.bits) - 1, dtype=np.uint8)
             f.seek(q_selector_off)
             f.write(pack_bits(q_selectors, NINT_V2_Q_SELECTOR_BITS))
 
         if synthetic:
-            return int(q_off + q_nbytes)
+            return int(blob_end)
 
         for start in range(0, out, row_chunk):
             end = min(start + row_chunk, out)
@@ -3771,6 +3870,7 @@ def _write_nint_axis0_blob(
                     device=device,
                     importance=importance,
                     row_sub_bits=(None if row_sub_bits is None else row_sub_bits[start:end]),
+                    row_q_bits=(None if row_q_bits is None else row_q_bits[start:end]),
                 )
             elif quant_backend == "cpu":
                 nt = nint_quantize(
@@ -3779,6 +3879,7 @@ def _write_nint_axis0_blob(
                     axis=0,
                     importance=importance,
                     row_sub_bits=(None if row_sub_bits is None else row_sub_bits[start:end]),
+                    row_q_bits=(None if row_q_bits is None else row_q_bits[start:end]),
                 )
             else:
                 raise ValueError(f"unsupported quant backend: {quant_backend}")
@@ -3793,7 +3894,7 @@ def _write_nint_axis0_blob(
             f.write(np.ascontiguousarray(nt.neuron_min, dtype=np.float16).tobytes())
             if is_nint_v2:
                 chunk_selectors = k_selectors[start:end]
-                for selector, (scale_writer, min_writer) in packed_writers.items():
+                for selector, (scale_writer, min_writer) in metadata_writers.items():
                     local_rows = np.flatnonzero(chunk_selectors == selector)
                     scale_writer.append(nt.sub_scale[local_rows])
                     min_writer.append(nt.sub_min[local_rows])
@@ -3802,12 +3903,20 @@ def _write_nint_axis0_blob(
                 f.write(pack_bits(nt.sub_scale, spec.sub_bits))
                 f.seek(sub_min_off + (start * ng * spec.sub_bits) // 8)
                 f.write(pack_bits(nt.sub_min, spec.sub_bits))
-            f.seek(q_off + (start * ng * gs * spec.bits) // 8)
-            f.write(pack_bits(nt.q, spec.bits))
+            if is_nint_v2:
+                chunk_q_selectors = q_selectors[start:end]
+                for selector, q_writer in q_writers.items():
+                    local_rows = np.flatnonzero(chunk_q_selectors == selector)
+                    q_writer.append(nt.q[local_rows])
+            else:
+                f.seek(q_off + (start * ng * gs * spec.bits) // 8)
+                f.write(pack_bits(nt.q, spec.bits))
             del chunk, nt, importance
-        for scale_writer, min_writer in packed_writers.values():
+        for scale_writer, min_writer in metadata_writers.values():
             scale_writer.finish()
             min_writer.finish()
+        for q_writer in q_writers.values():
+            q_writer.finish()
     return blob_path.stat().st_size
 
 
@@ -4272,17 +4381,6 @@ def _write_nint_moe_axis0_blob(
                             importance_array[np.asarray(expert_ids, dtype=np.int64)]
                         )
 
-                def importance_rows(
-                    start: int,
-                    end: int,
-                    *,
-                    _importance=pool_importance,
-                ) -> np.ndarray | None:
-                    if _importance is None or _importance.ndim == 1:
-                        return _importance
-                    expert_rows = np.arange(start, end, dtype=np.int64) // rows_per_expert
-                    return np.ascontiguousarray(_importance[expert_rows])
-
                 pool_neuron_importance = (
                     None
                     if all_neuron_importance is None
@@ -4292,6 +4390,32 @@ def _write_nint_moe_axis0_blob(
                         ].reshape(-1)
                     )
                 )
+
+                def importance_rows(
+                    start: int,
+                    end: int,
+                    *,
+                    _importance=pool_importance,
+                    _neuron_importance=pool_neuron_importance,
+                ) -> np.ndarray | None:
+                    if _importance is None:
+                        return None
+                    if _importance.ndim == 1:
+                        selected = np.broadcast_to(
+                            _importance, (end - start, _importance.size)
+                        )
+                    else:
+                        expert_rows = (
+                            np.arange(start, end, dtype=np.int64)
+                            // rows_per_expert
+                        )
+                        selected = _importance[expert_rows]
+                    if _neuron_importance is not None:
+                        selected = (
+                            selected
+                            * _neuron_importance[start:end, None]
+                        )
+                    return np.ascontiguousarray(selected, dtype=np.float32)
 
                 def neuron_importance_rows(
                     start: int,
@@ -4316,7 +4440,11 @@ def _write_nint_moe_axis0_blob(
                     quant_backend,
                     device,
                     importance_rows=(importance_rows if profile.bits in {2, 3, 4, 5, 6} else None),
-                    neuron_importance_rows=neuron_importance_rows,
+                    neuron_importance_rows=(
+                        neuron_importance_rows
+                        if pool_neuron_importance is not None
+                        else None
+                    ),
                     synthetic=synthetic,
                 )
                 dtype = _nint_blob_public_dtype(pool_path).encode("ascii")
@@ -5054,21 +5182,45 @@ def _write_mixed_moe_axis0_blob(
                         end: int,
                         *,
                         _importance=pool_importance,
+                        _neuron_importance=pool_neuron_importance,
                     ) -> np.ndarray | torch.Tensor | None:
-                        if _importance is None or len(_importance.shape) == 1:
-                            return _importance
+                        if _importance is None:
+                            return None
                         row_ids = np.arange(start, end, dtype=np.int64)
                         expert_rows = row_ids // rows_per_expert
                         if isinstance(_importance, torch.Tensor):
-                            return _importance.index_select(
-                                0,
-                                torch.as_tensor(
-                                    expert_rows,
-                                    device=_importance.device,
-                                    dtype=torch.int64,
-                                ),
+                            if len(_importance.shape) == 1:
+                                selected = _importance[None, :].expand(
+                                    end - start, -1
+                                )
+                            else:
+                                selected = _importance.index_select(
+                                    0,
+                                    torch.as_tensor(
+                                        expert_rows,
+                                        device=_importance.device,
+                                        dtype=torch.int64,
+                                    ),
+                                )
+                            if _neuron_importance is not None:
+                                selected = selected * torch.as_tensor(
+                                    _neuron_importance[start:end, None],
+                                    device=selected.device,
+                                    dtype=selected.dtype,
+                                )
+                            return selected
+                        if len(_importance.shape) == 1:
+                            selected = np.broadcast_to(
+                                _importance, (end - start, _importance.size)
                             )
-                        return np.ascontiguousarray(_importance[expert_rows])
+                        else:
+                            selected = _importance[expert_rows]
+                        if _neuron_importance is not None:
+                            selected = (
+                                selected
+                                * _neuron_importance[start:end, None]
+                            )
+                        return np.ascontiguousarray(selected, dtype=np.float32)
 
                     def neuron_importance_rows(
                         start: int,
@@ -5091,7 +5243,11 @@ def _write_mixed_moe_axis0_blob(
                         importance_rows=(
                             importance_rows if precision.nint_spec.bits in {2, 3, 4, 5, 6} else None
                         ),
-                        neuron_importance_rows=neuron_importance_rows,
+                        neuron_importance_rows=(
+                            neuron_importance_rows
+                            if pool_neuron_importance is not None
+                            else None
+                        ),
                         synthetic=synthetic,
                     )
                     runtime_payload = b""

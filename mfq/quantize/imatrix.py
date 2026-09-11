@@ -55,6 +55,43 @@ class ImportanceMatrix:
         storage_shape: tuple[int, int],
         rows: slice | np.ndarray,
     ) -> tuple[str, np.ndarray] | None:
+        resolved = self.input_for_rows(names, original_shape, storage_shape, rows)
+        if resolved is None:
+            return None
+        name, input_importance = resolved
+        entry = self.entries[name]
+        if entry.row_importance is None:
+            return name, input_importance
+        if isinstance(rows, slice):
+            start = 0 if rows.start is None else int(rows.start)
+            stop = int(storage_shape[0]) if rows.stop is None else int(rows.stop)
+            row_ids = np.arange(start, stop, dtype=np.int64)
+        else:
+            row_ids = np.asarray(rows, dtype=np.int64).reshape(-1)
+        row_importance = np.asarray(entry.row_importance, dtype=np.float32).reshape(-1)
+        if row_importance.shape != (int(storage_shape[0]),):
+            raise ValueError(
+                f"NAQ neuron importance mismatch for {name}: "
+                f"{row_importance.shape} != {(int(storage_shape[0]),)}"
+            )
+        selected_rows = row_importance[row_ids]
+        if np.ndim(input_importance) == 1:
+            input_importance = np.broadcast_to(
+                input_importance, (row_ids.size, int(storage_shape[1]))
+            )
+        return name, np.ascontiguousarray(
+            input_importance * selected_rows[:, None], dtype=np.float32
+        )
+
+    def input_for_rows(
+        self,
+        names: Iterable[str],
+        original_shape: tuple[int, ...],
+        storage_shape: tuple[int, int],
+        rows: slice | np.ndarray,
+    ) -> tuple[str, np.ndarray] | None:
+        """Return only the input-channel factor, without NAQ neuron scaling."""
+
         match = self.find(names)
         if match is None:
             return None
@@ -98,23 +135,7 @@ class ImportanceMatrix:
             input_importance = np.ascontiguousarray(
                 entry.values[expert_ids], dtype=np.float32
             )
-
-        if entry.row_importance is None:
-            return name, input_importance
-        row_importance = np.asarray(entry.row_importance, dtype=np.float32).reshape(-1)
-        if row_importance.shape != (int(storage_shape[0]),):
-            raise ValueError(
-                f"NAQ neuron importance mismatch for {name}: "
-                f"{row_importance.shape} != {(int(storage_shape[0]),)}"
-            )
-        selected_rows = row_importance[row_ids]
-        if np.ndim(input_importance) == 1:
-            input_importance = np.broadcast_to(
-                input_importance, (row_ids.size, neuron_len)
-            )
-        return name, np.ascontiguousarray(
-            input_importance * selected_rows[:, None], dtype=np.float32
-        )
+        return name, input_importance
 
     def neuron_importance_for_rows(
         self,

@@ -449,7 +449,7 @@ def test_mixed_nint_imatrix_changes_nint4_and_leaves_nint8_unchanged(tmp_path):
     )
 
 
-def test_nintm_stream_writer_keeps_per_neuron_sub_bits_inside_one_pool(tmp_path):
+def test_nintm_stream_writer_keeps_per_neuron_qk_inside_one_pool(tmp_path):
     rng = np.random.default_rng(20260911)
     shape = (2, 6, 73)
     weight = rng.normal(0, 0.05, size=shape).astype(np.float32)
@@ -476,8 +476,14 @@ def test_nintm_stream_writer_keeps_per_neuron_sub_bits_inside_one_pool(tmp_path)
     restored = io.unpack_nint_moe(path.read_bytes())
     pool = restored.pools[0].tensor
     assert pool.has_mixed_sub_bits
-    assert pool.mean_sub_bits == 6.0
-    assert set(pool.row_sub_bits.tolist()) == {5, 6, 7, 8}
+    assert pool.has_mixed_q_bits
+    actual_variable_bits = (
+        int(pool.row_q_bits.astype(np.int64).sum()) * 96
+        + 2 * int(pool.row_sub_bits.astype(np.int64).sum()) * 4
+    )
+    uniform_variable_bits = 12 * (4 * 96 + 2 * 6 * 4)
+    assert actual_variable_bits <= uniform_variable_bits
+    assert int(pool.row_q_bits[5]) > int(pool.row_q_bits[0])
     assert np.isfinite(dequantize_expertwise(restored)).all()
     assert io.pack_nint_moe(restored) == path.read_bytes()
 
