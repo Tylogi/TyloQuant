@@ -3,8 +3,8 @@
 # TyloQuant MFQ
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./docs/figures/tylogi-ai-lab-dark.svg">
-  <img src="./docs/figures/tylogi-ai-lab.svg" alt="Tylogi AI Lab" width="420">
+  <source media="(prefers-color-scheme: dark)" srcset="./docs/figures/tylogi-ai-lab-lockup-dark.svg">
+  <img src="./docs/figures/tylogi-ai-lab-lockup-light.svg" alt="Tylogi AI Lab" width="420">
 </picture>
 
 ### Next-generation quantization & inference infrastructure
