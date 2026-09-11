@@ -10098,8 +10098,8 @@ void launch_nint8_backward_rows(
 #undef MFQ_NINT8_BACKWARD_ROWS
 }
 
-template <int Bits>
-__global__ void __launch_bounds__(256) nint_backward_mma_m16_kernel(
+template <int Bits, int RowTiles>
+__global__ void __launch_bounds__(256) nint_backward_mma_kernel(
         const uint8_t * __restrict__ q_packed,
         const uint8_t * __restrict__ sub_scale,
         const uint8_t * __restrict__ sub_min,
@@ -10113,18 +10113,24 @@ __global__ void __launch_bounds__(256) nint_backward_mma_m16_kernel(
         int groups,
         int group_size) {
     constexpr int kWarps = 8;
-    __shared__ __align__(16) __half gradient_tile[kWarps][16 * 16];
+    __shared__ __align__(16) __half
+        gradient_tile[kWarps][RowTiles * 16 * 16];
     __shared__ __align__(16) __half weight_tile[kWarps][16 * 16];
-    __shared__ __align__(16) float result_tile[kWarps][16 * 16];
+    __shared__ __align__(16) float
+        result_tile[kWarps][RowTiles * 16 * 16];
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int column0 = static_cast<int>(blockIdx.x) * 16;
     const int qbytes = (group_size * Bits + 7) / 8;
-    for (int index = lane; index < 16 * 16; index += 32) {
+    for (int index = lane; index < RowTiles * 16 * 16; index += 32) {
         gradient_tile[warp][index] = __float2half_rn(0.0f);
     }
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
-    wmma::fill_fragment(accumulator, 0.0f);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float>
+        accumulators[RowTiles];
+#pragma unroll
+    for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+        wmma::fill_fragment(accumulators[row_tile], 0.0f);
+    }
     for (int output_group = warp * 128;
          output_group < outputs;
          output_group += kWarps * 128) {
@@ -10228,19 +10234,30 @@ __global__ void __launch_bounds__(256) nint_backward_mma_m16_kernel(
                 wmma::matrix_b, 16, 16, 16, __half, wmma::row_major>
                     weight_fragment;
             wmma::load_matrix_sync(
-                gradient_fragment, gradient_tile[warp], 16);
-            wmma::load_matrix_sync(
                 weight_fragment, weight_tile[warp], 16);
-            wmma::mma_sync(
-                accumulator, gradient_fragment, weight_fragment, accumulator);
+#pragma unroll
+            for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+                wmma::load_matrix_sync(
+                    gradient_fragment,
+                    gradient_tile[warp] + row_tile * 16 * 16,
+                    16);
+                wmma::mma_sync(
+                    accumulators[row_tile], gradient_fragment,
+                    weight_fragment, accumulators[row_tile]);
+            }
             __syncwarp();
         }
     }
-    wmma::store_matrix_sync(
-        result_tile[warp], accumulator, 16, wmma::mem_row_major);
+#pragma unroll
+    for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+        wmma::store_matrix_sync(
+            result_tile[warp] + row_tile * 16 * 16,
+            accumulators[row_tile], 16, wmma::mem_row_major);
+    }
     __syncthreads();
-    const int index = static_cast<int>(threadIdx.x);
-    if (index < rows * 16) {
+    for (int index = static_cast<int>(threadIdx.x);
+         index < rows * 16;
+         index += static_cast<int>(blockDim.x)) {
         const int row = index >> 4;
         const int column = column0 + (index & 15);
         if (column < width) {
@@ -10256,7 +10273,7 @@ __global__ void __launch_bounds__(256) nint_backward_mma_m16_kernel(
 }
 
 template <int Bits>
-void launch_nint_backward_mma_m16(
+void launch_nint_backward_mma(
         const mfq_tensor_backend::Tensor & q_packed,
         const mfq_tensor_backend::Tensor & sub_scale,
         const mfq_tensor_backend::Tensor & sub_min,
@@ -10270,15 +10287,22 @@ void launch_nint_backward_mma_m16(
         int groups,
         int group_size,
         cudaStream_t stream) {
-    nint_backward_mma_m16_kernel<Bits><<<
-        (width + 15) / 16, 256, 0, stream>>>(
-            q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
-            sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
-            neuron_min.data_ptr<float>(),
-            reinterpret_cast<const __half *>(
-                output_gradient.data_ptr<mfq_half>()),
-            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
-            rows, outputs, width, groups, group_size);
+#define MFQ_LAUNCH_NINT_BACKWARD_MMA(ROW_TILES) \
+    nint_backward_mma_kernel<Bits, ROW_TILES><<< \
+        (width + 15) / 16, 256, 0, stream>>>( \
+            q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), \
+            sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(), \
+            neuron_min.data_ptr<float>(), \
+            reinterpret_cast<const __half *>( \
+                output_gradient.data_ptr<mfq_half>()), \
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()), \
+            rows, outputs, width, groups, group_size)
+    if (rows <= 16) {
+        MFQ_LAUNCH_NINT_BACKWARD_MMA(1);
+    } else {
+        MFQ_LAUNCH_NINT_BACKWARD_MMA(2);
+    }
+#undef MFQ_LAUNCH_NINT_BACKWARD_MMA
 }
 
 }  // namespace
@@ -10361,11 +10385,11 @@ mfq_tensor_backend::Tensor nint_backward_input_cuda(
     // GS28 Q5 layouts retain the faster dequantize-and-GEMM path.
     if (!q5_exec && !(bits == 5 && group_size == 28) &&
             dtype == mfq_tensor_backend::kFloat16 &&
-            rows >= 9 && rows <= 16 &&
+            rows >= 9 && rows <= 32 &&
             static_cast<int64_t>(width) >=
                 2 * static_cast<int64_t>(outputs)) {
 #define MFQ_NINT_BACKWARD_MMA_BITS(BITS) \
-        launch_nint_backward_mma_m16<BITS>( \
+        launch_nint_backward_mma<BITS>( \
             q_packed, sub_scale, sub_min, neuron_scale, neuron_min, \
             output_gradient, result, rows, outputs, width, groups, \
             static_cast<int>(group_size), stream)
