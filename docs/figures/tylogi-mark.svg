@@ -1,0 +1,8 @@
+<svg width="80" height="80" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Tylogi AI Lab mark</title>
+  <desc id="desc">A geometric TL monogram ending in a copper dot.</desc>
+  <rect width="80" height="80" rx="21" fill="#111313"/>
+  <rect x="0.75" y="0.75" width="78.5" height="78.5" rx="20.25" stroke="#393A38" stroke-width="1.5"/>
+  <path d="M20 24H58M39 24V53C39 60 43.5 64 51 64H56" stroke="#F3F1EC" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="63" cy="64" r="4.5" fill="#B9854C"/>
+</svg>
