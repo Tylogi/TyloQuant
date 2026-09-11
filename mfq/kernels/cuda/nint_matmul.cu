@@ -10174,7 +10174,7 @@ mfq_tensor_backend::Tensor nint_backward_input_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
-    const bool use_small_m_partial = rows <= 16;
+    const bool use_small_m_partial = rows <= 8 || (rows <= 16 && bits >= 6);
     if (dtype == mfq_tensor_backend::kFloat16 && use_small_m_partial) {
         constexpr int output_tile = 32;
         const int splits = (outputs + output_tile - 1) / output_tile;
