@@ -456,14 +456,28 @@ def test_nint_packed_bits_matmul_matches_dequant(spec, M):
     torch.testing.assert_close(y, ref, atol=2e-3, rtol=3e-3)
 
 
-@pytest.mark.parametrize("bits", range(1, 9))
-def test_nint_packed_backward_and_autograd_match_dequant(bits):
-    torch.manual_seed(1700 + bits)
-    np.random.seed(1700 + bits)
-    out, width, rows = 19, 72, 3
+@pytest.mark.parametrize(
+    "spec",
+    [
+        NintSpec(1, 24, 7),
+        NintSpec(2, 16, 5),
+        NintSpec(3, 24, 5),
+        NintSpec(4, 24, 6),
+        NintSpec(5, 28, 7),
+        NintSpec(6, 24, 7),
+        NintSpec(6, 22, 6),
+        NintSpec(7, 24, 7),
+        NintSpec(8, 48, 7),
+    ],
+)
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
+def test_nint_packed_backward_and_autograd_match_dequant(spec, rows):
+    torch.manual_seed(1700 + spec.bits + spec.groupsize + rows)
+    np.random.seed(1700 + spec.bits + spec.groupsize + rows)
+    out, width = 19, 72
     tensor = nint_quantize(
         np.random.randn(out, width).astype(np.float32) * 0.05,
-        NintSpec(bits, 24, 7),
+        spec,
         axis=0,
     )
     weight = to_gpu(tensor, layout="deploy")
