@@ -7939,7 +7939,7 @@ __global__ void __launch_bounds__(32) nepq_backward_partial_kernel(
         const int8_t * table_pool,
         const uint8_t * bank_ids,
         const __half * output_gradient,
-        float * partials,
+        __half * partials,
         int M,
         int N,
         int K,
@@ -8022,7 +8022,8 @@ __global__ void __launch_bounds__(32) nepq_backward_partial_kernel(
                     const int column = k0 + component;
                     if (column < K) {
                         partials[(static_cast<int64_t>(split) * M + row0 + row) *
-                            K + column] = accumulators[row][component];
+                            K + column] = __float2half_rn(
+                                accumulators[row][component]);
                     }
                 }
             }
@@ -8063,7 +8064,8 @@ void launch_nepq_backward_small_m(
         bank_ids.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(
             output_gradient.data_ptr<mfq_half>()),
-        partials.data_ptr<float>(), M, N, K, ng, nvec, nsign,
+        reinterpret_cast<__half *>(partials.data_ptr<mfq_half>()),
+        M, N, K, ng, nvec, nsign,
         nsuper, table_stride, state_bits, output_tile);
 }
 
@@ -8280,8 +8282,7 @@ mfq_tensor_backend::Tensor nepq_backward_input_cuda(
         const int output_tile = M <= 4 ? 16 : 32;
         const int splits = (N + output_tile - 1) / output_tile;
         auto partials = mfq_tensor_backend::empty(
-            {splits, M, K},
-            neuron_scale.options().dtype(mfq_tensor_backend::kFloat32));
+            {splits, M, K}, output_gradient.options());
         launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {
             constexpr int F = decltype(tag)::value;
             if (M == 1) {
@@ -8310,8 +8311,9 @@ mfq_tensor_backend::Tensor nepq_backward_input_cuda(
                     static_cast<int>(state_bits), output_tile, stream);
             }
         });
-        mfq_packed_backward::launch_split_float_reduce_to_half(
-            partials.data_ptr<float>(),
+        mfq_packed_backward::launch_split_half_reduce_to_half(
+            reinterpret_cast<const __half *>(
+                partials.data_ptr<mfq_half>()),
             reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
             M, K, splits, stream);
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
