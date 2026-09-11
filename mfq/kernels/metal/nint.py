@@ -33,7 +33,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "MFQ's Metal backend requires MLX; install with `pip install -e '.[metal]'`"
     ) from exc
 
-from mfq.formats.nint import NintTensor
+from mfq.formats.nint import NINT_V2_FLAG, NintTensor
 
 _NINT_HEADER = struct.Struct("<BBiii")
 
@@ -2233,6 +2233,11 @@ class MetalNintWeight:
             raise ValueError("NINT group metadata shape mismatch")
         if tensor.neuron_scale.shape != (out,) or tensor.neuron_min.shape != (out,):
             raise ValueError("NINT neuron metadata shape mismatch")
+        if tensor.has_mixed_q_bits:
+            raise NotImplementedError(
+                "the Python Metal compatibility runtime does not execute "
+                "per-neuron q widths; use the C++ Metal runtime for NINTv2"
+            )
 
         bits = int(tensor.spec.bits)
         q_packed = _pack_q5_exec(tensor.q) if bits == 5 else _pack_qbits(tensor.q, bits)
@@ -2256,7 +2261,13 @@ class MetalNintWeight:
 
         if len(blob) < _NINT_HEADER.size:
             raise ValueError("truncated NINT blob")
-        bits, sub_bits, groupsize, axis, neuron_len = _NINT_HEADER.unpack_from(blob, 0)
+        raw_bits, sub_bits, groupsize, axis, neuron_len = _NINT_HEADER.unpack_from(blob, 0)
+        is_nint_v2 = bool(raw_bits & NINT_V2_FLAG)
+        bits = int(raw_bits & ~NINT_V2_FLAG)
+        if is_nint_v2:
+            from mfq.formats.io import unpack_nint
+
+            return cls.from_tensor(unpack_nint(blob))
         offset = _NINT_HEADER.size
         if offset + 4 > len(blob):
             raise ValueError("truncated NINT shape header")
@@ -2283,6 +2294,8 @@ class MetalNintWeight:
         neuron_min = np.frombuffer(blob, dtype="<f2", count=out, offset=offset).astype(np.float32)
         offset += anchors_nbytes
 
+        if not 1 <= int(sub_bits) <= 8:
+            raise ValueError(f"invalid NINT subgroup width {sub_bits}")
         metadata_count = out * groups
         q_count = metadata_count * int(groupsize)
         packed_metadata_nbytes = (metadata_count * int(sub_bits) + 7) // 8

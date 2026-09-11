@@ -29,6 +29,21 @@ def nint_embedding(g: dict, token_ids: torch.Tensor) -> torch.Tensor:
             int(g["gs"]),
         )
     if g.get("sub_scale") is not None:
+        if g.get("mixed_q", False):
+            return ext().nint_embedding_lookup_packed_mixed_q_cuda(
+                g["q_packed"],
+                g["row_q_bits"],
+                g["row_q_bit_offsets"],
+                g["sub_scale"],
+                g["sub_min"],
+                g["neuron_scale"],
+                g["neuron_min"],
+                token_ids.contiguous().to(
+                    device=g["q_packed"].device, dtype=torch.int64
+                ),
+                int(g["neuron_len"]),
+                int(g["gs"]),
+            )
         if int(g.get("bits", 4)) != 4:
             return ext().nint_embedding_lookup_packed_compact_bits_cuda(
                 g["q_packed"],

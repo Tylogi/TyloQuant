@@ -7,7 +7,13 @@ import pytest
 import torch
 from torch import nn
 
-from mfq.calibration.imatrix import ActivationImatrixCollector, ImatrixTarget, _targets
+from mfq.calibration.imatrix import (
+    ActivationImatrixCollector,
+    ImatrixTarget,
+    _backend,
+    _targets,
+)
+from mfq.calibration.layerwise_qwen35 import _create_causal_mask_compat
 
 
 class _Experts(nn.Module):
@@ -144,6 +150,54 @@ class _LinearAttentionLayer(nn.Module):
         self.mixer = _LinearAttention()
 
 
+@pytest.mark.parametrize("model_type", ("qwen3_5_text", "qwen3_5_moe_text"))
+def test_backend_normalizes_text_subconfig_family(monkeypatch, tmp_path, model_type):
+    import transformers
+
+    import mfq.calibration.layerwise_qwen35 as qwen_backend
+
+    sentinel = object()
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text_config=SimpleNamespace(model_type=model_type)
+        ),
+    )
+    monkeypatch.setattr(
+        qwen_backend,
+        "Qwen35LayerwiseBackend",
+        lambda *_args, **_kwargs: sentinel,
+    )
+
+    backend, resolved_type = _backend(tmp_path, torch.device("cpu"), "sdpa")
+
+    assert backend is sentinel
+    assert resolved_type == model_type
+
+
+def test_causal_mask_compat_supports_current_and_legacy_transformers():
+    current_calls = []
+
+    def current(**arguments):
+        current_calls.append(arguments)
+        return "current"
+
+    assert _create_causal_mask_compat(current, value=1) == "current"
+    assert current_calls == [{"value": 1}]
+
+    legacy_calls = []
+
+    def legacy(**arguments):
+        legacy_calls.append(arguments)
+        if "cache_position" not in arguments:
+            raise TypeError("missing required keyword-only argument: 'cache_position'")
+        return "legacy"
+
+    assert _create_causal_mask_compat(legacy, value=2) == "legacy"
+    assert legacy_calls[-1] == {"value": 2, "cache_position": None}
+
+
 def test_targets_discover_fused_experts_without_model_type_branch():
     prefix = "model.language_model.layers.0.moe."
 
@@ -180,6 +234,33 @@ def test_collector_accumulates_dense_second_moment():
     entry = collector.entries()[target.name]
     np.testing.assert_allclose(entry.values, [[5.0, 10.0]])
     np.testing.assert_array_equal(entry.counts, [2])
+
+
+def test_naq_collects_input_channels_and_output_neurons_for_ordinary_linear():
+    target = ImatrixTarget("proj.weight", "proj", 2)
+    layer = nn.Module()
+    layer.proj = nn.Linear(2, 3, bias=False)
+    with torch.no_grad():
+        layer.proj.weight.copy_(
+            torch.tensor([[1.0, 0.0], [0.0, 2.0], [1.0, -1.0]])
+        )
+    value = torch.tensor([[1.0, 2.0], [3.0, -1.0]])
+    collector = ActivationImatrixCollector(
+        (target,),
+        torch.device("cpu"),
+        accumulation_dtype=torch.float64,
+        neural=True,
+    )
+    collector.install_layer(layer, 0, (target,))
+    output = layer.proj(value)
+    collector.close()
+
+    entry = collector.entries()[target.name]
+    expected_neurons = output.square().mean(0)
+    expected_neurons /= expected_neurons.mean()
+    np.testing.assert_allclose(entry.values, value.square().mean(0).numpy()[None, :])
+    np.testing.assert_allclose(entry.row_importance, expected_neurons.detach().numpy())
+    assert collector.naq_categories[target.name] == "linear"
 
 
 def test_collector_accumulates_routed_gate_up_and_down_without_changing_output():
@@ -238,7 +319,7 @@ def test_collector_excludes_right_padding_from_dense_and_routed_statistics():
     np.testing.assert_array_equal(entries[down.name].counts, [2, 2])
 
 
-def test_aaq_uses_compact_nonlinear_energy_for_fused_routed_gate_up():
+def test_naq_uses_activation_corrected_energy_for_fused_routed_gate_up():
     gate = ImatrixTarget("experts.gate_up_proj", "experts", 2, 2, "expert_gate_up")
     down = ImatrixTarget("experts.down_proj", "experts", 1, 2, "expert_down")
     layer = _SiluExpertLayer()
@@ -250,14 +331,14 @@ def test_aaq_uses_compact_nonlinear_energy_for_fused_routed_gate_up():
         (gate, down),
         torch.device("cpu"),
         accumulation_dtype=torch.float64,
-        nonlinear=True,
+        neural=True,
     )
     collector.install_layer(layer, 0, (gate, down))
     actual_output = layer.experts(hidden, selected, weights)
     collector.close()
 
     torch.testing.assert_close(actual_output, expected_output)
-    expected = []
+    expected_rows = []
     for expert in range(2):
         token_idx, top_k_pos = torch.where(selected == expert)
         current = hidden[token_idx]
@@ -269,22 +350,31 @@ def test_aaq_uses_compact_nonlinear_energy_for_fused_routed_gate_up():
         probability = torch.sigmoid(gate_value)
         derivative = probability * (1.0 + gate_value * (1.0 - probability))
         downstream = layer.experts.down_proj[expert].float().square().sum(0)
-        energy = (
-            ((up_value * derivative).square() + activated.square()) * downstream
-        ).sum(-1)
-        energy *= weights[token_idx, top_k_pos].square()
-        nonlinear = (current.square() * energy[:, None]).mean(0)
-        ordinary = current.square().mean(0)
-        nonlinear *= ordinary.mean() / nonlinear.mean()
-        expected.append(nonlinear)
+        route_weight2 = weights[token_idx, top_k_pos].square()[:, None]
+        gate_rows = (
+            (up_value * derivative).square() * downstream * route_weight2
+        ).mean(0)
+        up_rows = (activated.square() * downstream * route_weight2).mean(0)
+        corrected = torch.cat((gate_rows, up_rows))
+        corrected /= corrected.mean()
+        expected_rows.append(corrected)
     entry = collector.entries()[gate.name]
     np.testing.assert_allclose(
-        entry.values, torch.stack(expected).detach().numpy(), rtol=1e-6
+        entry.values,
+        torch.stack(
+            [hidden[torch.where(selected == expert)[0]].square().mean(0) for expert in range(2)]
+        ).numpy(),
+        rtol=1e-6,
+    )
+    np.testing.assert_allclose(
+        entry.row_importance,
+        torch.stack(expected_rows).reshape(-1).detach().numpy(),
+        rtol=1e-6,
     )
     np.testing.assert_array_equal(entry.counts, [3, 3])
 
 
-def test_aaq_uses_silu_derivative_and_downstream_energy_for_dense_ffn_gate():
+def test_naq_uses_silu_and_downstream_energy_for_dense_ffn_gate_and_up():
     targets = (
         ImatrixTarget("mlp.gate_proj.weight", "mlp.gate_proj", 2),
         ImatrixTarget("mlp.up_proj.weight", "mlp.up_proj", 2),
@@ -297,7 +387,7 @@ def test_aaq_uses_silu_derivative_and_downstream_energy_for_dense_ffn_gate():
         targets,
         torch.device("cpu"),
         accumulation_dtype=torch.float64,
-        nonlinear=True,
+        neural=True,
     )
     collector.install_layer(layer, 0, targets)
     actual_output = layer.mlp(value)
@@ -308,17 +398,28 @@ def test_aaq_uses_silu_derivative_and_downstream_energy_for_dense_ffn_gate():
     up = layer.mlp.up_proj(value).float()
     probability = torch.sigmoid(gate)
     derivative = probability * (1.0 + gate * (1.0 - probability))
-    coupled = (up * derivative).square().T @ value.square()
     downstream = layer.mlp.down_proj.weight.float().square().sum(0)
     ordinary = value.square().mean(0)
-    expected = coupled * downstream[:, None] / value.shape[0]
-    expected *= ordinary.mean() / expected.mean()
-    entry = collector.entries()[targets[0].name]
-    np.testing.assert_allclose(entry.values, expected.detach().numpy(), rtol=1e-6)
-    np.testing.assert_array_equal(entry.counts, [3, 3])
+    expected_gate = (up * derivative).square().mean(0) * downstream
+    expected_gate /= expected_gate.mean()
+    expected_up = torch.nn.functional.silu(gate).square().mean(0) * downstream
+    expected_up /= expected_up.mean()
+    entries = collector.entries()
+    for target, expected in (
+        (targets[0], expected_gate),
+        (targets[1], expected_up),
+    ):
+        entry = entries[target.name]
+        np.testing.assert_allclose(
+            entry.values, ordinary.detach().numpy()[None, :], rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            entry.row_importance, expected.detach().numpy(), rtol=1e-6
+        )
+        np.testing.assert_array_equal(entry.counts, [3])
 
 
-def test_aaq_replaces_only_interleaved_attention_gate_rows():
+def test_naq_corrects_only_interleaved_attention_gate_neurons():
     targets = (
         ImatrixTarget("attention.q_proj.weight", "attention.q_proj", 2),
         ImatrixTarget("attention.o_proj.weight", "attention.o_proj", 2),
@@ -330,7 +431,7 @@ def test_aaq_replaces_only_interleaved_attention_gate_rows():
         targets,
         torch.device("cpu"),
         accumulation_dtype=torch.float64,
-        nonlinear=True,
+        neural=True,
     )
     collector.install_layer(layer, 0, targets)
     actual_output = layer.attention(value)
@@ -343,18 +444,18 @@ def test_aaq_replaces_only_interleaved_attention_gate_rows():
     gated = attended.reshape(-1, 2).float() * torch.sigmoid(gate)
     sensitivity = gated * (1.0 - torch.sigmoid(gate))
     ordinary = value.square().mean(0)
-    coupled = sensitivity.square().T @ value.square()
     downstream = layer.attention.o_proj.weight.float().square().sum(0)
-    expected_gate = coupled * downstream[:, None] / value.shape[0]
-    expected_gate *= ordinary.mean() / expected_gate.mean()
-    expected = ordinary.expand(4, -1).clone()
+    expected_gate = sensitivity.square().mean(0) * downstream
+    expected = layer.attention.q_proj(value).float().square().mean(0)
     expected[[1, 3]] = expected_gate
+    expected /= expected.mean()
     entry = collector.entries()[targets[0].name]
-    np.testing.assert_allclose(entry.values, expected.detach().numpy(), rtol=1e-6)
-    np.testing.assert_array_equal(entry.counts, [3, 3, 3, 3])
+    np.testing.assert_allclose(entry.values, ordinary.detach().numpy()[None, :], rtol=1e-6)
+    np.testing.assert_allclose(entry.row_importance, expected.detach().numpy(), rtol=1e-6)
+    np.testing.assert_array_equal(entry.counts, [3])
 
 
-def test_aaq_uses_gated_norm_activation_energy_for_linear_attention_gate():
+def test_naq_uses_gated_norm_activation_energy_for_linear_attention_gate():
     targets = (
         ImatrixTarget("mixer.in_proj_z.weight", "mixer.in_proj_z", 2),
         ImatrixTarget("mixer.out_proj.weight", "mixer.out_proj", 2),
@@ -366,7 +467,7 @@ def test_aaq_uses_gated_norm_activation_energy_for_linear_attention_gate():
         targets,
         torch.device("cpu"),
         accumulation_dtype=torch.float64,
-        nonlinear=True,
+        neural=True,
     )
     collector.install_layer(layer, 0, targets)
     actual_output = layer.mixer(value)
@@ -382,14 +483,14 @@ def test_aaq_uses_gated_norm_activation_energy_for_linear_attention_gate():
     probability = torch.sigmoid(gate)
     derivative = probability * (1.0 + gate * (1.0 - probability))
     sensitivity = (normalized * derivative).reshape(-1, 2)
-    coupled = sensitivity.square().T @ value.square()
     downstream = layer.mixer.out_proj.weight.float().square().sum(0)
     ordinary = value.square().mean(0)
-    expected = coupled * downstream[:, None] / value.shape[0]
-    expected *= ordinary.mean() / expected.mean()
+    expected = sensitivity.square().mean(0) * downstream
+    expected /= expected.mean()
     entry = collector.entries()[targets[0].name]
-    np.testing.assert_allclose(entry.values, expected.detach().numpy(), rtol=1e-6)
-    np.testing.assert_array_equal(entry.counts, [3, 3])
+    np.testing.assert_allclose(entry.values, ordinary.detach().numpy()[None, :], rtol=1e-6)
+    np.testing.assert_allclose(entry.row_importance, expected.detach().numpy(), rtol=1e-6)
+    np.testing.assert_array_equal(entry.counts, [3])
 
 
 @pytest.mark.parametrize(
@@ -432,11 +533,30 @@ def test_cli_dispatches_same_imatrix_collector_for_cuda_and_metal(
         work_dir="",
         keep_hidden=False,
         accumulation_dtype="auto",
-        objective="aaq",
+        objective="naq",
     )
 
     assert _calibrate_imatrix(args) == 0
     assert received["corpus"] is corpus
     assert received["device"] == device
     assert received["accumulation_dtype"] == accumulation_dtype
-    assert received["objective"] == "aaq"
+    assert received["objective"] == "naq"
+
+
+def test_cli_defaults_to_naq_imatrix():
+    from mfq.cli import _build_parser
+
+    args = _build_parser().parse_args(
+        [
+            "calibrate",
+            "imatrix",
+            "--model",
+            "model",
+            "--corpus",
+            "corpus",
+            "--output",
+            "output.imatrix",
+        ]
+    )
+
+    assert args.objective == "naq"

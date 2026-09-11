@@ -108,7 +108,18 @@ class SourceSegment:
     nbytes: int
 
 
-Segment = LiteralSegment | SourceSegment
+@dataclass(frozen=True)
+class BitRangesSegment:
+    source: str
+    ranges: tuple[tuple[int, int], ...]
+    bit_count: int
+
+    @property
+    def nbytes(self) -> int:
+        return (self.bit_count + 7) // 8
+
+
+Segment = LiteralSegment | SourceSegment | BitRangesSegment
 
 
 @dataclass(frozen=True)
@@ -369,6 +380,20 @@ def _source(source: str, offset: int, nbytes: int) -> SourceSegment:
     return SourceSegment(source, int(offset), int(nbytes))
 
 
+def _bit_ranges(
+    source: str,
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+) -> BitRangesSegment:
+    normalized = tuple((int(offset), int(count)) for offset, count in ranges if count)
+    if any(offset < 0 or count < 0 for offset, count in normalized):
+        raise ValueError("negative packed-bit source range")
+    return BitRangesSegment(
+        source,
+        normalized,
+        sum(count for _, count in normalized),
+    )
+
+
 def _sum_segments(segments: list[Segment] | tuple[Segment, ...]) -> int:
     return sum(segment.nbytes for segment in segments)
 
@@ -401,7 +426,11 @@ def _subset_nint_payload(
     neuron_len: int,
 ) -> tuple[tuple[Segment, ...], int]:
     prefix = _read_exact(handle, pool.payload_offset, _NINT_HDR.size + 4)
-    bits, sub_bits, groupsize, axis, payload_neuron_len = _NINT_HDR.unpack_from(prefix, 0)
+    raw_bits, sub_bits, groupsize, axis, payload_neuron_len = _NINT_HDR.unpack_from(
+        prefix, 0
+    )
+    is_nint_v2 = bool(raw_bits & 0x80)
+    bits = int(raw_bits & 0x7F)
     ndim = _U32.unpack_from(prefix, _NINT_HDR.size)[0]
     header_nbytes = _NINT_HDR.size + 4 + int(ndim) * 8 + 8
     header = _read_exact(handle, pool.payload_offset, header_nbytes)
@@ -422,19 +451,156 @@ def _subset_nint_payload(
         raise ValueError(f"unsupported sliced NINT pool layout: {pool.dtype}")
 
     anchors_per_expert = rows_per_expert * 2
-    sub_bits_per_expert = rows_per_expert * groups * sub_bits
-    q_bits_per_expert = rows_per_expert * groups * groupsize * bits
-    if sub_bits_per_expert % 8 or q_bits_per_expert % 8:
-        raise ValueError(f"{pool.dtype} expert streams are not byte-aligned for structural slicing")
-    sub_per_expert = sub_bits_per_expert // 8
-    q_per_expert = q_bits_per_expert // 8
     stream_offset = pool.payload_offset + header_nbytes
     anchors_offset = stream_offset
     minimum_offset = anchors_offset + int(out) * 2
-    sub_scale_offset = minimum_offset + int(out) * 2
-    sub_min_offset = sub_scale_offset + (int(out) * int(groups) * sub_bits + 7) // 8
-    q_offset = sub_min_offset + (int(out) * int(groups) * sub_bits + 7) // 8
-    payload_end = q_offset + (int(out) * int(groups) * int(groupsize) * bits + 7) // 8
+    metadata_offset = minimum_offset + int(out) * 2
+    payload_segments: list[Segment] = []
+    selected_set = set(selected_positions)
+    if is_nint_v2:
+        selector_bits = 2
+        selector_nbytes = (int(out) * selector_bits + 7) // 8
+        selector_offset = metadata_offset
+        selector_payload = _read_exact(handle, selector_offset, selector_nbytes)
+        cohort_counts = [0, 0, 0, 0]
+        selected_starts: dict[tuple[int, int], int] = {}
+        selected_counts: dict[tuple[int, int], int] = {}
+        for row in range(int(out)):
+            selector = (selector_payload[row // 4] >> ((row & 3) * 2)) & 0x03
+            expert = row // rows_per_expert
+            if expert in selected_set:
+                key = (expert, selector)
+                selected_starts.setdefault(key, cohort_counts[selector])
+                selected_counts[key] = selected_counts.get(key, 0) + 1
+            cohort_counts[selector] += 1
+
+        selector_ranges = [
+            (
+                selector_offset * 8 + position * rows_per_expert * selector_bits,
+                rows_per_expert * selector_bits,
+            )
+            for position in selected_positions
+        ]
+        payload_segments.append(_bit_ranges(pool.source, selector_ranges))
+        cursor = selector_offset + selector_nbytes
+        for selector in range(4):
+            row_bits = sub_bits - 1 + selector
+            source_rows = cohort_counts[selector]
+            if source_rows and not (1 <= row_bits <= 8):
+                raise ValueError(f"invalid NINT v2 subgroup width {row_bits}")
+            stream_nbytes = (source_rows * int(groups) * row_bits + 7) // 8
+            sub_scale_offset = cursor
+            sub_min_offset = sub_scale_offset + stream_nbytes
+            ranges = []
+            for position in selected_positions:
+                count = selected_counts.get((position, selector), 0)
+                if not count:
+                    continue
+                start = selected_starts[(position, selector)]
+                ranges.append(
+                    (
+                        start * int(groups) * row_bits,
+                        count * int(groups) * row_bits,
+                    )
+                )
+            if ranges:
+                payload_segments.append(
+                    _bit_ranges(
+                        pool.source,
+                        [
+                            (sub_scale_offset * 8 + offset, count)
+                            for offset, count in ranges
+                        ],
+                    )
+                )
+                payload_segments.append(
+                    _bit_ranges(
+                        pool.source,
+                        [
+                            (sub_min_offset * 8 + offset, count)
+                            for offset, count in ranges
+                        ],
+                    )
+                )
+            cursor = sub_min_offset + stream_nbytes
+
+        q_selector_bits = 3
+        q_selector_nbytes = (int(out) * q_selector_bits + 7) // 8
+        q_selector_offset = cursor
+        q_selector_payload = _read_exact(
+            handle, q_selector_offset, q_selector_nbytes
+        )
+        q_cohort_counts = [0] * 8
+        q_selected_starts: dict[tuple[int, int], int] = {}
+        q_selected_counts: dict[tuple[int, int], int] = {}
+        for row in range(int(out)):
+            bit_offset = row * q_selector_bits
+            byte_offset, shift = divmod(bit_offset, 8)
+            packed = int(q_selector_payload[byte_offset])
+            if shift + q_selector_bits > 8:
+                packed |= int(q_selector_payload[byte_offset + 1]) << 8
+            selector = (packed >> shift) & 0x07
+            expert = row // rows_per_expert
+            if expert in selected_set:
+                key = (expert, selector)
+                q_selected_starts.setdefault(key, q_cohort_counts[selector])
+                q_selected_counts[key] = q_selected_counts.get(key, 0) + 1
+            q_cohort_counts[selector] += 1
+
+        payload_segments.append(
+            _bit_ranges(
+                pool.source,
+                [
+                    (
+                        q_selector_offset * 8
+                        + position * rows_per_expert * q_selector_bits,
+                        rows_per_expert * q_selector_bits,
+                    )
+                    for position in selected_positions
+                ],
+            )
+        )
+        cursor = q_selector_offset + q_selector_nbytes
+        values_per_row = int(groups) * int(groupsize)
+        for selector in range(8):
+            row_bits = selector + 1
+            source_rows = q_cohort_counts[selector]
+            stream_nbytes = (source_rows * values_per_row * row_bits + 7) // 8
+            ranges = []
+            for position in selected_positions:
+                count = q_selected_counts.get((position, selector), 0)
+                if not count:
+                    continue
+                start = q_selected_starts[(position, selector)]
+                ranges.append(
+                    (
+                        cursor * 8 + start * values_per_row * row_bits,
+                        count * values_per_row * row_bits,
+                    )
+                )
+            if ranges:
+                payload_segments.append(_bit_ranges(pool.source, ranges))
+            cursor += stream_nbytes
+        payload_end = cursor
+    else:
+        sub_bits_per_expert = rows_per_expert * groups * sub_bits
+        if sub_bits_per_expert % 8:
+            raise ValueError(
+                f"{pool.dtype} expert metadata is not byte-aligned for structural slicing"
+            )
+        sub_per_expert = sub_bits_per_expert // 8
+        sub_scale_offset = metadata_offset
+        sub_min_offset = sub_scale_offset + (int(out) * int(groups) * sub_bits + 7) // 8
+        q_offset = sub_min_offset + (int(out) * int(groups) * sub_bits + 7) // 8
+        q_bits_per_expert = rows_per_expert * groups * groupsize * bits
+        if q_bits_per_expert % 8:
+            raise ValueError(
+                f"{pool.dtype} expert streams are not byte-aligned for structural slicing"
+            )
+        q_per_expert = q_bits_per_expert // 8
+        payload_end = q_offset + (
+            int(out) * int(groups) * int(groupsize) * bits + 7
+        ) // 8
     if payload_end != pool.payload_offset + pool.payload_nbytes:
         raise ValueError(f"{pool.dtype} payload size does not match its metadata")
 
@@ -443,25 +609,39 @@ def _subset_nint_payload(
     new_shape = [new_out, neuron_len]
     new_header = b"".join(
         [
-            _NINT_HDR.pack(bits, sub_bits, groupsize, axis, payload_neuron_len),
+            _NINT_HDR.pack(raw_bits, sub_bits, groupsize, axis, payload_neuron_len),
             _U32.pack(int(ndim)),
             struct.pack(f"<{int(ndim)}q", *new_shape),
             struct.pack("<II", new_out, groups),
         ]
     )
     segments: list[Segment] = [_literal(new_header)]
-    for offset, stride in (
-        (anchors_offset, anchors_per_expert),
-        (minimum_offset, anchors_per_expert),
-        (sub_scale_offset, sub_per_expert),
-        (sub_min_offset, sub_per_expert),
-        (q_offset, q_per_expert),
-    ):
+    for offset in (anchors_offset, minimum_offset):
         segments.extend(
             _selected_stream_segments(
                 source=pool.source,
                 stream_offset=offset,
-                bytes_per_expert=stride,
+                bytes_per_expert=anchors_per_expert,
+                selected_positions=selected_positions,
+            )
+        )
+    if is_nint_v2:
+        segments.extend(payload_segments)
+    else:
+        for offset in (sub_scale_offset, sub_min_offset):
+            segments.extend(
+                _selected_stream_segments(
+                    source=pool.source,
+                    stream_offset=offset,
+                    bytes_per_expert=sub_per_expert,
+                    selected_positions=selected_positions,
+                )
+            )
+        segments.extend(
+            _selected_stream_segments(
+                source=pool.source,
+                stream_offset=q_offset,
+                bytes_per_expert=q_per_expert,
                 selected_positions=selected_positions,
             )
         )
@@ -1199,6 +1379,80 @@ def plan_manifest(
     }
 
 
+def _stream_bit_ranges(
+    segment: BitRangesSegment,
+    source: BinaryIO,
+    output: BinaryIO,
+    *,
+    relative_start: int,
+    relative_end: int,
+    chunk_bytes: int,
+) -> int:
+    requested = relative_end - relative_start
+    if requested <= 0:
+        return 0
+    start_bit = relative_start * 8
+    end_bit = min(relative_end * 8, segment.bit_count)
+    max_source_bytes = max(1, min(int(chunk_bytes), 1 << 20))
+    carry = 0
+    carry_bits = 0
+    written = 0
+
+    logical_bit = 0
+    for source_bit, bit_count in segment.ranges:
+        range_end = logical_bit + bit_count
+        if range_end <= start_bit:
+            logical_bit = range_end
+            continue
+        if logical_bit >= end_bit:
+            break
+        overlap_start = max(start_bit, logical_bit)
+        overlap_end = min(end_bit, range_end)
+        read_bit = source_bit + (overlap_start - logical_bit)
+        remaining_bits = overlap_end - overlap_start
+        while remaining_bits:
+            shift = read_bit & 7
+            take_bits = min(
+                remaining_bits,
+                max_source_bytes * 8 - shift,
+            )
+            byte_offset = read_bit // 8
+            read_nbytes = (shift + take_bits + 7) // 8
+            source.seek(byte_offset)
+            raw = source.read(read_nbytes)
+            if len(raw) != read_nbytes:
+                raise ValueError(
+                    f"truncated {segment.source} packed-bit source at {byte_offset}"
+                )
+            value = int.from_bytes(raw, "little") >> shift
+            value &= (1 << take_bits) - 1
+            combined = carry | (value << carry_bits)
+            total_bits = carry_bits + take_bits
+            emit_nbytes = total_bits // 8
+            if emit_nbytes:
+                encoded = combined.to_bytes((total_bits + 7) // 8, "little")
+                output.write(encoded[:emit_nbytes])
+                written += emit_nbytes
+                combined >>= emit_nbytes * 8
+            carry = combined
+            carry_bits = total_bits - emit_nbytes * 8
+            read_bit += take_bits
+            remaining_bits -= take_bits
+        logical_bit = range_end
+
+    if carry_bits:
+        output.write(bytes((carry & 0xFF,)))
+        written += 1
+    if written < requested:
+        output.write(b"\0" * (requested - written))
+        written = requested
+    if written != requested:
+        raise RuntimeError(
+            f"packed-bit materializer wrote {written} bytes, expected {requested}"
+        )
+    return written
+
+
 def _stream_plan(
     plan: MaterializationPlan,
     sources: dict[str, BinaryIO],
@@ -1234,7 +1488,7 @@ def _stream_plan(
         if isinstance(segment, LiteralSegment):
             output.write(segment.data[relative_start:relative_end])
             written += nbytes
-        else:
+        elif isinstance(segment, SourceSegment):
             source = sources[segment.source]
             source.seek(segment.offset + relative_start)
             remaining = nbytes
@@ -1259,6 +1513,15 @@ def _stream_plan(
                         flush=True,
                     )
                     next_progress += progress_bytes
+        else:
+            written += _stream_bit_ranges(
+                segment,
+                sources[segment.source],
+                output,
+                relative_start=relative_start,
+                relative_end=relative_end,
+                chunk_bytes=chunk_bytes,
+            )
         logical_offset = segment_end
     if written != target:
         raise RuntimeError(f"materializer wrote {written} bytes, expected {target}")

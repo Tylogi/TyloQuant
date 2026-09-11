@@ -13,7 +13,9 @@ Per-group scale/minimum values are searched by weighted least squares (:func:`ma
 as llama.cpp K-quant. Neuron anchoring exploits per-neuron magnitude structure and measures about 0.5 dB higher than
 superblock-anchored Q4_K at equal bpw on real LLM weights (INT4/gs=24/k=6 -> 23.4 dB at 4.5 bpw).
 
-Theoretical bpw = bits + 32/neuron_len + 2*sub_bits/groupsize
+Theoretical bpw = mean(bits) + 32/neuron_len + 2*mean(sub_bits)/groupsize.
+NINTv2 may assign both primary-code width ``q`` and subgroup-metadata width
+``k`` per neuron while retaining one logical tensor and one runtime dispatch.
 """
 
 from __future__ import annotations
@@ -21,6 +23,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+
+NINT_V2_FLAG = 0x80
+NINT_V2_K_SELECTOR_BITS = 2
+NINT_V2_Q_SELECTOR_BITS = 3
 
 
 @dataclass(frozen=True)
@@ -66,6 +72,104 @@ class NintTensor:
     sub_scale: np.ndarray       # (out, ng) uint
     sub_min: np.ndarray         # (out, ng) uint
     neuron_len: int             # Valid length of each neuron, excluding padding
+    row_sub_bits: np.ndarray | None = None  # (out,) uint8; None means spec.sub_bits for every row
+    row_q_bits: np.ndarray | None = None    # (out,) uint8; None means spec.bits for every row
+
+    @property
+    def has_mixed_sub_bits(self) -> bool:
+        if self.row_sub_bits is None:
+            return False
+        values = np.asarray(self.row_sub_bits).reshape(-1)
+        return bool(np.any(values != int(self.spec.sub_bits)))
+
+    @property
+    def mean_sub_bits(self) -> float:
+        if self.row_sub_bits is None:
+            return float(self.spec.sub_bits)
+        return float(np.asarray(self.row_sub_bits, dtype=np.float64).mean())
+
+    @property
+    def has_mixed_q_bits(self) -> bool:
+        if self.row_q_bits is None:
+            return False
+        values = np.asarray(self.row_q_bits).reshape(-1)
+        return bool(np.any(values != int(self.spec.bits)))
+
+    @property
+    def mean_q_bits(self) -> float:
+        if self.row_q_bits is None:
+            return float(self.spec.bits)
+        return float(np.asarray(self.row_q_bits, dtype=np.float64).mean())
+
+    @property
+    def is_nint_v2(self) -> bool:
+        return self.row_q_bits is not None or self.row_sub_bits is not None
+
+    def bpw(self) -> float:
+        selector_bits = (
+            (NINT_V2_K_SELECTOR_BITS + NINT_V2_Q_SELECTOR_BITS)
+            / float(self.neuron_len)
+            if self.is_nint_v2
+            else 0.0
+        )
+        return (
+            self.mean_q_bits
+            + 32.0 / float(self.neuron_len)
+            + 2.0 * self.mean_sub_bits / float(self.spec.groupsize)
+            + selector_bits
+        )
+
+
+def normalize_row_q_bits(
+    spec: NintSpec,
+    row_q_bits: np.ndarray | None,
+    rows: int,
+) -> np.ndarray:
+    """Return validated per-neuron primary value-code widths."""
+
+    nominal = int(spec.bits)
+    if not 1 <= nominal <= 8:
+        raise ValueError("NINT bits must be in [1, 8]")
+    if rows <= 0:
+        raise ValueError("NINT tensors must contain at least one neuron")
+    if row_q_bits is None:
+        return np.full(rows, nominal, dtype=np.uint8)
+    source = np.asarray(row_q_bits)
+    if source.shape != (rows,) or not np.issubdtype(source.dtype, np.integer):
+        raise ValueError(f"NINT row_q_bits must be an integer vector of shape {(rows,)}")
+    values = np.ascontiguousarray(source, dtype=np.int16)
+    if np.any(values < 1) or np.any(values > 8):
+        raise ValueError("NINT row_q_bits values must be in [1, 8]")
+    return values.astype(np.uint8)
+
+
+def normalize_row_sub_bits(
+    spec: NintSpec,
+    row_sub_bits: np.ndarray | None,
+    rows: int,
+) -> np.ndarray:
+    """Return validated per-neuron metadata widths for the NINTv2 selector range."""
+
+    nominal = int(spec.sub_bits)
+    if not 1 <= nominal <= 8:
+        raise ValueError("NINT sub_bits must be in [1, 8]")
+    if rows <= 0:
+        raise ValueError("NINT tensors must contain at least one neuron")
+    if row_sub_bits is None:
+        return np.full(rows, nominal, dtype=np.uint8)
+    source = np.asarray(row_sub_bits)
+    if source.shape != (rows,) or not np.issubdtype(source.dtype, np.integer):
+        raise ValueError(f"NINT row_sub_bits must be an integer vector of shape {(rows,)}")
+    values = np.ascontiguousarray(source, dtype=np.int16)
+    if np.any(values < 1) or np.any(values > 8):
+        raise ValueError("NINT row_sub_bits values must be in [1, 8]")
+    selector = values - (nominal - 1)
+    if np.any(selector < 0) or np.any(selector >= (1 << NINT_V2_K_SELECTOR_BITS)):
+        raise ValueError(
+            "NINTv2 row_sub_bits must lie in "
+            f"[{nominal - 1}, {nominal + 2}] for nominal sub_bits={nominal}"
+        )
+    return values.astype(np.uint8)
 
 
 # Fixed point from the three-dimensional Pareto search on 2026-07-26:

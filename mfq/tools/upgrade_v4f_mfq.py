@@ -493,6 +493,16 @@ def _subset_pool_tensor(
                 experts=pool_experts,
                 rows_per_expert=rows_per_expert,
             ),
+            row_sub_bits=(
+                None
+                if tensor.row_sub_bits is None
+                else _subset_flat_rows(
+                    tensor.row_sub_bits,
+                    positions,
+                    experts=pool_experts,
+                    rows_per_expert=rows_per_expert,
+                )
+            ),
         )
     raise TypeError(f"unsupported V4F base pool type: {type(tensor)!r}")
 

@@ -314,6 +314,16 @@ mfq_tensor_backend::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
     mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor counts,
     mfq_tensor_backend::Tensor cursors, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
     mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_pool_mixed_q_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,
+    mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor ids,
+    mfq_tensor_backend::Tensor expert_local, int64_t n_experts,
+    int64_t n_local_experts, int64_t out_per_expert, int64_t gs,
+    bool input_quantized, mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 mfq_tensor_backend::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor expert_local, int64_t n_experts,
@@ -427,6 +437,12 @@ mfq_tensor_backend::Tensor nint_embedding_lookup_packed_compact_bits_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len, int64_t gs, int64_t bits);
+mfq_tensor_backend::Tensor nint_embedding_lookup_packed_mixed_q_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,
+    mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor token_ids, int64_t neuron_len, int64_t gs);
 mfq_tensor_backend::Tensor nint8_zero_embedding_lookup_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len);
@@ -513,6 +529,14 @@ mfq_tensor_backend::Tensor nint_gemv_packed_bits_ws_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
     int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_mixed_q_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,
+    mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor x, int64_t gs,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale,
+    mfq_tensor_backend::Tensor xsum);
 mfq_tensor_backend::Tensor nint_gemv_packed_int6_ws_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
@@ -596,6 +620,12 @@ mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_cuda(
 mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_bits_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t neuron_len, int64_t gs, int64_t bits);
+mfq_tensor_backend::Tensor nint_dequant_full_packed_mixed_q_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,
+    mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    int64_t neuron_len, int64_t gs);
 mfq_tensor_backend::Tensor nint_cublas_gemm_nt_f32acc_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor w);
 mfq_tensor_backend::Tensor mxfp8_dequant_cuda(
     mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales);
@@ -1736,6 +1766,16 @@ static std::string read_str(std::istream & is) {
 }
 
 static std::vector<uint8_t> unpack_bits(const std::vector<uint8_t> & blob, size_t & off, size_t count, int bits) {
+    if (bits < 1 || bits > 8 ||
+            count > (std::numeric_limits<size_t>::max() - 7) /
+                static_cast<size_t>(bits)) {
+        throw std::runtime_error("invalid packed-bit stream dimensions");
+    }
+    const size_t required =
+        (count * static_cast<size_t>(bits) + 7) / 8;
+    if (off > blob.size() || required > blob.size() - off) {
+        throw std::runtime_error("truncated packed-bit stream");
+    }
     std::vector<uint8_t> out(count);
     if (bits == 8) {
         std::copy(blob.begin() + (ptrdiff_t)off, blob.begin() + (ptrdiff_t)(off + count), out.begin());
@@ -2191,7 +2231,10 @@ struct NintCpu {
     int out = 0;
     int ng = 0;
     int qbytes = 0;
+    bool mixed_q = false;
     std::vector<uint8_t> q_packed;
+    std::vector<uint8_t> row_q_bits;
+    std::vector<int64_t> row_q_bit_offsets;
     std::vector<uint8_t> sub_scale;
     std::vector<uint8_t> sub_min;
     std::vector<uint16_t> neuron_scale_h;
@@ -2199,18 +2242,60 @@ struct NintCpu {
 };
 
 static NintCpu unpack_nint(const std::vector<uint8_t> & blob) {
+    constexpr size_t fixed_header_nbytes = 2 + 3 * sizeof(int32_t) + sizeof(uint32_t);
+    if (blob.size() < fixed_header_nbytes) {
+        throw std::runtime_error("truncated NINT header");
+    }
     NintCpu t;
     size_t off = 0;
-    t.bits = blob[off++];
+    const int raw_bits = blob[off++];
+    const bool is_nint_v2 = (raw_bits & 0x80) != 0;
+    t.mixed_q = is_nint_v2;
+    t.bits = raw_bits & 0x7f;
     t.sub_bits = blob[off++];
     t.gs = read_i32_from(blob, off);
     t.axis = read_i32_from(blob, off);
     t.neuron_len = read_i32_from(blob, off);
     uint32_t ndim = read_u32_from(blob, off);
+    if (t.bits < 1 || t.bits > 8 || t.sub_bits < 1 || t.sub_bits > 8 ||
+            t.gs <= 0 || t.axis < 0 || t.neuron_len <= 0 ||
+            ndim == 0 || t.axis >= static_cast<int>(ndim) ||
+            ndim > (blob.size() - off) / sizeof(int64_t)) {
+        throw std::runtime_error("invalid NINT header");
+    }
+    const size_t shape_and_counts =
+        static_cast<size_t>(ndim) * sizeof(int64_t) + 2 * sizeof(uint32_t);
+    if (shape_and_counts > blob.size() - off) {
+        throw std::runtime_error("truncated NINT dimensions");
+    }
     t.shape.resize(ndim);
     for (uint32_t i = 0; i < ndim; ++i) t.shape[i] = read_i64_from(blob, off);
     t.out = (int)read_u32_from(blob, off);
     t.ng = (int)read_u32_from(blob, off);
+    int64_t flattened_neuron_len = 1;
+    for (uint32_t index = 0; index < ndim; ++index) {
+        if (t.shape[index] <= 0 ||
+                (static_cast<int>(index) != t.axis &&
+                 flattened_neuron_len >
+                    std::numeric_limits<int64_t>::max() / t.shape[index])) {
+            throw std::runtime_error("invalid NINT tensor shape");
+        }
+        if (static_cast<int>(index) != t.axis) {
+            flattened_neuron_len *= t.shape[index];
+        }
+    }
+    const int64_t expected_groups =
+        (static_cast<int64_t>(t.neuron_len) + t.gs - 1) / t.gs;
+    if (t.out <= 0 || t.ng <= 0 ||
+            t.shape[static_cast<size_t>(t.axis)] != t.out ||
+            flattened_neuron_len != t.neuron_len ||
+            expected_groups != t.ng) {
+        throw std::runtime_error("inconsistent NINT tensor dimensions");
+    }
+    const size_t anchor_nbytes = static_cast<size_t>(t.out) * 2;
+    if (anchor_nbytes > (blob.size() - off) / 2) {
+        throw std::runtime_error("truncated NINT neuron metadata");
+    }
     t.neuron_scale_h.resize(t.out);
     std::memcpy(t.neuron_scale_h.data(), blob.data() + off, (size_t)t.out * 2);
     off += (size_t)t.out * 2;
@@ -2223,29 +2308,145 @@ static NintCpu unpack_nint(const std::vector<uint8_t> & blob) {
             throw std::runtime_error("NINT neuron metadata must be finite");
         }
     }
-    size_t sub_count = (size_t)t.out * t.ng;
-    size_t q_count = sub_count * (size_t)t.gs;
-    t.sub_scale = unpack_bits(blob, off, sub_count, t.sub_bits);
-    t.sub_min = unpack_bits(blob, off, sub_count, t.sub_bits);
-    t.qbytes = (t.gs * t.bits + 7) / 8;
-    size_t compact_q_nbytes = (q_count * (size_t)t.bits + 7) / 8;
-    size_t row_bits = (size_t)t.gs * t.bits;
-    size_t nrows = (size_t)t.out * t.ng;
-    if ((row_bits & 7u) == 0) {
-        t.q_packed.resize(compact_q_nbytes);
-        std::memcpy(t.q_packed.data(), blob.data() + off, compact_q_nbytes);
-    } else {
-        t.q_packed.assign(nrows * (size_t)t.qbytes, 0);
-        for (size_t row = 0; row < nrows; ++row) {
-            size_t src_bit0 = row * row_bits;
-            size_t dst_byte0 = row * (size_t)t.qbytes;
-            for (size_t bit = 0; bit < row_bits; ++bit) {
-                uint8_t v = (blob[off + (src_bit0 + bit) / 8] >> ((src_bit0 + bit) & 7)) & 1u;
-                if (v) t.q_packed[dst_byte0 + bit / 8] |= (uint8_t)(1u << (bit & 7));
+    if (static_cast<size_t>(t.out) >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(t.ng)) {
+        throw std::runtime_error("NINT metadata size overflow");
+    }
+    size_t sub_count = static_cast<size_t>(t.out) * static_cast<size_t>(t.ng);
+    if (sub_count >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(t.gs)) {
+        throw std::runtime_error("NINT value size overflow");
+    }
+    size_t q_count = sub_count * static_cast<size_t>(t.gs);
+    if (is_nint_v2) {
+        constexpr int selector_bits = 2;
+        const auto selectors = unpack_bits(
+            blob, off, static_cast<size_t>(t.out), selector_bits);
+        t.sub_scale.resize(sub_count);
+        t.sub_min.resize(sub_count);
+        for (int selector = 0; selector < (1 << selector_bits); ++selector) {
+            const int row_bits = t.sub_bits - 1 + selector;
+            const size_t selected_rows = static_cast<size_t>(std::count(
+                selectors.begin(), selectors.end(), static_cast<uint8_t>(selector)));
+            if (selected_rows == 0) continue;
+            if (row_bits < 1 || row_bits > 8) {
+                throw std::runtime_error("invalid NINT v2 subgroup width");
+            }
+            const size_t selected_values = selected_rows * static_cast<size_t>(t.ng);
+            const auto scales = unpack_bits(blob, off, selected_values, row_bits);
+            const auto minima = unpack_bits(blob, off, selected_values, row_bits);
+            size_t local_row = 0;
+            for (size_t row = 0; row < static_cast<size_t>(t.out); ++row) {
+                if (selectors[row] != static_cast<uint8_t>(selector)) continue;
+                const size_t source = local_row * static_cast<size_t>(t.ng);
+                const size_t destination = row * static_cast<size_t>(t.ng);
+                std::copy_n(
+                    scales.begin() + static_cast<ptrdiff_t>(source),
+                    t.ng,
+                    t.sub_scale.begin() + static_cast<ptrdiff_t>(destination));
+                std::copy_n(
+                    minima.begin() + static_cast<ptrdiff_t>(source),
+                    t.ng,
+                    t.sub_min.begin() + static_cast<ptrdiff_t>(destination));
+                ++local_row;
             }
         }
+    } else {
+        t.sub_scale = unpack_bits(blob, off, sub_count, t.sub_bits);
+        t.sub_min = unpack_bits(blob, off, sub_count, t.sub_bits);
     }
-    off += compact_q_nbytes;
+    if (t.mixed_q) {
+        constexpr int selector_bits = 3;
+        const auto selectors = unpack_bits(
+            blob, off, static_cast<size_t>(t.out), selector_bits);
+        t.row_q_bits.resize(static_cast<size_t>(t.out));
+        t.row_q_bit_offsets.resize(static_cast<size_t>(t.out));
+        const size_t values_per_row =
+            static_cast<size_t>(t.ng) * static_cast<size_t>(t.gs);
+        for (int selector = 0; selector < (1 << selector_bits); ++selector) {
+            const int row_bits = selector + 1;
+            const size_t selected_rows = static_cast<size_t>(std::count(
+                selectors.begin(), selectors.end(), static_cast<uint8_t>(selector)));
+            if (selected_rows == 0) continue;
+            if (values_per_row > std::numeric_limits<size_t>::max() / selected_rows) {
+                throw std::runtime_error("NINT mixed-q value count overflow");
+            }
+            const size_t selected_values = selected_rows * values_per_row;
+            if (selected_values >
+                    (std::numeric_limits<size_t>::max() - 7) /
+                        static_cast<size_t>(row_bits)) {
+                throw std::runtime_error("NINT mixed-q packed size overflow");
+            }
+            const size_t stream_nbytes =
+                (selected_values * static_cast<size_t>(row_bits) + 7) / 8;
+            if (off > blob.size() || stream_nbytes > blob.size() - off) {
+                throw std::runtime_error("truncated NINT mixed-q value stream");
+            }
+            const uint64_t cohort_start_bits =
+                static_cast<uint64_t>(t.q_packed.size()) * 8u;
+            t.q_packed.insert(
+                t.q_packed.end(),
+                blob.begin() + static_cast<ptrdiff_t>(off),
+                blob.begin() + static_cast<ptrdiff_t>(off + stream_nbytes));
+            off += stream_nbytes;
+            size_t local_row = 0;
+            const uint64_t packed_row_bits =
+                static_cast<uint64_t>(values_per_row) *
+                static_cast<uint64_t>(row_bits);
+            for (size_t row = 0; row < static_cast<size_t>(t.out); ++row) {
+                if (selectors[row] != static_cast<uint8_t>(selector)) continue;
+                const uint64_t bit_offset = cohort_start_bits +
+                    static_cast<uint64_t>(local_row) * packed_row_bits;
+                if (bit_offset > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                    throw std::runtime_error("NINT mixed-q row offset overflow");
+                }
+                t.row_q_bits[row] = static_cast<uint8_t>(row_bits);
+                t.row_q_bit_offsets[row] = static_cast<int64_t>(bit_offset);
+                ++local_row;
+            }
+        }
+        t.q_packed.insert(t.q_packed.end(), 8, 0);
+        t.qbytes = 0;
+    } else {
+        const int64_t qbytes64 =
+            (static_cast<int64_t>(t.gs) * t.bits + 7) / 8;
+        if (qbytes64 > std::numeric_limits<int>::max()) {
+            throw std::runtime_error("NINT packed row size overflow");
+        }
+        t.qbytes = static_cast<int>(qbytes64);
+        if (q_count >
+                (std::numeric_limits<size_t>::max() - 7) /
+                    static_cast<size_t>(t.bits)) {
+            throw std::runtime_error("NINT packed value size overflow");
+        }
+        size_t compact_q_nbytes = (q_count * (size_t)t.bits + 7) / 8;
+        size_t row_bits = (size_t)t.gs * t.bits;
+        size_t nrows = (size_t)t.out * t.ng;
+        if ((row_bits & 7u) == 0) {
+            if (off > blob.size() || compact_q_nbytes > blob.size() - off) {
+                throw std::runtime_error("truncated NINT packed values");
+            }
+            t.q_packed.resize(compact_q_nbytes);
+            std::memcpy(t.q_packed.data(), blob.data() + off, compact_q_nbytes);
+        } else {
+            if (off > blob.size() || compact_q_nbytes > blob.size() - off) {
+                throw std::runtime_error("truncated NINT packed values");
+            }
+            t.q_packed.assign(nrows * (size_t)t.qbytes, 0);
+            for (size_t row = 0; row < nrows; ++row) {
+                size_t src_bit0 = row * row_bits;
+                size_t dst_byte0 = row * (size_t)t.qbytes;
+                for (size_t bit = 0; bit < row_bits; ++bit) {
+                    uint8_t v = (blob[off + (src_bit0 + bit) / 8] >> ((src_bit0 + bit) & 7)) & 1u;
+                    if (v) t.q_packed[dst_byte0 + bit / 8] |= (uint8_t)(1u << (bit & 7));
+                }
+            }
+        }
+        off += compact_q_nbytes;
+    }
+    if (off != blob.size()) {
+        throw std::runtime_error("invalid NINT trailing bytes");
+    }
     return t;
 }
 
@@ -3060,6 +3261,14 @@ static mfq_tensor_backend::Tensor cpu_u8_tensor(const std::vector<uint8_t> & v, 
     return mfq_tensor_backend::from_blob((void *)v.data(), shape, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kUInt8)).clone();
 }
 
+static mfq_tensor_backend::Tensor cpu_i64_tensor(
+        const std::vector<int64_t> & v,
+        std::initializer_list<int64_t> shape) {
+    return mfq_tensor_backend::from_blob(
+        (void *)v.data(), shape,
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)).clone();
+}
+
 static mfq_tensor_backend::Tensor cpu_f16_tensor(
         const std::vector<uint16_t> & v,
         std::initializer_list<int64_t> shape) {
@@ -3127,6 +3336,8 @@ struct Workspace {
 
 struct NintWeight {
     mfq_tensor_backend::Tensor q_packed;
+    mfq_tensor_backend::Tensor row_q_bits;
+    mfq_tensor_backend::Tensor row_q_bit_offsets;
     mfq_tensor_backend::Tensor q8_zero_scale;
     mfq_tensor_backend::Tensor sub_scale;
     mfq_tensor_backend::Tensor sub_min;
@@ -3138,6 +3349,7 @@ struct NintWeight {
     int64_t bits = 0;
     int64_t qbytes = 0;
     int64_t neuron_len = 0;
+    bool mixed_q = false;
     bool q5_exec = false;
     bool q8_zero = false;
     std::vector<int64_t> shape;
@@ -3304,16 +3516,29 @@ static const char * nint6_mmq_mode_name(Nint6MmqMode mode) {
 static NintWeight to_device_nint(const NintCpu & c, bool cuda) {
     if (c.bits < 1 || c.bits > 8) throw std::runtime_error("unsupported NINT bits");
     int qbytes = (c.gs * c.bits + 7) / 8;
-    if (qbytes != c.qbytes) throw std::runtime_error("NINT qbytes mismatch");
+    if (!c.mixed_q && qbytes != c.qbytes) throw std::runtime_error("NINT qbytes mismatch");
+    if (c.mixed_q &&
+            (c.row_q_bits.size() != static_cast<size_t>(c.out) ||
+             c.row_q_bit_offsets.size() != static_cast<size_t>(c.out))) {
+        throw std::runtime_error("NINT mixed-q row metadata mismatch");
+    }
     NintWeight w;
     w.out = c.out;
     w.ng = c.ng;
     w.gs = c.gs;
     w.bits = c.bits;
-    w.qbytes = qbytes;
+    w.qbytes = c.mixed_q ? 0 : qbytes;
     w.neuron_len = c.neuron_len;
+    w.mixed_q = c.mixed_q;
     w.shape = c.shape;
-    w.q_packed = cpu_u8_tensor(c.q_packed, {c.out, c.ng, qbytes});
+    if (c.mixed_q) {
+        w.q_packed = cpu_u8_tensor(
+            c.q_packed, {static_cast<int64_t>(c.q_packed.size())});
+        w.row_q_bits = cpu_u8_tensor(c.row_q_bits, {c.out});
+        w.row_q_bit_offsets = cpu_i64_tensor(c.row_q_bit_offsets, {c.out});
+    } else {
+        w.q_packed = cpu_u8_tensor(c.q_packed, {c.out, c.ng, qbytes});
+    }
     w.sub_scale = cpu_u8_tensor(c.sub_scale, {c.out, c.ng});
     w.sub_min = cpu_u8_tensor(c.sub_min, {c.out, c.ng});
     w.neuron_scale = cpu_f16_to_f32_tensor(c.neuron_scale_h, c.out);
@@ -3322,6 +3547,10 @@ static NintWeight to_device_nint(const NintCpu & c, bool cuda) {
         const auto target = mfq_tensor_backend::Device(
             mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
         w.q_packed = w.q_packed.to(target).contiguous();
+        if (w.mixed_q) {
+            w.row_q_bits = w.row_q_bits.to(target).contiguous();
+            w.row_q_bit_offsets = w.row_q_bit_offsets.to(target).contiguous();
+        }
         w.sub_scale = w.sub_scale.to(target).contiguous();
         w.sub_min = w.sub_min.to(target).contiguous();
         w.neuron_scale = w.neuron_scale.to(target).contiguous();
@@ -4167,13 +4396,23 @@ struct NintMoeWeight {
             auto & workspace = activation_workspace(x, input_rows, groups, gs);
             bool input_quantized = input_prequantized ||
                 quantized.find(key) != quantized.end();
-            nint_moe_grouped_matmul_pool_ws_cuda(
-                pool.weight.q_packed, pool.weight.sub_scale, pool.weight.sub_min,
-                pool.weight.neuron_scale, pool.weight.neuron_min, x, route.ids,
-                pool.expert_local, n_experts, pool.local_experts, out_per_expert,
-                gs, pool.weight.bits, route.map_ready, input_quantized, output,
-                workspace.qx, workspace.xscale, route.counts, route.cursors,
-                route.ids_dst, route.expert_bounds, route.tile_bounds, route.tile_experts);
+            if (pool.weight.mixed_q) {
+                nint_moe_grouped_matmul_pool_mixed_q_ws_cuda(
+                    pool.weight.q_packed, pool.weight.row_q_bits,
+                    pool.weight.row_q_bit_offsets, pool.weight.sub_scale,
+                    pool.weight.sub_min, pool.weight.neuron_scale,
+                    pool.weight.neuron_min, x, route.ids, pool.expert_local,
+                    n_experts, pool.local_experts, out_per_expert, gs,
+                    input_quantized, output, workspace.qx, workspace.xscale);
+            } else {
+                nint_moe_grouped_matmul_pool_ws_cuda(
+                    pool.weight.q_packed, pool.weight.sub_scale, pool.weight.sub_min,
+                    pool.weight.neuron_scale, pool.weight.neuron_min, x, route.ids,
+                    pool.expert_local, n_experts, pool.local_experts, out_per_expert,
+                    gs, pool.weight.bits, route.map_ready, input_quantized, output,
+                    workspace.qx, workspace.xscale, route.counts, route.cursors,
+                    route.ids_dst, route.expert_bounds, route.tile_bounds, route.tile_experts);
+            }
             quantized.insert(key);
         }
         return output;
@@ -4379,9 +4618,11 @@ static void initialize_nint_moe_dispatch(
          pool_index < static_cast<int>(result.pools.size());
          ++pool_index) {
         auto & pool = result.pools.at(static_cast<size_t>(pool_index));
-        pool.profile_code = nint_moe_profile_code(
-            static_cast<int>(pool.weight.bits),
-            static_cast<int>(pool.weight.gs));
+        pool.profile_code = pool.weight.mixed_q
+            ? -1
+            : nint_moe_profile_code(
+                static_cast<int>(pool.weight.bits),
+                static_cast<int>(pool.weight.gs));
         hetero_supported =
             hetero_supported && pool.profile_code >= 0;
         if (pool.profile_code >= 0) {
@@ -6217,8 +6458,13 @@ static NintCpu select_nint_cpu_rows(
     const size_t q_row_bytes =
         static_cast<size_t>(source.ng) *
         source.qbytes;
-    result.q_packed.resize(
-        rows.size() * q_row_bytes);
+    if (source.mixed_q) {
+        result.q_packed.clear();
+        result.row_q_bits.resize(rows.size());
+        result.row_q_bit_offsets.resize(rows.size());
+    } else {
+        result.q_packed.resize(rows.size() * q_row_bytes);
+    }
     result.sub_scale.resize(
         rows.size() * source.ng);
     result.sub_min.resize(
@@ -6233,13 +6479,15 @@ static NintCpu select_nint_cpu_rows(
             throw std::runtime_error(
                 "NINT MoE shard row is out of range");
         }
-        std::memcpy(
-            result.q_packed.data() +
-                destination * q_row_bytes,
-            source.q_packed.data() +
-                static_cast<size_t>(source_row) *
-                    q_row_bytes,
-            q_row_bytes);
+        if (!source.mixed_q) {
+            std::memcpy(
+                result.q_packed.data() +
+                    destination * q_row_bytes,
+                source.q_packed.data() +
+                    static_cast<size_t>(source_row) *
+                        q_row_bytes,
+                q_row_bytes);
+        }
         std::memcpy(
             result.sub_scale.data() +
                 destination * source.ng,
@@ -6260,6 +6508,54 @@ static NintCpu select_nint_cpu_rows(
         result.neuron_min_h[destination] =
             source.neuron_min_h[
                 static_cast<size_t>(source_row)];
+    }
+    if (source.mixed_q) {
+        const uint64_t values_per_row =
+            static_cast<uint64_t>(source.ng) *
+            static_cast<uint64_t>(source.gs);
+        for (int bits = 1; bits <= 8; ++bits) {
+            std::vector<size_t> selected;
+            for (size_t destination = 0;
+                 destination < rows.size(); ++destination) {
+                const size_t source_row = static_cast<size_t>(rows[destination]);
+                if (source.row_q_bits[source_row] == bits) {
+                    selected.push_back(destination);
+                }
+            }
+            if (selected.empty()) continue;
+            const uint64_t row_bits =
+                values_per_row * static_cast<uint64_t>(bits);
+            const uint64_t cohort_start =
+                static_cast<uint64_t>(result.q_packed.size()) * 8u;
+            const uint64_t cohort_bits =
+                row_bits * static_cast<uint64_t>(selected.size());
+            const size_t cohort_bytes =
+                static_cast<size_t>((cohort_bits + 7u) / 8u);
+            const size_t old_size = result.q_packed.size();
+            result.q_packed.resize(old_size + cohort_bytes, 0);
+            for (size_t local = 0; local < selected.size(); ++local) {
+                const size_t destination = selected[local];
+                const size_t source_row = static_cast<size_t>(rows[destination]);
+                const uint64_t source_start = static_cast<uint64_t>(
+                    source.row_q_bit_offsets[source_row]);
+                const uint64_t destination_start =
+                    cohort_start + static_cast<uint64_t>(local) * row_bits;
+                result.row_q_bits[destination] = static_cast<uint8_t>(bits);
+                result.row_q_bit_offsets[destination] =
+                    static_cast<int64_t>(destination_start);
+                for (uint64_t bit = 0; bit < row_bits; ++bit) {
+                    const uint8_t value = static_cast<uint8_t>(
+                        (source.q_packed[static_cast<size_t>((source_start + bit) >> 3)] >>
+                         ((source_start + bit) & 7u)) & 1u);
+                    if (value != 0) {
+                        result.q_packed[static_cast<size_t>((destination_start + bit) >> 3)] |=
+                            static_cast<uint8_t>(1u << ((destination_start + bit) & 7u));
+                    }
+                }
+            }
+        }
+        result.q_packed.insert(result.q_packed.end(), 8, 0);
+        result.qbytes = 0;
     }
     return result;
 }
@@ -10829,16 +11125,22 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     if (ws.empty()) throw std::runtime_error("empty NINT group");
     const auto & a = ws[0];
     if (a.q5_exec) throw std::runtime_error("NINT5 Q5 execution weights cannot be concatenated");
-    std::vector<mfq_tensor_backend::Tensor> qp, q8s, ss, sm, ns, nm;
+    std::vector<mfq_tensor_backend::Tensor> qp, rqb, rqoff, q8s, ss, sm, ns, nm;
     int64_t out = 0;
+    int64_t q_bit_base = 0;
     for (const auto & w : ws) {
         if (w.q5_exec) throw std::runtime_error("NINT5 Q5 execution weights cannot be concatenated");
         if (w.ng != a.ng || w.gs != a.gs || w.bits != a.bits ||
             w.qbytes != a.qbytes || w.neuron_len != a.neuron_len ||
-            w.q8_zero != a.q8_zero) {
+            w.q8_zero != a.q8_zero || w.mixed_q != a.mixed_q) {
             throw std::runtime_error("cannot group NINT tensors with different input layout");
         }
         qp.push_back(w.q_packed);
+        if (w.mixed_q) {
+            rqb.push_back(w.row_q_bits);
+            rqoff.push_back(w.row_q_bit_offsets + q_bit_base);
+            q_bit_base += w.q_packed.numel() * 8;
+        }
         if (w.q8_zero) {
             q8s.push_back(w.q8_zero_scale);
             out += w.out;
@@ -10857,10 +11159,15 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     g.bits = a.bits;
     g.qbytes = a.qbytes;
     g.neuron_len = a.neuron_len;
+    g.mixed_q = a.mixed_q;
     g.q8_zero = a.q8_zero;
     g.shape = a.shape;
     g.shape[0] = out;
     g.q_packed = mfq_tensor_backend::cat(qp, 0).contiguous();
+    if (a.mixed_q) {
+        g.row_q_bits = mfq_tensor_backend::cat(rqb, 0).contiguous();
+        g.row_q_bit_offsets = mfq_tensor_backend::cat(rqoff, 0).contiguous();
+    }
     if (a.q8_zero) {
         g.q8_zero_scale = mfq_tensor_backend::cat(q8s, 0).contiguous();
         return g;
@@ -11068,6 +11375,25 @@ static inline void cpu_unpack_nint_group(
         values[index] = static_cast<uint8_t>(reservoir & mask);
         reservoir >>= bits;
         available -= bits;
+    }
+}
+
+static inline void cpu_unpack_nint_group_at_bit_offset(
+        const uint8_t * packed,
+        uint64_t bit_offset,
+        int bits,
+        int valid,
+        uint8_t * values) {
+    std::fill(values, values + 64, static_cast<uint8_t>(0));
+    const uint32_t mask = bits == 8 ? 255u : ((1u << bits) - 1u);
+    for (int index = 0; index < valid; ++index) {
+        const uint64_t value_bit =
+            bit_offset + static_cast<uint64_t>(index) * static_cast<uint64_t>(bits);
+        const size_t byte = static_cast<size_t>(value_bit >> 3);
+        const int shift = static_cast<int>(value_bit & 7u);
+        const uint32_t pair = static_cast<uint32_t>(packed[byte]) |
+            (static_cast<uint32_t>(packed[byte + 1]) << 8);
+        values[index] = static_cast<uint8_t>((pair >> shift) & mask);
     }
 }
 
@@ -11393,13 +11719,22 @@ static mfq_tensor_backend::Tensor nint_matmul_cpu(
     mfq_half * output = result.data_ptr<mfq_half>();
     const uint8_t * quant = w.q_packed.data_ptr<uint8_t>();
     const int64_t qbytes = w.qbytes;
+    const uint8_t * row_q_bits = w.mixed_q
+        ? w.row_q_bits.data_ptr<uint8_t>() : nullptr;
+    const int64_t * row_q_bit_offsets = w.mixed_q
+        ? w.row_q_bit_offsets.data_ptr<int64_t>() : nullptr;
     mfq_parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
         std::vector<float> accumulators(static_cast<size_t>(rows));
         for (int64_t neuron = begin; neuron < end; ++neuron) {
             std::fill(accumulators.begin(), accumulators.end(), 0.0f);
+            const int neuron_bits = w.mixed_q
+                ? static_cast<int>(row_q_bits[neuron])
+                : static_cast<int>(w.bits);
             for (int64_t group = 0; group < w.ng; ++group) {
                 const int64_t meta = neuron * w.ng + group;
-                const uint8_t * packed = quant + meta * qbytes;
+                const uint8_t * packed = w.mixed_q
+                    ? quant
+                    : quant + meta * qbytes;
                 float scale = 0.0f;
                 float minimum = 0.0f;
                 if (w.q8_zero) {
@@ -11418,9 +11753,19 @@ static mfq_tensor_backend::Tensor nint_matmul_cpu(
                     std::fill(weights, weights + 64, static_cast<uint8_t>(0));
                     std::memcpy(weights, packed, static_cast<size_t>(valid));
                 } else {
-                    cpu_unpack_nint_group(
-                        packed, static_cast<int>(w.bits),
-                        static_cast<int>(valid), weights);
+                    if (w.mixed_q) {
+                        const uint64_t bit_offset =
+                            static_cast<uint64_t>(row_q_bit_offsets[neuron]) +
+                            static_cast<uint64_t>(group * w.gs) *
+                                static_cast<uint64_t>(neuron_bits);
+                        cpu_unpack_nint_group_at_bit_offset(
+                            packed, bit_offset, neuron_bits,
+                            static_cast<int>(valid), weights);
+                    } else {
+                        cpu_unpack_nint_group(
+                            packed, neuron_bits,
+                            static_cast<int>(valid), weights);
+                    }
                 }
                 for (int64_t row = 0; row < rows; ++row) {
                     const int64_t activation_group =
@@ -11737,6 +12082,26 @@ static mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_b
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
+    if (w.mixed_q) {
+        if (M <= 8) {
+            Workspace & ws = w.workspace(M);
+            return g_profiler.measure("nint.mixed_q_gemv", [&]() {
+                return nint_gemv_packed_mixed_q_ws_cuda(
+                    w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
+                    w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
+                    x, w.gs, ws.qx, ws.xscale, ws.xsum);
+            });
+        }
+        auto dense = g_profiler.measure("nint.mixed_q_dequant", [&]() {
+            return nint_dequant_full_packed_mixed_q_cuda(
+                w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
+                w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
+                w.neuron_len, w.gs);
+        });
+        return g_profiler.measure("nint.mixed_q_gemm", [&]() {
+            return mfq_tensor_backend::matmul(x, dense.transpose(0, 1));
+        });
+    }
     if (g_kl_mmq_mode != KlMmqMode::Default) {
         const int original_m = M;
         MFQ_RUNTIME_CHECK(original_m > 0, "KLD common MMQ requires activation rows");
@@ -11928,7 +12293,7 @@ static mfq_tensor_backend::Tensor nint_matmul_bf16_output(
     const bool enabled =
         disabled == nullptr || disabled[0] != '1';
     if (!enabled || !flat.is_cuda() || flat.size(0) != 1 ||
-            w.bits != 4 || w.gs != 24 || w.q8_zero || w.q5_exec) {
+            w.mixed_q || w.bits != 4 || w.gs != 24 || w.q8_zero || w.q5_exec) {
         auto fallback = nint_matmul(w, flat)
             .to(mfq_tensor_backend::kBFloat16).contiguous();
         shape.back() = fallback.size(-1);
@@ -11960,6 +12325,9 @@ static mfq_tensor_backend::Tensor nint_matmul_f32_kld(
     x = pad_last(
         x.contiguous().to(mfq_tensor_backend::kFloat16),
         w.neuron_len);
+    if (w.mixed_q) {
+        return nint_matmul(w, x).to(mfq_tensor_backend::kFloat32);
+    }
     MFQ_RUNTIME_CHECK(
         x.size(0) >= 16,
         "FP32-output NINT MMQ requires at least 16 activation rows");
@@ -12045,7 +12413,7 @@ static mfq_tensor_backend::Tensor nint_matmul_input_mul(const NintWeight & w, mf
     x = pad_last(x, w.neuron_len);
     gate = pad_last(gate, w.neuron_len);
     int M = (int)x.size(0);
-    if (w.q8_zero) {
+    if (w.q8_zero || w.mixed_q) {
         if (mode == 1) return nint_matmul(w, x * mfq_tensor_backend::sigmoid(gate));
         return nint_matmul(w, x * mfq_tensor_backend::silu(gate));
     }
@@ -12064,9 +12432,9 @@ static mfq_tensor_backend::Tensor nint_matmul_input_mul(const NintWeight & w, mf
 }
 
 static mfq_tensor_backend::Tensor nint_matmul_qx(const NintWeight & w, Workspace & ws) {
-    if (w.q8_zero) {
+    if (w.q8_zero || w.mixed_q) {
         throw std::runtime_error(
-            "NINT8-0 prequantized activation path is not enabled");
+            "this NINT layout does not support the prequantized activation path");
     }
     int M = (int)ws.qx.size(0);
     if (w.bits == 4) {
@@ -12085,7 +12453,7 @@ static bool nint_small_m_qx_compatible(
         const NintWeight & source,
         const NintWeight & target) {
     const auto supported = [](const NintWeight & weight) {
-        return !weight.q8_zero && !weight.q5_exec &&
+        return !weight.mixed_q && !weight.q8_zero && !weight.q5_exec &&
             weight.gs == 24 &&
             (weight.bits == 4 || weight.bits == 6);
     };
@@ -12098,7 +12466,7 @@ static mfq_tensor_backend::Tensor nint_matmul_swiglu(const NintWeight & w, mfq_t
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
-    if (w.q8_zero) {
+    if (w.q8_zero || w.mixed_q) {
         auto parts = nint_matmul(w, x).chunk(2, -1);
         return mfq_tensor_backend::silu(parts[0]) * parts[1];
     }
@@ -12123,7 +12491,7 @@ static mfq_tensor_backend::Tensor nint_matmul_geglu(const NintWeight & w, mfq_te
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
-    if (w.q8_zero) {
+    if (w.q8_zero || w.mixed_q) {
         auto parts = nint_matmul(w, x).chunk(2, -1);
         return gelu_mul_cuda(parts[0].contiguous(), parts[1].contiguous());
     }
@@ -12316,7 +12684,7 @@ struct NintLinearGroup {
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
     const NintWeight * shared_qx_weight() const {
-        return split_w.empty() && !w.q8_zero && !w.q5_exec &&
+        return split_w.empty() && !w.mixed_q && !w.q8_zero && !w.q5_exec &&
                 w.gs == 24 && (w.bits == 4 || w.bits == 6)
             ? &w
             : nullptr;
@@ -12405,7 +12773,8 @@ static NintLinearGroup make_linear_group(const std::vector<NintWeight> & ws) {
         if (ws[i].ng != ws[0].ng || ws[i].gs != ws[0].gs ||
             ws[i].bits != ws[0].bits || ws[i].qbytes != ws[0].qbytes ||
             ws[i].neuron_len != ws[0].neuron_len ||
-            ws[i].q8_zero != ws[0].q8_zero) {
+            ws[i].q8_zero != ws[0].q8_zero ||
+            ws[i].mixed_q != ws[0].mixed_q) {
             same = false;
             break;
         }
@@ -12445,7 +12814,8 @@ static NintLinearGroup make_linear_group(const std::vector<NintWeight> & ws) {
                 w.ng == cur[0].ng && w.gs == cur[0].gs && w.bits == cur[0].bits &&
                 w.qbytes == cur[0].qbytes &&
                 w.neuron_len == cur[0].neuron_len &&
-                w.q8_zero == cur[0].q8_zero;
+                w.q8_zero == cur[0].q8_zero &&
+                w.mixed_q == cur[0].mixed_q;
             if (!append) flush();
             cur.push_back(w);
             cur_outs.push_back(w.out);
@@ -13487,6 +13857,18 @@ static mfq_tensor_backend::Tensor quant_embedding_lookup(
                 embedding.nint.w.q8_zero_scale,
                 token_ids, embedding.nint.w.neuron_len);
         }
+        if (embedding.nint.w.mixed_q) {
+            return nint_embedding_lookup_packed_mixed_q_cuda(
+                embedding.nint.w.q_packed,
+                embedding.nint.w.row_q_bits,
+                embedding.nint.w.row_q_bit_offsets,
+                embedding.nint.w.sub_scale,
+                embedding.nint.w.sub_min,
+                embedding.nint.w.neuron_scale,
+                embedding.nint.w.neuron_min,
+                token_ids, embedding.nint.w.neuron_len,
+                embedding.nint.w.gs);
+        }
         if (embedding.nint.w.bits == 4) {
             return nint_embedding_lookup_packed_compact_cuda(
                 embedding.nint.w.q_packed,
@@ -14399,6 +14781,7 @@ static QuantLinearGroup make_quant_group(
                 const auto & weight = layer.nint.w;
                 const auto & first = layers[0].nint.w;
                 return weight.bits == 4 && weight.gs == 24 &&
+                    !weight.mixed_q &&
                     !weight.q8_zero &&
                     !weight.q5_exec && weight.ng == first.ng &&
                     weight.gs == first.gs &&

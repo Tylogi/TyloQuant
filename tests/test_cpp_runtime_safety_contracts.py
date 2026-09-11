@@ -75,6 +75,19 @@ def test_cuda_kl_rejects_context_larger_than_model_capacity() -> None:
     assert DECODE.count("KL reference exceeds model context capacity") >= 2
 
 
+def test_cuda_nint_loader_expands_v2_metadata_before_kernel_dispatch() -> None:
+    start = DECODE.index("static NintCpu unpack_nint(")
+    stop = DECODE.index("struct Nint8ZeroCpu", start)
+    loader = DECODE[start:stop]
+    assert "const bool is_nint_v2 = (raw_bits & 0x80) != 0;" in loader
+    assert "t.sub_bits = blob[off++];" in loader
+    assert "if (is_nint_v2)" in loader
+    assert "const auto selectors = unpack_bits(" in loader
+    assert "t.sub_scale.resize(sub_count);" in loader
+    assert "t.sub_min.resize(sub_count);" in loader
+    assert 'throw std::runtime_error("invalid NINT trailing bytes")' in loader
+
+
 def test_unified_cuda_extension_can_include_runtime_headers() -> None:
     for include in (
         "_REPOSITORY_ROOT",

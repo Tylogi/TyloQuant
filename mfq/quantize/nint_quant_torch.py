@@ -10,7 +10,12 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from mfq.formats.nint import NintSpec, _uint_dtype
+from mfq.formats.nint import (
+    NintSpec,
+    _uint_dtype,
+    normalize_row_q_bits,
+    normalize_row_sub_bits,
+)
 from mfq.quantize.nint_quant import NintTensor
 
 
@@ -887,6 +892,8 @@ def quantize_axis0(
     priority_pair_chunk: int | None = None,
     use_metal_unweighted_kernels: bool = True,
     use_metal_imatrix_kernels: bool = True,
+    row_sub_bits: np.ndarray | None = None,
+    row_q_bits: np.ndarray | None = None,
 ) -> NintTensor | tuple[NintTensor, torch.Tensor]:
     """Quantize a 2D ``[out, in]`` tensor with axis=0 on GPU."""
 
@@ -894,6 +901,79 @@ def quantize_axis0(
         raise ValueError(f"quantize_axis0 expects a 2D tensor, got {tuple(weight.shape)}")
     W = weight.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
     out, neuron_len = (int(W.shape[0]), int(W.shape[1]))
+    selected_q_bits = normalize_row_q_bits(spec, row_q_bits, out)
+    selected_sub_bits = normalize_row_sub_bits(spec, row_sub_bits, out)
+    if (
+        np.any(selected_q_bits != int(spec.bits))
+        or np.any(selected_sub_bits != int(spec.sub_bits))
+    ):
+        importance_rows = (
+            None
+            if importance is None
+            else _importance_as_rows(importance, out, neuron_len, W.device)
+        )
+        ng = (neuron_len + int(spec.groupsize) - 1) // int(spec.groupsize)
+        q = np.empty(
+            (out, ng, int(spec.groupsize)),
+            dtype=_uint_dtype((1 << int(selected_q_bits.max())) - 1),
+        )
+        neuron_scale = np.empty(out, dtype=np.float32)
+        neuron_min = np.empty(out, dtype=np.float32)
+        sub_scale = np.empty((out, ng), dtype=np.uint8)
+        sub_min = np.empty((out, ng), dtype=np.uint8)
+        row_sse = (
+            torch.empty(out, device=W.device, dtype=torch.float32)
+            if return_row_sse
+            else None
+        )
+        row_profiles = np.stack((selected_q_bits, selected_sub_bits), axis=1)
+        for q_bits, sub_width in np.unique(row_profiles, axis=0):
+            row_ids = np.flatnonzero(
+                (selected_q_bits == q_bits)
+                & (selected_sub_bits == sub_width)
+            )
+            torch_rows = torch.as_tensor(row_ids, device=W.device, dtype=torch.int64)
+            cohort_result = quantize_axis0(
+                W.index_select(0, torch_rows),
+                NintSpec(int(q_bits), spec.groupsize, int(sub_width)),
+                device=W.device,
+                importance=(
+                    None
+                    if importance_rows is None
+                    else importance_rows.index_select(0, torch_rows)
+                ),
+                use_cuda_imatrix_kernels=use_cuda_imatrix_kernels,
+                use_priority_group_refinement=use_priority_group_refinement,
+                return_row_sse=return_row_sse,
+                priority_row_chunk=priority_row_chunk,
+                priority_pair_chunk=priority_pair_chunk,
+                use_metal_unweighted_kernels=use_metal_unweighted_kernels,
+                use_metal_imatrix_kernels=use_metal_imatrix_kernels,
+            )
+            if return_row_sse:
+                cohort, cohort_sse = cohort_result
+                row_sse.index_copy_(0, torch_rows, cohort_sse)
+            else:
+                cohort = cohort_result
+            q[row_ids] = cohort.q
+            neuron_scale[row_ids] = cohort.neuron_scale
+            neuron_min[row_ids] = cohort.neuron_min
+            sub_scale[row_ids] = cohort.sub_scale
+            sub_min[row_ids] = cohort.sub_min
+        encoded = NintTensor(
+            spec=spec,
+            shape=(out, neuron_len),
+            axis=0,
+            q=q,
+            neuron_scale=neuron_scale,
+            neuron_min=neuron_min,
+            sub_scale=sub_scale,
+            sub_min=sub_min,
+            neuron_len=neuron_len,
+            row_sub_bits=selected_sub_bits,
+            row_q_bits=selected_q_bits,
+        )
+        return (encoded, row_sse) if return_row_sse else encoded
     gs = int(spec.groupsize)
     nmax = int(spec.nmax)
     k = int(spec.sub_bits)

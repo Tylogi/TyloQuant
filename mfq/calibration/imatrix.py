@@ -80,30 +80,24 @@ def _activation_derivative(kind: str, value: torch.Tensor) -> torch.Tensor:
     if kind == "tanh":
         activated = torch.tanh(value)
         return 1.0 - activated.square()
-    raise ValueError(f"unsupported AAQ activation derivative: {kind}")
+    raise ValueError(f"unsupported NAQ activation derivative: {kind}")
 
 
-def _normalized_aaq(
-    coupled: torch.Tensor,
-    downstream_norm2: torch.Tensor,
-    standard: torch.Tensor,
-    count: int,
-) -> torch.Tensor:
+def _normalized_naq_rows(coupled: torch.Tensor, count: int) -> torch.Tensor:
     if count <= 0:
-        raise RuntimeError("AAQ target received no activations")
-    value = coupled.float() * downstream_norm2.float().reshape(-1, 1)
-    value.div_(float(count))
+        raise RuntimeError("NAQ target received no activations")
+    value = coupled / float(count)
     mean = value.mean()
     if not torch.isfinite(mean) or float(mean) <= 1e-30:
-        return standard.float().reshape(1, -1).expand(value.shape[0], -1).clone()
-    value.mul_(standard.float().mean() / mean)
+        return torch.ones_like(value, dtype=torch.float32)
+    value.div_(mean)
     if not torch.isfinite(value).all() or bool((value < 0).any()):
-        raise FloatingPointError("AAQ importance contains invalid values")
-    return value
+        raise FloatingPointError("NAQ importance contains invalid values")
+    return value.to(torch.float32)
 
 
-class _AaqBinding:
-    category = "nonlinear"
+class _NaqBinding:
+    category = "activation_corrected"
 
     def __init__(self, collector: ActivationImatrixCollector, target: ImatrixTarget) -> None:
         self.collector = collector
@@ -116,37 +110,59 @@ class _AaqBinding:
             handle.remove()
         self.handles.clear()
 
+    @property
+    def names(self) -> tuple[str, ...]:
+        return (self.target.name,)
+
     def entry(self) -> ImportanceEntry | None:
         raise NotImplementedError
 
-    def _standard(self) -> tuple[torch.Tensor, int]:
-        count = int(self.collector.counts[self.target.name][0].item())
+    def entries(self) -> dict[str, ImportanceEntry]:
+        entry = self.entry()
+        return {} if entry is None else {self.target.name: entry}
+
+    def _standard(
+        self, target: ImatrixTarget | None = None
+    ) -> tuple[torch.Tensor, int]:
+        selected = self.target if target is None else target
+        count = int(self.collector.counts[selected.name][0].item())
         if count <= 0:
             return torch.empty(0, device=self.collector.device), 0
-        standard = self.collector.sums[self.target.name][0].float() / float(count)
+        standard = self.collector.sums[selected.name][0].float() / float(count)
         return standard, count
 
 
-class _DenseFfnAaqBinding(_AaqBinding):
+class _DenseFfnNaqBinding(_NaqBinding):
     category = "ffn_gate"
 
     def __init__(
         self,
         collector: ActivationImatrixCollector,
-        target: ImatrixTarget,
+        gate_target: ImatrixTarget,
+        up_target: ImatrixTarget,
         gate: nn.Module,
         up: nn.Module,
         down: nn.Module,
+        activation: Any,
         activation_kind: str,
     ) -> None:
-        super().__init__(collector, target)
+        super().__init__(collector, gate_target)
+        self.up_target = up_target
         gate_weight = gate.weight
         down_weight = down.weight
         self.rows = int(gate_weight.shape[0])
         self.width = int(gate_weight.shape[1])
+        self.activation = activation
         self.activation_kind = activation_kind
-        self.coupled = torch.zeros(
-            (self.rows, self.width), device=collector.device, dtype=torch.float32
+        self.gate_coupled = torch.zeros(
+            self.rows,
+            device=collector.device,
+            dtype=collector.accumulation_dtype,
+        )
+        self.up_coupled = torch.zeros(
+            self.rows,
+            device=collector.device,
+            dtype=collector.accumulation_dtype,
         )
         self.downstream_norm2 = down_weight.detach().float().square().sum(0)
         self.observations = 0
@@ -173,28 +189,61 @@ class _DenseFfnAaqBinding(_AaqBinding):
         gate = self.cache.pop("gate")
         up = self.cache.pop("up")
         if gate.shape != up.shape or gate.shape[0] != x.shape[0]:
-            raise RuntimeError(f"inconsistent AAQ FFN observations for {self.target.name}")
-        sensitivity = up.float() * _activation_derivative(self.activation_kind, gate)
-        self.coupled.addmm_(sensitivity.square().T, x.float().square())
+            raise RuntimeError(f"inconsistent NAQ FFN observations for {self.target.name}")
+        gate_sensitivity = up.float() * _activation_derivative(
+            self.activation_kind, gate
+        )
+        up_sensitivity = self.activation(gate).float()
+        self.gate_coupled.add_(
+            (gate_sensitivity.square() * self.downstream_norm2).sum(
+                0, dtype=self.collector.accumulation_dtype
+            )
+        )
+        self.up_coupled.add_(
+            (up_sensitivity.square() * self.downstream_norm2).sum(
+                0, dtype=self.collector.accumulation_dtype
+            )
+        )
         self.observations += int(x.shape[0])
 
-    def entry(self) -> ImportanceEntry | None:
-        standard, count = self._standard()
-        if count <= 0:
-            return None
-        if self.cache or self.observations != count:
+    @property
+    def names(self) -> tuple[str, ...]:
+        return (self.target.name, self.up_target.name)
+
+    def entries(self) -> dict[str, ImportanceEntry]:
+        gate_standard, gate_count = self._standard(self.target)
+        up_standard, up_count = self._standard(self.up_target)
+        if gate_count <= 0 or up_count <= 0:
+            return {}
+        if (
+            self.cache
+            or self.observations != gate_count
+            or self.observations != up_count
+        ):
             raise RuntimeError(
-                f"invalid AAQ FFN state for {self.target.name}: "
-                f"observations={self.observations}, count={count}, cache={sorted(self.cache)}"
+                f"invalid NAQ FFN state for {self.target.name}: "
+                f"observations={self.observations}, gate_count={gate_count}, "
+                f"up_count={up_count}, cache={sorted(self.cache)}"
             )
-        value = _normalized_aaq(self.coupled, self.downstream_norm2, standard, count)
-        return ImportanceEntry(
-            np.ascontiguousarray(value.detach().cpu().numpy(), dtype=np.float32),
-            np.full(self.rows, count, dtype=np.int64),
-        )
+        result = {}
+        for target, standard, coupled in (
+            (self.target, gate_standard, self.gate_coupled),
+            (self.up_target, up_standard, self.up_coupled),
+        ):
+            row_importance = _normalized_naq_rows(coupled, gate_count)
+            result[target.name] = ImportanceEntry(
+                np.ascontiguousarray(
+                    standard.detach().cpu().numpy()[None, :], dtype=np.float32
+                ),
+                np.asarray([gate_count], dtype=np.int64),
+                np.ascontiguousarray(
+                    row_importance.detach().cpu().numpy(), dtype=np.float32
+                ),
+            )
+        return result
 
 
-class _AttentionGateAaqBinding(_AaqBinding):
+class _AttentionGateNaqBinding(_NaqBinding):
     category = "attention_gate"
 
     def __init__(
@@ -219,7 +268,9 @@ class _AttentionGateAaqBinding(_AaqBinding):
             + torch.arange(head_dim, device=collector.device, dtype=torch.int64)[None, :]
         ).reshape(-1)
         self.coupled = torch.zeros(
-            (self.gate_rows, self.width), device=collector.device, dtype=torch.float32
+            self.gate_rows,
+            device=collector.device,
+            dtype=collector.accumulation_dtype,
         )
         self.downstream_norm2 = output_weight.detach().float().square().sum(0)
         self.observations = 0
@@ -245,9 +296,13 @@ class _AttentionGateAaqBinding(_AaqBinding):
             inputs[0], self.gate_rows, self.target.name
         ).float()
         if gate.shape != gated_attention.shape or gate.shape[0] != x.shape[0]:
-            raise RuntimeError(f"inconsistent AAQ attention observations for {self.target.name}")
+            raise RuntimeError(f"inconsistent NAQ attention observations for {self.target.name}")
         sensitivity = gated_attention * (1.0 - torch.sigmoid(gate))
-        self.coupled.addmm_(sensitivity.square().T, x.float().square())
+        self.coupled.add_(
+            (sensitivity.square() * self.downstream_norm2).sum(
+                0, dtype=self.collector.accumulation_dtype
+            )
+        )
         self.observations += int(x.shape[0])
 
     def entry(self) -> ImportanceEntry | None:
@@ -256,19 +311,22 @@ class _AttentionGateAaqBinding(_AaqBinding):
             return None
         if self.cache or self.observations != count:
             raise RuntimeError(
-                f"invalid AAQ attention state for {self.target.name}: "
+                f"invalid NAQ attention state for {self.target.name}: "
                 f"observations={self.observations}, count={count}, cache={sorted(self.cache)}"
             )
-        gate = _normalized_aaq(self.coupled, self.downstream_norm2, standard, count)
-        value = standard.reshape(1, -1).expand(self.rows, -1).clone()
-        value.index_copy_(0, self.gate_indices, gate)
+        row_importance = self.collector.neuron_mean(self.target)
+        row_importance.index_copy_(
+            0, self.gate_indices, self.coupled / float(count)
+        )
+        row_importance = _normalized_naq_rows(row_importance, 1)
         return ImportanceEntry(
-            np.ascontiguousarray(value.detach().cpu().numpy(), dtype=np.float32),
-            np.full(self.rows, count, dtype=np.int64),
+            np.ascontiguousarray(standard.detach().cpu().numpy()[None, :], dtype=np.float32),
+            np.asarray([count], dtype=np.int64),
+            np.ascontiguousarray(row_importance.detach().cpu().numpy(), dtype=np.float32),
         )
 
 
-class _GatedNormAaqBinding(_AaqBinding):
+class _GatedNormNaqBinding(_NaqBinding):
     category = "linear_attention_gate"
 
     def __init__(
@@ -293,7 +351,9 @@ class _GatedNormAaqBinding(_AaqBinding):
         self.norm_weight = norm_weight.detach().float().reshape(1, self.head_dim)
         self.activation_kind = activation_kind
         self.coupled = torch.zeros(
-            (self.rows, self.width), device=collector.device, dtype=torch.float32
+            self.rows,
+            device=collector.device,
+            dtype=collector.accumulation_dtype,
         )
         self.downstream_norm2 = output_weight.detach().float().square().sum(0)
         self.observations = 0
@@ -309,7 +369,7 @@ class _GatedNormAaqBinding(_AaqBinding):
 
     def _norm_pre(self, _module, inputs) -> None:
         if len(inputs) < 2:
-            raise TypeError("AAQ gated norm requires hidden and gate inputs")
+            raise TypeError("NAQ gated norm requires hidden and gate inputs")
         x = self.cache.pop("x")
         hidden = inputs[0].detach().reshape(-1, self.head_dim).float()
         gate = inputs[1].detach().reshape(-1, self.head_dim).float()
@@ -321,8 +381,12 @@ class _GatedNormAaqBinding(_AaqBinding):
             sensitivity.reshape(-1, self.rows), self.rows, self.target.name
         )
         if sensitivity.shape[0] != x.shape[0]:
-            raise RuntimeError(f"inconsistent AAQ gated-norm observations for {self.target.name}")
-        self.coupled.addmm_(sensitivity.square().T, x.float().square())
+            raise RuntimeError(f"inconsistent NAQ gated-norm observations for {self.target.name}")
+        self.coupled.add_(
+            (sensitivity.square() * self.downstream_norm2).sum(
+                0, dtype=self.collector.accumulation_dtype
+            )
+        )
         self.observations += int(x.shape[0])
 
     def entry(self) -> ImportanceEntry | None:
@@ -331,18 +395,19 @@ class _GatedNormAaqBinding(_AaqBinding):
             return None
         if self.cache or self.observations != count:
             raise RuntimeError(
-                f"invalid AAQ gated-norm state for {self.target.name}: "
+                f"invalid NAQ gated-norm state for {self.target.name}: "
                 f"observations={self.observations}, count={count}, cache={sorted(self.cache)}"
             )
-        value = _normalized_aaq(self.coupled, self.downstream_norm2, standard, count)
+        row_importance = _normalized_naq_rows(self.coupled, count)
         return ImportanceEntry(
-            np.ascontiguousarray(value.detach().cpu().numpy(), dtype=np.float32),
-            np.full(self.rows, count, dtype=np.int64),
+            np.ascontiguousarray(standard.detach().cpu().numpy()[None, :], dtype=np.float32),
+            np.asarray([count], dtype=np.int64),
+            np.ascontiguousarray(row_importance.detach().cpu().numpy(), dtype=np.float32),
         )
 
 
 class ActivationImatrixCollector:
-    """Accumulate E[x^2] with independent counters for routed experts."""
+    """Collect factorized input-channel and output-neuron NAQ importance."""
 
     def __init__(
         self,
@@ -350,14 +415,14 @@ class ActivationImatrixCollector:
         device: torch.device,
         *,
         accumulation_dtype: torch.dtype = torch.float64,
-        nonlinear: bool = False,
+        neural: bool = False,
     ) -> None:
         if accumulation_dtype not in {torch.float32, torch.float64}:
             raise ValueError("imatrix accumulation dtype must be float32 or float64")
         self.targets = tuple(targets)
         self.device = device
         self.accumulation_dtype = accumulation_dtype
-        self.nonlinear = bool(nonlinear)
+        self.neural = bool(neural)
         self.sums = {
             target.name: torch.zeros(
                 (target.experts, target.width),
@@ -373,10 +438,11 @@ class ActivationImatrixCollector:
         self.handles: list[Any] = []
         self.restores: list[tuple[nn.Module, Any]] = []
         self.valid_mask: torch.Tensor | None = None
-        self._active_aaq: list[_AaqBinding] = []
-        self._aaq_entries: dict[str, ImportanceEntry] = {}
-        self._aaq_categories: dict[str, str] = {}
-        self._expert_aaq_sums: dict[str, torch.Tensor] = {}
+        self.neuron_sums: dict[str, torch.Tensor] = {}
+        self._active_naq: list[_NaqBinding] = []
+        self._naq_entries: dict[str, ImportanceEntry] = {}
+        self._naq_categories: dict[str, str] = {}
+        self._expert_naq_rows: dict[str, torch.Tensor] = {}
 
     def set_valid_mask(self, value: torch.Tensor | None) -> None:
         self.valid_mask = None if value is None else value.detach().reshape(-1).to(torch.bool)
@@ -394,6 +460,35 @@ class ActivationImatrixCollector:
         matrix = self._matrix(value, target.width, target.name)
         self.sums[target.name][0].add_(matrix.square().sum(0, dtype=self.accumulation_dtype))
         self.counts[target.name][0].add_(int(matrix.shape[0]))
+
+    def add_neurons(self, target: ImatrixTarget, value: torch.Tensor) -> None:
+        sums = self.neuron_sums[target.name]
+        if sums.ndim != 1:
+            raise RuntimeError(f"NAQ neuron shape is not linear for {target.name}")
+        matrix = self._matrix(value, int(sums.shape[0]), target.name)
+        sums.add_(matrix.square().sum(0, dtype=self.accumulation_dtype))
+
+    def add_expert_neurons(
+        self,
+        target: ImatrixTarget,
+        value: torch.Tensor,
+        expert: int,
+    ) -> None:
+        sums = self.neuron_sums[target.name]
+        if sums.ndim != 2:
+            raise RuntimeError(f"NAQ neuron shape is not routed for {target.name}")
+        matrix = self._matrix(value, int(sums.shape[1]), target.name)
+        sums[expert].add_(matrix.square().sum(0, dtype=self.accumulation_dtype))
+
+    def neuron_mean(self, target: ImatrixTarget) -> torch.Tensor:
+        sums = self.neuron_sums.get(target.name)
+        count = int(self.counts[target.name][0].item())
+        if sums is None or sums.ndim != 1 or count <= 0:
+            raise RuntimeError(f"NAQ neuron importance is unavailable for {target.name}")
+        value = sums / float(count)
+        if not torch.isfinite(value).all() or bool((value < 0).any()):
+            raise FloatingPointError(f"NAQ neuron importance is invalid for {target.name}")
+        return value
 
     def add_experts(
         self,
@@ -459,6 +554,25 @@ class ActivationImatrixCollector:
                     self.add_linear(_target, inputs[0])
 
                 self.handles.append(module.register_forward_pre_hook(pre_hook))
+                if self.neural:
+                    weight = getattr(module, "weight", None)
+                    if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+                        raise TypeError(
+                            f"NAQ target is not a matrix projection: {module_name}"
+                        )
+                    self.neuron_sums.setdefault(
+                        target.name,
+                        torch.zeros(
+                            int(weight.shape[0]),
+                            device=self.device,
+                            dtype=self.accumulation_dtype,
+                        ),
+                    )
+
+                    def post_hook(_module, _inputs, output, *, _target=target):
+                        self.add_neurons(_target, output)
+
+                    self.handles.append(module.register_forward_hook(post_hook))
                 continue
             if kinds != {"expert_gate_up", "expert_down"} or len(module_targets) != 2:
                 raise TypeError(f"invalid routed-expert imatrix binding: {module_name}")
@@ -474,13 +588,35 @@ class ActivationImatrixCollector:
             ):
                 raise TypeError(f"unsupported routed-expert module: {module_name}")
             original = module.forward
-            activation_kind = _activation_kind(activation) if self.nonlinear else None
-            if activation_kind is not None:
-                self._expert_aaq_sums.setdefault(
+            activation_kind = _activation_kind(activation) if self.neural else None
+            if self.neural:
+                self.neuron_sums.setdefault(
                     gate.name,
-                    torch.zeros_like(self.sums[gate.name], dtype=torch.float32),
+                    torch.zeros(
+                        (gate.experts, int(gate_up.shape[1])),
+                        device=self.device,
+                        dtype=self.accumulation_dtype,
+                    ),
                 )
-                self._aaq_categories[gate.name] = "routed_ffn_gate_up"
+                self.neuron_sums.setdefault(
+                    down.name,
+                    torch.zeros(
+                        (down.experts, int(down_proj.shape[1])),
+                        device=self.device,
+                        dtype=self.accumulation_dtype,
+                    ),
+                )
+            if activation_kind is not None:
+                rows_per_expert = int(gate_up.shape[1])
+                self._expert_naq_rows.setdefault(
+                    gate.name,
+                    torch.zeros(
+                        (gate.experts, rows_per_expert),
+                        device=self.device,
+                        dtype=self.accumulation_dtype,
+                    ),
+                )
+                self._naq_categories[gate.name] = "routed_ffn_gate_up"
 
             def expert_forward(
                 _module,
@@ -515,6 +651,12 @@ class ActivationImatrixCollector:
                     gate_value, up_value = torch.nn.functional.linear(
                         current, _module.gate_up_proj[expert]
                     ).chunk(2, dim=-1)
+                    if self.neural:
+                        measured_gate_up = torch.cat((gate_value, up_value), dim=-1)
+                        if valid is not None:
+                            measured_gate_up = measured_gate_up[valid]
+                        if measured_gate_up.numel():
+                            self.add_expert_neurons(_gate, measured_gate_up, expert)
                     activated = _module.act_fn(gate_value)
                     intermediate = activated * up_value
                     if _activation_kind is not None and measured_current.numel():
@@ -534,18 +676,19 @@ class ActivationImatrixCollector:
                             .square()
                             .sum(0)
                         )
-                        energy = (
-                            (
-                                (measured_up.float() * derivative).square()
-                                + measured_activated.float().square()
-                            )
+                        route_weight2 = measured_weight.detach().float().square()[:, None]
+                        gate_importance = (
+                            (measured_up.float() * derivative).square()
                             * downstream
-                        ).sum(-1)
-                        energy.mul_(measured_weight.detach().float().square())
-                        weighted = measured_current.detach().float().square()
-                        weighted.mul_(energy.reshape(-1, 1))
-                        self._expert_aaq_sums[_gate.name][expert].add_(
-                            weighted.sum(0)
+                            * route_weight2
+                        ).sum(0, dtype=self.accumulation_dtype)
+                        up_importance = (
+                            measured_activated.float().square()
+                            * downstream
+                            * route_weight2
+                        ).sum(0, dtype=self.accumulation_dtype)
+                        self._expert_naq_rows[_gate.name][expert].add_(
+                            torch.cat((gate_importance, up_importance))
                         )
                     measured_intermediate = intermediate if valid is None else intermediate[valid]
                     if measured_intermediate.numel():
@@ -554,20 +697,24 @@ class ActivationImatrixCollector:
                         intermediate, _module.down_proj[expert]
                     )
                     output = output * top_k_weights[token_idx, top_k_pos, None]
+                    if self.neural:
+                        measured_output = output if valid is None else output[valid]
+                        if measured_output.numel():
+                            self.add_expert_neurons(_down, measured_output, expert)
                     final.index_add_(0, token_idx, output.to(final.dtype))
                 return final
 
             self.restores.append((module, original))
             module.forward = types.MethodType(expert_forward, module)
 
-        if self.nonlinear:
-            self._install_nonlinear_bindings(modules, targets)
+        if self.neural:
+            self._install_activation_corrections(modules, targets)
 
     @staticmethod
     def _child_name(parent: str, child: str) -> str:
         return f"{parent}.{child}" if parent else child
 
-    def _install_nonlinear_bindings(
+    def _install_activation_corrections(
         self,
         modules: Mapping[str, nn.Module],
         targets: Sequence[ImatrixTarget],
@@ -575,17 +722,22 @@ class ActivationImatrixCollector:
         linear_targets = {
             target.module_name: target for target in targets if target.kind == "linear"
         }
-        bound = {binding.target.name for binding in self._active_aaq}
+        bound = {
+            name for binding in self._active_naq for name in binding.names
+        }
         for parent_name, parent in modules.items():
             gate = getattr(parent, "gate_proj", None)
             up = getattr(parent, "up_proj", None)
             down = getattr(parent, "down_proj", None)
             activation = getattr(parent, "act_fn", None)
             target = linear_targets.get(self._child_name(parent_name, "gate_proj"))
+            up_target = linear_targets.get(self._child_name(parent_name, "up_proj"))
             activation_kind = _activation_kind(activation)
             if (
                 target is not None
+                and up_target is not None
                 and target.name not in bound
+                and up_target.name not in bound
                 and isinstance(gate, nn.Module)
                 and isinstance(up, nn.Module)
                 and isinstance(down, nn.Module)
@@ -602,12 +754,20 @@ class ActivationImatrixCollector:
                     and gate_weight.shape == up_weight.shape
                     and int(down_weight.shape[1]) == int(gate_weight.shape[0])
                 ):
-                    self._active_aaq.append(
-                        _DenseFfnAaqBinding(
-                            self, target, gate, up, down, activation_kind
+                    self._active_naq.append(
+                        _DenseFfnNaqBinding(
+                            self,
+                            target,
+                            up_target,
+                            gate,
+                            up,
+                            down,
+                            activation,
+                            activation_kind,
                         )
                     )
                     bound.add(target.name)
+                    bound.add(up_target.name)
 
             query = getattr(parent, "q_proj", None)
             output = getattr(parent, "o_proj", None)
@@ -629,8 +789,8 @@ class ActivationImatrixCollector:
                     and int(query_weight.shape[0]) == 2 * int(output_weight.shape[1])
                     and int(query_weight.shape[0]) % (2 * head_dim) == 0
                 ):
-                    self._active_aaq.append(
-                        _AttentionGateAaqBinding(
+                    self._active_naq.append(
+                        _AttentionGateNaqBinding(
                             self, target, query, output, head_dim
                         )
                     )
@@ -662,8 +822,8 @@ class ActivationImatrixCollector:
                     and int(norm_weight.numel()) > 0
                     and int(z_weight.shape[0]) % int(norm_weight.numel()) == 0
                 ):
-                    self._active_aaq.append(
-                        _GatedNormAaqBinding(
+                    self._active_naq.append(
+                        _GatedNormNaqBinding(
                             self, target, z, norm, output, activation_kind
                         )
                     )
@@ -676,14 +836,13 @@ class ActivationImatrixCollector:
         for module, original in reversed(self.restores):
             module.forward = original
         self.restores.clear()
-        bindings, self._active_aaq = self._active_aaq, []
+        bindings, self._active_naq = self._active_naq, []
         for binding in bindings:
             binding.remove()
         for binding in bindings:
-            entry = binding.entry()
-            if entry is not None:
-                self._aaq_entries[binding.target.name] = entry
-                self._aaq_categories[binding.target.name] = binding.category
+            for name, entry in binding.entries().items():
+                self._naq_entries[name] = entry
+                self._naq_categories[name] = binding.category
 
     def entries(self) -> dict[str, ImportanceEntry]:
         result: dict[str, ImportanceEntry] = {}
@@ -696,25 +855,53 @@ class ActivationImatrixCollector:
             if not positive.any():
                 raise RuntimeError(f"imatrix target received no activations: {target.name}")
             result[target.name] = ImportanceEntry(np.ascontiguousarray(values), counts)
-        for name, sums in self._expert_aaq_sums.items():
+        for name, sums in self.neuron_sums.items():
             ordinary = result[name]
-            values = ordinary.values.copy()
+            if sums.ndim == 1:
+                row_importance = _normalized_naq_rows(
+                    sums, int(ordinary.counts[0])
+                ).detach().cpu().numpy()
+                category = "linear"
+            else:
+                row_importance = np.ones(tuple(sums.shape), dtype=np.float32)
+                for expert, count in enumerate(ordinary.counts):
+                    if count > 0:
+                        row_importance[expert] = (
+                            _normalized_naq_rows(sums[expert], int(count))
+                            .detach()
+                            .cpu()
+                            .numpy()
+                        )
+                category = "routed_linear"
+            result[name] = ImportanceEntry(
+                ordinary.values,
+                ordinary.counts,
+                np.ascontiguousarray(row_importance, dtype=np.float32).reshape(-1),
+            )
+            self._naq_categories.setdefault(name, category)
+        for name, sums in self._expert_naq_rows.items():
+            ordinary = result[name]
+            row_importance = np.ones(tuple(sums.shape), dtype=np.float32)
             for expert, count in enumerate(ordinary.counts):
                 if count <= 0:
                     continue
-                nonlinear = sums[expert].detach().cpu().numpy().astype(np.float64)
-                nonlinear /= float(count)
-                mean = float(nonlinear.mean())
+                corrected = sums[expert].detach().cpu().numpy().astype(np.float64)
+                corrected /= float(count)
+                mean = float(corrected.mean())
                 if np.isfinite(mean) and mean > 1e-30:
-                    nonlinear *= float(ordinary.values[expert].mean()) / mean
-                    values[expert] = nonlinear.astype(np.float32)
-            result[name] = ImportanceEntry(np.ascontiguousarray(values), ordinary.counts)
-        result.update(self._aaq_entries)
+                    corrected /= mean
+                    row_importance[expert] = corrected.astype(np.float32)
+            result[name] = ImportanceEntry(
+                ordinary.values,
+                ordinary.counts,
+                np.ascontiguousarray(row_importance.reshape(-1)),
+            )
+        result.update(self._naq_entries)
         return result
 
     @property
-    def aaq_categories(self) -> dict[str, str]:
-        return dict(self._aaq_categories)
+    def naq_categories(self) -> dict[str, str]:
+        return dict(self._naq_categories)
 
 
 def _sha256(path: Path) -> str:
@@ -750,11 +937,16 @@ def _backend(model: Path, device: torch.device, attention: str):
     outer = AutoConfig.from_pretrained(model, local_files_only=True, trust_remote_code=True)
     config = getattr(outer, "text_config", outer)
     model_type = str(getattr(config, "model_type", ""))
-    if model_type == "gemma4_text":
+    # Conditional-generation checkpoints expose the language model through a
+    # ``*_text`` sub-config, while text-only checkpoints use the family name
+    # directly.  Backend selection is a property of that family, not of the
+    # outer multimodal wrapper.
+    backend_family = model_type.removesuffix("_text")
+    if backend_family == "gemma4":
         from mfq.calibration.layerwise_gemma4 import Gemma4LayerwiseBackend
 
         return Gemma4LayerwiseBackend(model, device=device, attention=attention), model_type
-    if model_type in {"qwen3_5", "qwen3_5_moe"}:
+    if backend_family in {"qwen3_5", "qwen3_5_moe"}:
         from mfq.calibration.layerwise_qwen35 import Qwen35LayerwiseBackend
 
         return (
@@ -853,7 +1045,7 @@ def collect_imatrix(
     work_dir: str | Path | None = None,
     keep_hidden: bool = False,
     accumulation_dtype: str = "float64",
-    objective: str = "aaq",
+    objective: str = "naq",
 ) -> ImportanceMatrix:
     """Collect one frozen train-only BF16 imatrix layer by layer."""
 
@@ -870,8 +1062,8 @@ def collect_imatrix(
         raise RuntimeError("Metal imatrix requested but MPS is unavailable")
     if min(window_length, batch_size, train_tokens) <= 0:
         raise ValueError("imatrix window, batch, and train token counts must be positive")
-    if objective not in {"aaq", "linear"}:
-        raise ValueError("imatrix objective must be aaq or linear")
+    if objective not in {"naq", "linear"}:
+        raise ValueError("imatrix objective must be naq or linear")
     dtype = {"float32": torch.float32, "float64": torch.float64}.get(accumulation_dtype)
     if dtype is None:
         raise ValueError("accumulation dtype must be float32 or float64")
@@ -910,7 +1102,7 @@ def collect_imatrix(
         targets,
         target_device,
         accumulation_dtype=dtype,
-        nonlinear=objective == "aaq",
+        neural=objective == "naq",
     )
     store = HiddenStateStore(
         hidden_path,
@@ -982,16 +1174,48 @@ def collect_imatrix(
         for name, entry in tuple(entries.items()):
             if name.endswith(".linear_attn.in_proj_qkv.weight"):
                 base = name[: -len("in_proj_qkv.weight")]
-                entries[base + "in_proj_qk.weight"] = entry
-                entries[base + "in_proj_v.weight"] = entry
+                key_rows = int(backend.config.linear_num_key_heads) * int(
+                    backend.config.linear_key_head_dim
+                )
+                value_rows = int(backend.config.linear_num_value_heads) * int(
+                    backend.config.linear_value_head_dim
+                )
+                qk_rows = 2 * key_rows
+                if (
+                    entry.row_importance is not None
+                    and entry.row_importance.size != qk_rows + value_rows
+                ):
+                    raise ValueError(
+                        f"linear-attention NAQ neuron shape mismatch for {name}"
+                    )
+                entries[base + "in_proj_qk.weight"] = ImportanceEntry(
+                    entry.values,
+                    entry.counts,
+                    (
+                        None
+                        if entry.row_importance is None
+                        else np.ascontiguousarray(entry.row_importance[:qk_rows])
+                    ),
+                )
+                entries[base + "in_proj_v.weight"] = ImportanceEntry(
+                    entry.values,
+                    entry.counts,
+                    (
+                        None
+                        if entry.row_importance is None
+                        else np.ascontiguousarray(
+                            entry.row_importance[qk_rows : qk_rows + value_rows]
+                        )
+                    ),
+                )
         metadata = {
             "objective": (
-                "activation_aware_nonlinear_energy"
-                if objective == "aaq"
+                "neuron_aware_factorized_importance"
+                if objective == "naq"
                 else "mean_squared_linear_input_activation"
             ),
             "ordinary_objective": "mean_squared_linear_input_activation",
-            "aaq_entries": collector.aaq_categories,
+            "naq_entries": collector.naq_categories,
             "split": "train",
             "model": _model_identity(root),
             "model_type": model_type,

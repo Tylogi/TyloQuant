@@ -20,6 +20,7 @@ _NATIVE_METADATA = "__metadata_json__"
 class ImportanceEntry:
     values: np.ndarray
     counts: np.ndarray
+    row_importance: np.ndarray | None = None
 
     @property
     def matrices(self) -> int:
@@ -74,25 +75,76 @@ class ImportanceMatrix:
         ):
             raise IndexError(f"imatrix row selection is outside {storage_shape[0]} rows")
         if entry.matrices == 1:
-            return name, entry.values[0]
-        # Native AAQ entries may carry one input-importance vector per weight
-        # row.  Resolve those directly for both dense and flattened expert
-        # matrices; ordinary expert imatrices continue through the compact
-        # one-vector-per-expert path below.
-        if entry.matrices == int(storage_shape[0]):
-            return name, np.ascontiguousarray(entry.values[row_ids], dtype=np.float32)
-        if len(original_shape) != 3:
+            input_importance = entry.values[0]
+        # Older native activation-aware artifacts may carry one input vector per
+        # weight row. Keep reading them, but NAQ-imatrix uses the compact
+        # factorized representation below.
+        elif entry.matrices == int(storage_shape[0]):
+            input_importance = np.ascontiguousarray(
+                entry.values[row_ids], dtype=np.float32
+            )
+        elif len(original_shape) != 3:
             raise ValueError(
                 f"imatrix for non-expert tensor {name} has {entry.matrices} matrices"
             )
-        experts, rows_per_expert, _ = original_shape
-        if entry.matrices != experts:
-            raise ValueError(
-                f"imatrix expert count mismatch for {name}: "
-                f"{entry.matrices} != {experts}"
+        else:
+            experts, rows_per_expert, _ = original_shape
+            if entry.matrices != experts:
+                raise ValueError(
+                    f"imatrix expert count mismatch for {name}: "
+                    f"{entry.matrices} != {experts}"
+                )
+            expert_ids = row_ids // int(rows_per_expert)
+            input_importance = np.ascontiguousarray(
+                entry.values[expert_ids], dtype=np.float32
             )
-        expert_ids = row_ids // int(rows_per_expert)
-        return name, np.ascontiguousarray(entry.values[expert_ids], dtype=np.float32)
+
+        if entry.row_importance is None:
+            return name, input_importance
+        row_importance = np.asarray(entry.row_importance, dtype=np.float32).reshape(-1)
+        if row_importance.shape != (int(storage_shape[0]),):
+            raise ValueError(
+                f"NAQ neuron importance mismatch for {name}: "
+                f"{row_importance.shape} != {(int(storage_shape[0]),)}"
+            )
+        selected_rows = row_importance[row_ids]
+        if np.ndim(input_importance) == 1:
+            input_importance = np.broadcast_to(
+                input_importance, (row_ids.size, neuron_len)
+            )
+        return name, np.ascontiguousarray(
+            input_importance * selected_rows[:, None], dtype=np.float32
+        )
+
+    def neuron_importance_for_rows(
+        self,
+        names: Iterable[str],
+        storage_shape: tuple[int, int],
+        rows: slice | np.ndarray,
+    ) -> tuple[str, np.ndarray] | None:
+        """Return the independent NAQ output-neuron factor for selected rows."""
+
+        match = self.find(names)
+        if match is None or match[1].row_importance is None:
+            return None
+        name, entry = match
+        if isinstance(rows, slice):
+            start = 0 if rows.start is None else int(rows.start)
+            stop = int(storage_shape[0]) if rows.stop is None else int(rows.stop)
+            row_ids = np.arange(start, stop, dtype=np.int64)
+        else:
+            row_ids = np.asarray(rows, dtype=np.int64).reshape(-1)
+        if row_ids.size and (
+            int(row_ids.min()) < 0 or int(row_ids.max()) >= int(storage_shape[0])
+        ):
+            raise IndexError(f"imatrix row selection is outside {storage_shape[0]} rows")
+        importance = np.asarray(entry.row_importance, dtype=np.float32).reshape(-1)
+        if importance.shape != (int(storage_shape[0]),):
+            raise ValueError(
+                f"NAQ neuron importance mismatch for {name}: "
+                f"{importance.shape} != {(int(storage_shape[0]),)}"
+            )
+        return name, np.ascontiguousarray(importance[row_ids], dtype=np.float32)
 
 
 def _load_gguf_reader():
@@ -186,7 +238,27 @@ def save_importance_matrix(
         arrays[f"{prefix}_values"] = np.ascontiguousarray(values)
         arrays[f"{prefix}_counts"] = np.ascontiguousarray(counts)
         entry_document[name] = {"prefix": prefix, "shape": list(values.shape)}
-        normalized[name] = ImportanceEntry(arrays[f"{prefix}_values"], counts)
+        row_importance = None
+        if raw.row_importance is not None:
+            row_importance = np.ascontiguousarray(
+                raw.row_importance, dtype=np.float32
+            ).reshape(-1)
+            if (
+                not row_importance.size
+                or not np.isfinite(row_importance).all()
+                or np.any(row_importance < 0)
+                or not np.any(row_importance > 0)
+            ):
+                raise ValueError(f"invalid NAQ neuron importance for {name!r}")
+            row_key = f"{prefix}_row_importance"
+            arrays[row_key] = row_importance
+            entry_document[name]["row_importance"] = {
+                "key": row_key,
+                "rows": int(row_importance.size),
+            }
+        normalized[name] = ImportanceEntry(
+            arrays[f"{prefix}_values"], counts, row_importance
+        )
     document = {
         "format": _NATIVE_FORMAT,
         "datasets": [str(value) for value in datasets],
@@ -238,8 +310,31 @@ def _load_native(path: Path) -> ImportanceMatrix:
                 or np.any(counts < 0)
             ):
                 raise ValueError(f"native imatrix entry {name!r} is invalid")
+            row_importance = None
+            row_document = item.get("row_importance")
+            if row_document is not None:
+                row_key = str(row_document["key"])
+                row_count = int(row_document["rows"])
+                if row_key not in archive.files:
+                    raise ValueError(
+                        f"native NAQ-imatrix entry {name!r} is missing {row_key}"
+                    )
+                row_importance = np.ascontiguousarray(
+                    archive[row_key], dtype=np.float32
+                ).reshape(-1)
+                if (
+                    row_importance.shape != (row_count,)
+                    or not np.isfinite(row_importance).all()
+                    or np.any(row_importance < 0)
+                    or not np.any(row_importance > 0)
+                ):
+                    raise ValueError(
+                        f"native NAQ-imatrix entry {name!r} is invalid"
+                    )
             entries[str(name)] = ImportanceEntry(
-                np.ascontiguousarray(values), np.ascontiguousarray(counts)
+                np.ascontiguousarray(values),
+                np.ascontiguousarray(counts),
+                row_importance,
             )
     if not entries:
         raise ValueError(f"native imatrix contains no entries: {path}")

@@ -29,6 +29,13 @@ Inside a little-endian NINT blob::
     sub_scale(out·ng×sub_bits packed) sub_min(out·ng×sub_bits packed)
     q(out·ng·gs×bits packed)
 
+NINTv2 sets the high bit of the ``bits`` header byte. The remaining bits retain
+the nominal primary-code width, while ``sub_bits`` remains an unflagged nominal
+metadata width. Every NINTv2 payload then carries both compact per-neuron
+selectors: 3 bits for primary-code width ``q`` and 2 bits for subgroup-metadata
+width ``k``. Either selector may be uniform, but there is only one NINTv2
+container layout and one reader path.
+
 Version 2 and later use bitstream storage; the loader retains read compatibility with legacy uint-storage blobs.
 """
 
@@ -51,7 +58,16 @@ from mfq.formats.header import MFQ_MAGIC, FileHeader
 from mfq.formats.moe import NintMoePool, NintMoeTensor
 from mfq.formats.mx import MX_DTYPES, MxTensor, pack_mx, unpack_mx
 from mfq.formats.nepq import NepqTensor, pack_nepq, rotation_signs, unpack_nepq
-from mfq.formats.nint import NintSpec, NintTensor, _uint_dtype
+from mfq.formats.nint import (
+    NINT_V2_FLAG,
+    NINT_V2_K_SELECTOR_BITS,
+    NINT_V2_Q_SELECTOR_BITS,
+    NintSpec,
+    NintTensor,
+    _uint_dtype,
+    normalize_row_q_bits,
+    normalize_row_sub_bits,
+)
 from mfq.formats.nint8_zero import (
     Nint8ZeroTensor,
     pack_nint8_zero,
@@ -147,7 +163,144 @@ def _read_str(buf: bytes, off: int) -> tuple[str, int]:
 # ---------------------------------------------------------------------------
 # NINT codec packing / unpacking
 # ---------------------------------------------------------------------------
-_NINT_HDR = struct.Struct("<BBiii")   # bits, sub_bits, groupsize, axis, neuron_len
+_NINT_HDR = struct.Struct("<BBiii")   # bits|NINTv2 flag, sub_bits, groupsize, axis, neuron_len
+
+
+def _mixed_nint_metadata_nbytes(
+    selectors: np.ndarray,
+    nominal_sub_bits: int,
+    groups: int,
+) -> int:
+    total = (int(selectors.size) * NINT_V2_K_SELECTOR_BITS + 7) // 8
+    for selector in range(1 << NINT_V2_K_SELECTOR_BITS):
+        rows = int(np.count_nonzero(selectors == selector))
+        bits = nominal_sub_bits - 1 + selector
+        if rows and not 1 <= bits <= 8:
+            raise ValueError(f"invalid NINT v2 subgroup width {bits}")
+        values = rows * groups
+        total += 2 * ((values * bits + 7) // 8)
+    return total
+
+
+def _pack_mixed_nint_metadata(
+    sub_scale: np.ndarray,
+    sub_min: np.ndarray,
+    row_sub_bits: np.ndarray,
+    nominal_sub_bits: int,
+) -> bytes:
+    selectors = np.ascontiguousarray(
+        row_sub_bits.astype(np.int16) - (nominal_sub_bits - 1),
+        dtype=np.uint8,
+    )
+    parts = [pack_bits(selectors, NINT_V2_K_SELECTOR_BITS)]
+    for selector in range(1 << NINT_V2_K_SELECTOR_BITS):
+        rows = np.flatnonzero(selectors == selector)
+        bits = nominal_sub_bits - 1 + selector
+        if not rows.size:
+            continue
+        scales = np.ascontiguousarray(sub_scale[rows])
+        minima = np.ascontiguousarray(sub_min[rows])
+        maximum = (1 << bits) - 1
+        if np.any(scales > maximum) or np.any(minima > maximum):
+            raise ValueError(
+                f"NINT v2 subgroup metadata exceeds the selected {bits}-bit width"
+            )
+        parts.append(pack_bits(scales, bits))
+        parts.append(pack_bits(minima, bits))
+    return b"".join(parts)
+
+
+def _unpack_mixed_nint_metadata(
+    blob: bytes | memoryview,
+    off: int,
+    out: int,
+    groups: int,
+    nominal_sub_bits: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    selectors, off = unpack_bits(
+        blob,
+        off,
+        out,
+        NINT_V2_K_SELECTOR_BITS,
+    )
+    row_sub_bits = selectors.astype(np.int16) + (nominal_sub_bits - 1)
+    if np.any(row_sub_bits < 1) or np.any(row_sub_bits > 8):
+        raise ValueError("invalid NINT v2 per-neuron subgroup width")
+    sub_scale = np.empty((out, groups), dtype=np.uint8)
+    sub_min = np.empty((out, groups), dtype=np.uint8)
+    for selector in range(1 << NINT_V2_K_SELECTOR_BITS):
+        rows = np.flatnonzero(selectors == selector)
+        if not rows.size:
+            continue
+        bits = nominal_sub_bits - 1 + selector
+        count = int(rows.size) * groups
+        scales, off = unpack_bits(blob, off, count, bits)
+        minima, off = unpack_bits(blob, off, count, bits)
+        sub_scale[rows] = scales.reshape(rows.size, groups)
+        sub_min[rows] = minima.reshape(rows.size, groups)
+    return (
+        sub_scale,
+        sub_min,
+        np.ascontiguousarray(row_sub_bits, dtype=np.uint8),
+        off,
+    )
+
+
+def _mixed_nint_q_nbytes(selectors: np.ndarray, values_per_row: int) -> int:
+    total = (int(selectors.size) * NINT_V2_Q_SELECTOR_BITS + 7) // 8
+    for selector in range(1 << NINT_V2_Q_SELECTOR_BITS):
+        rows = int(np.count_nonzero(selectors == selector))
+        bits = selector + 1
+        total += (rows * values_per_row * bits + 7) // 8
+    return total
+
+
+def _pack_mixed_nint_q(q: np.ndarray, row_q_bits: np.ndarray) -> bytes:
+    selectors = np.ascontiguousarray(row_q_bits - 1, dtype=np.uint8)
+    parts = [pack_bits(selectors, NINT_V2_Q_SELECTOR_BITS)]
+    for selector in range(1 << NINT_V2_Q_SELECTOR_BITS):
+        rows = np.flatnonzero(selectors == selector)
+        if not rows.size:
+            continue
+        bits = selector + 1
+        values = np.ascontiguousarray(q[rows])
+        if np.any(values > (1 << bits) - 1):
+            raise ValueError(
+                f"NINTv2 values exceed the selected {bits}-bit q width"
+            )
+        parts.append(pack_bits(values, bits))
+    return b"".join(parts)
+
+
+def _unpack_mixed_nint_q(
+    blob: bytes | memoryview,
+    off: int,
+    out: int,
+    groups: int,
+    groupsize: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    selectors, off = unpack_bits(
+        blob,
+        off,
+        out,
+        NINT_V2_Q_SELECTOR_BITS,
+    )
+    row_q_bits = selectors.astype(np.uint8) + 1
+    values_per_row = groups * groupsize
+    q = np.empty((out, groups, groupsize), dtype=np.uint8)
+    for selector in range(1 << NINT_V2_Q_SELECTOR_BITS):
+        rows = np.flatnonzero(selectors == selector)
+        if not rows.size:
+            continue
+        bits = selector + 1
+        values, off = unpack_bits(
+            blob,
+            off,
+            int(rows.size) * values_per_row,
+            bits,
+        )
+        q[rows] = values.reshape(rows.size, groups, groupsize)
+    return q, np.ascontiguousarray(row_q_bits, dtype=np.uint8), off
 
 
 def pack_bits(values: np.ndarray, bits: int) -> bytes:
@@ -213,25 +366,49 @@ def unpack_bits(blob: bytes, off: int, count: int, bits: int) -> tuple[np.ndarra
 def pack_nint(tensor: NintTensor) -> bytes:
     s = tensor.spec
     out, ng, _gs = tensor.q.shape
+    row_q_bits = normalize_row_q_bits(s, tensor.row_q_bits, out)
+    row_sub_bits = normalize_row_sub_bits(s, tensor.row_sub_bits, out)
+    is_nint_v2 = tensor.is_nint_v2
+    header_bits = int(s.bits) | (NINT_V2_FLAG if is_nint_v2 else 0)
     with np.errstate(over="ignore", invalid="ignore"):
         neuron_scale = np.ascontiguousarray(tensor.neuron_scale, dtype=np.float16)
         neuron_min = np.ascontiguousarray(tensor.neuron_min, dtype=np.float16)
     if not np.isfinite(neuron_scale).all() or not np.isfinite(neuron_min).all():
         raise ValueError("NINT neuron metadata must remain finite in FP16 storage")
-    parts = [_NINT_HDR.pack(s.bits, s.sub_bits, s.groupsize, tensor.axis, tensor.neuron_len)]
+    parts = [_NINT_HDR.pack(header_bits, s.sub_bits, s.groupsize, tensor.axis, tensor.neuron_len)]
     parts.append(struct.pack("<I", len(tensor.shape)))
     parts.append(struct.pack(f"<{len(tensor.shape)}q", *tensor.shape))
     parts.append(struct.pack("<II", out, ng))
     parts.append(neuron_scale.tobytes())
     parts.append(neuron_min.tobytes())
-    parts.append(pack_bits(tensor.sub_scale, s.sub_bits))
-    parts.append(pack_bits(tensor.sub_min, s.sub_bits))
-    parts.append(pack_bits(tensor.q, s.bits))
+    if is_nint_v2:
+        parts.append(
+            _pack_mixed_nint_metadata(
+                np.asarray(tensor.sub_scale),
+                np.asarray(tensor.sub_min),
+                row_sub_bits,
+                int(s.sub_bits),
+            )
+        )
+    else:
+        parts.append(pack_bits(tensor.sub_scale, s.sub_bits))
+        parts.append(pack_bits(tensor.sub_min, s.sub_bits))
+    if is_nint_v2:
+        parts.append(_pack_mixed_nint_q(np.asarray(tensor.q), row_q_bits))
+    else:
+        parts.append(pack_bits(tensor.q, s.bits))
     return b"".join(parts)
 
 
-def unpack_nint(blob: bytes) -> NintTensor:
-    bits, sub_bits, groupsize, axis, neuron_len = _NINT_HDR.unpack_from(blob, 0)
+def unpack_nint(blob: bytes | memoryview) -> NintTensor:
+    raw_bits, raw_sub_bits, groupsize, axis, neuron_len = _NINT_HDR.unpack_from(blob, 0)
+    is_nint_v2 = bool(raw_bits & NINT_V2_FLAG)
+    bits = int(raw_bits & ~NINT_V2_FLAG)
+    sub_bits = int(raw_sub_bits)
+    if not 1 <= int(bits) <= 8 or not 1 <= sub_bits <= 8:
+        raise ValueError(
+            f"invalid NINT bit widths: bits={bits}, sub_bits={sub_bits}"
+        )
     off = _NINT_HDR.size
     ndim = struct.unpack_from("<I", blob, off)[0]
     off += 4
@@ -254,12 +431,30 @@ def unpack_nint(blob: bytes) -> NintTensor:
     old_q_dtype = _uint_dtype((1 << bits) - 1)
     old_tail = sub_count * old_sub_dtype.itemsize * 2 + q_count * old_q_dtype.itemsize
     remaining = len(blob) - off
-    if remaining == old_tail:
+    row_sub_bits = None
+    row_q_bits = None
+    if is_nint_v2:
+        sub_scale, sub_min, row_sub_bits, off = _unpack_mixed_nint_metadata(
+            blob,
+            off,
+            out,
+            ng,
+            sub_bits,
+        )
+        q, row_q_bits, off = _unpack_mixed_nint_q(
+            blob,
+            off,
+            out,
+            ng,
+            groupsize,
+        )
+    elif remaining == old_tail:
         sub_scale = np.frombuffer(blob, dtype=old_sub_dtype, count=sub_count, offset=off).copy().reshape(out, ng)
         off += sub_count * old_sub_dtype.itemsize
         sub_min = np.frombuffer(blob, dtype=old_sub_dtype, count=sub_count, offset=off).copy().reshape(out, ng)
         off += sub_count * old_sub_dtype.itemsize
         q = np.frombuffer(blob, dtype=old_q_dtype, count=q_count, offset=off).copy()
+        off += q_count * old_q_dtype.itemsize
     else:
         if remaining != packed_tail:
             raise ValueError(f"invalid NINT blob tail: remaining={remaining}, packed={packed_tail}, old={old_tail}")
@@ -268,12 +463,16 @@ def unpack_nint(blob: bytes) -> NintTensor:
         q, off = unpack_bits(blob, off, q_count, bits)
         sub_scale = sub_scale.reshape(out, ng)
         sub_min = sub_min.reshape(out, ng)
+    if off != len(blob):
+        raise ValueError(f"invalid NINT trailing bytes: {len(blob) - off}")
     q = q.reshape(out, ng, groupsize)
 
     return NintTensor(
         spec=spec, shape=shape, axis=axis, q=q,
         neuron_scale=neuron_scale, neuron_min=neuron_min,
         sub_scale=sub_scale, sub_min=sub_min, neuron_len=neuron_len,
+        row_sub_bits=row_sub_bits,
+        row_q_bits=row_q_bits,
     )
 
 
@@ -432,15 +631,19 @@ def inspect_nint_moe_header(
         if dtype.startswith("NINT") and dtype != "NINT8-0":
             if payload_nbytes < _NINT_HDR.size:
                 raise ValueError("truncated NINTM NINT cohort header")
-            bits, sub_bits, groupsize, _axis, _width = _NINT_HDR.unpack_from(
+            raw_bits, raw_sub_bits, groupsize, _axis, _width = _NINT_HDR.unpack_from(
                 blob, payload_off
             )
+            is_nint_v2 = bool(raw_bits & NINT_V2_FLAG)
+            bits = int(raw_bits & ~NINT_V2_FLAG)
+            sub_bits = int(raw_sub_bits)
             nint_spec = NintSpec(
                 bits=int(bits),
                 groupsize=int(groupsize),
-                sub_bits=int(sub_bits),
+                sub_bits=sub_bits,
             )
-            if dtype != f"NINT{nint_spec.bits}":
+            expected_dtype = "NINTv2" if is_nint_v2 else f"NINT{nint_spec.bits}"
+            if dtype != expected_dtype:
                 raise ValueError("NINTM cohort dtype/spec mismatch")
         pools.append(
             NintMoePoolMetadata(
@@ -833,7 +1036,8 @@ def _pack_tensor(tensor: MfqTensor, *, allow_moe: bool = True) -> tuple[str, byt
     if isinstance(tensor, TpqPqTensor):
         return tensor.spec.label, pack_tpq_pq(tensor)
     if isinstance(tensor, NintTensor):
-        return f"NINT{tensor.spec.bits}", pack_nint(tensor)
+        dtype = "NINTv2" if tensor.is_nint_v2 else f"NINT{tensor.spec.bits}"
+        return dtype, pack_nint(tensor)
     if isinstance(tensor, NintMoeTensor):
         if not allow_moe:
             raise TypeError("nested NINTM cohorts are not supported")
@@ -1079,7 +1283,9 @@ class MMapEmbeddingReader:
 
         if self.dtype in self._DENSE_ROW_DTYPES:
             self._init_dense()
-        elif self.dtype.startswith("NINT") and self.dtype[4:].isdigit():
+        elif self.dtype in {"NINT", "NINTv2"} or (
+            self.dtype.startswith("NINT") and self.dtype[4:].isdigit()
+        ):
             self._init_nint()
         else:
             raise TypeError(
@@ -1121,9 +1327,12 @@ class MMapEmbeddingReader:
     def _init_nint(self) -> None:
         offset = self._blob_start
         self._require(offset, _NINT_HDR.size + 4, "NINT header")
-        bits, sub_bits, groupsize, axis, neuron_len = _NINT_HDR.unpack_from(
+        raw_bits, raw_sub_bits, groupsize, axis, neuron_len = _NINT_HDR.unpack_from(
             self._mapping, offset
         )
+        is_nint_v2 = bool(raw_bits & NINT_V2_FLAG)
+        bits = int(raw_bits & ~NINT_V2_FLAG)
+        sub_bits = int(raw_sub_bits)
         offset += _NINT_HDR.size
         ndim = int(struct.unpack_from("<I", self._mapping, offset)[0])
         offset += 4
@@ -1156,10 +1365,11 @@ class MMapEmbeddingReader:
                 f"mmap NINT embedding requires 1-8 bit fields, got "
                 f"bits={bits}, sub_bits={sub_bits}"
             )
-        if self.dtype != f"NINT{int(bits)}":
+        expected_dtype = "NINTv2" if is_nint_v2 else f"NINT{int(bits)}"
+        if self.dtype != expected_dtype:
             raise ValueError(
                 f"MFQ dtype/blob mismatch for {self.name!r}: "
-                f"{self.dtype} contains NINT{int(bits)}"
+                f"{self.dtype} contains {expected_dtype}"
             )
 
         anchors_nbytes = out * np.dtype("<f2").itemsize
@@ -1184,7 +1394,51 @@ class MMapEmbeddingReader:
             + q_count * old_q_dtype.itemsize
         )
         remaining = self._blob_end - offset
-        if remaining == packed_tail_nbytes:
+        self._is_nint_v2 = is_nint_v2
+        self._row_sub_bits = None
+        self._row_cohort_rank = None
+        self._mixed_metadata_streams: dict[int, tuple[int, int, int]] = {}
+        if is_nint_v2:
+            selector_nbytes = (
+                out * NINT_V2_K_SELECTOR_BITS + 7
+            ) // 8
+            self._require(offset, selector_nbytes, "NINTv2 k selectors")
+            selectors = self._packed_values(
+                offset,
+                selector_nbytes,
+                np.arange(out, dtype=np.int64),
+                NINT_V2_K_SELECTOR_BITS,
+            )
+            offset += selector_nbytes
+            row_sub_bits = selectors.astype(np.int16) + (int(sub_bits) - 1)
+            if np.any(row_sub_bits < 1) or np.any(row_sub_bits > 8):
+                raise ValueError(f"invalid NINTv2 k selectors for {self.name!r}")
+            row_rank = np.empty(out, dtype=np.int64)
+            for selector in range(1 << NINT_V2_K_SELECTOR_BITS):
+                rows = np.flatnonzero(selectors == selector)
+                bits_for_rows = int(sub_bits) - 1 + selector
+                row_rank[rows] = np.arange(rows.size, dtype=np.int64)
+                stream_nbytes = (
+                    int(rows.size) * groups * bits_for_rows + 7
+                ) // 8
+                self._require(
+                    offset,
+                    2 * stream_nbytes,
+                    f"NINTv2 {bits_for_rows}-bit metadata",
+                )
+                self._mixed_metadata_streams[bits_for_rows] = (
+                    offset,
+                    offset + stream_nbytes,
+                    stream_nbytes,
+                )
+                offset += 2 * stream_nbytes
+            self._packed = True
+            self._sub_scale_offset = -1
+            self._sub_min_offset = -1
+            self._sub_stream_nbytes = 0
+            self._row_sub_bits = np.ascontiguousarray(row_sub_bits, dtype=np.uint8)
+            self._row_cohort_rank = row_rank
+        elif remaining == packed_tail_nbytes:
             self._packed = True
             self._sub_scale_offset = offset
             self._sub_min_offset = offset + packed_metadata_nbytes
@@ -1204,6 +1458,47 @@ class MMapEmbeddingReader:
                 f"remaining={remaining}, packed={packed_tail_nbytes}, old={old_tail_nbytes}"
             )
 
+        self._row_q_bits = None
+        self._row_q_cohort_rank = None
+        self._mixed_q_streams: dict[int, tuple[int, int]] = {}
+        if is_nint_v2:
+            selector_nbytes = (
+                out * NINT_V2_Q_SELECTOR_BITS + 7
+            ) // 8
+            self._require(offset, selector_nbytes, "NINTv2 q selectors")
+            selectors = self._packed_values(
+                offset,
+                selector_nbytes,
+                np.arange(out, dtype=np.int64),
+                NINT_V2_Q_SELECTOR_BITS,
+            )
+            offset += selector_nbytes
+            row_q_bits = selectors.astype(np.uint8) + 1
+            row_rank = np.empty(out, dtype=np.int64)
+            row_values = groups * int(groupsize)
+            for selector in range(1 << NINT_V2_Q_SELECTOR_BITS):
+                rows = np.flatnonzero(selectors == selector)
+                bits_for_rows = selector + 1
+                row_rank[rows] = np.arange(rows.size, dtype=np.int64)
+                stream_nbytes = (
+                    int(rows.size) * row_values * bits_for_rows + 7
+                ) // 8
+                self._require(
+                    offset,
+                    stream_nbytes,
+                    f"NINTv2 {bits_for_rows}-bit q values",
+                )
+                self._mixed_q_streams[bits_for_rows] = (
+                    offset,
+                    stream_nbytes,
+                )
+                offset += stream_nbytes
+            if offset != self._blob_end:
+                raise ValueError(f"invalid NINTv2 payload length for {self.name!r}")
+            self._q_offset = -1
+            self._q_stream_nbytes = 0
+            self._row_q_bits = np.ascontiguousarray(row_q_bits, dtype=np.uint8)
+            self._row_q_cohort_rank = row_rank
         self.shape = shape
         self.out = out
         self.neuron_len = int(neuron_len)
@@ -1340,7 +1635,36 @@ class MMapEmbeddingReader:
             unique[:, None] * row_values
             + np.arange(row_values, dtype=np.int64)[None, :]
         )
-        if self._packed:
+        if self._is_nint_v2:
+            sub_scale = np.empty((count, self.groups), dtype=np.uint8)
+            sub_min = np.empty((count, self.groups), dtype=np.uint8)
+            selected_bits = self._row_sub_bits[unique]
+            for bits_for_rows, (
+                scale_offset,
+                min_offset,
+                stream_nbytes,
+            ) in self._mixed_metadata_streams.items():
+                destination = np.flatnonzero(selected_bits == bits_for_rows)
+                if not destination.size:
+                    continue
+                local_rows = self._row_cohort_rank[unique[destination]]
+                cohort_indices = (
+                    local_rows[:, None] * self.groups
+                    + np.arange(self.groups, dtype=np.int64)[None, :]
+                )
+                sub_scale[destination] = self._packed_values(
+                    scale_offset,
+                    stream_nbytes,
+                    cohort_indices,
+                    bits_for_rows,
+                )
+                sub_min[destination] = self._packed_values(
+                    min_offset,
+                    stream_nbytes,
+                    cohort_indices,
+                    bits_for_rows,
+                )
+        elif self._packed:
             sub_scale = self._packed_values(
                 self._sub_scale_offset,
                 self._sub_stream_nbytes,
@@ -1352,12 +1676,6 @@ class MMapEmbeddingReader:
                 self._sub_stream_nbytes,
                 metadata_indices,
                 self.sub_bits,
-            )
-            q = self._packed_values(
-                self._q_offset,
-                self._q_stream_nbytes,
-                q_indices,
-                self.bits,
             )
         else:
             sub_scale = self._old_values(
@@ -1372,6 +1690,35 @@ class MMapEmbeddingReader:
                 self._old_sub_dtype,
                 metadata_indices,
             )
+        if self._is_nint_v2:
+            q = np.empty((count, row_values), dtype=np.uint8)
+            selected_bits = self._row_q_bits[unique]
+            for bits_for_rows, (
+                stream_offset,
+                stream_nbytes,
+            ) in self._mixed_q_streams.items():
+                destination = np.flatnonzero(selected_bits == bits_for_rows)
+                if not destination.size:
+                    continue
+                local_rows = self._row_q_cohort_rank[unique[destination]]
+                cohort_indices = (
+                    local_rows[:, None] * row_values
+                    + np.arange(row_values, dtype=np.int64)[None, :]
+                )
+                q[destination] = self._packed_values(
+                    stream_offset,
+                    stream_nbytes,
+                    cohort_indices,
+                    bits_for_rows,
+                )
+        elif self._packed:
+            q = self._packed_values(
+                self._q_offset,
+                self._q_stream_nbytes,
+                q_indices,
+                self.bits,
+            )
+        else:
             q = self._old_values(
                 self._q_offset,
                 self._q_count,
@@ -1397,10 +1744,22 @@ class MMapEmbeddingReader:
             logical_bytes = int(unique.size) * self._dense_row_nbytes
         else:
             selected = self._read_nint(unique)
-            logical_bits = int(unique.size) * (
-                32
-                + 2 * self.groups * self.sub_bits
-                + self.groups * self.groupsize * self.bits
+            metadata_bits = (
+                int(unique.size) * self.sub_bits
+                if self._row_sub_bits is None
+                else int(self._row_sub_bits[unique].sum())
+            )
+            q_bits = (
+                int(unique.size) * self.bits
+                if self._row_q_bits is None
+                else int(self._row_q_bits[unique].sum())
+            )
+            logical_bits = (
+                32 * int(unique.size)
+                + self.groups * self.groupsize * q_bits
+                + 2 * self.groups * metadata_bits
+                + ((NINT_V2_K_SELECTOR_BITS + NINT_V2_Q_SELECTOR_BITS)
+                   * int(unique.size) if self._is_nint_v2 else 0)
             )
             logical_bytes = (logical_bits + 7) // 8
         self.last_rows_read = int(unique.size)

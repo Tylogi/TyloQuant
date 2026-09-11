@@ -88,7 +88,7 @@ class QuantizePayload(_Payload):
     imatrix_backend: Literal["auto", "cuda", "metal"] = "auto"
     imatrix_device: str = Field(default="", max_length=64)
     imatrix_attention: Literal["sdpa", "eager"] = "sdpa"
-    imatrix_objective: Literal["aaq", "linear"] = "aaq"
+    imatrix_objective: Literal["naq", "linear"] = "naq"
     imatrix_window_length: int = Field(default=16_384, ge=2)
     imatrix_batch_size: int = Field(default=1, ge=1)
     imatrix_train_tokens: int = Field(default=1_572_864, ge=2)
@@ -152,7 +152,7 @@ class ImatrixCalibrationPayload(_Payload):
     backend: Literal["auto", "cuda", "metal"] = "auto"
     device: str = Field(default="", max_length=64)
     attention: Literal["sdpa", "eager"] = "sdpa"
-    objective: Literal["aaq", "linear"] = "aaq"
+    objective: Literal["naq", "linear"] = "naq"
     window_length: int = Field(default=16_384, ge=2)
     batch_size: int = Field(default=1, ge=1)
     train_tokens: int = Field(default=1_572_864, ge=2)

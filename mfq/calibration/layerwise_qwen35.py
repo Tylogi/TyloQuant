@@ -71,6 +71,19 @@ class _OpenSafetensorRows:
         return self.reader.get_slice(self.name)[start:end].contiguous()
 
 
+def _create_causal_mask_compat(factory, **arguments):
+    """Call the Transformers mask API across its cache-position transition."""
+
+    try:
+        return factory(**arguments)
+    except TypeError as error:
+        # Transformers 5.14 removed the deprecated cache_position argument;
+        # earlier supported releases still require it.
+        if "cache_position" not in str(error):
+            raise
+        return factory(**arguments, cache_position=None)
+
+
 def _module(root: nn.Module, name: str) -> nn.Module:
     current = root
     for part in name.split("."):
@@ -491,13 +504,16 @@ class Qwen35LayerwiseBackend:
         rope_positions = text_positions.unsqueeze(0).expand(3, -1, -1)
         position_embeddings = self.rotary(hidden_states, rope_positions)
         if self.config.layer_types[layer_index] == "full_attention":
-            layer_attention_mask = create_causal_mask(
-                config=self.config,
-                inputs_embeds=hidden_states,
-                attention_mask=attention_mask,
-                cache_position=None,
-                past_key_values=None,
-                position_ids=text_positions,
+            mask_arguments = {
+                "config": self.config,
+                "inputs_embeds": hidden_states,
+                "attention_mask": attention_mask,
+                "past_key_values": None,
+                "position_ids": text_positions,
+            }
+            layer_attention_mask = _create_causal_mask_compat(
+                create_causal_mask,
+                **mask_arguments,
             )
         else:
             layer_attention_mask = attention_mask

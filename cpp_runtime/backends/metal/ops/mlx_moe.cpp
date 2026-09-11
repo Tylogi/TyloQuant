@@ -66,6 +66,9 @@ constexpr int kNintQOffset = 7;
 constexpr int kNintSubOffset = 8;
 constexpr int kNintAnchorOffset = 9;
 constexpr int kNintQ5Execution = 10;
+constexpr int kNintRowQBitsOffset = 11;
+constexpr int kNintRowQBitOffsetsOffset = 12;
+constexpr int kNintV2 = 13;
 
 // Keep the same family value and fields as the Python Metal descriptor.  The
 // unused value 1 remains available for the VQ-family extension.
@@ -377,6 +380,21 @@ inline uint mfq_moe_nint_read_bits(
     uint byte_index =
         (value_index >> 3) * bits + (residual_bits >> 3);
     uint shift = residual_bits & 7u;
+    uint packed = uint(stream[byte_index]);
+    if (shift + bits > 8u) {
+        packed |= uint(stream[byte_index + 1u]) << 8;
+    }
+    return (packed >> shift) & ((1u << bits) - 1u);
+}
+
+template <typename Stream>
+inline uint mfq_moe_nint_read_bit_offset(
+    Stream stream,
+    uint bit_offset,
+    uint bits
+) {
+    uint byte_index = bit_offset >> 3;
+    uint shift = bit_offset & 7u;
     uint packed = uint(stream[byte_index]);
     if (shift + bits > 8u) {
         packed |= uint(stream[byte_index + 1u]) << 8;
@@ -765,6 +783,12 @@ constexpr const char* kMoeSource = R"METAL(
             uint(descriptors[descriptor_base + 9u]);
         uint q5_execution =
             uint(descriptors[descriptor_base + 10u]);
+        uint row_q_bits_offset =
+            uint(descriptors[descriptor_base + 11u]);
+        uint row_q_bit_offsets_offset =
+            uint(descriptors[descriptor_base + 12u]);
+        uint nint_v2 =
+            uint(descriptors[descriptor_base + 13u]);
 
         for (
             uint group = k_lane;
@@ -806,7 +830,45 @@ constexpr const char* kMoeSource = R"METAL(
                             sub_offset + metadata]);
             }
 
-            if (
+            if (nint_v2 != 0u) {
+                device const uint* row_q_bit_offsets =
+                    (device const uint*)(
+                        nint_q + row_q_bit_offsets_offset);
+                for (
+                    uint element = 0u;
+                    element < group_size;
+                    ++element
+                ) {
+                    uint column =
+                        group * group_size + element;
+                    float activation =
+                        column < uint(K)
+                            ? float(x[x_offset + column])
+                            : 0.0f;
+                    for (
+                        uint row = 0u;
+                        row < MATRIX_ROWS;
+                        ++row
+                    ) {
+                        uint pool_output = uint(outputs[row]);
+                        uint row_bits = uint(nint_q[
+                            row_q_bits_offset + pool_output]);
+                        uint bit_offset =
+                            row_q_bit_offsets[pool_output]
+                            + column * row_bits;
+                        uint quantized =
+                            mfq_moe_nint_read_bit_offset(
+                                nint_q + q_offset,
+                                bit_offset,
+                                row_bits);
+                        accumulators[row] = fma(
+                            activation,
+                            scales[row] * float(quantized)
+                                - minimums[row],
+                            accumulators[row]);
+                    }
+                }
+            } else if (
                 bits == 2u
                 && (group_size % 4u) == 0u
             ) {
@@ -3844,8 +3906,10 @@ void validate_nint_payload_shape(
     int expected_rows,
     int expected_columns) {
     BlobCursor cursor(payload);
-    const int bits = static_cast<int>(
+    const int raw_bits = static_cast<int>(
         cursor.scalar<std::uint8_t>("NINT bits"));
+    const bool is_nint_v2 = (raw_bits & 0x80) != 0;
+    const int bits = raw_bits & 0x7f;
     const int sub_bits = static_cast<int>(
         cursor.scalar<std::uint8_t>(
             "NINT sub bits"));
@@ -3943,6 +4007,28 @@ void validate_nint_payload_shape(
         value_count,
         "legacy NINT tail");
     const auto remaining = cursor.remaining();
+    if (is_nint_v2) {
+        const auto k_selector_bytes = checked_packed_size(
+            static_cast<std::size_t>(output_size),
+            2,
+            "NINTv2 k-selector bytes");
+        const auto q_selector_bytes = checked_packed_size(
+            static_cast<std::size_t>(output_size),
+            3,
+            "NINTv2 q-selector bytes");
+        const auto minimum_v2 = checked_add(
+            anchor_bytes,
+            checked_add(
+                k_selector_bytes,
+                q_selector_bytes,
+                "NINTv2 selector bytes"),
+            "NINTv2 minimum payload");
+        if (remaining < minimum_v2) {
+            throw std::runtime_error(
+                "invalid NINTM NINTv2 cohort payload length");
+        }
+        return;
+    }
     if (
         remaining
             != checked_add(
@@ -4018,6 +4104,29 @@ MlxNintWeight add_nint_pool(
         return weight;
     }
 
+    int row_q_bits_offset = 0;
+    int row_q_bit_offsets_offset = 0;
+    if (weight.is_nint_v2()) {
+        row_q_bits_offset = checked_int(
+            streams.nint_q.size(),
+            "NINTv2 q-width offset");
+        append_raw(
+            streams.nint_q,
+            weight.row_q_bits(),
+            mlx::core::uint8,
+            "NINTv2 q widths");
+        while ((streams.nint_q.size() & 3u) != 0u) {
+            streams.nint_q.push_back(0);
+        }
+        row_q_bit_offsets_offset = checked_int(
+            streams.nint_q.size(),
+            "NINTv2 q-bit-offset offset");
+        append_raw(
+            streams.nint_q,
+            weight.row_q_bit_offsets(),
+            mlx::core::uint32,
+            "NINTv2 q bit offsets");
+    }
     const int q_offset =
         checked_int(streams.nint_q.size(), "NINT q offset");
     const int sub_offset =
@@ -4061,6 +4170,12 @@ MlxNintWeight add_nint_pool(
         descriptors[base + kNintQ5Execution] =
             static_cast<int>(
                 weight.q5_execution_layout());
+        descriptors[base + kNintRowQBitsOffset] =
+            row_q_bits_offset;
+        descriptors[base + kNintRowQBitOffsetsOffset] =
+            row_q_bit_offsets_offset;
+        descriptors[base + kNintV2] =
+            static_cast<int>(weight.is_nint_v2());
     }
 
     append_raw(
@@ -4068,8 +4183,8 @@ MlxNintWeight add_nint_pool(
         weight.packed_values(),
         mlx::core::uint8,
         "NINT values");
-    // Fast 3/6-bit paths load up to two bytes past the logical packet.
-    streams.nint_q.insert(streams.nint_q.end(), 2, 0);
+    // Fixed 3/6-bit and dynamic-q paths load beyond the logical packet.
+    streams.nint_q.insert(streams.nint_q.end(), 4, 0);
     append_raw(
         streams.nint_sub_scale,
         weight.sub_scales(),
@@ -6715,9 +6830,11 @@ struct MlxNintMoeWeight::Impl {
                 }
             }
             const bool supported_nint =
-                family == kFamilyNint;
+                family == kFamilyNint
+                && descriptor_values[base + kNintV2] == 0;
             if (
                 family != kFamilyNint
+                || descriptor_values[base + kNintV2] != 0
                 || descriptor_values[base + kNintBits] != 4
                 || descriptor_values[base + kNintGroupSize] != 24
                 || descriptor_values[base + kNintQ5Execution] != 0
@@ -7505,6 +7622,18 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
                             kNintAnchorOffset],
                         nint_anchor_offset,
                         "NINT anchor offset");
+                if (descriptor[kNintV2] != 0) {
+                    descriptor[kNintRowQBitsOffset] =
+                        descriptor_with_offset(
+                            descriptor[kNintRowQBitsOffset],
+                            nint_q_offset,
+                            "NINTv2 q-width offset");
+                    descriptor[kNintRowQBitOffsetsOffset] =
+                        descriptor_with_offset(
+                            descriptor[kNintRowQBitOffsetsOffset],
+                            nint_q_offset,
+                            "NINTv2 q-bit-offset offset");
+                }
             } else if (
                 descriptor[kFamily]
                 == kFamilyNint8Zero

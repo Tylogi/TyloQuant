@@ -80,6 +80,15 @@ public:
     bool q5_execution_layout() const noexcept {
         return q5_execution_layout_;
     }
+    bool is_nint_v2() const noexcept {
+        return row_q_bits_.has_value();
+    }
+    const mlx::core::array& row_q_bits() const {
+        return row_q_bits_.value();
+    }
+    const mlx::core::array& row_q_bit_offsets() const {
+        return row_q_bit_offsets_.value();
+    }
 
 private:
     mlx::core::array matmul_impl(
@@ -92,6 +101,8 @@ private:
         mlx::core::array sub_min,
         mlx::core::array neuron_scale,
         mlx::core::array neuron_min,
+        std::optional<mlx::core::array> row_q_bits,
+        std::optional<mlx::core::array> row_q_bit_offsets,
         int bits,
         int group_size,
         int groups,
@@ -104,6 +115,8 @@ private:
     mlx::core::array sub_min_;
     mlx::core::array neuron_scale_;
     mlx::core::array neuron_min_;
+    std::optional<mlx::core::array> row_q_bits_;
+    std::optional<mlx::core::array> row_q_bit_offsets_;
     int bits_ = 0;
     int group_size_ = 0;
     int groups_ = 0;

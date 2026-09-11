@@ -24,6 +24,22 @@ __device__ __forceinline__ uint8_t nint_unpack_qbits_one(const uint8_t* p, int l
     }
 }
 
+__device__ __forceinline__ uint8_t nint_unpack_mixed_qbits_one(
+    const uint8_t* stream,
+    uint64_t row_bit_offset,
+    int element,
+    int bits)
+{
+    const uint64_t bit = row_bit_offset + (uint64_t)element * (uint64_t)bits;
+    const uint64_t byte = bit >> 3;
+    const int shift = (int)(bit & 7u);
+    uint32_t word = (uint32_t)stream[byte];
+    if (shift + bits > 8) {
+        word |= (uint32_t)stream[byte + 1] << 8;
+    }
+    return (uint8_t)((word >> shift) & ((1u << bits) - 1u));
+}
+
 template <typename scalar_t>
 __global__ void embedding_lookup_kernel(
     const scalar_t* __restrict__ weight,
@@ -183,6 +199,47 @@ __global__ void nint_embedding_lookup_packed_compact_bits_kernel(
             val = d_eff * (float)qv - m_eff;
         }
         out[idx] = __float2half(val);
+    }
+}
+
+__global__ void nint_embedding_lookup_packed_mixed_q_kernel(
+    const uint8_t* __restrict__ q_packed,
+    const uint8_t* __restrict__ row_q_bits,
+    const int64_t* __restrict__ row_q_bit_offsets,
+    const uint8_t* __restrict__ sub_scale,
+    const uint8_t* __restrict__ sub_min,
+    const float* __restrict__ neuron_scale,
+    const float* __restrict__ neuron_min,
+    const int64_t* __restrict__ ids,
+    half* __restrict__ out,
+    int N,
+    int vocab,
+    int ng,
+    int gs,
+    int D)
+{
+    const size_t total = (size_t)N * (size_t)D;
+    for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < total;
+         index += (size_t)gridDim.x * blockDim.x) {
+        const int column = (int)(index % (size_t)D);
+        const int token_index = (int)(index / (size_t)D);
+        const int64_t token = ids[token_index];
+        float value = 0.0f;
+        if (token >= 0 && token < vocab) {
+            const int group = column / gs;
+            const size_t metadata = (size_t)token * (size_t)ng + (size_t)group;
+            const int bits = (int)row_q_bits[token];
+            const uint8_t quantized = nint_unpack_mixed_qbits_one(
+                q_packed,
+                (uint64_t)row_q_bit_offsets[token],
+                column,
+                bits);
+            const float scale = neuron_scale[token] * (float)sub_scale[metadata];
+            const float minimum = neuron_min[token] * (float)sub_min[metadata];
+            value = scale * (float)quantized - minimum;
+        }
+        out[index] = __float2half(value);
     }
 }
 
@@ -449,6 +506,83 @@ mfq_tensor_backend::Tensor nint_embedding_lookup_packed_compact_bits_cuda(
     }
 #undef NINT_EMB_BITS_GS_SWITCH
 #undef NINT_EMB_BITS_LAUNCH
+    return out;
+}
+
+mfq_tensor_backend::Tensor nint_embedding_lookup_packed_mixed_q_cuda(
+    mfq_tensor_backend::Tensor q_packed,
+    mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor token_ids,
+    int64_t neuron_len,
+    int64_t gs)
+{
+    MFQ_RUNTIME_CHECK(
+        q_packed.is_cuda() && q_packed.is_contiguous() &&
+        q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.dim() == 1,
+        "mixed-q embedding values must be CUDA contiguous uint8 rank-1");
+    MFQ_RUNTIME_CHECK(
+        row_q_bits.is_cuda() && row_q_bits.is_contiguous() &&
+        row_q_bits.scalar_type() == mfq_tensor_backend::kUInt8 && row_q_bits.dim() == 1,
+        "mixed-q embedding row widths must be CUDA contiguous uint8 rank-1");
+    MFQ_RUNTIME_CHECK(
+        row_q_bit_offsets.is_cuda() && row_q_bit_offsets.is_contiguous() &&
+        row_q_bit_offsets.scalar_type() == mfq_tensor_backend::kInt64 &&
+        row_q_bit_offsets.dim() == 1,
+        "mixed-q embedding row offsets must be CUDA contiguous int64 rank-1");
+    MFQ_RUNTIME_CHECK(
+        sub_scale.is_cuda() && sub_scale.is_contiguous() &&
+        sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.dim() == 2 &&
+        sub_min.is_cuda() && sub_min.is_contiguous() &&
+        sub_min.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        sub_min.sizes() == sub_scale.sizes(),
+        "mixed-q embedding subgroup metadata is invalid");
+    MFQ_RUNTIME_CHECK(
+        neuron_scale.is_cuda() && neuron_scale.is_contiguous() &&
+        neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
+        neuron_min.is_cuda() && neuron_min.is_contiguous() &&
+        neuron_min.scalar_type() == mfq_tensor_backend::kFloat32,
+        "mixed-q embedding neuron metadata is invalid");
+    MFQ_RUNTIME_CHECK(
+        token_ids.is_cuda() && token_ids.is_contiguous() &&
+        token_ids.scalar_type() == mfq_tensor_backend::kInt64,
+        "mixed-q embedding token IDs must be CUDA contiguous int64");
+    const int vocab = (int)sub_scale.size(0);
+    const int ng = (int)sub_scale.size(1);
+    MFQ_RUNTIME_CHECK(
+        row_q_bits.numel() == vocab && row_q_bit_offsets.numel() == vocab &&
+        neuron_scale.numel() == vocab && neuron_min.numel() == vocab,
+        "mixed-q embedding row metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(
+        gs > 0 && neuron_len > 0 && neuron_len <= (int64_t)ng * gs,
+        "mixed-q embedding dimensions are invalid");
+    const int D = (int)neuron_len;
+    const int N = (int)token_ids.numel();
+    auto shape = token_ids.sizes().vec();
+    shape.push_back(D);
+    auto out = mfq_tensor_backend::empty(
+        shape, q_packed.options().dtype(mfq_tensor_backend::kFloat16));
+    constexpr int threads = 256;
+    const size_t total = (size_t)N * (size_t)D;
+    int blocks = (int)((total + threads - 1) / threads);
+    blocks = std::min(blocks, 4096);
+    nint_embedding_lookup_packed_mixed_q_kernel<<<
+        blocks, threads, 0, mfq_current_cuda_stream()>>>(
+            q_packed.data_ptr<uint8_t>(),
+            row_q_bits.data_ptr<uint8_t>(),
+            row_q_bit_offsets.data_ptr<int64_t>(),
+            sub_scale.data_ptr<uint8_t>(),
+            sub_min.data_ptr<uint8_t>(),
+            neuron_scale.data_ptr<float>(),
+            neuron_min.data_ptr<float>(),
+            token_ids.data_ptr<int64_t>(),
+            reinterpret_cast<half*>(out.data_ptr<mfq_half>()),
+            N, vocab, ng, (int)gs, D);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 

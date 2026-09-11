@@ -1316,6 +1316,107 @@ TensorFixture make_nint_tensor(
     };
 }
 
+TensorFixture make_nint_v2_tensor(
+    int rows,
+    int columns,
+    int salt,
+    int group_size = kGroupSize) {
+    constexpr int nominal_bits = 4;
+    constexpr int nominal_sub_bits = 6;
+    const int groups = (columns + group_size - 1) / group_size;
+    const int values_per_row = groups * group_size;
+    std::vector<std::uint8_t> row_q_bits(rows);
+    std::vector<std::uint8_t> row_sub_bits(rows);
+    std::vector<std::uint8_t> q_selectors(rows);
+    std::vector<std::uint8_t> sub_selectors(rows);
+    std::vector<std::uint8_t> quantized(
+        static_cast<std::size_t>(rows) * values_per_row);
+    std::vector<std::uint8_t> sub_scale(
+        static_cast<std::size_t>(rows) * groups);
+    std::vector<std::uint8_t> sub_min(sub_scale.size());
+    for (int row = 0; row < rows; ++row) {
+        const int q_bits = 2 + (row + salt) % 5;
+        const int sub_bits = 5 + (row + salt) % 4;
+        row_q_bits[row] = static_cast<std::uint8_t>(q_bits);
+        row_sub_bits[row] = static_cast<std::uint8_t>(sub_bits);
+        q_selectors[row] = static_cast<std::uint8_t>(q_bits - 1);
+        sub_selectors[row] = static_cast<std::uint8_t>(sub_bits - 5);
+        const int q_maximum = (1 << q_bits) - 1;
+        for (int group = 0; group < groups; ++group) {
+            const auto metadata = static_cast<std::size_t>(row) * groups + group;
+            sub_scale[metadata] = static_cast<std::uint8_t>(
+                1 + (row * 3 + group + salt) % 7);
+            sub_min[metadata] = static_cast<std::uint8_t>(
+                (row + group + salt) & 1);
+            for (int element = 0; element < group_size; ++element) {
+                const auto value = static_cast<std::size_t>(row) * values_per_row
+                    + group * group_size + element;
+                quantized[value] = static_cast<std::uint8_t>(
+                    (row * 11 + group * 5 + element * 3 + salt) & q_maximum);
+            }
+        }
+    }
+
+    std::vector<std::uint8_t> blob;
+    append<std::uint8_t>(blob, 0x80u | nominal_bits);
+    append<std::uint8_t>(blob, nominal_sub_bits);
+    append<std::int32_t>(blob, group_size);
+    append<std::int32_t>(blob, 0);
+    append<std::int32_t>(blob, columns);
+    append<std::uint32_t>(blob, 2);
+    append<std::int64_t>(blob, rows);
+    append<std::int64_t>(blob, columns);
+    append<std::uint32_t>(blob, static_cast<std::uint32_t>(rows));
+    append<std::uint32_t>(blob, static_cast<std::uint32_t>(groups));
+    for (int row = 0; row < rows; ++row) {
+        append<std::uint16_t>(blob, 0x2400);
+    }
+    for (int row = 0; row < rows; ++row) {
+        append<std::uint16_t>(blob, 0x2000);
+    }
+    append_bytes(blob, pack_values(sub_selectors, 2));
+    for (int selector = 0; selector < 4; ++selector) {
+        std::vector<std::uint8_t> scales;
+        std::vector<std::uint8_t> minima;
+        for (int row = 0; row < rows; ++row) {
+            if (sub_selectors[row] != selector) continue;
+            const auto begin = static_cast<std::size_t>(row) * groups;
+            scales.insert(scales.end(), sub_scale.begin() + begin,
+                sub_scale.begin() + begin + groups);
+            minima.insert(minima.end(), sub_min.begin() + begin,
+                sub_min.begin() + begin + groups);
+        }
+        append_bytes(blob, pack_values(scales, nominal_sub_bits - 1 + selector));
+        append_bytes(blob, pack_values(minima, nominal_sub_bits - 1 + selector));
+    }
+    append_bytes(blob, pack_values(q_selectors, 3));
+    for (int selector = 0; selector < 8; ++selector) {
+        std::vector<std::uint8_t> cohort;
+        for (int row = 0; row < rows; ++row) {
+            if (q_selectors[row] != selector) continue;
+            const auto begin = static_cast<std::size_t>(row) * values_per_row;
+            cohort.insert(cohort.end(), quantized.begin() + begin,
+                quantized.begin() + begin + values_per_row);
+        }
+        append_bytes(blob, pack_values(cohort, selector + 1));
+    }
+
+    std::vector<float> dense(static_cast<std::size_t>(rows) * columns);
+    for (int row = 0; row < rows; ++row) {
+        for (int column = 0; column < columns; ++column) {
+            const int group = column / group_size;
+            const auto metadata = static_cast<std::size_t>(row) * groups + group;
+            const auto value = static_cast<std::size_t>(row) * values_per_row
+                + group * group_size + column % group_size;
+            dense[static_cast<std::size_t>(row) * columns + column] =
+                static_cast<float>(sub_scale[metadata]) * (1.0f / 64.0f)
+                    * static_cast<float>(quantized[value])
+                - static_cast<float>(sub_min[metadata]) * (1.0f / 128.0f);
+        }
+    }
+    return {std::move(blob), std::move(dense), rows, columns};
+}
+
 TensorFixture make_q8_tensor(
     int rows,
     int columns,
@@ -1467,6 +1568,13 @@ MoeFixture make_moe_fixture(
             if (profile == "F16" || profile == "BF16") {
                 return make_dense_tensor(
                     profile, output, input, salt + expert);
+            }
+            if (profile == "NINTv2") {
+                return make_nint_v2_tensor(
+                    output,
+                    input,
+                    salt + expert,
+                    nint_group_size);
             }
             return make_nint_tensor(
                 std::stoi(profile.substr(4)),
@@ -3013,6 +3121,7 @@ void test_all_families_and_projections() {
         "NINT8",
         "NINT1",
         "NINT5",
+        "NINTv2",
     };
     const auto first = make_moe_fixture(
         profiles,
@@ -3044,8 +3153,8 @@ void test_all_families_and_projections() {
 
     const std::vector<std::int32_t> ids{
         0, 1, 4, 8,
-        7, 5, -1, 9,
-        2, 3, 6, 0,
+        7, 5, -1, 10,
+        2, 3, 6, 9,
     };
     std::vector<float> shared_input(
         tokens * input_width);

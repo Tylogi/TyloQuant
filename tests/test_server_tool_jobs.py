@@ -16,12 +16,25 @@ from mfq.server.catalog import ModelCatalog
 from mfq.server.jobs import JobManager
 from mfq.server.models import CreateJobRequest, JobStatus
 from mfq.server.storage import SessionStore
-from mfq.server.tool_jobs import ToolJobHandlers, ToolJobPaths
+from mfq.server.tool_jobs import (
+    ImatrixCalibrationPayload,
+    QuantizePayload,
+    ToolJobHandlers,
+    ToolJobPaths,
+)
 
 
 def test_cli_preserves_the_active_environment_entry_point_directory(tmp_path: Path) -> None:
     executable = tmp_path / ".venv" / "bin" / "python"
     assert _console_script_dir(executable) == executable.parent
+
+
+def test_imatrix_jobs_default_to_compact_activation_aware_objective() -> None:
+    assert ImatrixCalibrationPayload(
+        model="model", corpus="corpus", output="output.imatrix"
+    ).objective == "naq"
+    payload = QuantizePayload(input="model", output="output.mfq")
+    assert payload.imatrix_objective == "naq"
 
 
 def test_standalone_cli_jobs_reinvoke_the_unified_mfq_binary(tmp_path: Path) -> None:
