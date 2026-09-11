@@ -5650,25 +5650,41 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                     neuron_scale[row], state, codebook);
             }
 #pragma unroll
-            for (int quartet = 0; quartet < kChunksPerGroup; ++quartet) {
-                const int packed = valid_weight
-                    ? decode_chunk4<FORMAT>(
-                          indices, indices_nbytes, aux, aux_nbytes,
-                          codebook, row, group, quartet, nvec, nsign, ng,
-                          sign_mode, state)
-                    : 0;
+            for (int segment_local = 0;
+                 segment_local < kChunksPerGroup / 2;
+                 ++segment_local) {
+                int2 packed = make_int2(0, 0);
+                if (valid_weight) {
+                    const auto decoded = load_nvq_vec8<FORMAT>(
+                        indices, indices_nbytes, aux, aux_nbytes,
+                        codebook, row, group * 3 + segment_local, group,
+                        ng, nvec, nsign, sign_mode, state);
+                    packed = decoded.values;
+                    if constexpr (FORMAT == kNvq1S) {
+                        packed.x = nvq1_s_scale_delta4(
+                            packed.x, decoded.delta);
+                        packed.y = nvq1_s_scale_delta4(
+                            packed.y, decoded.delta);
+                    } else if constexpr (FORMAT == kNvq1L) {
+                        packed.x = nvq1_l_scale_delta4(
+                            packed.x, decoded.delta);
+                        packed.y = nvq1_l_scale_delta4(
+                            packed.y, decoded.delta);
+                    }
+                }
 #pragma unroll
-                for (int pair = 0; pair < 2; ++pair) {
-                    const int shift = pair * 16;
+                for (int pair = 0; pair < 4; ++pair) {
+                    const int word = pair < 2 ? packed.x : packed.y;
+                    const int shift = (pair & 1) * 16;
                     const int value0 = static_cast<int>(
-                        static_cast<int8_t>((packed >> shift) & 0xff));
+                        static_cast<int8_t>((word >> shift) & 0xff));
                     const int value1 = static_cast<int>(
                         static_cast<int8_t>(
-                            (packed >> (shift + 8)) & 0xff));
+                            (word >> (shift + 8)) & 0xff));
                     *reinterpret_cast<__half2 *>(
                         weight_tile + row_local * kStrideK +
                             group_local * kGroupSize +
-                            quartet * 4 + pair * 2) =
+                            segment_local * 8 + pair * 2) =
                         __halves2half2(
                             __float2half(
                                 scale * static_cast<float>(value0)),
