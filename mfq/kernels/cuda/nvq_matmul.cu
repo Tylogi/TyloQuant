@@ -19,6 +19,8 @@
 #include <limits>
 #include <type_traits>
 
+#include "packed_backward.cuh"
+
 using namespace nvcuda;
 
 namespace {
@@ -178,6 +180,24 @@ __device__ __forceinline__ uint32_t load_packed_bits(
     return (word >> shift) & ((1u << bits) - 1u);
 }
 
+// One GS24 group contains three 7-bit sign masks.  Load their contiguous
+// 21-bit window once so the three vector decodes can reuse it.  Four byte
+// reads cover the worst seven-bit starting offset while retaining the exact
+// checked tail semantics of load_packed_bits().
+__device__ __forceinline__ uint32_t load_packed_sign_group3(
+    const uint8_t * data, int64_t bit, int64_t nbytes) {
+    const int64_t byte = bit >> 3;
+    const int shift = static_cast<int>(bit & 7);
+    uint32_t word = 0;
+#pragma unroll
+    for (int offset = 0; offset < 4; ++offset) {
+        if (byte + offset < nbytes) {
+            word |= static_cast<uint32_t>(data[byte + offset]) << (8 * offset);
+        }
+    }
+    return (word >> shift) & 0x1fffffu;
+}
+
 __device__ __forceinline__ uint32_t load_packed_4(
     const uint8_t * data, int64_t linear) {
     return (data[linear >> 1] >> ((linear & 1) * 4)) & 0x0fu;
@@ -206,6 +226,15 @@ __device__ __forceinline__ uint32_t load_group_exec96_bits(
     const uint8_t * data, int row, int group, int ng, int bit, int bits) {
     uint32_t words[3];
     load_group_exec96_words(data, row, group, ng, words);
+    const int word = bit >> 5;
+    const int shift = bit & 31;
+    uint32_t value = words[word] >> shift;
+    if (shift + bits > 32) value |= words[word + 1] << (32 - shift);
+    return value & ((1u << bits) - 1u);
+}
+
+__device__ __forceinline__ uint32_t extract_group_exec96_bits_ptr(
+    const uint32_t * words, int bit, int bits) {
     const int word = bit >> 5;
     const int shift = bit & 31;
     uint32_t value = words[word] >> shift;
@@ -892,6 +921,140 @@ __device__ __forceinline__ NvqVec8Values<FORMAT> load_nepq_vec8(
 }
 
 template <int FORMAT>
+__device__ __forceinline__ NvqVec8Values<FORMAT> load_nvq_group_vec8(
+    const uint8_t * indices,
+    int64_t indices_nbytes,
+    const uint8_t * aux,
+    int64_t aux_nbytes,
+    const int8_t * codebook,
+    const int8_t * bank,
+    int row,
+    int group,
+    int segment_local,
+    int ng,
+    int nvec,
+    int nsign,
+    int sign_mode,
+    uint32_t state,
+    uint32_t packed_signs,
+    uint64_t group_exec64,
+    const uint32_t * group_exec96,
+    int group_delta) {
+    const int segment = group * 3 + segment_local;
+    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+        if (segment >= nsign) return {make_int2(0, 0), 0, false};
+        const uint32_t metadata =
+            (group_exec64 >> (segment_local * 20)) & 0xfffffu;
+        const uint32_t index = metadata & 0xfffu;
+        const uint32_t mask8 = metadata >> 12;
+        return {apply_sign8(
+            reinterpret_cast<const int2 *>(bank)[index], mask8), 0, true};
+    } else if constexpr (FORMAT == kNvq3JscLGroupExec) {
+        const int vector4 = segment * 2;
+        if (vector4 >= nvec || segment >= nsign) {
+            return {make_int2(0, 0), 0, false};
+        }
+        const uint32_t index0 = extract_group_exec96_bits_ptr(
+            group_exec96, segment_local * 20, 10);
+        const uint32_t index1 = vector4 + 1 < nvec
+            ? extract_group_exec96_bits_ptr(
+                group_exec96, segment_local * 20 + 10, 10)
+            : 0;
+        const uint32_t mask8 = extract_group_exec96_bits_ptr(
+            group_exec96, 60 + segment_local * 8, 8);
+        return {apply_sign8(
+            make_int2(
+                reinterpret_cast<const int *>(bank)[index0],
+                reinterpret_cast<const int *>(bank)[index1]),
+            mask8), 0, true};
+    } else if constexpr (
+        FORMAT == kNvq3 || FORMAT == kNvq3Jsc ||
+        FORMAT == kNvq3Jsc2 || FORMAT == kNvq3Jsc512 ||
+        FORMAT == kNvq3JscL) {
+        const int vector4 = segment * 2;
+        if (vector4 >= nvec || segment >= nsign) {
+            return {make_int2(0, 0), 0, false};
+        }
+        const int64_t index_linear =
+            static_cast<int64_t>(row) * nvec + vector4;
+        constexpr int INDEX_BITS = format_index_bits(FORMAT);
+        const uint32_t index0 = INDEX_BITS == 8
+            ? indices[index_linear]
+            : load_packed_bits(
+                indices, index_linear * INDEX_BITS,
+                INDEX_BITS, indices_nbytes);
+        const uint32_t index1 = vector4 + 1 < nvec
+            ? (INDEX_BITS == 8
+                ? indices[index_linear + 1]
+                : load_packed_bits(
+                    indices, (index_linear + 1) * INDEX_BITS,
+                    INDEX_BITS, indices_nbytes))
+            : 0;
+        const uint32_t mask7 =
+            (packed_signs >> (segment_local * 7)) & 0x7fu;
+        const uint32_t mask8 = mask7 |
+            (static_cast<uint32_t>(parity7(mask7)) << 7);
+        return {apply_sign8(
+            make_int2(
+                reinterpret_cast<const int *>(bank)[index0],
+                reinterpret_cast<const int *>(bank)[index1]),
+            mask8), 0, true};
+    } else if constexpr (
+        FORMAT == kNvq2 || FORMAT == kNvq2Exec ||
+        FORMAT == kNvq2Jsc || FORMAT == kNvq2JscExec ||
+        FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL) {
+        if (segment >= nvec || segment >= nsign) {
+            return {make_int2(0, 0), 0, false};
+        }
+        const int64_t index_linear =
+            static_cast<int64_t>(row) * nvec + segment;
+        uint32_t index;
+        uint32_t mask8;
+        if constexpr (FORMAT == kNvq2Exec || FORMAT == kNvq2JscExec) {
+            const uint16_t metadata =
+                reinterpret_cast<const uint16_t *>(indices)[index_linear];
+            index = metadata & 0xffu;
+            mask8 = metadata >> 8;
+        } else {
+            constexpr int INDEX_BITS = format_index_bits(FORMAT);
+            index = INDEX_BITS == 8
+                ? indices[index_linear]
+                : load_packed_bits(
+                    indices, index_linear * INDEX_BITS,
+                    INDEX_BITS, indices_nbytes);
+            const uint32_t mask7 =
+                (packed_signs >> (segment_local * 7)) & 0x7fu;
+            const int last = parity7(mask7) ^
+                (sign_mode ? ((index >> 7) & 1u) : 0u);
+            mask8 = mask7 | (static_cast<uint32_t>(last) << 7);
+        }
+        const int2 values = reinterpret_cast<const int2 *>(bank)[index];
+        if constexpr (FORMAT == kNvq2Exec || FORMAT == kNvq2JscExec) {
+            return {apply_sign8_exec(values, mask8), 0, true};
+        }
+        return {apply_sign8(values, mask8), 0, true};
+    } else if constexpr (FORMAT == kNvq1S) {
+        if (segment >= nvec) return {make_int2(0, 0), 0, false};
+        const int64_t index_linear =
+            static_cast<int64_t>(row) * nvec + segment;
+        const uint32_t index = load_packed_bits(
+            indices, index_linear * 9, 9, indices_nbytes);
+        return {reinterpret_cast<const int2 *>(bank)[index], group_delta, true};
+    } else if constexpr (FORMAT == kNvq1L) {
+        if (segment >= nvec) return {make_int2(0, 0), 0, false};
+        const int64_t index_linear =
+            static_cast<int64_t>(row) * nvec + segment;
+        const uint32_t index = load_packed_bits(
+            indices, index_linear * 11, 11, indices_nbytes);
+        return {
+            reinterpret_cast<const int2 *>(codebook)[index], group_delta, true};
+    }
+    return load_nvq_vec8<FORMAT>(
+        indices, indices_nbytes, aux, aux_nbytes, codebook,
+        row, segment, group, ng, nvec, nsign, sign_mode, state);
+}
+
+template <int FORMAT>
 __device__ __forceinline__ float dot_nvq_vec8(
     const NvqVec8Values<FORMAT> & weight,
     const int8_t * activation) {
@@ -1318,11 +1481,7 @@ __global__ void __launch_bounds__(NWARPS * 32, 1) nvq3j2_gemv_m1_group_kernel(
 
 __device__ __forceinline__ uint32_t extract_group_exec96_bits(
     const uint32_t (&words)[3], int bit, int bits) {
-    const int word = bit >> 5;
-    const int shift = bit & 31;
-    uint32_t value = words[word] >> shift;
-    if (shift + bits > 32) value |= words[word + 1] << (32 - shift);
-    return value & ((1u << bits) - 1u);
+    return extract_group_exec96_bits_ptr(words, bit, bits);
 }
 
 __device__ __forceinline__ int aligned_group_d4_dot_words(
@@ -5640,6 +5799,11 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                 local_row < out_per_expert && group < ng;
             uint32_t state = 0;
             float scale = 0.0f;
+            uint32_t packed_signs = 0;
+            uint64_t group_exec64 = 0;
+            uint32_t group_exec96[3] = {0, 0, 0};
+            int group_delta = 1;
+            const int8_t * bank = codebook;
             if (valid_weight) {
                 const int64_t sub_linear =
                     static_cast<int64_t>(row) * ng + group;
@@ -5648,6 +5812,34 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                     sub_bits, sub_scale_nbytes);
                 scale = format_scale<FORMAT>(
                     neuron_scale[row], state, codebook);
+                if constexpr (is_e8_format(FORMAT) || is_d4_format(FORMAT)) {
+                    bank = active_codebook<FORMAT>(codebook, state);
+                }
+                if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+                    group_exec64 = load_group_exec64(
+                        indices, row, group, ng);
+                } else if constexpr (FORMAT == kNvq3JscLGroupExec) {
+                    load_group_exec96_words(
+                        indices, row, group, ng, group_exec96);
+                } else if constexpr (
+                    FORMAT == kNvq2 || FORMAT == kNvq2Jsc ||
+                    FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL ||
+                    FORMAT == kNvq3 || FORMAT == kNvq3Jsc ||
+                    FORMAT == kNvq3Jsc2 || FORMAT == kNvq3Jsc512 ||
+                    FORMAT == kNvq3JscL) {
+                    const int64_t sign_linear =
+                        static_cast<int64_t>(row) * nsign + group * 3;
+                    packed_signs = load_packed_sign_group3(
+                        aux, sign_linear * 7, aux_nbytes);
+                } else if constexpr (
+                    FORMAT == kNvq1S || FORMAT == kNvq1L) {
+                    group_delta = load_packed_bits(
+                        aux, sub_linear, 1, aux_nbytes) ? -1 : 1;
+                    if constexpr (FORMAT == kNvq1S) {
+                        bank = codebook +
+                            (group_delta < 0 ? kNvq1SBankBytes : 0);
+                    }
+                }
             }
 #pragma unroll
             for (int segment_local = 0;
@@ -5655,10 +5847,12 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
                  ++segment_local) {
                 int2 packed = make_int2(0, 0);
                 if (valid_weight) {
-                    const auto decoded = load_nvq_vec8<FORMAT>(
+                    const auto decoded = load_nvq_group_vec8<FORMAT>(
                         indices, indices_nbytes, aux, aux_nbytes,
-                        codebook, row, group * 3 + segment_local, group,
-                        ng, nvec, nsign, sign_mode, state);
+                        codebook, bank, row, group, segment_local,
+                        ng, nvec, nsign, sign_mode, state,
+                        packed_signs, group_exec64, group_exec96,
+                        group_delta);
                     packed = decoded.values;
                     if constexpr (FORMAT == kNvq1S) {
                         packed.x = nvq1_s_scale_delta4(
@@ -7236,28 +7430,11 @@ mfq_tensor_backend::Tensor nvq_backward_input_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
-#define NVQ_BACKWARD_LAUNCH(TYPE)                                                \
-    launch_by_format(static_cast<int>(format), [&](auto tag) {                   \
-        constexpr int F = decltype(tag)::value;                                  \
-        launch_backward_by_dtype<TYPE>(output_gradient, result, [&](             \
-                const TYPE * source, TYPE * destination) {                       \
-            nvq_backward_input_kernel<F, TYPE><<<blocks, threads, 0, stream>>>(  \
-                indices.data_ptr<uint8_t>(), indices.numel(),                    \
-                aux.data_ptr<uint8_t>(), aux.numel(),                            \
-                sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),                \
-                neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),     \
-                source, destination, M, N, K, ng, nvec, nsign,                   \
-                static_cast<int>(sub_bits), static_cast<int>(sign_mode));        \
-        });                                                                      \
-    })
-    if (dtype == mfq_tensor_backend::kFloat16) {
-        NVQ_BACKWARD_LAUNCH(__half);
-    } else if (dtype == mfq_tensor_backend::kBFloat16) {
-        NVQ_BACKWARD_LAUNCH(__nv_bfloat16);
-    } else {
-        NVQ_BACKWARD_LAUNCH(float);
-    }
-#undef NVQ_BACKWARD_LAUNCH
+    auto weight = nvq_dequant_cuda(
+        indices, aux, sub_scale, neuron_scale, codebook,
+        neuron_len, gs, sub_bits, format, sign_mode);
+    mfq_packed_backward::launch_dense_half_weight(
+        output_gradient, weight, result, M, N, K, stream);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
@@ -7314,29 +7491,11 @@ mfq_tensor_backend::Tensor nepq_backward_input_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
-#define NEPQ_BACKWARD_LAUNCH(TYPE)                                               \
-    launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {              \
-        constexpr int F = decltype(tag)::value;                                  \
-        launch_backward_by_dtype<TYPE>(output_gradient, result, [&](             \
-                const TYPE * source, TYPE * destination) {                       \
-            nepq_backward_input_kernel<F, TYPE><<<blocks, threads, 0, stream>>>( \
-                indices.data_ptr<uint8_t>(), indices.numel(),                    \
-                aux.data_ptr<uint8_t>(), aux.numel(),                            \
-                state_stream.data_ptr<uint8_t>(), state_stream.numel(),          \
-                neuron_scale.data_ptr<float>(), table_pool.data_ptr<int8_t>(),   \
-                bank_ids.data_ptr<uint8_t>(), source, destination,               \
-                M, N, K, ng, nvec, nsign, nsuper, table_stride,                 \
-                static_cast<int>(state_bits));                                  \
-        });                                                                      \
-    })
-    if (dtype == mfq_tensor_backend::kFloat16) {
-        NEPQ_BACKWARD_LAUNCH(__half);
-    } else if (dtype == mfq_tensor_backend::kBFloat16) {
-        NEPQ_BACKWARD_LAUNCH(__nv_bfloat16);
-    } else {
-        NEPQ_BACKWARD_LAUNCH(float);
-    }
-#undef NEPQ_BACKWARD_LAUNCH
+    auto weight = nepq_dequant_cuda(
+        indices, aux, state_stream, neuron_scale, table_pool, bank_ids,
+        neuron_len, state_bits, format);
+    mfq_packed_backward::launch_dense_half_weight(
+        output_gradient, weight, result, M, N, K, stream);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }

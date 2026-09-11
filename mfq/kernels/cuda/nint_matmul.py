@@ -231,6 +231,18 @@ def nint_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
     bits = int(g.get("bits", 4))
     packed = q_packed is not None
     if packed and bits != 4 and g.get("sub_scale") is not None:
+        if bits in {1, 7}:
+            weight = ext().nint_dequant_full_packed_compact_bits_cuda(
+                q_packed,
+                g["sub_scale"],
+                g["sub_min"],
+                g["neuron_scale"],
+                g["neuron_min"],
+                int(g["neuron_len"]),
+                int(g["gs"]),
+                bits,
+            )
+            return x @ weight.T
         if bits == 8 and M <= 8:
             qx, xscale, xsum = _workspace(g, x)
             return ext().nint_gemv_packed_u8_ws_cuda(

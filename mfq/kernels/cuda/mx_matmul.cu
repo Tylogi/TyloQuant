@@ -7,6 +7,8 @@
 #include <limits>
 #include <type_traits>
 
+#include "packed_backward.cuh"
+
 namespace {
 
 __device__ __forceinline__ float decode_e8m0(std::uint8_t raw) {
@@ -1191,19 +1193,11 @@ mfq_tensor_backend::Tensor mx_backward_input_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
-    if (dtype == mfq_tensor_backend::kFloat16) {
-        launch_mx_backward<__half>(
-            values, scales, output_gradient, result, mxfp4,
-            rows, outputs, width, blocks, threads, stream);
-    } else if (dtype == mfq_tensor_backend::kBFloat16) {
-        launch_mx_backward<__nv_bfloat16>(
-            values, scales, output_gradient, result, mxfp4,
-            rows, outputs, width, blocks, threads, stream);
-    } else {
-        launch_mx_backward<float>(
-            values, scales, output_gradient, result, mxfp4,
-            rows, outputs, width, blocks, threads, stream);
-    }
+    auto weight = mxfp4
+        ? mxfp4_dequant_cuda(values, scales)
+        : mxfp8_dequant_cuda(values, scales);
+    mfq_packed_backward::launch_dense_half_weight(
+        output_gradient, weight, result, rows, outputs, width, stream);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }

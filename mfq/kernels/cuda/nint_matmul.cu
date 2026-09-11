@@ -31,6 +31,7 @@
 #include "reduce.cuh"
 #include "glu.cuh"
 #include "nint_small_m.h"
+#include "packed_backward.cuh"
 using namespace nvcuda;
 
 #define MFQ_CUBLAS_CHECK(expr) MFQ_RUNTIME_CHECK((expr) == CUBLAS_STATUS_SUCCESS, "cuBLAS call failed: ", #expr)
@@ -621,8 +622,8 @@ mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_bits_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t neuron_len, int64_t gs, int64_t bits)
 {
-    MFQ_RUNTIME_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
-                "packed-bits full dequant supports bits in {2,3,5,6,8}, got ", bits);
+    MFQ_RUNTIME_CHECK(bits >= 1 && bits <= 8 && bits != 4,
+                "generic packed-bits full dequant supports bits in {1,2,3,5,6,7,8}, got ", bits);
     MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
     MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
@@ -671,7 +672,9 @@ mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_bits_cuda(
         default: MFQ_RUNTIME_CHECK(false, "packed-bits full dequant unsupported gs ", gs);     \
     }
 
-    if (bits == 2) {
+    if (bits == 1) {
+        DQFULLBITS_GS_SWITCH(1);
+    } else if (bits == 2) {
         DQFULLBITS_GS_SWITCH(2);
     } else if (bits == 3) {
         DQFULLBITS_GS_SWITCH(3);
@@ -690,6 +693,8 @@ mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_bits_cuda(
         } else {
             DQFULLBITS_GS_SWITCH(6);
         }
+    } else if (bits == 7) {
+        DQFULLBITS_GS_SWITCH(7);
     } else {
         DQFULLBITS_GS_SWITCH(8);
     }
@@ -9711,31 +9716,31 @@ mfq_tensor_backend::Tensor nint_backward_input_cuda(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
     if (dtype == mfq_tensor_backend::kFloat16) {
-        nint_backward_input_kernel<<<blocks, threads, 0, stream>>>(
-            q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
-            sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
-            neuron_min.data_ptr<float>(),
-            reinterpret_cast<const __half *>(output_gradient.data_ptr<mfq_half>()),
-            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
-            rows, outputs, width, groups, static_cast<int>(group_size),
-            static_cast<int>(bits), q5_exec);
-    } else if (dtype == mfq_tensor_backend::kBFloat16) {
-        nint_backward_input_kernel<<<blocks, threads, 0, stream>>>(
-            q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
-            sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
-            neuron_min.data_ptr<float>(),
-            reinterpret_cast<const __nv_bfloat16 *>(
-                output_gradient.data_ptr<mfq_bfloat16>()),
-            reinterpret_cast<__nv_bfloat16 *>(result.data_ptr<mfq_bfloat16>()),
-            rows, outputs, width, groups, static_cast<int>(group_size),
-            static_cast<int>(bits), q5_exec);
+        auto weight = q5_exec
+            ? nint5_gs28_q5_dequant_cuda(
+                q_packed, neuron_scale, neuron_min, neuron_len)
+            : (bits == 4
+                ? nint_dequant_full_packed_compact_cuda(
+                    q_packed, sub_scale, sub_min, neuron_scale, neuron_min,
+                    neuron_len, group_size)
+                : nint_dequant_full_packed_compact_bits_cuda(
+                    q_packed, sub_scale, sub_min, neuron_scale, neuron_min,
+                    neuron_len, group_size, bits));
+        mfq_packed_backward::launch_dense_half_weight(
+            output_gradient, weight, result, rows, outputs, width, stream);
     } else {
-        nint_backward_input_kernel<<<blocks, threads, 0, stream>>>(
-            q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
-            sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
-            neuron_min.data_ptr<float>(), output_gradient.data_ptr<float>(),
-            result.data_ptr<float>(), rows, outputs, width, groups,
-            static_cast<int>(group_size), static_cast<int>(bits), q5_exec);
+        auto weight = q5_exec
+            ? nint5_gs28_q5_dequant_cuda(
+                q_packed, neuron_scale, neuron_min, neuron_len)
+            : (bits == 4
+                ? nint_dequant_full_packed_compact_cuda(
+                    q_packed, sub_scale, sub_min, neuron_scale, neuron_min,
+                    neuron_len, group_size)
+                : nint_dequant_full_packed_compact_bits_cuda(
+                    q_packed, sub_scale, sub_min, neuron_scale, neuron_min,
+                    neuron_len, group_size, bits));
+        mfq_packed_backward::launch_dense_half_weight(
+            output_gradient, weight, result, rows, outputs, width, stream);
     }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
@@ -9821,28 +9826,9 @@ mfq_tensor_backend::Tensor nint8_zero_backward_input_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
-    if (dtype == mfq_tensor_backend::kFloat16) {
-        nint8_zero_backward_input_kernel<<<blocks, threads, 0, stream>>>(
-            reinterpret_cast<const int8_t *>(q.data_ptr<uint8_t>()),
-            reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
-            reinterpret_cast<const __half *>(output_gradient.data_ptr<mfq_half>()),
-            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
-            rows, outputs, width, groups);
-    } else if (dtype == mfq_tensor_backend::kBFloat16) {
-        nint8_zero_backward_input_kernel<<<blocks, threads, 0, stream>>>(
-            reinterpret_cast<const int8_t *>(q.data_ptr<uint8_t>()),
-            reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
-            reinterpret_cast<const __nv_bfloat16 *>(
-                output_gradient.data_ptr<mfq_bfloat16>()),
-            reinterpret_cast<__nv_bfloat16 *>(result.data_ptr<mfq_bfloat16>()),
-            rows, outputs, width, groups);
-    } else {
-        nint8_zero_backward_input_kernel<<<blocks, threads, 0, stream>>>(
-            reinterpret_cast<const int8_t *>(q.data_ptr<uint8_t>()),
-            reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
-            output_gradient.data_ptr<float>(), result.data_ptr<float>(),
-            rows, outputs, width, groups);
-    }
+    auto weight = nint8_zero_dequant_cuda(q, scale, neuron_len);
+    mfq_packed_backward::launch_dense_half_weight(
+        output_gradient, weight, result, rows, outputs, width, stream);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }

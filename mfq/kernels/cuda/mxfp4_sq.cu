@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <cstdint>
 
+#include "packed_backward.cuh"
+
 namespace {
 
 // Exact frozen catalogs; source tests compare every entry to Metal.
@@ -282,26 +284,11 @@ mfq_tensor_backend::Tensor mxfp4_sq_backward_input_cuda(
     const auto stream = mfq_current_cuda_stream();
     const auto* data = blob.data_ptr<std::uint8_t>();
     const int rows = int(output_gradient.size(0));
-    if (output_gradient.scalar_type() == mfq_tensor_backend::kFloat32) {
-        if (bits == 2) {
-            sq_backward_input<2><<<blocks, threads, 0, stream>>>(
-                data, output_gradient.data_ptr<float>(), result.data_ptr<float>(), q, rows);
-        } else {
-            sq_backward_input<3><<<blocks, threads, 0, stream>>>(
-                data, output_gradient.data_ptr<float>(), result.data_ptr<float>(), q, rows);
-        }
-    } else {
-        const auto* source = reinterpret_cast<const __half*>(
-            output_gradient.data_ptr<mfq_half>());
-        auto* destination = reinterpret_cast<__half*>(result.data_ptr<mfq_half>());
-        if (bits == 2) {
-            sq_backward_input<2><<<blocks, threads, 0, stream>>>(
-                data, source, destination, q, rows);
-        } else {
-            sq_backward_input<3><<<blocks, threads, 0, stream>>>(
-                data, source, destination, q, rows);
-        }
-    }
+    auto weight = mxfp4_sq_dequant_cuda(
+        blob, bits, outputs, width, base, false);
+    mfq_packed_backward::launch_dense_half_weight(
+        output_gradient, weight, result,
+        rows, int(outputs), int(width), stream);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
