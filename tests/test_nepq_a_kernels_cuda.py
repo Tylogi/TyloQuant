@@ -49,7 +49,8 @@ def test_nepq_a_cuda_dequant_and_gemv(spec):
 
 
 @pytest.mark.parametrize("spec", [NEPQ0_A, NEPQ1_A])
-def test_nepq_a_packed_backward_and_autograd_match_dequant(spec):
+@pytest.mark.parametrize("m", [3, 8, 16])
+def test_nepq_a_packed_backward_and_autograd_match_dequant(spec, m):
     tensor, _ = _a_tensor(spec)
     gpu = to_gpu_nepq(tensor)
     dense = torch.as_tensor(
@@ -58,7 +59,7 @@ def test_nepq_a_packed_backward_and_autograd_match_dequant(spec):
         dtype=torch.float16,
     )
     output_gradient = torch.randn(
-        3, dense.shape[0], device="cuda", dtype=torch.float16
+        m, dense.shape[0], device="cuda", dtype=torch.float16
     )
     stored_gradient = output_gradient @ dense
     signs = torch.as_tensor(
@@ -89,13 +90,13 @@ def test_nepq_a_packed_backward_and_autograd_match_dequant(spec):
         atol=0.008,
     )
     source = torch.randn(
-        3,
+        m,
         tensor.neuron_len,
         device="cuda",
         dtype=torch.float16,
         requires_grad=True,
     )
-    (nepq_matmul(gpu, source).reshape(3, -1) * output_gradient).sum().backward()
+    (nepq_matmul(gpu, source).reshape(m, -1) * output_gradient).sum().backward()
     torch.testing.assert_close(source.grad, expected, rtol=0.008, atol=0.008)
 
 

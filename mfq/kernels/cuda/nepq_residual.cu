@@ -214,40 +214,73 @@ __global__ void nepq_sparse_residual_backward_input_kernel(
     int blocks_per_row,
     int position_bits,
     int block_vectors) {
-    const int64_t total = static_cast<int64_t>(input_rows) * width;
-    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         logical < total;
-         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-        const int input_row = static_cast<int>(logical / width);
-        const int column = static_cast<int>(
-            logical - static_cast<int64_t>(input_row) * width);
-        const int vector = column / 8;
-        const int component = column & 7;
-        const int block = vector / block_vectors;
-        const int position_in_block = vector - block * block_vectors;
-        float value = 0.0f;
-        for (int row = 0; row < rows; ++row) {
+    extern __shared__ float warp_gradients[];
+    const int input_row = static_cast<int>(blockIdx.y);
+    const int residual_block = static_cast<int>(blockIdx.x);
+    const int values_per_block = block_vectors * 8;
+    const int warp_count = static_cast<int>(blockDim.x) / kWarpSize;
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int row_group = lane / 8;
+    const int component = lane & 7;
+    for (int index = static_cast<int>(threadIdx.x);
+         index < warp_count * values_per_block;
+         index += static_cast<int>(blockDim.x)) {
+        warp_gradients[index] = 0.0f;
+    }
+    __syncthreads();
+
+    const int position_mask = (1 << position_bits) - 1;
+    for (int row_base = warp * 4;
+         row_base < rows;
+         row_base += warp_count * 4) {
+        const int row = row_base + row_group;
+        float gradient = 0.0f;
+        int first_record = -1;
+        int second_record = -1;
+        if (component == 0 && row < rows) {
+            gradient = __half2float(output_gradient[
+                static_cast<int64_t>(input_row) * rows + row]);
             const int64_t record_index =
-                static_cast<int64_t>(row) * blocks_per_row + block;
-            const int records[2] = {first[record_index], second[record_index]};
-#pragma unroll
-            for (int stream = 0; stream < 2; ++stream) {
-                const int record = records[stream];
-                if (record < 0) continue;
-                const int position = record & ((1 << position_bits) - 1);
-                const int dictionary_id = record >> position_bits;
-                if (position == position_in_block && dictionary_id < 1024) {
-                    value = fmaf(
-                        __half2float(output_gradient[
-                            static_cast<int64_t>(input_row) * rows + row]),
-                        __half2float(dictionary[
-                            static_cast<int64_t>(dictionary_id) * 8 + component]),
-                        value);
-                }
-            }
+                static_cast<int64_t>(row) * blocks_per_row + residual_block;
+            first_record = first[record_index];
+            second_record = second[record_index];
         }
-        input_gradient[logical] = __float2half(
-            __half2float(input_gradient[logical]) + value);
+        const int source_lane = row_group * 8;
+        gradient = __shfl_sync(0xffffffffu, gradient, source_lane);
+        first_record = __shfl_sync(0xffffffffu, first_record, source_lane);
+        second_record = __shfl_sync(0xffffffffu, second_record, source_lane);
+        const int records[2] = {first_record, second_record};
+#pragma unroll
+        for (int stream = 0; stream < 2; ++stream) {
+            const int record = records[stream];
+            if (record < 0) continue;
+            const int position = record & position_mask;
+            const int dictionary_id = record >> position_bits;
+            atomicAdd(
+                warp_gradients + warp * values_per_block +
+                    position * 8 + component,
+                gradient * __half2float(dictionary[
+                    static_cast<int64_t>(dictionary_id) * 8 + component]));
+        }
+    }
+    __syncthreads();
+
+    for (int index = static_cast<int>(threadIdx.x);
+         index < values_per_block;
+         index += static_cast<int>(blockDim.x)) {
+        const int column = residual_block * values_per_block + index;
+        if (column < width) {
+            float value = 0.0f;
+            for (int source_warp = 0; source_warp < warp_count; ++source_warp) {
+                value += warp_gradients[
+                    source_warp * values_per_block + index];
+            }
+            const int64_t logical =
+                static_cast<int64_t>(input_row) * width + column;
+            input_gradient[logical] = __float2half(
+                __half2float(input_gradient[logical]) + value);
+        }
     }
 }
 
@@ -479,15 +512,17 @@ mfq_tensor_backend::Tensor nepq_sparse_residual_backward_input_cuda(
         output_gradient.device() == input_gradient.device(),
         "NEPQ-A backward tensors must share one CUDA device");
     MfqCudaGuard guard(input_gradient.device());
-    const int64_t total = input_gradient.numel();
-    if (total == 0) {
+    if (input_gradient.numel() == 0) {
         return input_gradient;
     }
-    constexpr int threads = 256;
-    const int blocks = static_cast<int>(std::min<int64_t>(
-        (total + threads - 1) / threads, 65535));
+    const int threads = output_gradient.size(0) <= 8 ? 1024 : 256;
+    const dim3 blocks(
+        static_cast<unsigned>(first.size(1)),
+        static_cast<unsigned>(output_gradient.size(0)));
+    const size_t shared_bytes =
+        static_cast<size_t>(threads / kWarpSize) * block_vectors * 8 * sizeof(float);
     nepq_sparse_residual_backward_input_kernel<<<
-        blocks, threads, 0, mfq_current_cuda_stream()>>>(
+        blocks, threads, shared_bytes, mfq_current_cuda_stream()>>>(
         reinterpret_cast<const __half *>(dictionary.data_ptr<mfq_half>()),
         first.data_ptr<int16_t>(), second.data_ptr<int16_t>(),
         reinterpret_cast<const __half *>(
