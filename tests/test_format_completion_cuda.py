@@ -173,7 +173,7 @@ def test_mxfp8_matmul_matches_packed_reference(activation_rows: int):
 
 
 @pytest.mark.parametrize("factory", [_mxfp4, _mxfp8])
-@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 7, 8, 16])
 def test_mx_packed_backward_and_autograd_match_dequant(factory, rows):
     tensor, dense = factory()
     weight = to_gpu_mx(tensor)
