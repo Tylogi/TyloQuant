@@ -10098,6 +10098,189 @@ void launch_nint8_backward_rows(
 #undef MFQ_NINT8_BACKWARD_ROWS
 }
 
+template <int Bits>
+__global__ void __launch_bounds__(256) nint_backward_mma_m16_kernel(
+        const uint8_t * __restrict__ q_packed,
+        const uint8_t * __restrict__ sub_scale,
+        const uint8_t * __restrict__ sub_min,
+        const float * __restrict__ neuron_scale,
+        const float * __restrict__ neuron_min,
+        const __half * __restrict__ output_gradient,
+        __half * __restrict__ input_gradient,
+        int rows,
+        int outputs,
+        int width,
+        int groups,
+        int group_size) {
+    constexpr int kWarps = 8;
+    __shared__ __align__(16) __half gradient_tile[kWarps][16 * 16];
+    __shared__ __align__(16) __half weight_tile[kWarps][16 * 16];
+    __shared__ __align__(16) float result_tile[kWarps][16 * 16];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int column0 = static_cast<int>(blockIdx.x) * 16;
+    const int qbytes = (group_size * Bits + 7) / 8;
+    for (int index = lane; index < 16 * 16; index += 32) {
+        gradient_tile[warp][index] = __float2half_rn(0.0f);
+    }
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
+    wmma::fill_fragment(accumulator, 0.0f);
+    for (int output_group = warp * 128;
+         output_group < outputs;
+         output_group += kWarps * 128) {
+        for (int output0 = output_group;
+             output0 < min(output_group + 128, outputs);
+             output0 += 16) {
+            for (int index = lane; index < rows * 16; index += 32) {
+                const int row = index >> 4;
+                const int output = output0 + (index & 15);
+                gradient_tile[warp][index] = output < outputs
+                    ? output_gradient[
+                        static_cast<int64_t>(row) * outputs + output]
+                    : __float2half_rn(0.0f);
+            }
+            const int output = output0 + (lane & 15);
+            const int k0 = column0 + (lane >> 4) * 8;
+            const float output_scale = output < outputs
+                ? neuron_scale[output] : 0.0f;
+            const float output_minimum = output < outputs
+                ? neuron_min[output] : 0.0f;
+            float weights[8] = {};
+            if (output < outputs && k0 < width) {
+                const int first_group = k0 / group_size;
+                const int first_element = k0 - first_group * group_size;
+                const bool whole_segment =
+                    k0 + 7 < width && first_element + 7 < group_size;
+                if (whole_segment) {
+                    const int64_t metadata =
+                        static_cast<int64_t>(output) * groups + first_group;
+                    const uint8_t * packed_group =
+                        q_packed + metadata * qbytes;
+                    const int first_bit = first_element * Bits;
+                    const int first_byte = first_bit >> 3;
+                    const int shift = first_bit & 7;
+                    const int packed_bytes =
+                        (shift + 8 * Bits + 7) >> 3;
+                    uint64_t packed_codes = 0;
+#pragma unroll
+                    for (int byte = 0; byte < 8; ++byte) {
+                        if (byte < packed_bytes) {
+                            packed_codes |= static_cast<uint64_t>(
+                                packed_group[first_byte + byte]) <<
+                                (8 * byte);
+                        }
+                    }
+                    packed_codes >>= shift;
+                    const float scale = output_scale * static_cast<float>(
+                        sub_scale[metadata]);
+                    const float minimum =
+                        output_minimum * static_cast<float>(
+                            sub_min[metadata]);
+                    constexpr uint64_t mask =
+                        (uint64_t{1} << Bits) - 1;
+#pragma unroll
+                    for (int component = 0; component < 8; ++component) {
+                        const uint8_t code = static_cast<uint8_t>(
+                            (packed_codes >> (component * Bits)) & mask);
+                        weights[component] =
+                            scale * static_cast<float>(code) - minimum;
+                    }
+                }
+                if (!whole_segment) {
+#pragma unroll
+                    for (int component = 0; component < 8; ++component) {
+                        const int column = k0 + component;
+                        if (column >= width) {
+                            continue;
+                        }
+                        const int group_index = column / group_size;
+                        const int element = column - group_index * group_size;
+                        const int64_t metadata =
+                            static_cast<int64_t>(output) * groups +
+                            group_index;
+                        const uint8_t * packed_group =
+                            q_packed + metadata * qbytes;
+                        const uint8_t code =
+                            unpack_qbits_one_dequant<Bits>(
+                                packed_group, element);
+                        const float scale =
+                            output_scale * static_cast<float>(
+                                sub_scale[metadata]);
+                        const float minimum =
+                            output_minimum * static_cast<float>(
+                                sub_min[metadata]);
+                        weights[component] =
+                            scale * static_cast<float>(code) - minimum;
+                    }
+                }
+            }
+#pragma unroll
+            for (int component = 0; component < 8; ++component) {
+                weight_tile[warp][
+                    (lane & 15) * 16 + (lane >> 4) * 8 + component] =
+                    __float2half_rn(weights[component]);
+            }
+            __syncwarp();
+            wmma::fragment<
+                wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>
+                    gradient_fragment;
+            wmma::fragment<
+                wmma::matrix_b, 16, 16, 16, __half, wmma::row_major>
+                    weight_fragment;
+            wmma::load_matrix_sync(
+                gradient_fragment, gradient_tile[warp], 16);
+            wmma::load_matrix_sync(
+                weight_fragment, weight_tile[warp], 16);
+            wmma::mma_sync(
+                accumulator, gradient_fragment, weight_fragment, accumulator);
+            __syncwarp();
+        }
+    }
+    wmma::store_matrix_sync(
+        result_tile[warp], accumulator, 16, wmma::mem_row_major);
+    __syncthreads();
+    const int index = static_cast<int>(threadIdx.x);
+    if (index < rows * 16) {
+        const int row = index >> 4;
+        const int column = column0 + (index & 15);
+        if (column < width) {
+            float value = 0.0f;
+#pragma unroll
+            for (int source_warp = 0; source_warp < kWarps; ++source_warp) {
+                value += result_tile[source_warp][index];
+            }
+            input_gradient[static_cast<int64_t>(row) * width + column] =
+                __float2half_rn(value);
+        }
+    }
+}
+
+template <int Bits>
+void launch_nint_backward_mma_m16(
+        const mfq_tensor_backend::Tensor & q_packed,
+        const mfq_tensor_backend::Tensor & sub_scale,
+        const mfq_tensor_backend::Tensor & sub_min,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & neuron_min,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & result,
+        int rows,
+        int outputs,
+        int width,
+        int groups,
+        int group_size,
+        cudaStream_t stream) {
+    nint_backward_mma_m16_kernel<Bits><<<
+        (width + 15) / 16, 256, 0, stream>>>(
+            q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
+            sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
+            neuron_min.data_ptr<float>(),
+            reinterpret_cast<const __half *>(
+                output_gradient.data_ptr<mfq_half>()),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
+            rows, outputs, width, groups, group_size);
+}
+
 }  // namespace
 
 mfq_tensor_backend::Tensor nint_backward_input_cuda(
@@ -10174,6 +10357,32 @@ mfq_tensor_backend::Tensor nint_backward_input_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
+    // Fuse byte-aligned packed-bit segments into WMMA for wide projections.
+    // GS28 Q5 layouts retain the faster dequantize-and-GEMM path.
+    if (!q5_exec && !(bits == 5 && group_size == 28) &&
+            dtype == mfq_tensor_backend::kFloat16 &&
+            rows >= 9 && rows <= 16 &&
+            static_cast<int64_t>(width) >=
+                2 * static_cast<int64_t>(outputs)) {
+#define MFQ_NINT_BACKWARD_MMA_BITS(BITS) \
+        launch_nint_backward_mma_m16<BITS>( \
+            q_packed, sub_scale, sub_min, neuron_scale, neuron_min, \
+            output_gradient, result, rows, outputs, width, groups, \
+            static_cast<int>(group_size), stream)
+        switch (static_cast<int>(bits)) {
+            case 1: MFQ_NINT_BACKWARD_MMA_BITS(1); break;
+            case 2: MFQ_NINT_BACKWARD_MMA_BITS(2); break;
+            case 3: MFQ_NINT_BACKWARD_MMA_BITS(3); break;
+            case 4: MFQ_NINT_BACKWARD_MMA_BITS(4); break;
+            case 5: MFQ_NINT_BACKWARD_MMA_BITS(5); break;
+            case 6: MFQ_NINT_BACKWARD_MMA_BITS(6); break;
+            case 7: MFQ_NINT_BACKWARD_MMA_BITS(7); break;
+            case 8: MFQ_NINT_BACKWARD_MMA_BITS(8); break;
+        }
+#undef MFQ_NINT_BACKWARD_MMA_BITS
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return result;
+    }
     const bool use_small_m_partial = rows <= 8 || (rows <= 16 && bits >= 6);
     if (dtype == mfq_tensor_backend::kFloat16 && use_small_m_partial) {
         constexpr int output_tile = 32;

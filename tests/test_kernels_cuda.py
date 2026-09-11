@@ -470,7 +470,7 @@ def test_nint_packed_bits_matmul_matches_dequant(spec, M):
         NintSpec(8, 48, 7),
     ],
 )
-@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 13, 16])
 def test_nint_packed_backward_and_autograd_match_dequant(spec, rows):
     torch.manual_seed(1700 + spec.bits + spec.groupsize + rows)
     np.random.seed(1700 + spec.bits + spec.groupsize + rows)
