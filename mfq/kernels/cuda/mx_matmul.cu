@@ -1155,7 +1155,7 @@ void launch_mx_backward(
     }
 }
 
-template <int Rows>
+template <int Rows, int Columns>
 __global__ void __launch_bounds__(256) mxfp8_backward_mma_kernel(
         const uint8_t * __restrict__ values,
         const uint8_t * __restrict__ scales,
@@ -1171,10 +1171,13 @@ __global__ void __launch_bounds__(256) mxfp8_backward_mma_kernel(
     __shared__ __align__(16) float result_tile[kWarps][16 * 16];
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int column0 = static_cast<int>(blockIdx.x) * 16;
+    const int column0 = static_cast<int>(blockIdx.x) * Columns;
     const int scale_columns = width >> 7;
     for (int index = lane; index < 16 * 16; index += 32) {
         gradient_tile[warp][index] = __float2half_rn(0.0f);
+        if constexpr (Columns < 16) {
+            weight_tile[warp][index] = __float2half_rn(0.0f);
+        }
     }
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
     wmma::fill_fragment(accumulator, 0.0f);
@@ -1198,10 +1201,12 @@ __global__ void __launch_bounds__(256) mxfp8_backward_mma_kernel(
                     (column0 >> 7)])
                 : 0.0f;
             scale = __shfl_sync(0xffffffffu, scale, 0);
-            for (int index = lane; index < 16 * 16; index += 32) {
-                const int output = output0 + (index >> 4);
-                const int column = column0 + (index & 15);
-                weight_tile[warp][index] = output < outputs
+            for (int index = lane; index < 16 * Columns; index += 32) {
+                const int output = output0 + index / Columns;
+                const int local_column = index % Columns;
+                const int column = column0 + local_column;
+                weight_tile[warp][
+                    (index / Columns) * 16 + local_column] = output < outputs
                     ? __float2half_rn(
                         decode_e4m3fn(values[
                             static_cast<int64_t>(output) * width + column]) *
@@ -1228,20 +1233,21 @@ __global__ void __launch_bounds__(256) mxfp8_backward_mma_kernel(
         result_tile[warp], accumulator, 16, wmma::mem_row_major);
     __syncthreads();
     const int index = static_cast<int>(threadIdx.x);
-    if (index < rows * 16) {
-        const int row = index >> 4;
-        const int column = column0 + (index & 15);
+    if (index < rows * Columns) {
+        const int row = index / Columns;
+        const int local_column = index % Columns;
+        const int column = column0 + local_column;
         float value = 0.0f;
 #pragma unroll
         for (int source_warp = 0; source_warp < kWarps; ++source_warp) {
-            value += result_tile[source_warp][index];
+            value += result_tile[source_warp][row * 16 + local_column];
         }
         input_gradient[static_cast<int64_t>(row) * width + column] =
             __float2half_rn(value);
     }
 }
 
-template <int Rows>
+template <int Rows, int Columns>
 void launch_mxfp8_backward_mma(
         const mfq_tensor_backend::Tensor & values,
         const mfq_tensor_backend::Tensor & scales,
@@ -1251,8 +1257,9 @@ void launch_mxfp8_backward_mma(
         int outputs,
         int width,
         cudaStream_t stream) {
-    const int blocks = (width + 15) / 16;
-    mxfp8_backward_mma_kernel<Rows><<<blocks, 256, 0, stream>>>(
+    const int blocks = (width + Columns - 1) / Columns;
+    mxfp8_backward_mma_kernel<Rows, Columns><<<
+        blocks, 256, 0, stream>>>(
         values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(
             output_gradient.data_ptr<mfq_half>()),
@@ -1602,7 +1609,12 @@ mfq_tensor_backend::Tensor mx_backward_input_cuda(
         // square and output-wide projections keep the vector path.
         } else if (static_cast<int64_t>(width) >=
                 2 * static_cast<int64_t>(outputs)) {
-            launch_mxfp8_backward_mma<8>(
+            launch_mxfp8_backward_mma<8, 16>(
+                values, scales, output_gradient, result,
+                rows, outputs, width, stream);
+        } else if (2 * static_cast<int64_t>(width) >=
+                static_cast<int64_t>(outputs)) {
+            launch_mxfp8_backward_mma<8, 8>(
                 values, scales, output_gradient, result,
                 rows, outputs, width, stream);
         } else {

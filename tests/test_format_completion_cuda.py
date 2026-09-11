@@ -188,6 +188,7 @@ def test_mxfp8_matmul_matches_packed_reference(activation_rows: int):
 @pytest.mark.parametrize("factory", [_mxfp4, _mxfp8])
 @pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 7, 8, 16])
 def test_mx_packed_backward_and_autograd_match_dequant(factory, rows):
+    torch.manual_seed(1600 + rows + (100 if factory is _mxfp8 else 0))
     tensor, dense = factory()
     weight = to_gpu_mx(tensor)
     output_gradient = torch.randn(
@@ -214,8 +215,12 @@ def test_mx_packed_backward_and_autograd_match_dequant(factory, rows):
 
 
 @pytest.mark.parametrize("rows", [5, 8])
-def test_mxfp8_wide_backward_matches_packed_reference(rows: int):
-    tensor, dense = _mxfp8_shape(257, 1024, 1608)
+@pytest.mark.parametrize("shape", [(257, 256), (257, 1024)])
+def test_mxfp8_tiled_backward_matches_packed_reference(
+    rows: int,
+    shape: tuple[int, int],
+):
+    tensor, dense = _mxfp8_shape(*shape, 1608 + shape[1])
     weight = to_gpu_mx(tensor)
     output_gradient = torch.randn(
         rows, tensor.shape[0], device="cuda", dtype=torch.float16
