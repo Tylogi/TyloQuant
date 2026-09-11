@@ -21,8 +21,8 @@ inline void launch_half_gemm_nn(
     MFQ_RUNTIME_CHECK(
         cublasSetStream(handle, stream) == CUBLAS_STATUS_SUCCESS,
         "packed backward cublasSetStream failed");
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    const __half alpha = __float2half(1.0f);
+    const __half beta = __float2half(0.0f);
     // Row-major dX[M,K] = dY[M,N] * W[N,K] maps to
     // column-major dX^T[K,M] = W^T[K,N] * dY^T[N,M].
     MFQ_RUNTIME_CHECK(
@@ -34,7 +34,7 @@ inline void launch_half_gemm_nn(
             output_gradient, CUDA_R_16F, outputs,
             &beta,
             input_gradient, CUDA_R_16F, width,
-            CUBLAS_COMPUTE_32F,
+            CUBLAS_COMPUTE_16F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS,
         "packed backward GEMM failed");
 }
