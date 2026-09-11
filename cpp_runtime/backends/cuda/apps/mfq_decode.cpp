@@ -6851,6 +6851,16 @@ struct MixedMoeRuntime {
                 : nint_dispatch->forward(x, route);
         }
         if (use_nvq_prefill) {
+            const int routed_rows_per_expert = std::max(
+                1, (tokens * routes + n_experts - 1) / n_experts);
+            const bool use_coarse_nvq_tiles =
+                routed_rows_per_expert > 64 && route.wide_tile_m > 8;
+            const int nvq_tile_m = use_coarse_nvq_tiles
+                ? route.wide_tile_m : 8;
+            const auto & nvq_tile_bounds = use_coarse_nvq_tiles
+                ? route.wide_tile_bounds : route.tile_bounds;
+            const auto & nvq_tile_experts = use_coarse_nvq_tiles
+                ? route.wide_tile_experts : route.tile_experts;
             nvq_moe_grouped_matmul_hetero_f16_cuda(
                 nvq_dispatch->weight_ptrs,
                 nvq_dispatch->weight_sizes,
@@ -6858,9 +6868,9 @@ struct MixedMoeRuntime {
                 nvq_dispatch->expert_pool,
                 nvq_dispatch->expert_local,
                 x, n_experts, out_per_expert, neuron_len,
-                route.wide_tile_m, output,
+                nvq_tile_m, output,
                 route.ids_dst, route.expert_bounds,
-                route.wide_tile_bounds, route.wide_tile_experts);
+                nvq_tile_bounds, nvq_tile_experts);
         }
 
         mfq_tensor_backend::Tensor shared_nint_qx;

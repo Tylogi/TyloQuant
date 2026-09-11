@@ -6536,7 +6536,12 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     }
 
     const int tile_m = static_cast<int>(route_tile_m);
-    const int fine_bm = tokens <= 128 ? 64 : (tokens <= 512 ? 32 : 64);
+    const int rows_per_expert = std::max(
+        1, (pairs + static_cast<int>(n_experts) - 1) /
+               static_cast<int>(n_experts));
+    const int fine_bm = rows_per_expert <= 16
+        ? 16
+        : (rows_per_expert <= 32 ? 32 : 64);
     const int max_tiles =
         (pairs + tile_m - 1) / tile_m + static_cast<int>(n_experts);
     const int ntiles_n =
@@ -6564,6 +6569,8 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
         NVQ_MOE_HETERO_F16_LAUNCH(128, 128, 2);
     } else if (tile_m == 64) {
         NVQ_MOE_HETERO_F16_LAUNCH(128, 64, 2);
+    } else if (fine_bm == 16) {
+        NVQ_MOE_HETERO_F16_LAUNCH(16, 8, 4);
     } else if (fine_bm == 32) {
         NVQ_MOE_HETERO_F16_LAUNCH(32, 8, 4);
     } else {
