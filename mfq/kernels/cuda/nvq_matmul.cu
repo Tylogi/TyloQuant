@@ -7316,7 +7316,7 @@ __global__ void __launch_bounds__(32) nvq_backward_quad_partial_kernel(
         const float * neuron_scale,
         const int8_t * codebook,
         const __half * output_gradient,
-        float * partials,
+        __half * partials,
         int M,
         int N,
         int K,
@@ -7388,7 +7388,8 @@ __global__ void __launch_bounds__(32) nvq_backward_quad_partial_kernel(
                     const int column = k0 + component;
                     if (column < K) {
                         partials[(static_cast<int64_t>(split) * M + row) *
-                            K + column] = accumulators[row][component];
+                            K + column] = __float2half_rn(
+                                accumulators[row][component]);
                     }
                 }
             }
@@ -7426,7 +7427,8 @@ void launch_nvq_backward_quad_small_m(
             neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),
             reinterpret_cast<const __half *>(
                 output_gradient.data_ptr<mfq_half>()),
-            partials.data_ptr<float>(), M, N, K, ng, nvec, nsign,
+            reinterpret_cast<__half *>(partials.data_ptr<mfq_half>()),
+            M, N, K, ng, nvec, nsign,
             sub_bits, sign_mode, output_tile);
 }
 
@@ -7441,7 +7443,7 @@ __global__ void __launch_bounds__(32) nvq_backward_vec8_partial_kernel(
         const float * neuron_scale,
         const int8_t * codebook,
         const __half * output_gradient,
-        float * partials,
+        __half * partials,
         int M,
         int N,
         int K,
@@ -7521,7 +7523,8 @@ __global__ void __launch_bounds__(32) nvq_backward_vec8_partial_kernel(
                     const int column = k0 + component;
                     if (column < K) {
                         partials[(static_cast<int64_t>(split) * M + row0 + row) *
-                            K + column] = accumulators[row][component];
+                            K + column] = __float2half_rn(
+                                accumulators[row][component]);
                     }
                 }
             }
@@ -7560,7 +7563,8 @@ void launch_nvq_backward_vec8_small_m(
             neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),
             reinterpret_cast<const __half *>(
                 output_gradient.data_ptr<mfq_half>()),
-            partials.data_ptr<float>(), M, N, K, ng, nvec, nsign,
+            reinterpret_cast<__half *>(partials.data_ptr<mfq_half>()),
+            M, N, K, ng, nvec, nsign,
             sub_bits, sign_mode, output_tile);
 }
 
@@ -7834,7 +7838,7 @@ mfq_tensor_backend::Tensor nvq_backward_input_cuda(
         const int splits = (N + output_tile - 1) / output_tile;
         auto partials = mfq_tensor_backend::empty(
             {splits, M, K},
-            neuron_scale.options().dtype(mfq_tensor_backend::kFloat32));
+            output_gradient.options());
         launch_by_format(static_cast<int>(format), [&](auto tag) {
             constexpr int F = decltype(tag)::value;
             if (M == 1) {
@@ -7871,8 +7875,8 @@ mfq_tensor_backend::Tensor nvq_backward_input_cuda(
                 }
             }
         });
-        mfq_packed_backward::launch_split_float_reduce_to_half(
-            partials.data_ptr<float>(),
+        mfq_packed_backward::launch_split_half_reduce_to_half(
+            reinterpret_cast<const __half *>(partials.data_ptr<mfq_half>()),
             reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
             M, K, splits, stream);
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();

@@ -125,6 +125,70 @@ inline void launch_split_float_reduce_to_half(
         partials, destination, rows, width, splits);
 }
 
+static __global__ void split_half_reduce_to_half_kernel(
+        const __half * __restrict__ partials,
+        __half * __restrict__ destination,
+        int64_t total,
+        int splits) {
+    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+             threadIdx.x;
+         logical < total;
+         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        float accumulator = 0.0f;
+        for (int split = 0; split < splits; ++split) {
+            accumulator += __half2float(partials[
+                static_cast<int64_t>(split) * total + logical]);
+        }
+        destination[logical] = __float2half_rn(accumulator);
+    }
+}
+
+static __global__ void split_half2_reduce_to_half_kernel(
+        const __half2 * __restrict__ partials,
+        __half2 * __restrict__ destination,
+        int64_t pairs,
+        int splits) {
+    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+             threadIdx.x;
+         logical < pairs;
+         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        float2 accumulator = make_float2(0.0f, 0.0f);
+        for (int split = 0; split < splits; ++split) {
+            const __half2 value = partials[
+                static_cast<int64_t>(split) * pairs + logical];
+            const float2 unpacked = __half22float2(value);
+            accumulator.x += unpacked.x;
+            accumulator.y += unpacked.y;
+        }
+        destination[logical] = __floats2half2_rn(
+            accumulator.x, accumulator.y);
+    }
+}
+
+inline void launch_split_half_reduce_to_half(
+        const __half * partials,
+        __half * destination,
+        int rows,
+        int width,
+        int splits,
+        cudaStream_t stream) {
+    constexpr int threads = 256;
+    const int64_t total = static_cast<int64_t>(rows) * width;
+    if ((total & 1) == 0) {
+        const int64_t pairs = total / 2;
+        const int blocks = static_cast<int>(std::min<int64_t>(
+            (pairs + threads - 1) / threads, 65535));
+        split_half2_reduce_to_half_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __half2 *>(partials),
+            reinterpret_cast<__half2 *>(destination), pairs, splits);
+        return;
+    }
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (total + threads - 1) / threads, 65535));
+    split_half_reduce_to_half_kernel<<<blocks, threads, 0, stream>>>(
+        partials, destination, total, splits);
+}
+
 inline void launch_float_gemm_nn(
         const float * output_gradient,
         const float * weight,
