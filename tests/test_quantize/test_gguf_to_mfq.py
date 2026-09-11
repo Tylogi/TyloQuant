@@ -259,6 +259,11 @@ def test_imatrix_binds_mixed_nint_experts(tmp_path):
         binding.selected(np.asarray([0, 3])),
         values * np.asarray([[1.0], [4.0]]),
     )
+    assert binding.input_selected is not None
+    np.testing.assert_array_equal(
+        binding.input_selected(np.asarray([0, 3])),
+        values,
+    )
     assert binding.neuron_rows is not None
     np.testing.assert_array_equal(
         binding.neuron_rows(1, 5),

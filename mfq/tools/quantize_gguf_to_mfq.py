@@ -348,6 +348,7 @@ class ImatrixBinding:
     rows: ImportanceRows
     selected: ImportanceSelection
     neuron_rows: ImportanceRows | None = None
+    input_selected: ImportanceSelection | None = None
 
 
 @dataclass(frozen=True)
@@ -419,6 +420,22 @@ def _bind_imatrix(
                 raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
             return resolved[1]
 
+        def input_selected(
+            row_ids: np.ndarray,
+            *,
+            _item=item,
+            _names=names,
+        ) -> np.ndarray:
+            resolved = imatrix.input_for_rows(
+                _names,
+                _item.original_shape,
+                _item.storage_shape,
+                np.asarray(row_ids, dtype=np.int64),
+            )
+            if resolved is None:
+                raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
+            return resolved[1]
+
         neuron_probe = imatrix.neuron_importance_for_rows(
             names,
             item.storage_shape,
@@ -446,7 +463,11 @@ def _bind_imatrix(
                 return resolved[1]
 
         bindings[item.name] = ImatrixBinding(
-            entry_name, rows, selected, neuron_rows
+            entry_name,
+            rows,
+            selected,
+            neuron_rows,
+            input_selected,
         )
     if missing:
         preview = ", ".join(missing[:8])
@@ -2529,8 +2550,13 @@ def convert(args: argparse.Namespace) -> None:
                 neuron_importance = None
                 if imatrix_binding is not None:
                     n_experts, rows_per_expert, _ = item.expert_shape
-                    expert_importance = imatrix_binding.selected(
+                    expert_rows = (
                         np.arange(n_experts, dtype=np.int64) * rows_per_expert
+                    )
+                    expert_importance = (
+                        imatrix_binding.selected(expert_rows)
+                        if imatrix_binding.input_selected is None
+                        else imatrix_binding.input_selected(expert_rows)
                     )
                     if imatrix_binding.neuron_rows is not None:
                         neuron_importance = imatrix_binding.neuron_rows(
