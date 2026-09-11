@@ -2,7 +2,10 @@
 
 # TyloQuant MFQ
 
-<img src="./docs/figures/tylogi-ai-lab.svg" alt="Tylogi AI Lab" width="520">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./docs/figures/tylogi-ai-lab-dark.svg">
+  <img src="./docs/figures/tylogi-ai-lab.svg" alt="Tylogi AI Lab" width="420">
+</picture>
 
 ### 新一代量化与推理基础设施
 
