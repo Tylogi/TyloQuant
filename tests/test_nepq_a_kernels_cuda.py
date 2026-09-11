@@ -49,7 +49,7 @@ def test_nepq_a_cuda_dequant_and_gemv(spec):
 
 
 @pytest.mark.parametrize("spec", [NEPQ0_A, NEPQ1_A])
-@pytest.mark.parametrize("m", [3, 8, 16])
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 8, 16])
 def test_nepq_a_packed_backward_and_autograd_match_dequant(spec, m):
     tensor, _ = _a_tensor(spec)
     gpu = to_gpu_nepq(tensor)
