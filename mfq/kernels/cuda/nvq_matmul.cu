@@ -7833,8 +7833,8 @@ mfq_tensor_backend::Tensor nvq_backward_input_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
-    if (dtype == mfq_tensor_backend::kFloat16 && M <= 8) {
-        const int output_tile = M <= 4 ? 16 : 32;
+    if (dtype == mfq_tensor_backend::kFloat16 && M <= 4) {
+        constexpr int output_tile = 16;
         const int splits = (N + output_tile - 1) / output_tile;
         auto partials = mfq_tensor_backend::empty(
             {splits, M, K},
