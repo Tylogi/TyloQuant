@@ -1404,6 +1404,8 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
+    { name = "tokenizers", version = "0.21.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-3-mfq-minicpmo45'" },
+    { name = "tokenizers", version = "0.22.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-3-mfq-calibration' or extra != 'extra-3-mfq-minicpmo45'" },
     { name = "tqdm" },
 ]
 
@@ -1542,6 +1544,7 @@ requires-dist = [
     { name = "soundfile", marker = "extra == 'minicpmo45-realtime'", specifier = ">=0.12.1" },
     { name = "stepaudio2-minicpmo", marker = "extra == 'minicpmo45-realtime'", specifier = ">=0.1.1" },
     { name = "tiktoken", marker = "extra == 'tpq'", specifier = ">=0.7.0" },
+    { name = "tokenizers", specifier = ">=0.19.0" },
     { name = "tokenizers", marker = "extra == 'tpq'", specifier = ">=0.19.0" },
     { name = "torch", marker = "extra == 'calibration'", specifier = ">=2.4.0" },
     { name = "torch", marker = "extra == 'minicpmo45'", specifier = ">=2.3.0,<=2.8.0" },

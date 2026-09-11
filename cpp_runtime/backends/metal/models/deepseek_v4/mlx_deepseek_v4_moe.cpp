@@ -4,6 +4,8 @@
 #include "mlx_moe_ops.h"
 #include "mlx_ssd_expert_arena.h"
 
+#include <mlx/memory.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -33,8 +35,13 @@ MlxDeepseekV4SsdExpertWeights load_resident_hf_experts(
     DeepseekV4NativeExpertStore store(
         model.checkpoint().root(),
         std::vector<std::string>{prefix},
-        count);
-    MlxDeepseekV4SsdExpertArena arena(count);
+        count,
+        static_cast<std::size_t>(config.hidden),
+        static_cast<std::size_t>(config.moe_inter));
+    MlxDeepseekV4SsdExpertArena arena(
+        count,
+        static_cast<std::size_t>(config.hidden),
+        static_cast<std::size_t>(config.moe_inter));
     std::vector<DeepseekV4NativeExpertDestination> destinations;
     destinations.reserve(count);
     for (std::size_t expert = 0; expert < count; ++expert) {
@@ -59,6 +66,8 @@ MlxDeepseekV4SsdExpertWeights load_resident_hf_experts(
         << "Resident HF experts: " << prefix
         << " experts=" << count
         << " bytes=" << arena.nbytes()
+        << " mlx_active_bytes=" << mlx::core::get_active_memory()
+        << " mlx_cache_bytes=" << mlx::core::get_cache_memory()
         << std::endl;
     // The returned MLX arrays retain the four arena bank allocations.
     return arena.slot_weights();
@@ -991,12 +1000,16 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
                 "dimensions mismatch");
         }
     } else {
-        if (config_.hidden != 4096 || config_.moe_inter != 2048 ||
-            config_.n_experts != 256 ||
+        // The SSD store and arena are parameterized by the checkpoint's
+        // geometry. Keep the alignment and layer-bound checks here without
+        // pinning the path to the legacy V4F 4096/2048/256 dimensions.
+        if (config_.hidden <= 0 || config_.hidden % 32 != 0 ||
+            config_.moe_inter <= 0 || config_.moe_inter % 32 != 0 ||
+            config_.n_experts <= 0 ||
             layer_ >= static_cast<std::size_t>(
                 config_.n_layers + config_.n_mtp_layers)) {
             throw std::invalid_argument(
-                "DeepSeek-V4 SSD experts require official V4F geometry");
+                "DeepSeek-V4 SSD expert geometry is incompatible");
         }
     }
     const auto router_scale =
@@ -1243,7 +1256,6 @@ MlxDeepseekV4Moe::forward_branches(
         && !token_experts_.has_value()
         && !visual_router_bias_.has_value()
         && dense_router != nullptr
-        && config_.n_experts == 256
         && config_.top_k == 6
         && config_.norm_topk_prob
         && moe_dense_router_topk_supported(
@@ -1254,7 +1266,13 @@ MlxDeepseekV4Moe::forward_branches(
     const bool route_transaction =
         ssd_expert_cache_ &&
         ssd_expert_cache_->route_transaction_active();
+    // Packed device-route IDs currently reserve eight low bits for the
+    // global expert ID. V4.1 has 384 experts, so keep its fused router on the
+    // unpacked path until that wire format is widened.
+    const bool packed_device_route_supported =
+        config_.n_experts <= 256;
     if (ssd_expert_cache_ && prefetched == nullptr && rows == 1 &&
+        packed_device_route_supported &&
         (route_transaction || ssd_device_route_enabled()) &&
         (use_fused_dense_router || route_transaction)) {
         device_route_snapshot.emplace(

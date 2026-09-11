@@ -25,7 +25,10 @@ struct MlxDeepseekV4SsdExpertWeights {
 // in each slot so one routed MXFP4 kernel can project and apply SwiGLU.
 class MlxDeepseekV4SsdExpertArena {
 public:
-    explicit MlxDeepseekV4SsdExpertArena(std::size_t slots);
+    explicit MlxDeepseekV4SsdExpertArena(
+        std::size_t slots,
+        std::size_t hidden_size = 4096,
+        std::size_t intermediate_size = 2048);
 
     std::size_t slots() const noexcept;
     std::size_t bytes_per_slot() const noexcept;
@@ -68,6 +71,12 @@ private:
         std::size_t bytes = 0) const;
 
     std::size_t slots_ = 0;
+    std::size_t hidden_size_ = 0;
+    std::size_t intermediate_size_ = 0;
+    std::size_t value_gate_bytes_ = 0;
+    std::size_t value_down_bytes_ = 0;
+    std::size_t scale_gate_bytes_ = 0;
+    std::size_t scale_down_bytes_ = 0;
     Bank gate_up_scale_;
     Bank w2_scale_;
     Bank gate_up_weight_;

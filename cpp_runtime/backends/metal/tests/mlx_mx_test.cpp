@@ -1,9 +1,12 @@
 #include "mlx_mx.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_nint8_zero.h"
+#include "mlx_deepseek_v4_attention.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -85,6 +88,35 @@ std::vector<std::uint8_t> make_patterned_mxfp8_blob(
             123 + (index * 5 + static_cast<std::size_t>(salt)) % 7);
     }
     return blob;
+}
+
+mfq::metal::MlxMxWeight make_patterned_block32_mxfp8_weight(
+    int outputs,
+    int inputs,
+    int salt) {
+    using namespace mlx::core;
+    std::vector<std::uint8_t> values(
+        static_cast<std::size_t>(outputs) * inputs);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        const auto magnitude = static_cast<std::uint8_t>(
+            1 + (index * 17 + static_cast<std::size_t>(salt)) % 119);
+        values[index] = static_cast<std::uint8_t>(
+            magnitude | (((index + salt) & 7u) == 0u ? 0x80u : 0u));
+    }
+    const int scale_rows = (outputs + 31) / 32;
+    const int scale_columns = inputs / 32;
+    std::vector<std::uint8_t> scales(
+        static_cast<std::size_t>(scale_rows) * scale_columns);
+    for (std::size_t index = 0; index < scales.size(); ++index) {
+        scales[index] = static_cast<std::uint8_t>(
+            123 + (index * 5 + static_cast<std::size_t>(salt)) % 7);
+    }
+    return mfq::metal::MlxMxWeight::from_arrays(
+        "MXFP8",
+        array(values.begin(), Shape{outputs, inputs}),
+        array(scales.begin(), Shape{scale_rows, scale_columns}),
+        inputs,
+        outputs);
 }
 
 std::vector<std::uint8_t> make_q8_blob(int outputs, int inputs) {
@@ -637,6 +669,213 @@ void test_grouped_mxfp8_inverse_rope_small_m_matches_decode() {
     }
 }
 
+mlx::core::array block32_inverse_rope_reference(
+    const mfq::metal::MlxMxWeight& weight,
+    const mlx::core::array& input,
+    int groups,
+    const mlx::core::array& cosine,
+    const mlx::core::array& sine,
+    int head_dimension,
+    int rotary_dimension) {
+    using namespace mlx::core;
+    const int inputs = input.shape(-1);
+    const int heads = groups * inputs / head_dimension;
+    const int rotary_prefix = head_dimension - rotary_dimension;
+    auto head_values = reshape(
+        input,
+        Shape{1, 1, heads, head_dimension});
+    auto prefix = slice(
+        head_values,
+        Shape{0, 0, 0, 0},
+        Shape{1, 1, heads, rotary_prefix});
+    auto rotary_values = slice(
+        head_values,
+        Shape{0, 0, 0, rotary_prefix},
+        Shape{1, 1, heads, head_dimension});
+    auto rotated = reshape(
+        concatenate(
+            {
+                std::move(prefix),
+                mfq::metal::deepseek_v4_rope_adjacent(
+                    rotary_values,
+                    cosine,
+                    sine,
+                    true),
+            },
+            3),
+        Shape{1, 1, groups, inputs});
+    return weight.grouped_row_matmul(rotated, groups);
+}
+
+void test_grouped_block32_mxfp8_inverse_rope_matches_native_qmv() {
+    using namespace mlx::core;
+    constexpr int groups = 2;
+    constexpr int inputs = 512;
+    constexpr int outputs_per_group = 16;
+    constexpr int outputs = groups * outputs_per_group;
+    constexpr int head_dimension = 64;
+    constexpr int rotary_dimension = 16;
+    const auto weight = make_patterned_block32_mxfp8_weight(
+        outputs,
+        inputs,
+        29);
+
+    std::vector<float> values(
+        static_cast<std::size_t>(groups) * inputs);
+    for (int group = 0; group < groups; ++group) {
+        for (int column = 0; column < inputs; ++column) {
+            values[static_cast<std::size_t>(group) * inputs + column] =
+                static_cast<float>(
+                    ((column * 13 + group * 19) % 43) - 21) /
+                256.0f;
+        }
+    }
+    std::vector<float> cosine(rotary_dimension / 2);
+    std::vector<float> sine(rotary_dimension / 2);
+    for (int pair = 0; pair < rotary_dimension / 2; ++pair) {
+        const float angle = static_cast<float>(pair + 1) / 19.0f;
+        cosine[static_cast<std::size_t>(pair)] = std::cos(angle);
+        sine[static_cast<std::size_t>(pair)] = std::sin(angle);
+    }
+    const array input(values.begin(), Shape{1, 1, groups, inputs});
+    const array cosine_array(
+        cosine.begin(),
+        Shape{1, rotary_dimension / 2});
+    const array sine_array(
+        sine.begin(),
+        Shape{1, rotary_dimension / 2});
+    auto actual = contiguous(weight.grouped_row_matmul_inverse_rope(
+        input,
+        groups,
+        cosine_array,
+        sine_array,
+        head_dimension,
+        rotary_dimension));
+
+    auto reference = contiguous(block32_inverse_rope_reference(
+        weight,
+        input,
+        groups,
+        cosine_array,
+        sine_array,
+        head_dimension,
+        rotary_dimension));
+    eval(actual, reference);
+    require(
+        actual.shape() == Shape{1, 1, groups, outputs_per_group},
+        "block32 MXFP8 inverse-RoPE shape mismatch");
+    require(
+        actual.dtype() == float32 && reference.dtype() == float32,
+        "block32 MXFP8 inverse-RoPE dtype mismatch");
+    const auto* actual_bits =
+        reinterpret_cast<const std::uint32_t*>(actual.data<float>());
+    const auto* reference_bits =
+        reinterpret_cast<const std::uint32_t*>(reference.data<float>());
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        require(
+            actual_bits[index] == reference_bits[index],
+            "block32 MXFP8 fused inverse-RoPE differs from native QMV");
+    }
+}
+
+void benchmark_v41_block32_mxfp8_inverse_rope() {
+    const char* enabled = std::getenv("MFQ_METAL_MX_BLOCK32_BENCH");
+    if (enabled == nullptr || std::string(enabled) == "0") {
+        return;
+    }
+    using namespace mlx::core;
+    constexpr int groups = 8;
+    constexpr int inputs = 4096;
+    constexpr int outputs_per_group = 1024;
+    constexpr int outputs = groups * outputs_per_group;
+    constexpr int head_dimension = 512;
+    constexpr int rotary_dimension = 64;
+    constexpr int repetitions = 20;
+    const auto weight = make_patterned_block32_mxfp8_weight(
+        outputs,
+        inputs,
+        37);
+    std::vector<float> values(
+        static_cast<std::size_t>(groups) * inputs);
+    for (int group = 0; group < groups; ++group) {
+        for (int column = 0; column < inputs; ++column) {
+            values[static_cast<std::size_t>(group) * inputs + column] =
+                static_cast<float>(
+                    ((column * 11 + group * 23) % 97) - 48) /
+                512.0f;
+        }
+    }
+    std::vector<float> cosine(rotary_dimension / 2);
+    std::vector<float> sine(rotary_dimension / 2);
+    for (int pair = 0; pair < rotary_dimension / 2; ++pair) {
+        const float angle = static_cast<float>(pair + 3) / 71.0f;
+        cosine[static_cast<std::size_t>(pair)] = std::cos(angle);
+        sine[static_cast<std::size_t>(pair)] = std::sin(angle);
+    }
+    const array input(values.begin(), Shape{1, 1, groups, inputs});
+    const array cosine_array(
+        cosine.begin(),
+        Shape{1, rotary_dimension / 2});
+    const array sine_array(
+        sine.begin(),
+        Shape{1, rotary_dimension / 2});
+    const auto fused = [&] {
+        return weight.grouped_row_matmul_inverse_rope(
+            input,
+            groups,
+            cosine_array,
+            sine_array,
+            head_dimension,
+            rotary_dimension);
+    };
+    const auto reference = [&] {
+        return block32_inverse_rope_reference(
+            weight,
+            input,
+            groups,
+            cosine_array,
+            sine_array,
+            head_dimension,
+            rotary_dimension);
+    };
+
+    auto actual = contiguous(fused());
+    auto expected = contiguous(reference());
+    eval(actual, expected);
+    const auto* actual_bits =
+        reinterpret_cast<const std::uint32_t*>(actual.data<float>());
+    const auto* expected_bits =
+        reinterpret_cast<const std::uint32_t*>(expected.data<float>());
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        require(
+            actual_bits[index] == expected_bits[index],
+            "V4.1 block32 inverse-RoPE differs from reference graph");
+    }
+
+    const auto measure = [&](const auto& operation) {
+        for (int warmup = 0; warmup < 3; ++warmup) {
+            auto output = operation();
+            eval(output);
+        }
+        const auto started = std::chrono::steady_clock::now();
+        for (int repetition = 0; repetition < repetitions; ++repetition) {
+            auto output = operation();
+            eval(output);
+        }
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - started)
+                   .count() /
+            repetitions;
+    };
+    const double reference_ms = measure(reference);
+    const double fused_ms = measure(fused);
+    std::cout
+        << "V4.1 block32 inverse-RoPE reference_ms=" << reference_ms
+        << " fused_ms=" << fused_ms
+        << " speedup=" << reference_ms / fused_ms
+        << "x\n";
+}
+
 void test_grouped_row_mxfp8_prefill() {
     using namespace mlx::core;
     constexpr int groups = 2;
@@ -850,6 +1089,8 @@ int main() {
         test_grouped_mxfp8_q8();
         test_grouped_mxfp8_inverse_rope();
         test_grouped_mxfp8_inverse_rope_small_m_matches_decode();
+        test_grouped_block32_mxfp8_inverse_rope_matches_native_qmv();
+        benchmark_v41_block32_mxfp8_inverse_rope();
         test_grouped_row_mxfp8_prefill();
         test_grouped_row_mxfp8_verify();
         test_grouped_mxfp8_small_m_matches_decode();

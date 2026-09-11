@@ -27,6 +27,8 @@ _CHAT_FIELDS = {
     "frequency_penalty": float,
     "repetition_penalty": float,
     "enable_thinking": bool,
+    "enable_mtp": bool,
+    "mtp_max_draft_tokens": int,
 }
 _DUPLEX_FIELDS = {
     "system_prompt": str,
@@ -72,6 +74,16 @@ def _profile(
 # Verified model-family defaults. Keep these partial instead of copying generic
 # runtime defaults into every profile.
 _ARCHITECTURE_REGISTRY: dict[str, dict[str, Any]] = {
+    "deepseek_v41": _profile(
+        chat={
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "presence_penalty": 0.0,
+            "enable_mtp": False,
+            "mtp_max_draft_tokens": 4,
+        },
+        source="architecture-registry:deepseek_v41",
+    ),
     "deepseek_v4": _profile(
         chat={
             "temperature": 1.0,
@@ -161,7 +173,14 @@ def architecture_profile(*identities: object) -> dict[str, Any] | None:
     names = [_normalise_identity(value) for value in identities if value]
     for name in names:
         for key, profile in _ARCHITECTURE_REGISTRY.items():
-            if name == key or name.startswith(f"{key}_") or key in name:
+            compact_name = name.replace("_", "")
+            compact_key = key.replace("_", "")
+            if (
+                name == key
+                or name.startswith(f"{key}_")
+                or key in name
+                or compact_key in compact_name
+            ):
                 return copy.deepcopy(profile)
     return None
 

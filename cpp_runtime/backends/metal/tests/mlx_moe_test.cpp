@@ -3634,6 +3634,195 @@ void test_mxfp4_smallm_nax_policy() {
     }
 }
 
+void test_mxfp4_decode_down_reduce() {
+    constexpr int experts = 8;
+    constexpr int output = 13;
+    constexpr int input = 64;
+    constexpr int routes = 6;
+    const auto fixture = make_mxfp4(experts * output, input);
+    std::vector<std::uint8_t> blob;
+    append_magic(blob, "NIM2");
+    append<std::uint32_t>(blob, experts);
+    append<std::uint32_t>(blob, output);
+    append<std::uint32_t>(blob, input);
+    append<std::uint32_t>(blob, 1);
+    append<std::uint32_t>(blob, experts);
+    append<std::uint32_t>(blob, 5);
+    append<std::uint64_t>(blob, fixture.blob.size());
+    append<std::uint64_t>(blob, 0);
+    for (int expert = 0; expert < experts; ++expert) {
+        append<std::int32_t>(blob, experts - expert - 1);
+    }
+    blob.insert(blob.end(), {'M', 'X', 'F', 'P', '4'});
+    append_bytes(blob, fixture.blob);
+    const auto weight = mfq::metal::MlxMoeWeight::from_blob(blob);
+
+    std::vector<float> source_values(routes * input);
+    for (std::size_t index = 0; index < source_values.size(); ++index) {
+        source_values[index] = static_cast<float>(
+            static_cast<int>((index * 17 + 9) % 37) - 18) / 128.0f;
+    }
+    const std::vector<std::int32_t> ids{7, 1, 6, 0, 3, 2};
+    const std::vector<float> route_weights{
+        0.07f, 0.13f, 0.19f, 0.23f, 0.17f, 0.21f};
+    const auto source = mlx::core::astype(
+        mlx::core::array(
+            source_values.begin(),
+            mlx::core::Shape{1, routes, input}),
+        mlx::core::float16);
+    const mlx::core::array expert_ids(
+        ids.begin(),
+        mlx::core::Shape{1, routes});
+    const mlx::core::array weights(
+        route_weights.begin(),
+        mlx::core::Shape{1, routes});
+
+    const char* prior = std::getenv(
+        "MFQ_METAL_NINTM_DECODE_DOWN_REDUCE");
+    const std::optional<std::string> saved = prior == nullptr
+        ? std::nullopt
+        : std::optional<std::string>(prior);
+    const char* prior_rows = std::getenv(
+        "MFQ_METAL_NINTM_DECODE_DOWN_REDUCE_ROWS");
+    const std::optional<std::string> saved_rows = prior_rows == nullptr
+        ? std::nullopt
+        : std::optional<std::string>(prior_rows);
+    const char* prior_pack = std::getenv(
+        "MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD");
+    const std::optional<std::string> saved_pack = prior_pack == nullptr
+        ? std::nullopt
+        : std::optional<std::string>(prior_pack);
+    setenv("MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD", "1", 1);
+    const auto pair_reference = evaluated_floats(
+        weight.routed_matmul(source, expert_ids));
+    for (const char* rows : {"2", "4"}) {
+        setenv("MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD", rows, 1);
+        const auto packed_rows = evaluated_floats(
+            weight.routed_matmul(source, expert_ids));
+        require(pair_reference.size() == packed_rows.size(),
+                "MXFP4 decode row packing output shape mismatch");
+        for (std::size_t index = 0; index < pair_reference.size(); ++index) {
+            require_close(pair_reference[index], packed_rows[index], 1e-4f);
+        }
+    }
+    setenv("MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD", "1", 1);
+    setenv("MFQ_METAL_NINTM_DECODE_DOWN_REDUCE", "0", 1);
+    const auto reference = evaluated_floats(
+        weight.routed_matmul_reduce(source, expert_ids, weights));
+    setenv("MFQ_METAL_NINTM_DECODE_DOWN_REDUCE", "1", 1);
+    for (const char* rows : {"1", "2", "4"}) {
+        setenv("MFQ_METAL_NINTM_DECODE_DOWN_REDUCE_ROWS", rows, 1);
+        const auto fused = evaluated_floats(
+            weight.routed_matmul_reduce(source, expert_ids, weights));
+        require(
+            reference.size() == static_cast<std::size_t>(output)
+                && fused.size() == reference.size(),
+            "MXFP4 decode down-reduce output shape mismatch");
+        for (std::size_t index = 0; index < reference.size(); ++index) {
+            require_close(reference[index], fused[index], 1e-4f);
+        }
+    }
+
+    if (saved.has_value()) {
+        setenv(
+            "MFQ_METAL_NINTM_DECODE_DOWN_REDUCE",
+            saved->c_str(),
+            1);
+    } else {
+        unsetenv("MFQ_METAL_NINTM_DECODE_DOWN_REDUCE");
+    }
+    if (saved_rows.has_value()) {
+        setenv(
+            "MFQ_METAL_NINTM_DECODE_DOWN_REDUCE_ROWS",
+            saved_rows->c_str(),
+            1);
+    } else {
+        unsetenv("MFQ_METAL_NINTM_DECODE_DOWN_REDUCE_ROWS");
+    }
+    if (saved_pack.has_value()) {
+        setenv(
+            "MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD",
+            saved_pack->c_str(),
+            1);
+    } else {
+        unsetenv("MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD");
+    }
+}
+
+void test_mxfp4_decode_swiglu_row_packing() {
+    constexpr int experts = 8;
+    constexpr int matrix_output = 16;
+    constexpr int input = 64;
+    constexpr int routes = 6;
+    std::vector<std::int32_t> slots(experts);
+    for (int expert = 0; expert < experts; ++expert) {
+        slots[static_cast<std::size_t>(expert)] = experts - expert - 1;
+    }
+    std::vector<std::uint8_t> packed(
+        static_cast<std::size_t>(experts) * matrix_output * input / 2,
+        0x32);
+    std::vector<std::uint8_t> scales(
+        static_cast<std::size_t>(experts) * matrix_output * input / 32,
+        127);
+    const auto weight = mfq::metal::MlxMoeWeight::from_mxfp4_slots(
+        experts,
+        matrix_output,
+        input,
+        slots,
+        mlx::core::array(
+            packed.begin(),
+            mlx::core::Shape{
+                experts,
+                matrix_output * input / 2,
+            }),
+        mlx::core::array(
+            scales.begin(),
+            mlx::core::Shape{
+                experts,
+                matrix_output * input / 32,
+            }));
+    std::vector<float> source_values(input);
+    for (int column = 0; column < input; ++column) {
+        source_values[static_cast<std::size_t>(column)] =
+            static_cast<float>((column * 7 + 3) % 23 - 11) / 128.0f;
+    }
+    const auto source = mlx::core::astype(
+        mlx::core::array(
+            source_values.begin(),
+            mlx::core::Shape{1, input}),
+        mlx::core::float16);
+    const std::vector<std::int32_t> id_values{7, 1, 6, 0, 3, 2};
+    const mlx::core::array expert_ids(
+        id_values.begin(),
+        mlx::core::Shape{1, routes});
+    const char* prior = std::getenv(
+        "MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD");
+    const std::optional<std::string> saved = prior == nullptr
+        ? std::nullopt
+        : std::optional<std::string>(prior);
+    setenv("MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD", "1", 1);
+    const auto reference = evaluated_floats(
+        weight.routed_swiglu(source, expert_ids, 0.0f));
+    for (const char* rows : {"2", "4"}) {
+        setenv("MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD", rows, 1);
+        const auto candidate = evaluated_floats(
+            weight.routed_swiglu(source, expert_ids, 0.0f));
+        require(reference.size() == candidate.size(),
+                "MXFP4 decode SwiGLU row packing shape mismatch");
+        for (std::size_t index = 0; index < reference.size(); ++index) {
+            require_close(reference[index], candidate[index], 1e-4f);
+        }
+    }
+    if (saved.has_value()) {
+        setenv(
+            "MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD",
+            saved->c_str(),
+            1);
+    } else {
+        unsetenv("MFQ_METAL_NINTM_DECODE_ROWS_PER_SIMD");
+    }
+}
+
 void test_large_mxfp4_arena_avoids_single_group_builder() {
     constexpr int experts = 1025;
     constexpr int output = 1;
@@ -5501,6 +5690,8 @@ int main(int argc, char** argv) {
         test_swiglu_ffn();
         test_mxfp4_nintm_and_projection_offsets();
         test_mxfp4_smallm_nax_policy();
+        test_mxfp4_decode_down_reduce();
+        test_mxfp4_decode_swiglu_row_packing();
         test_large_mxfp4_arena_avoids_single_group_builder();
         test_vq_cohorts_and_ffn();
         test_nepq_a_routed_and_fused_swiglu();

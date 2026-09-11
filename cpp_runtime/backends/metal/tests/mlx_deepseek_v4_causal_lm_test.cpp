@@ -895,6 +895,8 @@ MlxDeepseekV4CausalLm make_dspark_model(bool attach_dspark = true) {
     config.dspark_noise_token_id = kVocab - 1;
     config.dspark_target_layer_ids = {2};
     config.dspark_markov_rank = 4;
+    config.dspark_n_experts = kExperts;
+    config.dspark_top_k = 1;
     config.mtp_compress_ratios = {0};
     config.validate();
     std::vector<MlxDeepseekV4Layer> layers;

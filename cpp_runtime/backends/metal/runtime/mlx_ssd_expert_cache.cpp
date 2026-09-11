@@ -123,11 +123,15 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
         std::size_t num_experts,
         std::size_t bytes,
         std::size_t worker_count,
-        bool overlap)
+        bool overlap,
+        std::size_t hidden_size,
+        std::size_t intermediate_size)
         : store(
               std::move(root),
               std::move(layer_prefixes),
-              num_experts),
+              num_experts,
+              hidden_size,
+              intermediate_size),
           slot_bytes(store.slot_bytes()),
           prefill_slots(overlap ? 2 * store.num_experts() : 0),
           total_slots(bytes / slot_bytes),
@@ -135,7 +139,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
               ? total_slots - prefill_slots
               : 0),
           limit_bytes(total_slots * slot_bytes),
-          arena(total_slots),
+          arena(total_slots, hidden_size, intermediate_size),
           slots(slot_count),
           page_tables(store.num_layers()),
           route_confidence(store.num_layers(), 0) {
@@ -1171,7 +1175,9 @@ MlxDeepseekV4SsdExpertCache::MlxDeepseekV4SsdExpertCache(
           256,
           cache_bytes,
           io_workers,
-          prefill_overlap)) {}
+          prefill_overlap,
+          4096,
+          2048)) {}
 
 MlxDeepseekV4SsdExpertCache::MlxDeepseekV4SsdExpertCache(
     std::filesystem::path model_root,
@@ -1179,14 +1185,18 @@ MlxDeepseekV4SsdExpertCache::MlxDeepseekV4SsdExpertCache(
     std::size_t cache_bytes,
     std::size_t io_workers,
     bool prefill_overlap,
-    std::size_t num_experts)
+    std::size_t num_experts,
+    std::size_t hidden_size,
+    std::size_t intermediate_size)
     : impl_(std::make_shared<Impl>(
           std::move(model_root),
           std::move(layer_prefixes),
           num_experts,
           cache_bytes,
           io_workers,
-          prefill_overlap)) {}
+          prefill_overlap,
+          hidden_size,
+          intermediate_size)) {}
 
 MlxDeepseekV4SsdExpertCache::~MlxDeepseekV4SsdExpertCache() = default;
 

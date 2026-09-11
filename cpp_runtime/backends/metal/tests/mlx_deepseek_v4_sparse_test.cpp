@@ -680,6 +680,188 @@ void test_indexer_paths() {
         }
     }
 
+    constexpr int v41_heads = 32;
+    auto v41_scores = mfq::metal::dsv4_indexer_scores(
+        mlx::core::astype(
+            float_array(
+                std::vector<float>(queries * v41_heads * 128, 1.0f),
+                Shape{1, queries, v41_heads, 128}),
+            mlx::core::bfloat16),
+        mlx::core::astype(
+            float_array(key, Shape{1, keys, 128}),
+            mlx::core::bfloat16),
+        mlx::core::astype(
+            float_array(
+                std::vector<float>(
+                    queries * v41_heads,
+                    1.0f / static_cast<float>(v41_heads)),
+                Shape{1, queries, v41_heads}),
+            mlx::core::bfloat16),
+        128,
+        2);
+    require(
+        v41_scores.dtype() == mlx::core::float32,
+        "V4.1 Indexer scores lost FP32 output");
+    const auto v41_actual = evaluated_float(std::move(v41_scores));
+    const float v41_expected =
+        64.0f / std::sqrt(4096.0f);
+    for (int query_index = 0;
+         query_index < queries;
+         ++query_index) {
+        const int visible = 64 + query_index;
+        for (int key_index = 0;
+             key_index < keys;
+             ++key_index) {
+            const float value =
+                v41_actual[query_index * keys + key_index];
+            if (key_index < visible) {
+                require(
+                    std::fabs(value - v41_expected) < 1.5e-3f,
+                    "V4.1 tiled Indexer score mismatch");
+            } else {
+                require(
+                    std::isinf(value) && std::signbit(value),
+                    "V4.1 tiled Indexer visibility mismatch");
+            }
+        }
+    }
+
+    std::vector<float> patterned_query(
+        queries * v41_heads * 128);
+    std::vector<float> patterned_key(keys * 128);
+    std::vector<float> patterned_weights(
+        queries * v41_heads);
+    for (int query_index = 0;
+         query_index < queries;
+         ++query_index) {
+        for (int head = 0; head < v41_heads; ++head) {
+            patterned_weights[
+                query_index * v41_heads + head] =
+                static_cast<float>(
+                    (query_index * 5 + head * 3) % 9 - 4) /
+                32.0f;
+            for (int dimension = 0;
+                 dimension < 128;
+                 ++dimension) {
+                patterned_query[
+                    (query_index * v41_heads + head) * 128 +
+                    dimension] =
+                    static_cast<float>(
+                        (query_index * 7 + head * 5 + dimension * 3) %
+                            17 -
+                        8) /
+                    16.0f;
+            }
+        }
+    }
+    for (int key_index = 0; key_index < keys; ++key_index) {
+        for (int dimension = 0;
+             dimension < 128;
+             ++dimension) {
+            patterned_key[key_index * 128 + dimension] =
+                static_cast<float>(
+                    (key_index * 11 + dimension * 7) % 19 - 9) /
+                16.0f;
+        }
+    }
+    const auto patterned_actual = evaluated_float(
+        mfq::metal::dsv4_indexer_scores(
+            mlx::core::astype(
+                float_array(
+                    patterned_query,
+                    Shape{1, queries, v41_heads, 128}),
+                mlx::core::bfloat16),
+            mlx::core::astype(
+                float_array(
+                    patterned_key,
+                    Shape{1, keys, 128}),
+                mlx::core::bfloat16),
+            mlx::core::astype(
+                float_array(
+                    patterned_weights,
+                    Shape{1, queries, v41_heads}),
+                mlx::core::bfloat16),
+            128,
+            2));
+    for (int query_index = 0;
+         query_index < queries;
+         ++query_index) {
+        const int visible = 64 + query_index;
+        for (int key_index = 0;
+             key_index < keys;
+             ++key_index) {
+            const auto offset = query_index * keys + key_index;
+            if (key_index >= visible) {
+                require(
+                    std::isinf(patterned_actual[offset]) &&
+                        std::signbit(patterned_actual[offset]),
+                    "patterned V4.1 Indexer visibility mismatch");
+                continue;
+            }
+            float expected = 0.0f;
+            for (int head = 0; head < v41_heads; ++head) {
+                float dot = 0.0f;
+                for (int dimension = 0;
+                     dimension < 128;
+                     ++dimension) {
+                    dot += patterned_query[
+                               (query_index * v41_heads + head) * 128 +
+                               dimension] *
+                        patterned_key[key_index * 128 + dimension];
+                }
+                expected += std::max(dot, 0.0f) *
+                    patterned_weights[
+                        query_index * v41_heads + head];
+            }
+            expected /= std::sqrt(4096.0f);
+            require(
+                std::fabs(patterned_actual[offset] - expected) < 2e-3f,
+                "patterned V4.1 tiled Indexer score mismatch");
+        }
+    }
+
+    auto v41_decode = mfq::metal::dsv4_indexer_scores_decode(
+        mlx::core::astype(
+            float_array(
+                std::vector<float>(v41_heads * 128, 1.0f),
+                Shape{1, 1, v41_heads, 128}),
+            mlx::core::bfloat16),
+        mlx::core::astype(
+            float_array(
+                std::vector<float>(decode_keys * 128, 0.5f),
+                Shape{1, decode_keys, 128}),
+            mlx::core::bfloat16),
+        mlx::core::astype(
+            float_array(
+                std::vector<float>(
+                    v41_heads,
+                    1.0f / static_cast<float>(v41_heads)),
+                Shape{1, 1, v41_heads}),
+            mlx::core::bfloat16),
+        130,
+        2);
+    require(
+        v41_decode.dtype() == mlx::core::float32,
+        "V4.1 decode Indexer scores lost FP32 output");
+    const auto v41_decode_values =
+        evaluated_float(std::move(v41_decode));
+    for (int key_index = 0;
+         key_index < decode_keys;
+         ++key_index) {
+        if (key_index < 65) {
+            require(
+                std::fabs(
+                    v41_decode_values[key_index] -
+                    v41_expected) < 1.5e-3f,
+                "V4.1 decode Indexer score mismatch");
+        } else {
+            require(
+                std::isinf(v41_decode_values[key_index]) &&
+                    std::signbit(v41_decode_values[key_index]),
+                "V4.1 decode Indexer visibility mismatch");
+        }
+    }
+
     constexpr int fixed_capacity = 257;
     constexpr int fixed_prefix = 129;
     auto fixed_scores = mfq::metal::dsv4_indexer_scores_decode(

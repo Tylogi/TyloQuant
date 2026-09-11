@@ -52,6 +52,8 @@ constexpr std::size_t kMinimumServerCacheLimitBytes =
     std::size_t{1} << 30;
 constexpr std::size_t kMaximumServerCacheLimitBytes =
     std::size_t{8} << 30;
+constexpr std::size_t kDeepseekV41AutomaticExpertCacheLimitBytes =
+    std::size_t{128} << 30;
 
 void release_model_load_staging_memory() {
     // Model conversion and NINTM repacking leave large, now-unused buffers in
@@ -1704,6 +1706,15 @@ int serve_loaded_runtime(
                             "ssd_expert_hits",
                             static_cast<double>(stats->hits));
                         metrics.emplace_back(
+                            "ssd_expert_misses",
+                            static_cast<double>(stats->misses));
+                        metrics.emplace_back(
+                            "ssd_expert_evictions",
+                            static_cast<double>(stats->evictions));
+                        metrics.emplace_back(
+                            "ssd_expert_loads",
+                            static_cast<double>(stats->loads));
+                        metrics.emplace_back(
                             "ssd_expert_hit_rate",
                             stats->hit_rate());
                         metrics.emplace_back(
@@ -1716,9 +1727,76 @@ int serve_loaded_runtime(
                             "ssd_expert_resident_count",
                             static_cast<double>(stats->resident_experts));
                         metrics.emplace_back(
+                            "ssd_expert_cache_slots",
+                            static_cast<double>(stats->cache_slots));
+                        metrics.emplace_back(
+                            "ssd_expert_cache_limit_bytes",
+                            static_cast<double>(
+                                runtime_holder->value()
+                                    .expert_cache_limit_bytes()));
+                        metrics.emplace_back(
+                            "ssd_expert_io_seconds",
+                            stats->io_seconds);
+                        metrics.emplace_back(
                             "ssd_expert_wait_seconds",
                             stats->wait_seconds);
                     }
+                }
+            }
+            if constexpr (requires(Runtime& value) {
+                    value.engram_ssd_stats();
+                }) {
+                if (lock.owns_lock() && runtime_holder->has_value()) {
+                    const auto stats =
+                        runtime_holder->value().engram_ssd_stats();
+                    if (stats.has_value()) {
+                        metrics.emplace_back(
+                            "engram_row_requests",
+                            static_cast<double>(stats->row_requests));
+                        metrics.emplace_back(
+                            "engram_cache_hits",
+                            static_cast<double>(stats->cache_hits));
+                        metrics.emplace_back(
+                            "engram_cache_misses",
+                            static_cast<double>(stats->cache_misses));
+                        metrics.emplace_back(
+                            "engram_hit_rate",
+                            stats->hit_rate());
+                        metrics.emplace_back(
+                            "engram_rows_loaded",
+                            static_cast<double>(stats->rows_loaded));
+                        metrics.emplace_back(
+                            "engram_bytes_read",
+                            static_cast<double>(stats->bytes_read));
+                        metrics.emplace_back(
+                            "engram_read_calls",
+                            static_cast<double>(stats->read_calls));
+                        metrics.emplace_back(
+                            "engram_io_seconds",
+                            stats->io_seconds);
+                        metrics.emplace_back(
+                            "engram_resident_rows",
+                            static_cast<double>(stats->resident_rows));
+                        metrics.emplace_back(
+                            "engram_resident_bytes",
+                            static_cast<double>(
+                                stats->resident_payload_bytes));
+                        metrics.emplace_back(
+                            "engram_cache_limit_bytes",
+                            static_cast<double>(stats->cache_limit_bytes));
+                    }
+                }
+            }
+            if constexpr (requires(Runtime& value) {
+                    value.fused_hyper_connections_active();
+                }) {
+                if (lock.owns_lock() && runtime_holder->has_value()) {
+                    metrics.emplace_back(
+                        "fused_hyper_connections",
+                        runtime_holder->value()
+                                .fused_hyper_connections_active()
+                            ? 1.0
+                            : 0.0);
                 }
             }
             return metrics;
@@ -1736,8 +1814,17 @@ int run_native_hf_server(const Arguments& arguments) {
         std::min<std::int64_t>(
             arguments.context_size,
             config.max_position_embeddings));
-    const auto expert_cache_bytes = requested_cache_bytes(
+    auto expert_cache_bytes = requested_cache_bytes(
         arguments.expert_cache_gb, true);
+    // V4.1's large routed pool makes the generic two-thirds-of-UMA default
+    // needlessly reserve 341 GiB on a 512-GiB Mac. A 128-GiB arena retains
+    // the complete measured 128-token working set while leaving ample UMA
+    // for a concurrent model server. Explicit CLI values still win.
+    if (config.is_v41() && !arguments.expert_cache_gb.has_value()) {
+        expert_cache_bytes = std::min(
+            expert_cache_bytes,
+            kDeepseekV41AutomaticExpertCacheLimitBytes);
+    }
     std::size_t resident_wired_limit = 0;
     if (expert_cache_bytes == 0) {
         resident_wired_limit = resident_hf_wired_limit_bytes(arguments.mfq);
@@ -1745,8 +1832,12 @@ int run_native_hf_server(const Arguments& arguments) {
     }
     constexpr std::size_t prefill_buffers_minimum =
         std::size_t{7} << 30;
+    constexpr std::size_t v41_prefill_buffers_minimum =
+        std::size_t{16} << 30;
     const bool prefill_overlap =
-        expert_cache_bytes >= prefill_buffers_minimum;
+        expert_cache_bytes >= (config.is_v41()
+            ? v41_prefill_buffers_minimum
+            : prefill_buffers_minimum);
     const auto runtime_stream = mlx::core::new_thread_unsafe_stream(
         mlx::core::Device::gpu);
     mlx::core::set_default_stream(runtime_stream);
@@ -1807,7 +1898,9 @@ int run_native_hf_server(const Arguments& arguments) {
         std::move(runtime),
         load_runtime,
         config.has_vision()
-            ? std::string("deepseek_v4_vision")
+            ? std::string(config.is_v41()
+                  ? "deepseek_v41_vision"
+                  : "deepseek_v4_vision")
             : config.model_type,
         config.max_position_embeddings,
         config.vocab,
@@ -1910,7 +2003,9 @@ int run_native_server(
             std::move(runtime),
             load_runtime,
             config.has_vision()
-                ? std::string("deepseek_v4_vision")
+                ? std::string(config.is_v41()
+                      ? "deepseek_v41_vision"
+                      : "deepseek_v4_vision")
                 : config.model_type,
             config.max_position_embeddings,
             config.vocab,

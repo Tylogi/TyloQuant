@@ -17,6 +17,7 @@ from PIL import Image
 from mfq.server.backend import OpenAIChatBackend
 from mfq.server.models import SamplingParams
 from mfq.server.vision import (
+    DeepseekV41VisionProcessor,
     DeepseekV4VisionProcessor,
     Glm5NextVisionProcessor,
     MiniCPMO45VisionProcessor,
@@ -130,6 +131,30 @@ def test_deepseek_v4_request_defers_position_dependent_image_block() -> None:
         _decode_tensor(result.tensors["vision_grid"]),
         [[3, 5, 1, 2]],
     )
+
+
+def test_deepseek_v41_processor_uses_compact_row_major_layout() -> None:
+    class TinyProcessor(DeepseekV41VisionProcessor):
+        minimum_pixels = 0
+
+    image = Image.new("RGB", (70, 42), (20, 40, 60))
+    result = TinyProcessor().prepare_openai_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": _data_url(image)}},
+                ],
+            }
+        ]
+    )
+
+    assert result is not None
+    assert result.tensors["processor"] == "deepseek_v41"
+    grid = _decode_tensor(result.tensors["vision_grid"])
+    np.testing.assert_array_equal(grid, [[3, 5, 1, 2]])
+    # START + two image cells + NEWLINE + END.
+    assert TinyProcessor._grid_tokens(42, 70) == (1, 2, 5)
 
 
 def test_qwen4_exp_image_processor_matches_official_block_major_layout() -> None:

@@ -94,7 +94,8 @@ MlxDsv4PoolUpdate dsv4_decode_pool_update(
     int quant_mode = 0,
     float eps = 1e-6f);
 
-// Compute the 64-head pooled-token indexer score.
+// Compute the pooled-token indexer score. The V4F 64-head path returns FP16;
+// the V4.1 32-head path retains FP32 scores for candidate/top-k selection.
 mlx::core::array dsv4_indexer_scores(
     const mlx::core::array& q,
     const mlx::core::array& k,

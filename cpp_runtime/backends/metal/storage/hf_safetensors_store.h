@@ -58,7 +58,9 @@ public:
         std::span<const std::span<std::byte>> destinations) const;
 
     // Best-effort cache eviction before a storage benchmark. Production reads
-    // use F_NOCACHE on macOS so expert streaming does not evict useful VM pages.
+    // use F_NOCACHE/F_GLOBAL_NOCACHE on macOS so expert streaming and resident
+    // loads do not evict useful VM pages or duplicate hundreds of GiB in the
+    // unified file cache.
     void drop_file_cache() const noexcept;
 
 private:
@@ -101,11 +103,15 @@ public:
     DeepseekV4NativeExpertStore(
         std::filesystem::path root,
         std::size_t num_layers,
-        std::size_t num_experts);
+        std::size_t num_experts,
+        std::size_t hidden_size = 4096,
+        std::size_t intermediate_size = 2048);
     DeepseekV4NativeExpertStore(
         std::filesystem::path root,
         std::vector<std::string> layer_prefixes,
-        std::size_t num_experts);
+        std::size_t num_experts,
+        std::size_t hidden_size = 4096,
+        std::size_t intermediate_size = 2048);
     ~DeepseekV4NativeExpertStore();
 
     const HfSafetensorStore& checkpoint() const noexcept;
@@ -155,6 +161,8 @@ private:
     HfSafetensorStore checkpoint_;
     std::size_t num_layers_ = 0;
     std::size_t num_experts_ = 0;
+    std::size_t hidden_size_ = 0;
+    std::size_t intermediate_size_ = 0;
     std::size_t slot_bytes_ = 0;
     std::array<std::size_t, kParts + 1> slot_offsets_{};
     std::vector<ExpertRecord> experts_;

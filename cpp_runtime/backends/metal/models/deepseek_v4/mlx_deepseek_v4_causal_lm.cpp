@@ -33,6 +33,56 @@ using mlx::core::array;
 constexpr int kConnections = 4;
 constexpr int kHcProjectionWidth =
     2 * kConnections + kConnections * kConnections;
+constexpr std::size_t kDefaultEngramCacheMiB = 256;
+
+struct V41ExpertCacheBudgets {
+    std::size_t backbone = 0;
+    std::size_t dspark = 0;
+};
+
+V41ExpertCacheBudgets split_v41_expert_cache(
+    const DeepseekV4Config& config,
+    std::size_t total,
+    bool prefill_overlap) {
+    const auto hidden = static_cast<std::size_t>(config.hidden);
+    const auto intermediate = static_cast<std::size_t>(config.moe_inter);
+    if (hidden == 0 || intermediate == 0 ||
+        hidden > std::numeric_limits<std::size_t>::max() / intermediate) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4.1 expert-cache geometry");
+    }
+    const auto elements = hidden * intermediate;
+    // Three MXFP4 matrices: 4-bit values plus one E8M0 scale per 32 values.
+    if (elements > std::numeric_limits<std::size_t>::max() / 51u) {
+        throw std::invalid_argument(
+            "DeepSeek-V4.1 expert-cache slot size overflows");
+    }
+    const auto slot_bytes = elements * 51u / 32u;
+    const auto backbone_slots = std::size_t{6} +
+        (prefill_overlap
+             ? 2u * static_cast<std::size_t>(config.n_experts)
+             : 0u);
+    const auto dspark_slots = std::min(
+        static_cast<std::size_t>(config.dspark_n_experts),
+        std::max<std::size_t>(
+            6,
+            4u * static_cast<std::size_t>(config.dspark_top_k)));
+    if (slot_bytes == 0 ||
+        backbone_slots > std::numeric_limits<std::size_t>::max() / slot_bytes ||
+        dspark_slots > std::numeric_limits<std::size_t>::max() / slot_bytes) {
+        throw std::invalid_argument(
+            "DeepSeek-V4.1 expert-cache minimum overflows");
+    }
+    const auto backbone_minimum = backbone_slots * slot_bytes;
+    const auto dspark_minimum = dspark_slots * slot_bytes;
+    if (total < backbone_minimum ||
+        total - backbone_minimum < dspark_minimum) {
+        throw std::invalid_argument(
+            "DeepSeek-V4.1 SSD expert cache is too small for separate "
+            "backbone and DSpark arenas");
+    }
+    return {total - dspark_minimum, dspark_minimum};
+}
 
 bool ssd_route_transactions_enabled() noexcept {
     const char* value = std::getenv(
@@ -52,6 +102,66 @@ bool force_ssd_route_transactions() noexcept {
     const char* value = std::getenv(
         "MFQ_SSD_DEVICE_ROUTE_FORCE_TRANSACTION");
     return value != nullptr && std::string_view(value) != "0";
+}
+
+bool v41_fused_hyper_connections_enabled() noexcept {
+    // Opt in explicitly: the fused BF16 reduction is numerically close but
+    // can change greedy token tie-breaks after many layers.
+    const char* value = std::getenv("MFQ_METAL_DSV41_FUSED_HC");
+    return value != nullptr && std::string_view(value) != "0";
+}
+
+bool v41_exact_hc_post_enabled() noexcept {
+    // HC post preserves the generic BF16 graph exactly. Keep the wider HC
+    // pre fusion opt-in because its reduction can change greedy tie-breaks,
+    // while using the exact post-only kernel by default for V4.1 decode.
+    const char* value = std::getenv("MFQ_METAL_DSV41_EXACT_HC_POST");
+    return value == nullptr ||
+        (std::string_view(value) != "0" &&
+         std::string_view(value) != "false" &&
+         std::string_view(value) != "off");
+}
+
+bool v41_exact_hc_collapse_norm_enabled() noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_DSV41_EXACT_HC_COLLAPSE_NORM");
+    return value == nullptr ||
+        (std::string_view(value) != "0" &&
+         std::string_view(value) != "false" &&
+         std::string_view(value) != "off");
+}
+
+bool v41_exact_hc_metadata_enabled() noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_DSV41_EXACT_HC_METADATA");
+    return value == nullptr ||
+        (std::string_view(value) != "0" &&
+         std::string_view(value) != "false" &&
+         std::string_view(value) != "off");
+}
+
+int v41_resident_prefill_layer_group() noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_DSV41_PREFILL_LAYER_GROUP");
+    return value == nullptr
+        ? 1
+        : std::clamp(std::atoi(value), 1, 43);
+}
+
+std::size_t engram_cache_bytes() {
+    const char* value = std::getenv(
+        "MFQ_DEEPSEEK_V41_ENGRAM_CACHE_MIB");
+    if (value == nullptr || *value == '\0') {
+        return kDefaultEngramCacheMiB * 1024u * 1024u;
+    }
+    char* end = nullptr;
+    const auto mib = std::strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || mib == 0 ||
+        mib > std::numeric_limits<std::size_t>::max() / (1024u * 1024u)) {
+        throw std::invalid_argument(
+            "MFQ_DEEPSEEK_V41_ENGRAM_CACHE_MIB must be a positive integer");
+    }
+    return static_cast<std::size_t>(mib) * 1024u * 1024u;
 }
 
 int checked_int(
@@ -164,6 +274,36 @@ array softmax_last(const array& input) {
         mlx::core::sum(exponential, -1, true);
 }
 
+array collapse_hc(
+    const array& residual,
+    const array& pre) {
+    if (residual.ndim() != 4 ||
+        residual.shape(2) != kConnections ||
+        pre.shape() != Shape{
+            residual.shape(0),
+            residual.shape(1),
+            kConnections,
+        }) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4.1 carried HC pre coefficients");
+    }
+    auto reduced = mlx::core::sum(
+        mlx::core::expand_dims(
+            float32_contiguous(pre),
+            -1) *
+            mlx::core::astype(
+                residual,
+                mlx::core::float32),
+        2);
+    if (residual.dtype() == mlx::core::float16 ||
+        residual.dtype() == mlx::core::bfloat16) {
+        reduced = mlx::core::astype(
+            reduced,
+            residual.dtype());
+    }
+    return reduced;
+}
+
 MlxDeepseekV4HcPreResult hc_pre_generic(
     const array& residual,
     const array& mixes,
@@ -268,6 +408,7 @@ MlxDeepseekV4HcPreResult hc_pre_generic(
         std::move(post),
         std::move(combination),
         std::nullopt,
+        std::move(pre),
     };
 }
 
@@ -621,7 +762,10 @@ MlxDeepseekV4Layer::hc_pre_norm(
                 hidden,
                 "hyper-connection width"),
         });
-    if (config_.fast_hyper_connections() &&
+    const bool fused_hyper_connections =
+        config_.fast_hyper_connections() ||
+        (config_.is_v41() && v41_fused_hyper_connections_enabled());
+    if (fused_hyper_connections &&
         residual.dtype() == mlx::core::bfloat16) {
         auto flat_float = mlx::core::astype(
             flat,
@@ -649,7 +793,7 @@ MlxDeepseekV4Layer::hc_pre_norm(
     auto raw_mixes = mlx::core::astype(
         function(flat),
         mlx::core::float32);
-    if (config_.fast_hyper_connections() &&
+    if (fused_hyper_connections &&
         residual.dtype() == mlx::core::float16) {
         return deepseek_v4_hc_pre_norm(
             residual,
@@ -677,6 +821,28 @@ MlxDeepseekV4Layer::hc_pre_norm(
         static_cast<float>(
             config_.rms_eps));
     auto mixes = raw_mixes * inverse;
+    if (config_.is_v41() &&
+        v41_exact_hc_metadata_enabled() &&
+        residual.dtype() == mlx::core::bfloat16 &&
+        batch * tokens == 1) {
+        auto metadata = deepseek_v41_hc_metadata_exact(
+            mixes,
+            scale,
+            base,
+            checked_int(
+                config_.hc_sinkhorn_iters,
+                "HC Sinkhorn iterations"),
+            static_cast<float>(config_.hc_eps));
+        return {
+            mlx::core::zeros(
+                Shape{batch, tokens, hidden},
+                residual.dtype()),
+            std::move(metadata.post),
+            std::move(metadata.combination),
+            std::nullopt,
+            std::move(metadata.pre),
+        };
+    }
     auto result = hc_pre_generic(
         residual,
         mixes,
@@ -693,7 +859,12 @@ array MlxDeepseekV4Layer::hc_post(
     const array& residual,
     const array& post,
     const array& combination) const {
-    if (config_.fast_hyper_connections() &&
+    const bool fused_hyper_connections =
+        config_.fast_hyper_connections() ||
+        (config_.is_v41() &&
+         (v41_fused_hyper_connections_enabled() ||
+          v41_exact_hc_post_enabled()));
+    if (fused_hyper_connections &&
         (residual.dtype() == mlx::core::float16 ||
          residual.dtype() == mlx::core::bfloat16)) {
         return deepseek_v4_hc_post(
@@ -751,7 +922,10 @@ array MlxDeepseekV4Layer::forward(
     int pos0,
     MlxDeepseekV4SsdPrefetchedLayer* prefetched,
     const MlxDeepseekV4ImageVisibility* visibility,
-    std::vector<array>* debug_stages) const {
+    std::vector<array>* debug_stages,
+    const array* incoming_pre,
+    array* outgoing_pre,
+    MlxDeepseekV41SharedAttentionState* shared_attention) const {
     auto source = floating_contiguous(hidden);
     const int expected_hidden =
         checked_int(config_.hidden, "hidden size");
@@ -765,7 +939,13 @@ array MlxDeepseekV4Layer::forward(
                 source.shape(0)) *
                 source.shape(1) ||
         state.batch() != source.shape(0) ||
-        state.position() != pos0) {
+        state.position() != pos0 ||
+        (config_.is_v41() &&
+         (incoming_pre == nullptr || outgoing_pre == nullptr ||
+          shared_attention == nullptr)) ||
+        (!config_.is_v41() &&
+         (incoming_pre != nullptr || outgoing_pre != nullptr ||
+          shared_attention != nullptr))) {
         throw std::invalid_argument(
             "invalid DeepSeek-V4 layer input/cache state");
     }
@@ -787,7 +967,17 @@ array MlxDeepseekV4Layer::forward(
         components_.hc_attention_base,
         components_.attention_norm,
         attention_norm_);
-    auto branch = attention_hc.reduced;
+    auto branch = config_.is_v41()
+        ? (v41_exact_hc_collapse_norm_enabled() &&
+                   source.dtype() == mlx::core::bfloat16 &&
+                   source.shape(0) * source.shape(1) == 1
+               ? deepseek_v41_hc_collapse_norm(
+                     source,
+                     *incoming_pre,
+                     components_.attention_norm,
+                     static_cast<float>(config_.rms_eps))
+               : attention_norm_(collapse_hc(source, *incoming_pre)))
+        : attention_hc.reduced;
     if (debug_stages != nullptr) {
         debug_stages->push_back(branch);
     }
@@ -799,7 +989,8 @@ array MlxDeepseekV4Layer::forward(
         state,
         pos0,
         visibility,
-        debug_stages);
+        debug_stages,
+        shared_attention);
     auto result = attention_hc.packed_metadata.has_value()
         ? deepseek_v4_hc_post_packed(
               branch,
@@ -830,7 +1021,21 @@ array MlxDeepseekV4Layer::forward(
         components_.hc_ffn_base,
         components_.ffn_norm,
         ffn_norm_);
-    branch = ffn_hc.reduced;
+    if (config_.is_v41() && !attention_hc.pre.has_value()) {
+        throw std::logic_error(
+            "DeepSeek-V4.1 attention HC pre coefficients are unavailable");
+    }
+    branch = config_.is_v41()
+        ? (v41_exact_hc_collapse_norm_enabled() &&
+                   result.dtype() == mlx::core::bfloat16 &&
+                   result.shape(0) * result.shape(1) == 1
+               ? deepseek_v41_hc_collapse_norm(
+                     result,
+                     *attention_hc.pre,
+                     components_.ffn_norm,
+                     static_cast<float>(config_.rms_eps))
+               : ffn_norm_(collapse_hc(result, *attention_hc.pre)))
+        : ffn_hc.reduced;
     if (debug_stages != nullptr) {
         debug_stages->push_back(branch);
     }
@@ -851,16 +1056,35 @@ array MlxDeepseekV4Layer::forward(
               moe_branches.shared,
               residual,
               *ffn_hc.packed_metadata)
-        : hc_post(
-              moe_branches.routed + moe_branches.shared,
-              residual,
-              ffn_hc.post,
-              ffn_hc.combination);
+        : ((config_.fast_hyper_connections() ||
+            (config_.is_v41() &&
+             (v41_fused_hyper_connections_enabled() ||
+              v41_exact_hc_post_enabled()))) &&
+                   (residual.dtype() == mlx::core::float16 ||
+                    residual.dtype() == mlx::core::bfloat16)
+               ? deepseek_v4_hc_post_sum(
+                     moe_branches.routed,
+                     moe_branches.shared,
+                     residual,
+                     ffn_hc.post,
+                     ffn_hc.combination)
+               : hc_post(
+                     moe_branches.routed + moe_branches.shared,
+                     residual,
+                     ffn_hc.post,
+                     ffn_hc.combination));
     detail::profile_eval(
         "layer.ffn_hc_post",
         output);
     if (debug_stages != nullptr) {
         debug_stages->push_back(output);
+    }
+    if (config_.is_v41()) {
+        if (!ffn_hc.pre.has_value()) {
+            throw std::logic_error(
+                "DeepSeek-V4.1 FFN HC pre coefficients are unavailable");
+        }
+        *outgoing_pre = *ffn_hc.pre;
     }
     return output;
 }
@@ -898,6 +1122,11 @@ MlxDeepseekV4CausalLm::load(
     int max_context,
     std::optional<std::size_t> expert_cache_bytes) {
     config.validate();
+    if (config.is_v41() && config.has_engram()) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 Engram must be loaded directly from its HF "
+            "Safetensors directory so the tables remain on SSD");
+    }
     validate_deepseek_v4_model_bindings(
         model,
         config,
@@ -975,6 +1204,14 @@ MlxDeepseekV4CausalLm::load(
         context,
         expert_offload,
         static_cast<std::size_t>(config.n_layers));
+    std::optional<MlxLinear> hc_head_fn;
+    std::optional<array> hc_head_base;
+    std::optional<array> hc_head_scale;
+    if (!config.is_v41()) {
+        hc_head_fn.emplace(MlxLinear::load(model, names.hc_head_fn));
+        hc_head_base.emplace(load_float_array(model, names.hc_head_base));
+        hc_head_scale.emplace(load_float_array(model, names.hc_head_scale));
+    }
     return MlxDeepseekV4CausalLm(
         config,
         std::move(embedding),
@@ -983,15 +1220,9 @@ MlxDeepseekV4CausalLm::load(
             model,
             names.output_norm),
         std::move(output),
-        MlxLinear::load(
-            model,
-            names.hc_head_fn),
-        load_float_array(
-            model,
-            names.hc_head_base),
-        load_float_array(
-            model,
-            names.hc_head_scale),
+        std::move(hc_head_fn),
+        std::move(hc_head_base),
+        std::move(hc_head_scale),
         context,
         mlx::core::float16,
         std::move(expert_offload),
@@ -1020,14 +1251,15 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
     auto checkpoint = std::make_shared<HfSafetensorStore>(model_root);
     MlxHfTensorStore model(std::move(checkpoint));
     std::vector<std::string> expert_prefixes;
-    expert_prefixes.reserve(
-        static_cast<std::size_t>(config.n_layers + config.n_mtp_layers));
+    const bool split_dspark_cache =
+        config.is_v41() && config.has_dspark();
+    expert_prefixes.reserve(static_cast<std::size_t>(config.n_layers));
     for (std::size_t layer = 0;
          layer < static_cast<std::size_t>(config.n_layers);
          ++layer) {
         expert_prefixes.push_back("model.block." + std::to_string(layer));
     }
-    if (config.has_dspark()) {
+    if (config.has_dspark() && !split_dspark_cache) {
         for (std::size_t stage = 0;
              stage < static_cast<std::size_t>(config.n_mtp_layers);
              ++stage) {
@@ -1036,14 +1268,51 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
         }
     }
     std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache;
+    std::shared_ptr<MlxDeepseekV4SsdExpertCache> dspark_expert_cache;
+    std::size_t dspark_cache_layer_base =
+        static_cast<std::size_t>(config.n_layers);
     if (expert_cache_bytes > 0) {
+        auto backbone_cache_bytes = expert_cache_bytes;
+        std::size_t dspark_cache_bytes = 0;
+        if (split_dspark_cache) {
+            const auto budgets = split_v41_expert_cache(
+                config,
+                expert_cache_bytes,
+                prefill_overlap);
+            backbone_cache_bytes = budgets.backbone;
+            dspark_cache_bytes = budgets.dspark;
+        }
         expert_cache = std::make_shared<MlxDeepseekV4SsdExpertCache>(
             model_root,
             std::move(expert_prefixes),
-            expert_cache_bytes,
+            backbone_cache_bytes,
             io_workers,
             prefill_overlap,
-            static_cast<std::size_t>(config.n_experts));
+            static_cast<std::size_t>(config.n_experts),
+            static_cast<std::size_t>(config.hidden),
+            static_cast<std::size_t>(config.moe_inter));
+        if (split_dspark_cache) {
+            std::vector<std::string> dspark_prefixes;
+            dspark_prefixes.reserve(
+                static_cast<std::size_t>(config.n_mtp_layers));
+            for (std::size_t stage = 0;
+                 stage < static_cast<std::size_t>(config.n_mtp_layers);
+                 ++stage) {
+                dspark_prefixes.push_back(
+                    "predictor.stage." + std::to_string(stage));
+            }
+            dspark_expert_cache =
+                std::make_shared<MlxDeepseekV4SsdExpertCache>(
+                    model_root,
+                    std::move(dspark_prefixes),
+                    dspark_cache_bytes,
+                    io_workers,
+                    false,
+                    static_cast<std::size_t>(config.dspark_n_experts),
+                    static_cast<std::size_t>(config.hidden),
+                    static_cast<std::size_t>(config.moe_inter));
+            dspark_cache_layer_base = 0;
+        }
     }
     auto rope_base = deepseek_v4_yarn_tables(
         checked_int(config.qk_rope_head_dim, "rotary dimension"),
@@ -1083,8 +1352,34 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
             embedding,
             output,
             context,
-            expert_cache,
-            static_cast<std::size_t>(config.n_layers)));
+            split_dspark_cache ? dspark_expert_cache : expert_cache,
+            dspark_cache_layer_base));
+    }
+    std::optional<MlxDeepseekV41Engram> engram;
+    if (config.has_engram()) {
+        const char* asset = std::getenv(
+            "MFQ_DEEPSEEK_V41_ENGRAM_TOKEN_MAP");
+        if (asset == nullptr || *asset == '\0') {
+            throw std::runtime_error(
+                "DeepSeek-V4.1 Engram hash asset is missing; launch through "
+                "the TyloQuant server so its tokenizer asset is generated");
+        }
+        engram.emplace(MlxDeepseekV41Engram::load_hf(
+            model,
+            config,
+            asset,
+            engram_cache_bytes(),
+            io_workers));
+    }
+    std::optional<MlxLinear> hc_head_fn;
+    std::optional<array> hc_head_base;
+    std::optional<array> hc_head_scale;
+    if (!config.is_v41()) {
+        hc_head_fn.emplace(model.load_linear(names.hc_head_fn));
+        hc_head_base.emplace(
+            float32_contiguous(model.load_dense(names.hc_head_base)));
+        hc_head_scale.emplace(
+            float32_contiguous(model.load_dense(names.hc_head_scale)));
     }
     return MlxDeepseekV4CausalLm(
         config,
@@ -1092,15 +1387,16 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
         std::move(layers),
         float32_contiguous(model.load_dense(names.output_norm)),
         std::move(output),
-        model.load_linear(names.hc_head_fn),
-        float32_contiguous(model.load_dense(names.hc_head_base)),
-        float32_contiguous(model.load_dense(names.hc_head_scale)),
+        std::move(hc_head_fn),
+        std::move(hc_head_base),
+        std::move(hc_head_scale),
         context,
         mlx::core::bfloat16,
         nullptr,
         std::move(expert_cache),
         std::move(vision),
-        std::move(dspark));
+        std::move(dspark),
+        std::move(engram));
 }
 
 MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
@@ -1109,9 +1405,9 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
     std::vector<MlxDeepseekV4Layer> layers,
     array output_norm,
     MlxLinear output,
-    MlxLinear hc_head_fn,
-    array hc_head_base,
-    array hc_head_scale,
+    std::optional<MlxLinear> hc_head_fn,
+    std::optional<array> hc_head_base,
+    std::optional<array> hc_head_scale,
     int max_context,
     Dtype activation_dtype,
     std::shared_ptr<MlxNintMoeOffloadCache>
@@ -1119,7 +1415,8 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
     std::shared_ptr<MlxDeepseekV4SsdExpertCache>
         ssd_expert_cache,
     std::optional<MlxDeepseekV4Vision> vision,
-    std::optional<MlxDeepseekV4DSpark> dspark)
+    std::optional<MlxDeepseekV4DSpark> dspark,
+    std::optional<MlxDeepseekV41Engram> engram)
     : config_(std::move(config)),
       embedding_(std::move(embedding)),
       layers_(std::move(layers)),
@@ -1129,18 +1426,19 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
               config_.rms_eps)),
       output_(std::move(output)),
       hc_head_fn_(std::move(hc_head_fn)),
-      hc_head_base_(
-          float32_contiguous(
-              hc_head_base)),
-      hc_head_scale_(
-          float32_contiguous(
-              hc_head_scale)),
+      hc_head_base_(hc_head_base.has_value()
+          ? std::optional<array>{float32_contiguous(*hc_head_base)}
+          : std::nullopt),
+      hc_head_scale_(hc_head_scale.has_value()
+          ? std::optional<array>{float32_contiguous(*hc_head_scale)}
+          : std::nullopt),
       expert_offload_(
           std::move(expert_offload)),
       ssd_expert_cache_(
           std::move(ssd_expert_cache)),
       vision_(std::move(vision)),
       dspark_(std::move(dspark)),
+      engram_(std::move(engram)),
       max_context_(max_context),
       activation_dtype_(activation_dtype) {
     validate_components();
@@ -1158,6 +1456,14 @@ void MlxDeepseekV4CausalLm::validate_components() const {
         kConnections,
         hidden,
         "hyper-connection width");
+    const bool has_complete_legacy_head =
+        hc_head_fn_.has_value() &&
+        hc_head_base_.has_value() &&
+        hc_head_scale_.has_value();
+    const bool has_any_legacy_head =
+        hc_head_fn_.has_value() ||
+        hc_head_base_.has_value() ||
+        hc_head_scale_.has_value();
     if (max_context_ <= 0 ||
         max_context_ >
             config_.max_position_embeddings ||
@@ -1169,12 +1475,17 @@ void MlxDeepseekV4CausalLm::validate_components() const {
         output_norm_.width() != hidden ||
         output_.input_size() != hidden ||
         output_.output_size() != vocab ||
-        hc_head_fn_.input_size() != hc_width ||
-        hc_head_fn_.output_size() != kConnections ||
-        hc_head_base_.size() != kConnections ||
-        hc_head_scale_.size() != 1 ||
+        (config_.is_v41()
+             ? has_any_legacy_head
+             : (!has_complete_legacy_head ||
+                hc_head_fn_->input_size() != hc_width ||
+                hc_head_fn_->output_size() != kConnections ||
+                hc_head_base_->size() != kConnections ||
+                hc_head_scale_->size() != 1)) ||
         vision_.has_value() != config_.has_vision() ||
         (dspark_.has_value() && !config_.has_dspark()) ||
+        engram_.has_value() != config_.has_engram() ||
+        (engram_.has_value() && !config_.is_v41()) ||
         layers_.size() !=
             static_cast<std::size_t>(layers)) {
         throw std::invalid_argument(
@@ -1236,19 +1547,24 @@ void MlxDeepseekV4CausalLm::reset_cache(
     }
     std::vector<MlxDeepseekV4LayerState> states;
     states.reserve(layers_.size());
-    for (const auto& layer : layers_) {
+    for (std::size_t index = 0; index < layers_.size(); ++index) {
+        const auto& layer = layers_[index];
         states.push_back(
             MlxDeepseekV4LayerState::allocate(
                 config_,
                 layer.ratio(),
                 batch,
                 max_context_,
-                activation_dtype_));
+                activation_dtype_,
+                config_.is_v41()
+                    ? std::optional<std::size_t>(index)
+                    : std::nullopt));
     }
     states_ = std::move(states);
     cache_position_ = 0;
     cache_batch_ = batch;
     stable_cache_tokens_.clear();
+    if (engram_) engram_->reset_hash();
 }
 
 void MlxDeepseekV4CausalLm::clear_cache() noexcept {
@@ -1256,6 +1572,7 @@ void MlxDeepseekV4CausalLm::clear_cache() noexcept {
     cache_position_ = 0;
     cache_batch_ = 0;
     stable_cache_tokens_.clear();
+    if (engram_) engram_->reset_hash();
 }
 
 void MlxDeepseekV4CausalLm::append_state_arrays(
@@ -1342,12 +1659,25 @@ void MlxDeepseekV4CausalLm::rollback_speculative_target(
     // decoder layer.
     materialize_states(states_);
     cache_position_ -= draft_tokens - accepted_tokens;
+    if (engram_) engram_->truncate_hash(cache_position_);
 }
 
 array MlxDeepseekV4CausalLm::head(
-    const array& hidden) const {
+    const array& hidden,
+    const array* carried_pre) const {
     const int batch = hidden.shape(0);
     const int tokens = hidden.shape(1);
+    if (config_.is_v41()) {
+        if (carried_pre == nullptr) {
+            throw std::invalid_argument(
+                "DeepSeek-V4.1 final HC pre coefficients are missing");
+        }
+        return output_norm_(collapse_hc(hidden, *carried_pre));
+    }
+    if (!hc_head_fn_ || !hc_head_base_ || !hc_head_scale_) {
+        throw std::logic_error(
+            "DeepSeek-V4 legacy output HC parameters are unavailable");
+    }
     const int width = checked_product(
         kConnections,
         checked_int(
@@ -1366,15 +1696,15 @@ array MlxDeepseekV4CausalLm::head(
         static_cast<float>(config_.rms_eps));
     auto mixes =
         mlx::core::astype(
-            hc_head_fn_(normalized),
+            (*hc_head_fn_)(normalized),
             mlx::core::float32);
     auto pre = mlx::core::sigmoid(
         mixes *
             mlx::core::reshape(
-                hc_head_scale_,
+                *hc_head_scale_,
                 Shape{1}) +
         mlx::core::reshape(
-            hc_head_base_,
+            *hc_head_base_,
             Shape{kConnections})) +
         static_cast<float>(
             config_.hc_eps);
@@ -1432,6 +1762,29 @@ array MlxDeepseekV4CausalLm::forward_chunk(
         });
     auto hidden_values =
         mlx::core::contiguous(streams);
+    std::optional<MlxDeepseekV41EngramBatch> engram_batch;
+    if (engram_) {
+        const bool prefetch_engram_rows =
+            tokens > 1 && !expert_offload_ && !ssd_expert_cache_;
+        engram_batch.emplace(engram_->prepare(
+            token_ids,
+            pos0,
+            prefetch_engram_rows));
+    }
+    std::optional<array> carried_pre;
+    MlxDeepseekV41SharedAttentionState shared_attention;
+    if (config_.is_v41()) {
+        carried_pre.emplace(mlx::core::concatenate(
+            std::vector<array>{
+                mlx::core::ones(
+                    Shape{batch, tokens, 1},
+                    mlx::core::float32),
+                mlx::core::zeros(
+                    Shape{batch, tokens, kConnections - 1},
+                    mlx::core::float32),
+            },
+            -1));
+    }
     std::vector<std::optional<array>> target_hiddens;
     if (dspark_hidden != nullptr) {
         if (!dspark_.has_value() ||
@@ -1463,6 +1816,12 @@ array MlxDeepseekV4CausalLm::forward_chunk(
         visibility == nullptr && !expert_offload_ && !ssd_expert_cache_;
     const bool materialize_each_layer =
         bounded_prefill && !compact_resident_speculation;
+    const int materialize_layer_group =
+        materialize_each_layer && config_.is_v41() &&
+                !expert_offload_ && !ssd_expert_cache_
+        ? v41_resident_prefill_layer_group()
+        : 1;
+    std::size_t materialize_group_begin = 0;
     std::array<
         std::optional<MlxDeepseekV4SsdPrefetchedLayer>,
         2> routed_pipeline;
@@ -1477,7 +1836,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
     const bool grouped_route_transaction =
         !bounded_prefill && ssd_expert_cache_ &&
         ssd_route_transactions_enabled() &&
-        dspark_hidden == nullptr;
+        dspark_hidden == nullptr && !config_.is_v41();
     if (grouped_route_transaction) {
         const bool force_transactions = force_ssd_route_transactions();
         const auto group_layers = static_cast<std::size_t>(
@@ -1574,9 +1933,17 @@ array MlxDeepseekV4CausalLm::forward_chunk(
         for (std::size_t index = 0;
              index < layers_.size();
              ++index) {
+            if (engram_ && engram_->has_layer(index)) {
+                hidden_values = engram_->apply(
+                    index,
+                    hidden_values,
+                    *engram_batch);
+            }
+            if (config_.is_v41()) capture_target(index);
             auto* prefetched = routed_pipeline[index % 2].has_value()
                 ? &*routed_pipeline[index % 2]
                 : nullptr;
+            array next_pre(0.0f);
             hidden_values = layers_[index].forward(
                 hidden_values,
                 token_ids,
@@ -1584,17 +1951,38 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                 pos0,
                 prefetched,
                 visibility,
-                index == 6 ? debug_layer0_stages : nullptr);
+                index == 6 ? debug_layer0_stages : nullptr,
+                config_.is_v41() ? &*carried_pre : nullptr,
+                config_.is_v41() ? &next_pre : nullptr,
+                config_.is_v41() ? &shared_attention : nullptr);
+            if (config_.is_v41()) {
+                carried_pre = std::move(next_pre);
+            }
             if (debug_layer_hiddens != nullptr) {
                 debug_layer_hiddens->push_back(hidden_values);
             }
-            capture_target(index);
-            if (materialize_each_layer) {
-                // Hidden and cache branches share the layer projections.
+            if (!config_.is_v41()) capture_target(index);
+            if (materialize_each_layer &&
+                (index + 1 == layers_.size() ||
+                 index + 1 - materialize_group_begin >=
+                     static_cast<std::size_t>(materialize_layer_group) ||
+                 prefetched != nullptr)) {
+                // Hidden and cache branches share the layer projections. A
+                // fully resident V4.1 model can safely materialize several
+                // layers in one command-buffer boundary because no prefetched
+                // expert lifetime has to end between them. Keep every pending
+                // cache branch in the evaluation frontier so in-place writes
+                // remain ordered and observable.
                 std::vector<array> layer_outputs{hidden_values};
-                layer_outputs.reserve(12);
-                append_state_arrays(states_[index], layer_outputs);
+                layer_outputs.reserve(
+                    1 + (index + 1 - materialize_group_begin) * 8);
+                for (std::size_t pending = materialize_group_begin;
+                     pending <= index;
+                     ++pending) {
+                    append_state_arrays(states_[pending], layer_outputs);
+                }
                 detail::eval_with_timing(std::move(layer_outputs));
+                materialize_group_begin = index + 1;
             }
             if (prefetched != nullptr) {
                 routed_pipeline[index % 2].reset();
@@ -1632,7 +2020,22 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                   kConnections,
                   hidden,
               });
-    auto headed = head(head_input);
+    std::optional<array> final_pre;
+    if (config_.is_v41()) {
+        if (!carried_pre.has_value()) {
+            throw std::logic_error(
+                "DeepSeek-V4.1 final HC state is unavailable");
+        }
+        final_pre = full_logits
+            ? *carried_pre
+            : mlx::core::slice(
+                  *carried_pre,
+                  Shape{0, tokens - 1, 0},
+                  Shape{batch, tokens, kConnections});
+    }
+    auto headed = head(
+        head_input,
+        final_pre.has_value() ? &*final_pre : nullptr);
     detail::profile_eval(
         "model.final_hc_norm",
         headed);
@@ -1875,6 +2278,18 @@ MlxDeepseekV4CausalLm::ssd_expert_cache_stats() const {
         : std::nullopt;
 }
 
+std::optional<DeepseekV41EngramSsdStats>
+MlxDeepseekV4CausalLm::engram_ssd_stats() const {
+    return engram_
+        ? std::optional<DeepseekV41EngramSsdStats>(engram_->stats())
+        : std::nullopt;
+}
+
+bool MlxDeepseekV4CausalLm::fused_hyper_connections_active() const noexcept {
+    return config_.fast_hyper_connections() ||
+        (config_.is_v41() && v41_fused_hyper_connections_enabled());
+}
+
 void MlxDeepseekV4CausalLm::prewarm_ssd_expert_arena() {
     if (ssd_expert_cache_) {
         ssd_expert_cache_->prewarm_metal();
@@ -1962,6 +2377,7 @@ void MlxDeepseekV4CausalLm::restore_text_session_state(
         cache_position_ = state.cache_position;
         cache_batch_ = state.cache_batch;
         stable_cache_tokens_ = state.tokens;
+        if (engram_) engram_->restore_text_hash(state.tokens);
     } catch (...) {
         clear_cache();
         throw;
@@ -2036,6 +2452,11 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     const MlxDeepseekV4PrefillCallback& prefill_callback,
     std::optional<std::size_t> stable_prefix_tokens,
     const MfqTokenConstraintPtr& token_constraint) {
+    const bool profile_prefill =
+        detail::component_profile_requested();
+    const auto request_setup_started =
+        std::chrono::steady_clock::now();
+    double cache_reset_ms = 0.0;
     if (prompt.empty()) {
         throw std::invalid_argument(
             "DeepSeek-V4 generation prompt cannot be empty");
@@ -2139,8 +2560,15 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     } else {
         // State allocation/zeroing is request setup. Keep it in TTFT while
         // materializing it before the model-evaluation prefill metric starts.
+        const auto cache_reset_started =
+            std::chrono::steady_clock::now();
         reset_cache(1);
         materialize_states(states_);
+        cache_reset_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now()
+                - cache_reset_started)
+                .count();
     }
 
     struct StableCacheRestore {
@@ -2148,6 +2576,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         int& target_position;
         int& target_batch;
         std::vector<std::int64_t>& target_tokens;
+        MlxDeepseekV41Engram* target_engram;
         std::optional<std::vector<MlxDeepseekV4LayerState>> saved_states;
         std::vector<std::int64_t> saved_tokens;
         int saved_position = 0;
@@ -2157,11 +2586,13 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             std::vector<MlxDeepseekV4LayerState>& states,
             int& position,
             int& batch,
-            std::vector<std::int64_t>& tokens)
+            std::vector<std::int64_t>& tokens,
+            MlxDeepseekV41Engram* engram)
             : target_states(states),
               target_position(position),
               target_batch(batch),
-              target_tokens(tokens) {}
+              target_tokens(tokens),
+              target_engram(engram) {}
 
         void capture(
             const std::vector<std::int64_t>& prompt_tokens,
@@ -2206,18 +2637,25 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 target_position = saved_position;
                 target_batch = saved_batch;
                 target_tokens = std::move(saved_tokens);
+                if (target_engram != nullptr) {
+                    target_engram->restore_text_hash(target_tokens);
+                }
             } catch (...) {
                 target_states.clear();
                 target_position = 0;
                 target_batch = 0;
                 target_tokens.clear();
+                if (target_engram != nullptr) {
+                    target_engram->reset_hash();
+                }
             }
         }
     } stable_restore(
         states_,
         cache_position_,
         cache_batch_,
-        stable_cache_tokens_);
+        stable_cache_tokens_,
+        engram_ ? &*engram_ : nullptr);
 
     const bool dspark_active =
         dspark_candidate && reused_tokens == 0 && stable_count == 0;
@@ -2238,9 +2676,12 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         prompt.size() - reused_tokens;
     double llm_prefill_evaluation_ms = 0.0;
     double multimodal_prefill_evaluation_ms = 0.0;
-    const bool profile_prefill =
-        detail::component_profile_requested();
     detail::ComponentProfile prefill_component_profile;
+    const double request_setup_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now()
+            - request_setup_started)
+            .count();
     const auto prefill_component_started =
         std::chrono::steady_clock::now();
     auto logits = [&]() {
@@ -2394,6 +2835,15 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         return value;
     }();
     if (profile_prefill) {
+        std::cout
+            << "component_profile phase=request_setup"
+            << " tokens=" << prompt.size()
+            << " wall_ms=" << std::fixed
+            << std::setprecision(3) << request_setup_ms
+            << " cache_reset_ms=" << cache_reset_ms
+            << " other_ms="
+            << std::max(0.0, request_setup_ms - cache_reset_ms)
+            << std::endl;
         const double wall_ms =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now()

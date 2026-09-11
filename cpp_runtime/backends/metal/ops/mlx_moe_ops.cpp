@@ -140,11 +140,13 @@ constexpr const char* kTopKSource = R"METAL(
 )METAL";
 
 constexpr const char* kDenseRouterTopKSource = R"METAL(
-    constexpr uint EXPERTS = 256u;
+    constexpr uint EXPERTS = uint(N_EXPERTS);
     constexpr uint TOP_K = 6u;
     constexpr uint SIMD_GROUPS = 32u;
     constexpr uint EXPERTS_PER_SIMD = 4u;
     constexpr uint EXPERTS_PER_ROUND = SIMD_GROUPS * EXPERTS_PER_SIMD;
+    constexpr uint REDUCTION_SIMD_GROUPS =
+        (EXPERTS + 31u) / 32u;
 
     uint tid = thread_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
@@ -153,11 +155,11 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
     threadgroup float route_weights[EXPERTS];
     threadgroup float scores[EXPERTS];
     threadgroup float topk_weights[TOP_K];
-    threadgroup float partial_scores[8];
-    threadgroup uint partial_ids[8];
+    threadgroup float partial_scores[REDUCTION_SIMD_GROUPS];
+    threadgroup uint partial_ids[REDUCTION_SIMD_GROUPS];
 
-    // All 256 router rows consume the same activation. Load its 8 KiB once
-    // instead of issuing the identical device reads from every SIMD group.
+    // All router rows consume the same activation. Load it once instead of
+    // issuing identical device reads from every SIMD group.
     for (uint column = tid * 4u; column < uint(K); column += 4096u) {
         *(threadgroup activation4_t*)(cached_input + column) =
             *(device const activation4_t*)(input + column);
@@ -208,12 +210,14 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // The first eight SIMD groups reduce the 256 scores in parallel. The
-    // score/ID comparator exactly preserves the original stable tie-break.
+    // The first ceil(EXPERTS/32) SIMD groups reduce the scores in parallel.
+    // The score/ID comparator exactly preserves the stable tie-break.
     for (uint rank = 0u; rank < TOP_K; ++rank) {
-        if (simd_group < 8u) {
+        if (simd_group < REDUCTION_SIMD_GROUPS) {
             uint candidate_id = tid;
-            float candidate_score = scores[candidate_id];
+            float candidate_score = candidate_id < EXPERTS
+                ? scores[candidate_id]
+                : -INFINITY;
             for (uint offset = 16u; offset > 0u; offset >>= 1u) {
                 float other_score = simd_shuffle_down(
                     candidate_score, offset);
@@ -235,7 +239,9 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
         if (tid == 0u) {
             float best_score = partial_scores[0];
             uint best_expert = partial_ids[0];
-            for (uint group = 1u; group < 8u; ++group) {
+            for (uint group = 1u;
+                 group < REDUCTION_SIMD_GROUPS;
+                 ++group) {
                 float score = partial_scores[group];
                 uint expert = partial_ids[group];
                 if (score > best_score ||
@@ -883,7 +889,7 @@ bool moe_dense_router_topk_supported(
         && (input.shape(-1) % 4) == 0
         && weight.ndim() == 2
         && weight.dtype() == input.dtype()
-        && weight.shape(0) == 256
+        && (weight.shape(0) == 256 || weight.shape(0) == 384)
         && weight.shape(1) == input.shape(-1);
 }
 
@@ -898,7 +904,7 @@ MlxMoeTopKResult dense_router_topk_impl(
     if (!moe_dense_router_topk_supported(input, weight)) {
         throw std::invalid_argument(
             "fused dense router requires one FP16/BF16 row and a "
-            "matching contiguous [256,K] weight with K divisible by four");
+            "matching contiguous [256|384,K] weight with K divisible by four");
     }
     if (!std::isfinite(norm_floor) || norm_floor < 0.0f ||
         !std::isfinite(scale)) {
@@ -910,17 +916,18 @@ MlxMoeTopKResult dense_router_topk_impl(
             input,
             Shape{1, input.shape(-1)}));
     auto weights = mlx::core::contiguous(weight);
+    const int experts = weight.shape(0);
     array bias_values =
-        mlx::core::zeros(Shape{256}, mlx::core::float32);
+        mlx::core::zeros(Shape{experts}, mlx::core::float32);
     if (bias.has_value()) {
         bias_values = float32_contiguous(*bias);
-        if (bias_values.shape() != Shape{256}) {
+        if (bias_values.shape() != Shape{experts}) {
             throw std::invalid_argument(
                 "fused dense router bias shape mismatch");
         }
     }
     array available_values =
-        mlx::core::ones(Shape{256}, mlx::core::bool_);
+        mlx::core::ones(Shape{experts}, mlx::core::bool_);
     if (available.has_value()) {
         available_values = mlx::core::contiguous(
             mlx::core::reshape(
@@ -930,7 +937,7 @@ MlxMoeTopKResult dense_router_topk_impl(
                 Shape{checked_int(
                     available->size(),
                     "fused router availability size")}));
-        if (available_values.shape() != Shape{256}) {
+        if (available_values.shape() != Shape{experts}) {
             throw std::invalid_argument(
                 "fused dense router availability shape mismatch");
         }
@@ -943,10 +950,10 @@ MlxMoeTopKResult dense_router_topk_impl(
         mlx::core::int32);
     if (expert_map != nullptr) {
         if (expert_map->dtype() != mlx::core::int32 ||
-            expert_map->shape() != Shape{256} ||
+            expert_map->shape() != Shape{experts} ||
             !expert_map->flags().row_contiguous) {
             throw std::invalid_argument(
-                "fused dense router expert map must be contiguous int32[256]");
+                "fused dense router expert map shape/dtype mismatch");
         }
         expert_map_values = *expert_map;
     }
@@ -978,6 +985,7 @@ MlxMoeTopKResult dense_router_topk_impl(
         {1024, 1, 1},
         {
             {"K", input.shape(-1)},
+            {"N_EXPERTS", experts},
             {"HAS_BIAS", static_cast<int>(bias.has_value())},
             {
                 "HAS_AVAILABLE",

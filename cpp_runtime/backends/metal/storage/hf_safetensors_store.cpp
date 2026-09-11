@@ -215,9 +215,9 @@ std::string expert_tensor_name(
 void require_tensor(
     const HfSafetensorRecord& record,
     std::string_view dtype,
-    std::initializer_list<std::int64_t> shape) {
+    const std::vector<std::int64_t>& shape) {
     if (record.dtype != dtype ||
-        record.shape != std::vector<std::int64_t>(shape)) {
+        record.shape != shape) {
         throw std::runtime_error(
             "unexpected native DeepSeek-V4 expert tensor " + record.name);
     }
@@ -261,6 +261,17 @@ struct HfSafetensorStore::Impl {
                     std::generic_category(),
                     "F_NOCACHE " + path.string());
             }
+#if defined(F_GLOBAL_NOCACHE)
+            if (bypass_file_cache) {
+                // This is only an extra whole-vnode eviction hint. External
+                // filesystems can reject it transiently (notably when another
+                // process recently mapped the shard), while the per-descriptor
+                // F_NOCACHE above still provides the required no-fill policy.
+                // Do not turn that optional cache-pressure optimization into a
+                // model-load failure.
+                (void)::fcntl(fd, F_GLOBAL_NOCACHE, 1);
+            }
+#endif
 #endif
             return fd;
         }
@@ -514,7 +525,9 @@ struct DeepseekV4NativeExpertStore::ExpertRecord {
 DeepseekV4NativeExpertStore::DeepseekV4NativeExpertStore(
     std::filesystem::path root,
     std::size_t num_layers,
-    std::size_t num_experts)
+    std::size_t num_experts,
+    std::size_t hidden_size,
+    std::size_t intermediate_size)
     : DeepseekV4NativeExpertStore(
           std::move(root),
           [&] {
@@ -526,19 +539,34 @@ DeepseekV4NativeExpertStore::DeepseekV4NativeExpertStore(
               }
               return prefixes;
           }(),
-          num_experts) {}
+          num_experts,
+          hidden_size,
+          intermediate_size) {}
 
 DeepseekV4NativeExpertStore::DeepseekV4NativeExpertStore(
     std::filesystem::path root,
     std::vector<std::string> layer_prefixes,
-    std::size_t num_experts)
+    std::size_t num_experts,
+    std::size_t hidden_size,
+    std::size_t intermediate_size)
     : checkpoint_(std::move(root)),
       num_layers_(layer_prefixes.size()),
-      num_experts_(num_experts) {
-    if (num_layers_ == 0 || num_experts_ == 0) {
+      num_experts_(num_experts),
+      hidden_size_(hidden_size),
+      intermediate_size_(intermediate_size) {
+    if (num_layers_ == 0 || num_experts_ == 0 ||
+        hidden_size_ == 0 || intermediate_size_ == 0 ||
+        hidden_size_ % 32 != 0 || intermediate_size_ % 32 != 0 ||
+        hidden_size_ > static_cast<std::size_t>(
+            std::numeric_limits<std::int64_t>::max()) ||
+        intermediate_size_ > static_cast<std::size_t>(
+            std::numeric_limits<std::int64_t>::max())) {
         throw std::invalid_argument(
             "DeepSeek-V4 expert store dimensions must be positive");
     }
+    const auto hidden = static_cast<std::int64_t>(hidden_size_);
+    const auto intermediate =
+        static_cast<std::int64_t>(intermediate_size_);
     experts_.resize(num_layers_ * num_experts_);
     constexpr std::array<std::string_view, kParts> suffixes = {
         "w1.scale", "w2.scale", "w3.scale",
@@ -553,12 +581,24 @@ DeepseekV4NativeExpertStore::DeepseekV4NativeExpertStore(
                     expert_tensor_name(
                         layer_prefixes[layer], expert, suffixes[part]));
             }
-            require_tensor(*record.parts[0], "F8_E8M0", {2048, 128});
-            require_tensor(*record.parts[1], "F8_E8M0", {4096, 64});
-            require_tensor(*record.parts[2], "F8_E8M0", {2048, 128});
-            require_tensor(*record.parts[3], "I8", {2048, 2048});
-            require_tensor(*record.parts[4], "I8", {4096, 1024});
-            require_tensor(*record.parts[5], "I8", {2048, 2048});
+            require_tensor(
+                *record.parts[0], "F8_E8M0",
+                {intermediate, hidden / 32});
+            require_tensor(
+                *record.parts[1], "F8_E8M0",
+                {hidden, intermediate / 32});
+            require_tensor(
+                *record.parts[2], "F8_E8M0",
+                {intermediate, hidden / 32});
+            require_tensor(
+                *record.parts[3], "I8",
+                {intermediate, hidden / 2});
+            require_tensor(
+                *record.parts[4], "I8",
+                {hidden, intermediate / 2});
+            require_tensor(
+                *record.parts[5], "I8",
+                {intermediate, hidden / 2});
             for (std::size_t part = 1; part < 3; ++part) {
                 if (record.parts[part]->shard != record.parts[0]->shard ||
                     record.parts[part]->offset !=

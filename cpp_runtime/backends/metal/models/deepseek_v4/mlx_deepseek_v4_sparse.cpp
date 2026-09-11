@@ -182,6 +182,7 @@ kernel decltype(mfq_dsv4_cache_write<float>)
 };
 
 constexpr int kIndexerHeads = 64;
+constexpr int kV41IndexerHeads = 32;
 constexpr int kIndexerDimension = 128;
 constexpr int kAttentionHeads = 64;
 constexpr int kAttentionDimension = 512;
@@ -908,14 +909,15 @@ array dsv4_indexer_scores_decode(
         key.ndim() != 3 ||
         head_weights.ndim() != 3 ||
         query.shape(1) != 1 ||
-        query.shape(2) != kIndexerHeads ||
+        (query.shape(2) != kIndexerHeads &&
+         query.shape(2) != kV41IndexerHeads) ||
         query.shape(3) != kIndexerDimension ||
         query.shape(0) <= 0 ||
         key.shape(0) != query.shape(0) ||
         key.shape(1) <= 0 ||
         key.shape(2) != kIndexerDimension ||
         head_weights.shape() !=
-            Shape{query.shape(0), 1, kIndexerHeads} ||
+            Shape{query.shape(0), 1, query.shape(2)} ||
         query_offset < 0 ||
         ratio <= 0 ||
         score_count == 0 ||
@@ -925,6 +927,7 @@ array dsv4_indexer_scores_decode(
             "DSV4 decode indexer score shape mismatch");
     }
     const int batch = query.shape(0);
+    const int heads = query.shape(2);
     const int key_capacity = key.shape(1);
     const int keys = score_count < 0
         ? key_capacity
@@ -943,7 +946,7 @@ array dsv4_indexer_scores_decode(
         1.0f /
         std::sqrt(
             static_cast<float>(
-                kIndexerDimension * kIndexerHeads));
+                kIndexerDimension * heads));
     const array params({scale}, mlx::core::float32);
     const array decode_params(
         {
@@ -963,11 +966,14 @@ array dsv4_indexer_scores_decode(
             decode_params,
         },
         {Shape{batch, 1, key_capacity}},
-        {mlx::core::float16},
+        {heads == kV41IndexerHeads
+             ? mlx::core::float32
+             : mlx::core::float16},
         {grid, 1, 1},
         {threads, 1, 1},
         {
             {"B", batch},
+            {"INDEX_HEADS", heads},
             {"THREADS", threads},
         },
         std::nullopt,
@@ -996,7 +1002,8 @@ array dsv4_indexer_scores(
         head_weights.ndim() != 3 ||
         query.shape(0) <= 0 ||
         query.shape(1) <= 0 ||
-        query.shape(2) != kIndexerHeads ||
+        (query.shape(2) != kIndexerHeads &&
+         query.shape(2) != kV41IndexerHeads) ||
         query.shape(3) != kIndexerDimension ||
         key.shape(0) != query.shape(0) ||
         key.shape(1) <= 0 ||
@@ -1004,7 +1011,7 @@ array dsv4_indexer_scores(
         head_weights.shape() != Shape{
             query.shape(0),
             query.shape(1),
-            kIndexerHeads,
+            query.shape(2),
         } ||
         query_offset < 0 ||
         ratio <= 0) {
@@ -1013,6 +1020,7 @@ array dsv4_indexer_scores(
     }
     const int batch = query.shape(0);
     const int queries = query.shape(1);
+    const int heads = query.shape(2);
     const int keys = key.shape(1);
     if (queries == 1 && keys <= 1024) {
         return dsv4_indexer_scores_decode(
@@ -1033,7 +1041,7 @@ array dsv4_indexer_scores(
         1.0f /
         std::sqrt(
             static_cast<float>(
-                kIndexerDimension * kIndexerHeads));
+                kIndexerDimension * heads));
     const array params({scale}, mlx::core::float32);
     const array decode_params(
         {query_offset, ratio},
@@ -1047,7 +1055,9 @@ array dsv4_indexer_scores(
             decode_params,
         },
         {Shape{batch, queries, keys}},
-        {mlx::core::float16},
+        {heads == kV41IndexerHeads
+             ? mlx::core::float32
+             : mlx::core::float16},
         {grid, 1, 1},
         {256, 1, 1},
         {
@@ -1055,6 +1065,7 @@ array dsv4_indexer_scores(
             {"M", queries},
             {"K", keys},
             {"KEY_TILES", key_tiles},
+            {"INDEX_HEADS", heads},
         },
         std::nullopt,
         false,

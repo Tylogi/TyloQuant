@@ -76,9 +76,9 @@ struct MlxDeepseekV4DSparkStageComponents {
 
 struct MlxDeepseekV4DSparkHeadComponents {
     mlx::core::array norm;
-    MlxLinear hc_head_fn;
-    mlx::core::array hc_head_base;
-    mlx::core::array hc_head_scale;
+    std::optional<MlxLinear> hc_head_fn;
+    std::optional<mlx::core::array> hc_head_base;
+    std::optional<mlx::core::array> hc_head_scale;
     MlxEmbedding markov_embedding;
     MlxLinear markov_output;
     MlxLinear confidence;

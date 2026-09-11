@@ -240,7 +240,7 @@ def topology_from_config(config: Mapping[str, object]) -> GraphTopology:
         or 0
     )
     model_type = str(text.get("model_type", config.get("model_type", ""))).lower()
-    if model_type == "deepseek_v4":
+    if model_type.startswith("deepseek_v4"):
         target_layers = text.get("dspark_target_layer_ids", ())
         compress_ratios = text.get("compress_ratios", ())
         structural = [int(text.get("n_mtp_layers", 0) or 0)]
@@ -1303,6 +1303,8 @@ _DEEPSEEK_BLOCK_SUFFIXES: dict[str, str] = {
     "attn.compressor.norm.weight": "attention.compressor.norm.weight",
     "attn.indexer.wq_b.weight": "attention.indexer.query.weight",
     "attn.indexer.wq_b.scale": "attention.indexer.query.weight_scale",
+    "attn.indexer.wk.weight": "attention.indexer.key.weight",
+    "attn.indexer.k_norm.weight": "attention.indexer.key_norm.weight",
     "attn.indexer.weights_proj.weight": "attention.indexer.score.weight",
     "attn.indexer.compressor.wkv.weight": (
         "attention.indexer.compressor.key_value.weight"
@@ -1337,6 +1339,15 @@ def _deepseek_block_suffix(source_suffix: str) -> str | None:
         projection = {"1": "gate", "2": "down", "3": "up"}[match.group(1)]
         leaf = "weight" if match.group(2) == "weight" else "weight_scale"
         return f"mlp.shared_expert.{projection}.{leaf}"
+    match = re.match(r"^engram\.(embed|wkv)\.(weight|scale)$", source_suffix)
+    if match is not None:
+        tensor = "embedding" if match.group(1) == "embed" else "key_value"
+        leaf = "weight" if match.group(2) == "weight" else "weight_scale"
+        return f"engram.{tensor}.{leaf}"
+    if source_suffix == "engram.q_weight":
+        return "engram.query.weight"
+    if source_suffix == "engram.k_weight":
+        return "engram.key.weight"
     return None
 
 
@@ -1437,6 +1448,8 @@ def _deepseek_v4_source_mapper(
         "confidence_head.proj.weight": "confidence.projection.weight",
         "markov_head.markov_w1.weight": "markov.input.weight",
         "markov_head.markov_w2.weight": "markov.output.weight",
+        "markov_head.embed.weight": "markov.embedding.weight",
+        "markov_head.head.weight": "markov.output.weight",
     }
     suffix = predictor_suffixes.get(source_suffix)
     return (
@@ -1643,6 +1656,31 @@ register_tensor_schema(
                 "deepseek_v4_vision",
                 input_contract="deepseek_v4_vision.v1",
                 position_policy="deepseek_v4_positions",
+                capabilities=("vision",),
+            ),
+            GraphComponentSpec(
+                TensorComponent.PREDICTOR,
+                "predictor",
+                "dspark",
+                capabilities=("speculative_prediction",),
+            ),
+        ),
+    )
+)
+
+register_tensor_schema(
+    TensorSchemaRegistration(
+        architecture="deepseek_v41",
+        aliases=("deepseek_v41_text", "deepseek_v41_vision"),
+        source_mapper=_deepseek_v4_source_mapper,
+        backbone="deepseek_v4",
+        component_specs=(
+            GraphComponentSpec(
+                TensorComponent.VISION,
+                "vision",
+                "deepseek_v41_vision",
+                input_contract="deepseek_v41_vision.v1",
+                position_policy="deepseek_v41_positions",
                 capabilities=("vision",),
             ),
             GraphComponentSpec(

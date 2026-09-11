@@ -180,7 +180,9 @@ public:
         std::size_t cache_bytes,
         std::size_t io_workers = 8,
         bool prefill_overlap = false,
-        std::size_t num_experts = 256);
+        std::size_t num_experts = 256,
+        std::size_t hidden_size = 4096,
+        std::size_t intermediate_size = 2048);
     ~MlxDeepseekV4SsdExpertCache();
 
     MlxDeepseekV4SsdExpertCache(

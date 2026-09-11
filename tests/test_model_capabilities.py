@@ -70,6 +70,14 @@ def test_deepseek_v4_vision_alias_advertises_only_image_input() -> None:
     }
 
 
+def test_deepseek_v41_advertises_vision_and_mtp() -> None:
+    profile = capabilities_for_architecture("deepseek_v41")
+    assert profile.architecture_family == "deepseek_v41"
+    assert profile.features.text
+    assert profile.features.image_input
+    assert profile.features.mtp
+
+
 def test_every_mtp_runtime_family_registers_architecture_support() -> None:
     for model_type in (
         "deepseek_v4",

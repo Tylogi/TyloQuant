@@ -769,6 +769,10 @@ MlxLinear::grouped_weight_ref() const noexcept {
     if (mlx_reference_enabled()) {
         if (const auto* packed =
                 std::get_if<MlxMxWeight>(&weight_)) {
+            if (packed->bits() == 8 &&
+                packed->scale_block_size() != 128) {
+                return std::nullopt;
+            }
             return MlxGroupedLinearWeightRef{packed};
         }
         return std::nullopt;
@@ -795,6 +799,10 @@ MlxLinear::grouped_weight_ref() const noexcept {
     }
     if (const auto* packed =
             std::get_if<MlxMxWeight>(&weight_)) {
+        if (packed->bits() == 8 &&
+            packed->scale_block_size() != 128) {
+            return std::nullopt;
+        }
         return MlxGroupedLinearWeightRef{packed};
     }
     return std::nullopt;

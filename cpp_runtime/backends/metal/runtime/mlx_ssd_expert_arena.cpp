@@ -17,9 +17,6 @@ namespace {
 using mlx::core::Shape;
 using mlx::core::array;
 
-constexpr std::size_t kValueBytes = 2048ull * 2048ull;
-constexpr std::size_t kScaleBytes = 2048ull * 128ull;
-
 int checked_dimension(std::size_t value, const char* name) {
     if (value == 0 || value > static_cast<std::size_t>(
         std::numeric_limits<std::int32_t>::max())) {
@@ -78,12 +75,26 @@ MlxDeepseekV4SsdExpertArena::allocate_bank(
 }
 
 MlxDeepseekV4SsdExpertArena::MlxDeepseekV4SsdExpertArena(
-    std::size_t slots)
+    std::size_t slots,
+    std::size_t hidden_size,
+    std::size_t intermediate_size)
     : slots_(slots),
-      gate_up_scale_(allocate_bank(slots, 2 * kScaleBytes)),
-      w2_scale_(allocate_bank(slots, kScaleBytes)),
-      gate_up_weight_(allocate_bank(slots, 2 * kValueBytes)),
-      w2_weight_(allocate_bank(slots, kValueBytes)) {
+      hidden_size_(hidden_size),
+      intermediate_size_(intermediate_size),
+      value_gate_bytes_(
+          checked_product(hidden_size, intermediate_size, "weight geometry") / 2),
+      value_down_bytes_(value_gate_bytes_),
+      scale_gate_bytes_(
+          checked_product(hidden_size, intermediate_size, "scale geometry") / 32),
+      scale_down_bytes_(scale_gate_bytes_),
+      gate_up_scale_(allocate_bank(slots, 2 * scale_gate_bytes_)),
+      w2_scale_(allocate_bank(slots, scale_down_bytes_)),
+      gate_up_weight_(allocate_bank(slots, 2 * value_gate_bytes_)),
+      w2_weight_(allocate_bank(slots, value_down_bytes_)) {
+    if (hidden_size_ % 32 != 0 || intermediate_size_ % 32 != 0) {
+        throw std::invalid_argument(
+            "SSD expert dimensions must be multiples of 32");
+    }
     std::vector<std::int32_t> identity(slots);
     std::iota(identity.begin(), identity.end(), 0);
     const auto experts = checked_dimension(slots, "slot count");
@@ -92,16 +103,17 @@ MlxDeepseekV4SsdExpertArena::MlxDeepseekV4SsdExpertArena(
             .gate_up = MlxRoutedLinear(
                 MlxNintMoeWeight::from_mxfp4_slots(
                     experts,
-                    4096,
-                    4096,
+                    checked_dimension(
+                        2 * intermediate_size_, "gate/up size"),
+                    checked_dimension(hidden_size_, "hidden size"),
                     identity,
                     gate_up_weight_.array,
                     gate_up_scale_.array)),
             .down = MlxRoutedLinear(
                 MlxNintMoeWeight::from_mxfp4_slots(
                     experts,
-                    4096,
-                    2048,
+                    checked_dimension(hidden_size_, "hidden size"),
+                    checked_dimension(intermediate_size_, "intermediate size"),
                     identity,
                     w2_weight_.array,
                     w2_scale_.array)),
@@ -113,7 +125,8 @@ std::size_t MlxDeepseekV4SsdExpertArena::slots() const noexcept {
 }
 
 std::size_t MlxDeepseekV4SsdExpertArena::bytes_per_slot() const noexcept {
-    return 3 * (kValueBytes + kScaleBytes);
+    return 2 * (value_gate_bytes_ + scale_gate_bytes_) +
+        value_down_bytes_ + scale_down_bytes_;
 }
 
 std::size_t MlxDeepseekV4SsdExpertArena::nbytes() const noexcept {
@@ -137,11 +150,16 @@ void MlxDeepseekV4SsdExpertArena::prewarm_metal() {
     const mlx::core::array expert_ids(
         active.data(), Shape{1, 1}, mlx::core::int32);
     auto gate_up = weights.gate_up.swiglu(
-        mlx::core::zeros(Shape{1, 4096}, mlx::core::float16),
+        mlx::core::zeros(
+            Shape{1, checked_dimension(hidden_size_, "hidden size")},
+            mlx::core::float16),
         expert_ids,
         0.0f);
     auto down = weights.down.forward(
-        mlx::core::zeros(Shape{1, 2048}, mlx::core::float16),
+        mlx::core::zeros(
+            Shape{1, checked_dimension(
+                intermediate_size_, "intermediate size")},
+            mlx::core::float16),
         expert_ids);
     mlx::core::eval({std::move(gate_up), std::move(down)});
 }
@@ -168,12 +186,14 @@ MlxDeepseekV4SsdExpertArena::destination(std::size_t slot) {
     auto gate_up_scale = bank_slot(gate_up_scale_, slot);
     auto gate_up_weight = bank_slot(gate_up_weight_, slot);
     return {
-        .w1_scale = gate_up_scale.first(kScaleBytes),
+        .w1_scale = gate_up_scale.first(scale_gate_bytes_),
         .w2_scale = bank_slot(w2_scale_, slot),
-        .w3_scale = gate_up_scale.subspan(kScaleBytes, kScaleBytes),
-        .w1_weight = gate_up_weight.first(kValueBytes),
+        .w3_scale = gate_up_scale.subspan(
+            scale_gate_bytes_, scale_gate_bytes_),
+        .w1_weight = gate_up_weight.first(value_gate_bytes_),
         .w2_weight = bank_slot(w2_weight_, slot),
-        .w3_weight = gate_up_weight.subspan(kValueBytes, kValueBytes),
+        .w3_weight = gate_up_weight.subspan(
+            value_gate_bytes_, value_gate_bytes_),
     };
 }
 
@@ -210,16 +230,16 @@ MlxDeepseekV4SsdExpertArena::routed_weights(
         .gate_up = MlxRoutedLinear(
             MlxNintMoeWeight::from_mxfp4_slots(
                 experts,
-                4096,
-                4096,
+                checked_dimension(2 * intermediate_size_, "gate/up size"),
+                checked_dimension(hidden_size_, "hidden size"),
                 complete,
                 gate_up_weight_.array,
                 gate_up_scale_.array)),
         .down = MlxRoutedLinear(
             MlxNintMoeWeight::from_mxfp4_slots(
                 experts,
-                4096,
-                2048,
+                checked_dimension(hidden_size_, "hidden size"),
+                checked_dimension(intermediate_size_, "intermediate size"),
                 complete,
                 w2_weight_.array,
                 w2_scale_.array)),
@@ -261,28 +281,28 @@ MlxMxWeight MlxDeepseekV4SsdExpertArena::expert_weight(
     if (projection == '1') {
         return MlxMxWeight::from_arrays(
             "MXFP4",
-            bank_slot_array(gate_up_weight_, slot, 0, kValueBytes),
-            bank_slot_array(gate_up_scale_, slot, 0, kScaleBytes),
-            4096,
-            2048);
+            bank_slot_array(gate_up_weight_, slot, 0, value_gate_bytes_),
+            bank_slot_array(gate_up_scale_, slot, 0, scale_gate_bytes_),
+            checked_dimension(hidden_size_, "hidden size"),
+            checked_dimension(intermediate_size_, "intermediate size"));
     }
     if (projection == '2') {
         return MlxMxWeight::from_arrays(
             "MXFP4",
             bank_slot_array(w2_weight_, slot),
             bank_slot_array(w2_scale_, slot),
-            2048,
-            4096);
+            checked_dimension(intermediate_size_, "intermediate size"),
+            checked_dimension(hidden_size_, "hidden size"));
     }
     if (projection == '3') {
         return MlxMxWeight::from_arrays(
             "MXFP4",
             bank_slot_array(
-                gate_up_weight_, slot, kValueBytes, kValueBytes),
+                gate_up_weight_, slot, value_gate_bytes_, value_gate_bytes_),
             bank_slot_array(
-                gate_up_scale_, slot, kScaleBytes, kScaleBytes),
-            4096,
-            2048);
+                gate_up_scale_, slot, scale_gate_bytes_, scale_gate_bytes_),
+            checked_dimension(hidden_size_, "hidden size"),
+            checked_dimension(intermediate_size_, "intermediate size"));
     }
     throw std::invalid_argument("MXFP4 projection must be '1', '2', or '3'");
 }

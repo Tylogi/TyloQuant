@@ -144,6 +144,87 @@ json hf_config() {
     };
 }
 
+json hf_v41_config() {
+    std::vector<std::int64_t> ratios(43, 0);
+    std::fill(ratios.begin() + 2, ratios.begin() + 20, 2);
+    std::fill(ratios.begin() + 20, ratios.begin() + 40, 1);
+    return {
+        {"model_type", "deepseek_v41"},
+        {"eos_token_id", 1},
+        {"image_token_id", 129264},
+        {
+            "text_config",
+            {
+                {"model_type", "deepseek_v41_text"},
+                {"vocab_size", 129280},
+                {"hidden_size", 5120},
+                {"moe_intermediate_size", 2304},
+                {"num_hidden_layers", 40},
+                {"num_attention_heads", 64},
+                {"num_key_value_heads", 1},
+                {"head_dim", 512},
+                {"qk_rope_head_dim", 64},
+                {"q_lora_rank", 1280},
+                {"o_lora_rank", 1024},
+                {"o_groups", 8},
+                {"rms_norm_eps", 1e-20},
+                {"n_routed_experts", 384},
+                {"n_shared_experts", 1},
+                {"num_experts_per_tok", 6},
+                {"scoring_func", "sqrtsoftplus"},
+                {"norm_topk_prob", true},
+                {"routed_scaling_factor", 1.5},
+                {"swiglu_limit", 10.0},
+                {"sliding_window", 128},
+                {"compress_ratios", ratios},
+                {"compress_rope_theta", 160000},
+                {"kv_source_layer_ids", {2, 8, 14, 20}},
+                {"index_source_layer_ids", {2, 8, 14, 20, 24, 28, 32, 36}},
+                {"index_n_heads", 32},
+                {"index_head_dim", 128},
+                {"index_topk", 512},
+                {"candidate_source_layer_id", 20},
+                {"candidate_topk_blocks", 2048},
+                {"candidate_block_size", 8},
+                {"hc_mult", 4},
+                {"hc_sinkhorn_iters", 20},
+                {"hc_eps", 1e-6},
+                {"engram_layer_ids", {1, 14}},
+                {"engram_num_embeddings", {384006168, 384016682}},
+                {"engram_max_ngram_size", 4},
+                {"engram_vocab_size", 16000000},
+                {"engram_n_heads", 8},
+                {"engram_head_dim", 256},
+                {"engram_pad_token_id", 2},
+                {"engram_compressed_vocab_size", 99092},
+                {"num_nextn_predict_layers", 3},
+                {"dspark_block_size", 5},
+                {"dspark_noise_token_id", 128799},
+                {"dspark_target_layer_ids", {37, 38, 39}},
+                {"dspark_markov_rank", 256},
+                {"dspark_n_routed_experts", 128},
+                {"dspark_num_experts_per_tok", 3},
+            },
+        },
+        {
+            "vision_config",
+            {
+                {"model_type", "deepseek_v41_vision"},
+                {"num_hidden_layers", 32},
+                {"hidden_size", 1024},
+                {"num_attention_heads", 16},
+                {"intermediate_size", 2816},
+                {"patch_size", 14},
+                {"rope_theta", 10000},
+                {"downsample_ratio", 3},
+                {"max_image_tokens", 1024},
+                {"min_pixels", 295936},
+                {"max_wh_ratio", nullptr},
+            },
+        },
+    };
+}
+
 template <typename T>
 void append_scalar(
     std::vector<std::uint8_t>& output,
@@ -433,6 +514,64 @@ void test_manifest_and_hf_normalization() {
         "DSpark stage count was not derived from the checkpoint schedule");
 }
 
+void test_v41_hf_normalization_and_bindings() {
+    const auto config = DeepseekV4Config::from_json(
+        hf_v41_config().dump());
+    require(
+        config.is_v41() && config.n_layers == 40 &&
+            config.hidden == 5120 && config.moe_inter == 2304 &&
+            config.n_experts == 384 && config.top_k == 6,
+        "DeepSeek-V4.1 text config normalization mismatch");
+    require(
+        config.compress_ratios.size() == 40 &&
+            config.compress_ratios[2] == 2 &&
+            config.compress_ratios[20] == 1 &&
+            config.n_mtp_layers == 3 &&
+            config.mtp_compress_ratios ==
+                std::vector<std::int64_t>({0, 0, 0}) &&
+            config.dspark_n_experts == 128 && config.dspark_top_k == 3,
+        "DeepSeek-V4.1 backbone/DSpark schedule mismatch");
+    require(
+        config.has_engram() &&
+            config.engram_layer_ids ==
+                std::vector<std::int64_t>({1, 14}) &&
+            config.engram_num_embeddings[0] == 384006168,
+        "DeepSeek-V4.1 Engram config normalization mismatch");
+    require(
+        config.has_vision() && config.vision_n_layers == 32 &&
+            config.vision_max_n_token == 1024 &&
+            config.vision_min_pixels == 295936 &&
+            config.vision_max_wh_ratio == 0 &&
+            config.image_token_id == 129264 &&
+            config.eos_token_id == std::vector<std::int64_t>({1}),
+        "DeepSeek-V4.1 outer config normalization mismatch");
+
+    const auto required = DeepseekV4TensorNames::required(config);
+    require(
+        !contains(required, "model.mhc.output.function") &&
+            contains(required,
+                "model.block.2.attention.compressor.key_value.weight") &&
+            contains(required,
+                "model.block.2.attention.compressor.gate.weight") &&
+            contains(required,
+                "model.block.2.attention.indexer.key.weight") &&
+            !contains(required,
+                "model.block.20.attention.compressor.gate.weight"),
+        "DeepSeek-V4.1 compressed-KV ownership schedule mismatch");
+    require(
+        contains(required,
+            "model.block.24.attention.indexer.query.weight") &&
+            !contains(required,
+                "model.block.24.attention.indexer.key.weight") &&
+            !contains(required,
+                "model.block.24.attention.compressor.key_value.weight"),
+        "DeepSeek-V4.1 shared Indexer schedule mismatch");
+    require(
+        contains(required, "model.block.1.engram.key_value.weight") &&
+            contains(required, "model.block.14.engram.query.weight"),
+        "DeepSeek-V4.1 Engram projections are missing");
+}
+
 void test_config_validation() {
     auto invalid_architecture = hf_config();
     invalid_architecture["model_type"] = "qwen3_5";
@@ -631,6 +770,7 @@ int main() {
     try {
         std::filesystem::create_directories(directory);
         test_manifest_and_hf_normalization();
+        test_v41_hf_normalization_and_bindings();
         test_config_validation();
         test_required_ratio_schedule();
         test_container_bindings(directory);

@@ -19,6 +19,7 @@ from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.server.catalog import ModelCatalog, native_hf_model_type_supported
 from mfq.server.hf_tokenizer import (
+    DEEPSEEK_V41_CHAT_TEMPLATE,
     ensure_hf_tokenizer_gguf,
     ensure_mfq_tokenizer_gguf,
     native_hf_asset_environment,
@@ -57,8 +58,24 @@ def _hf_fixture(root: Path) -> None:
                     "merges": [["a", "b"]],
                 },
                 "added_tokens": [
-                    {"id": 3, "content": "<bos>", "special": True},
-                    {"id": 4, "content": "<eos>", "special": True},
+                    {
+                        "id": 3,
+                        "content": "<bos>",
+                        "special": True,
+                        "single_word": False,
+                        "lstrip": False,
+                        "rstrip": False,
+                        "normalized": False,
+                    },
+                    {
+                        "id": 4,
+                        "content": "<eos>",
+                        "special": True,
+                        "single_word": False,
+                        "lstrip": False,
+                        "rstrip": False,
+                        "normalized": False,
+                    },
                 ],
             }
         ),
@@ -137,6 +154,7 @@ def test_catalog_prefers_same_name_mfq_over_its_hf_source(tmp_path: Path) -> Non
 
 def test_native_hf_support_matches_cpp_dispatch_families() -> None:
     assert native_hf_model_type_supported("deepseek_v4_vision")
+    assert native_hf_model_type_supported("deepseek_v41")
     assert native_hf_model_type_supported("minicpmo")
     assert native_hf_model_type_supported("qwen3_8")
     assert not native_hf_model_type_supported("qwen4_exp")
@@ -228,3 +246,48 @@ def test_minicpmo_native_runtime_materializes_exact_resampler_asset(
     asset = Path(environment["MFQ_MINICPMO45_RESAMPLER_POSITION_ASSET"])
     assert asset.is_file()
     assert asset.read_bytes()[:20] == b"MFQRSPB1" + struct.pack("<III", 70, 70, 4096)
+
+
+def test_deepseek_v41_gets_chat_template_and_engram_token_map(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "DeepSeek-V41-Test"
+    _hf_fixture(model)
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v41",
+                "bos_token_id": 3,
+                "eos_token_id": 4,
+                "text_config": {
+                    "model_type": "deepseek_v41_text",
+                    "vocab_size": 5,
+                    "engram_layer_ids": [1],
+                    "engram_num_embeddings": [36],
+                    "engram_max_ngram_size": 3,
+                    "engram_vocab_size": 5,
+                    "engram_n_heads": 2,
+                    "engram_compressed_vocab_size": 5,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    tokenizer_config = json.loads((model / "tokenizer_config.json").read_text())
+    tokenizer_config.pop("chat_template")
+    (model / "tokenizer_config.json").write_text(
+        json.dumps(tokenizer_config), encoding="utf-8"
+    )
+
+    tokenizer = ensure_hf_tokenizer_gguf(model, tmp_path / "tokenizers")
+    reader = GGUFReader(tokenizer, "r")
+    assert reader.get_field("tokenizer.chat_template").contents() == (
+        DEEPSEEK_V41_CHAT_TEMPLATE
+    )
+
+    environment = native_hf_asset_environment(model, tmp_path / "assets")
+    asset = Path(environment["MFQ_DEEPSEEK_V41_ENGRAM_TOKEN_MAP"])
+    payload = asset.read_bytes()
+    assert payload[:28] == struct.pack("<4sIIIIII", b"D41T", 2, 5, 5, 1, 3, 2)
+    # header + token map + layer IDs + multipliers + prime bucket sizes
+    assert len(payload) == 28 + 5 * 4 + 4 + 3 * 8 + 4 * 4

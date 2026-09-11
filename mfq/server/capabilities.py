@@ -44,6 +44,11 @@ _REGISTRY = (
         features=ModelFeatureSet(text=True, image_input=True, mtp=True),
     ),
     _CapabilityRegistration(
+        family="deepseek_v41",
+        aliases=("deepseek_v41", "deepseek_v41_text", "deepseek_v41_vision"),
+        features=ModelFeatureSet(text=True, image_input=True, mtp=True),
+    ),
+    _CapabilityRegistration(
         family="glm_dsa",
         aliases=("glm_moe_dsa",),
         features=ModelFeatureSet(),
