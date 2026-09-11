@@ -5694,28 +5694,39 @@ __device__ __forceinline__ void nvq_moe_grouped_f16_task(
             }
         }
 
-        constexpr int kActivationPairs =
-            BM * (kTileK / 2);
-        for (int index = tid; index < kActivationPairs; index += 256) {
-            const int m_local = index / (kTileK / 2);
-            const int k_pair =
-                index - m_local * (kTileK / 2);
-            const int k = k_base + k_pair * 2;
-            __half2 values = __float2half2_rn(0.0f);
+        constexpr int kActivationVectorWidth = 8;
+        static_assert(kTileK % kActivationVectorWidth == 0);
+        constexpr int kActivationVectorsPerRow =
+            kTileK / kActivationVectorWidth;
+        constexpr int kActivationVectors =
+            BM * kActivationVectorsPerRow;
+        for (int index = tid; index < kActivationVectors; index += 256) {
+            const int m_local = index / kActivationVectorsPerRow;
+            const int vector_local =
+                index - m_local * kActivationVectorsPerRow;
+            const int k_local = vector_local * kActivationVectorWidth;
+            const int k = k_base + k_local;
             const int source_row = source_rows[m_local];
-            if (source_row >= 0) {
-                if (k + 1 < K) {
-                    values = *reinterpret_cast<const __half2 *>(
+            __half * destination =
+                activation_tile + m_local * kStrideK + k_local;
+            if (source_row < 0 || k >= K) {
+                *reinterpret_cast<int4 *>(destination) =
+                    make_int4(0, 0, 0, 0);
+            } else if ((K & 7) == 0 && k + 7 < K) {
+                *reinterpret_cast<int4 *>(destination) =
+                    *reinterpret_cast<const int4 *>(
                         x + static_cast<int64_t>(source_row) * K + k);
-                } else if (k < K) {
-                    values = __halves2half2(
-                        x[static_cast<int64_t>(source_row) * K + k],
-                        __float2half(0.0f));
+            } else {
+#pragma unroll
+                for (int element = 0;
+                     element < kActivationVectorWidth;
+                     ++element) {
+                    destination[element] = k + element < K
+                        ? x[static_cast<int64_t>(source_row) * K +
+                            k + element]
+                        : __float2half(0.0f);
                 }
             }
-            *reinterpret_cast<__half2 *>(
-                activation_tile + m_local * kStrideK +
-                    k_pair * 2) = values;
         }
         __syncthreads();
 
