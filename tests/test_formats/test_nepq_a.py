@@ -10,6 +10,7 @@ from mfq.formats.nepq import (
     NEPQ1_S,
     dequantize_nepq,
     pack_nepq,
+    transpose_sparse_residual_records,
     unpack_nepq,
 )
 from tests.test_formats.test_nepq import _tensor
@@ -97,6 +98,33 @@ def test_nepq_a_requires_hadamard_rotation():
     tensor.rotation_seed = 0
     with pytest.raises(ValueError, match="requires a Hadamard"):
         pack_nepq(tensor)
+
+
+def test_nepq_sparse_residual_transpose_indexes_input_vectors():
+    first = np.array(
+        [
+            [(1 << 2) | 2, (2 << 2) | 1],
+            [(3 << 2) | 0, (4 << 2) | 2],
+        ],
+        dtype=np.int16,
+    )
+    second = np.array(
+        [
+            [-1, (5 << 2) | 0],
+            [(6 << 2) | 2, -1],
+        ],
+        dtype=np.int16,
+    )
+    offsets, rows, dictionary = transpose_sparse_residual_records(
+        first,
+        second,
+        vectors=6,
+        block_vectors=3,
+        position_bits=2,
+    )
+    np.testing.assert_array_equal(offsets, [0, 1, 1, 3, 4, 5, 6])
+    np.testing.assert_array_equal(rows, [1, 0, 1, 0, 0, 1])
+    np.testing.assert_array_equal(dictionary, [3, 1, 6, 5, 2, 4])
 
 
 def test_nepq_a_rejects_values_that_overflow_serialized_fp16():

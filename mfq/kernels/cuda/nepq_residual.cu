@@ -284,6 +284,90 @@ __global__ void nepq_sparse_residual_backward_input_kernel(
     }
 }
 
+__global__ void nepq_sparse_residual_backward_transpose_kernel(
+    const __half * dictionary,
+    const int32_t * transpose_offsets,
+    const int32_t * transpose_rows,
+    const int16_t * transpose_dictionary,
+    const __half * output_gradient,
+    const int8_t * rotation_signs,
+    __half * input_gradient,
+    int input_rows,
+    int rows,
+    int width,
+    int vectors,
+    bool fuse_rotation) {
+    const int64_t thread =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t group = thread / kWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int component = static_cast<int>(thread & 7);
+    const int record_split = lane / 8;
+    const int64_t total_groups = static_cast<int64_t>(input_rows) * vectors;
+    if (group >= total_groups) return;
+
+    const int input_row = static_cast<int>(group / vectors);
+    const int vector = static_cast<int>(group -
+        static_cast<int64_t>(input_row) * vectors);
+    const unsigned active = __activemask();
+    int begin = lane == 0 ? transpose_offsets[vector] : 0;
+    int end = lane == 0 ? transpose_offsets[vector + 1] : 0;
+    begin = __shfl_sync(active, begin, 0);
+    end = __shfl_sync(active, end, 0);
+
+    float value = 0.0f;
+    for (int record = begin + record_split;
+         record < end;
+         record += 4) {
+        const unsigned record_active = __activemask();
+        const int source_lane = record_split * 8;
+        int output = component == 0 ? transpose_rows[record] : 0;
+        int dictionary_id = component == 0
+            ? static_cast<int>(transpose_dictionary[record])
+            : 0;
+        output = __shfl_sync(record_active, output, source_lane);
+        dictionary_id = __shfl_sync(
+            record_active, dictionary_id, source_lane);
+        float gradient = component == 0
+            ? __half2float(output_gradient[
+                static_cast<int64_t>(input_row) * rows + output])
+            : 0.0f;
+        gradient = __shfl_sync(record_active, gradient, source_lane);
+        value = fmaf(
+            gradient,
+            __half2float(dictionary[
+                static_cast<int64_t>(dictionary_id) * 8 + component]),
+            value);
+    }
+
+    const unsigned reduce_active = __activemask();
+    const float split1 = __shfl_sync(
+        reduce_active, value, component + 8);
+    const float split2 = __shfl_sync(
+        reduce_active, value, component + 16);
+    const float split3 = __shfl_sync(
+        reduce_active, value, component + 24);
+    value += split1 + split2 + split3;
+    if (record_split != 0) return;
+
+    const int column = vector * 8 + component;
+    const int64_t logical =
+        static_cast<int64_t>(input_row) * width + column;
+    value += __half2float(input_gradient[logical]);
+    if (fuse_rotation) {
+        const unsigned rotate_active = __activemask();
+#pragma unroll
+        for (int stride = 1; stride < 8; stride <<= 1) {
+            const float other = __shfl_xor_sync(
+                rotate_active, value, stride, 8);
+            value = (component & stride) ? other - value : value + other;
+        }
+        value *= 0.3535533905932738f *
+            static_cast<float>(rotation_signs[column]);
+    }
+    input_gradient[logical] = __float2half(value);
+}
+
 void validate_residual(
     const mfq_tensor_backend::Tensor & dictionary,
     const mfq_tensor_backend::Tensor & first,
@@ -534,6 +618,94 @@ mfq_tensor_backend::Tensor nepq_sparse_residual_backward_input_cuda(
         static_cast<int>(first.size(1)),
         static_cast<int>(position_bits),
         static_cast<int>(block_vectors));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return input_gradient;
+}
+
+
+mfq_tensor_backend::Tensor nepq_sparse_residual_backward_transpose_cuda(
+    mfq_tensor_backend::Tensor dictionary,
+    mfq_tensor_backend::Tensor transpose_offsets,
+    mfq_tensor_backend::Tensor transpose_rows,
+    mfq_tensor_backend::Tensor transpose_dictionary,
+    mfq_tensor_backend::Tensor output_gradient,
+    mfq_tensor_backend::Tensor rotation_signs,
+    bool fuse_rotation,
+    mfq_tensor_backend::Tensor input_gradient) {
+    MFQ_RUNTIME_CHECK(
+        dictionary.is_cuda() &&
+        dictionary.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        dictionary.is_contiguous() && dictionary.dim() == 2 &&
+        dictionary.size(0) == 1024 && dictionary.size(1) == 8,
+        "NEPQ-A transpose dictionary must be CUDA fp16 [1024,8]");
+    MFQ_RUNTIME_CHECK(
+        transpose_offsets.is_cuda() &&
+        transpose_offsets.scalar_type() == mfq_tensor_backend::kInt32 &&
+        transpose_offsets.is_contiguous() && transpose_offsets.dim() == 1,
+        "NEPQ-A transpose offsets must be CUDA contiguous int32");
+    MFQ_RUNTIME_CHECK(
+        transpose_rows.is_cuda() &&
+        transpose_rows.scalar_type() == mfq_tensor_backend::kInt32 &&
+        transpose_rows.is_contiguous() && transpose_rows.dim() == 1 &&
+        transpose_dictionary.is_cuda() &&
+        transpose_dictionary.scalar_type() == mfq_tensor_backend::kInt16 &&
+        transpose_dictionary.is_contiguous() &&
+        transpose_dictionary.dim() == 1 &&
+        transpose_dictionary.numel() == transpose_rows.numel(),
+        "NEPQ-A transpose records must be matching int32/int16 vectors");
+    MFQ_RUNTIME_CHECK(
+        output_gradient.is_cuda() &&
+        output_gradient.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        output_gradient.is_contiguous() && output_gradient.dim() == 2,
+        "NEPQ-A transpose gradient must be CUDA contiguous fp16 [M,rows]");
+    MFQ_RUNTIME_CHECK(
+        input_gradient.is_cuda() &&
+        input_gradient.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        input_gradient.is_contiguous() && input_gradient.dim() == 2 &&
+        input_gradient.size(0) == output_gradient.size(0) &&
+        input_gradient.size(1) % 8 == 0,
+        "NEPQ-A transpose output must be CUDA contiguous fp16 [M,K]");
+    const int64_t vectors = input_gradient.size(1) / 8;
+    MFQ_RUNTIME_CHECK(
+        transpose_offsets.numel() == vectors + 1,
+        "NEPQ-A transpose offset count mismatch");
+    MFQ_RUNTIME_CHECK(
+        rotation_signs.is_cuda() &&
+        rotation_signs.scalar_type() == mfq_tensor_backend::kInt8 &&
+        rotation_signs.is_contiguous() && rotation_signs.dim() == 1 &&
+        (!fuse_rotation || rotation_signs.numel() == input_gradient.size(1)),
+        "NEPQ-A fused rotation signs must match K");
+    MFQ_RUNTIME_CHECK(
+        dictionary.device() == transpose_offsets.device() &&
+        dictionary.device() == transpose_rows.device() &&
+        dictionary.device() == transpose_dictionary.device() &&
+        dictionary.device() == output_gradient.device() &&
+        dictionary.device() == rotation_signs.device() &&
+        dictionary.device() == input_gradient.device(),
+        "NEPQ-A transpose tensors must share one CUDA device");
+    if (input_gradient.numel() == 0) return input_gradient;
+
+    MfqCudaGuard guard(input_gradient.device());
+    constexpr int threads = 256;
+    const int64_t total_threads =
+        output_gradient.size(0) * vectors * kWarpSize;
+    const int blocks = static_cast<int>(
+        (total_threads + threads - 1) / threads);
+    nepq_sparse_residual_backward_transpose_kernel<<<
+        blocks, threads, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __half *>(dictionary.data_ptr<mfq_half>()),
+        transpose_offsets.data_ptr<int32_t>(),
+        transpose_rows.data_ptr<int32_t>(),
+        transpose_dictionary.data_ptr<int16_t>(),
+        reinterpret_cast<const __half *>(
+            output_gradient.data_ptr<mfq_half>()),
+        rotation_signs.data_ptr<int8_t>(),
+        reinterpret_cast<__half *>(input_gradient.data_ptr<mfq_half>()),
+        static_cast<int>(output_gradient.size(0)),
+        static_cast<int>(output_gradient.size(1)),
+        static_cast<int>(input_gradient.size(1)),
+        static_cast<int>(vectors),
+        fuse_rotation);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return input_gradient;
 }

@@ -28,6 +28,7 @@ from mfq.formats.nepq import (
     NepqTensor,
     nepq_base_spec,
     rotation_signs,
+    transpose_sparse_residual_records as _transpose_sparse_residual_records,
     validate_nepq,
 )
 from mfq.formats.npq0_l import Npq0LTensor, unpack_npq0_l_tables
@@ -2169,55 +2170,6 @@ def _matrix_shape(tensor: VqTensor) -> tuple[int, int]:
     if tuple(tensor.shape) != (out, int(tensor.neuron_len)):
         raise ValueError("Metal NVQ/NPQ matrix dimensions are inconsistent")
     return out, int(tensor.neuron_len)
-
-
-def _transpose_sparse_residual_records(
-    first: np.ndarray,
-    second: np.ndarray,
-    *,
-    vectors: int,
-    block_vectors: int,
-    position_bits: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    blocks = int(first.shape[1])
-    vector_parts = []
-    row_parts = []
-    dictionary_parts = []
-    position_mask = (1 << position_bits) - 1
-    for records in (first, second):
-        flat = np.asarray(records, dtype=np.int32).reshape(-1)
-        locations = np.flatnonzero(flat >= 0)
-        if not locations.size:
-            continue
-        selected = flat[locations]
-        rows = locations // blocks
-        block_ids = locations - rows * blocks
-        vector_ids = block_ids * block_vectors + (selected & position_mask)
-        dictionary_ids = selected >> position_bits
-        valid = (vector_ids < vectors) & (dictionary_ids < 1024)
-        vector_parts.append(vector_ids[valid])
-        row_parts.append(rows[valid])
-        dictionary_parts.append(dictionary_ids[valid])
-    if not vector_parts:
-        return (
-            np.zeros(vectors + 1, dtype=np.uint32),
-            np.zeros(1, dtype=np.uint32),
-            np.zeros(1, dtype=np.uint16),
-        )
-    vector_ids = np.concatenate(vector_parts)
-    rows = np.concatenate(row_parts)
-    dictionary_ids = np.concatenate(dictionary_parts)
-    order = np.argsort(vector_ids, kind="stable")
-    vector_ids = vector_ids[order]
-    counts = np.bincount(vector_ids, minlength=vectors)
-    offsets = np.empty(vectors + 1, dtype=np.uint32)
-    offsets[0] = 0
-    np.cumsum(counts, dtype=np.uint32, out=offsets[1:])
-    return (
-        offsets,
-        np.ascontiguousarray(rows[order], dtype=np.uint32),
-        np.ascontiguousarray(dictionary_ids[order], dtype=np.uint16),
-    )
 
 
 @dataclass(frozen=True)

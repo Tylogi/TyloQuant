@@ -454,6 +454,11 @@ torch::Tensor nepq_sparse_residual_backward_input_cuda(
     torch::Tensor dictionary, torch::Tensor first, torch::Tensor second,
     torch::Tensor output_gradient, int64_t position_bits,
     int64_t block_vectors, torch::Tensor input_gradient);
+torch::Tensor nepq_sparse_residual_backward_transpose_cuda(
+    torch::Tensor dictionary, torch::Tensor transpose_offsets,
+    torch::Tensor transpose_rows, torch::Tensor transpose_dictionary,
+    torch::Tensor output_gradient, torch::Tensor rotation_signs,
+    bool fuse_rotation, torch::Tensor input_gradient);
 torch::Tensor nepq_dequant_cuda(
     torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
     torch::Tensor neuron_scale, torch::Tensor table_pool, torch::Tensor bank_ids,
@@ -833,6 +838,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nepq_sparse_residual_dequant_cuda", &nepq_sparse_residual_dequant_cuda, "NEPQ-A sparse residual dequantization (CUDA)");
     m.def("nepq_sparse_residual_grouped_cuda", &nepq_sparse_residual_grouped_cuda, "NEPQ-A sparse residual routed matmul (CUDA)");
     m.def("nepq_sparse_residual_backward_input_cuda", &nepq_sparse_residual_backward_input_cuda, "NEPQ-A sparse residual input backward (CUDA)");
+    m.def("nepq_sparse_residual_backward_transpose_cuda", &nepq_sparse_residual_backward_transpose_cuda, "NEPQ-A transposed sparse residual input backward (CUDA)");
     m.def("nepq_dequant_cuda", &nepq_dequant_cuda, "NEPQ shared-bank full dequant (CUDA)");
     m.def("nepq_gemv_ws_cuda", &nepq_gemv_ws_cuda, "NEPQ shared-bank q8 GEMV with caller workspace (CUDA)");
     m.def("nepq_mmq_ws_cuda", &nepq_mmq_ws_cuda, "NEPQ shared-bank gs24 int8 Tensor Core MMQ (CUDA)");

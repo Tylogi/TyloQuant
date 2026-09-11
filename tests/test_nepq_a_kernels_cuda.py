@@ -58,6 +58,7 @@ def test_nepq_a_packed_backward_and_autograd_match_dequant(spec, m):
         device="cuda",
         dtype=torch.float16,
     )
+    assert "_residual_transpose" not in gpu
     output_gradient = torch.randn(
         m, dense.shape[0], device="cuda", dtype=torch.float16
     )
@@ -83,12 +84,19 @@ def test_nepq_a_packed_backward_and_autograd_match_dequant(spec, m):
         * np.float32(1.0 / np.sqrt(tensor.rotation_block))
         * signs
     ).to(torch.float16)
+    actual = nepq_backward_input(gpu, output_gradient)
     torch.testing.assert_close(
-        nepq_backward_input(gpu, output_gradient),
+        actual,
         expected,
         rtol=0.008,
         atol=0.008,
     )
+    if m <= 8:
+        offsets, rows, dictionary = gpu["_residual_transpose"]
+        assert offsets.numel() == tensor.neuron_len // 8 + 1
+        assert rows.numel() == dictionary.numel()
+    else:
+        assert "_residual_transpose" not in gpu
     source = torch.randn(
         m,
         tensor.neuron_len,

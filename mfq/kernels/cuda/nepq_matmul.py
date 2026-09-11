@@ -14,6 +14,7 @@ from mfq.formats.nepq import (
     _pack_bits,
     nepq_base_spec,
     rotation_signs as build_rotation_signs,
+    transpose_sparse_residual_records,
     validate_nepq,
 )
 from mfq.formats.npq0_s import unpack_npq0_s_tables
@@ -174,6 +175,42 @@ def to_gpu_nepq(
 
 def _has_residual(g: dict) -> bool:
     return "residual_codebook" in g
+
+
+def _ensure_sparse_residual_transpose(
+    g: dict,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cached = g.get("_residual_transpose")
+    if cached is not None:
+        return cached
+    first = g["residual_first"].detach().cpu().numpy()
+    second = g["residual_second"].detach().cpu().numpy()
+    offsets, rows, dictionary = transpose_sparse_residual_records(
+        first,
+        second,
+        vectors=int(g["neuron_len"]) // 8,
+        block_vectors=int(g["residual_block_vectors"]),
+        position_bits=int(g["residual_position_bits"]),
+    )
+    cached = (
+        torch.as_tensor(
+            offsets.astype(np.int32, copy=False),
+            device=g["device"],
+            dtype=torch.int32,
+        ).contiguous(),
+        torch.as_tensor(
+            rows.astype(np.int32, copy=False),
+            device=g["device"],
+            dtype=torch.int32,
+        ).contiguous(),
+        torch.as_tensor(
+            dictionary.astype(np.int16, copy=False),
+            device=g["device"],
+            dtype=torch.int16,
+        ).contiguous(),
+    )
+    g["_residual_transpose"] = cached
+    return cached
 
 
 def _add_residual_matmul(
@@ -388,7 +425,9 @@ def nepq_backward_input(g: dict, output_gradient: torch.Tensor) -> torch.Tensor:
     """Compute the NEPQ input gradient with a row-count-aware dispatch."""
 
     gradient = output_gradient.reshape(-1, int(g["rows"])).contiguous().to(torch.float16)
-    if _has_residual(g) and gradient.shape[0] >= 16:
+    split_residual = _has_residual(g) and gradient.shape[0] <= 8
+    fuse_residual_rotation = split_residual and int(g["rotation_block"]) == 8
+    if _has_residual(g) and not split_residual:
         weight = nepq_dequantize(g).reshape(
             int(g["rows"]), int(g["neuron_len"])
         )
@@ -401,18 +440,20 @@ def nepq_backward_input(g: dict, output_gradient: torch.Tensor) -> torch.Tensor:
             int(g["sub_bits"]),
             int(g["format"]),
         )
-        if _has_residual(g):
-            result = ext().nepq_sparse_residual_backward_input_cuda(
+        if split_residual:
+            offsets, rows, dictionary = _ensure_sparse_residual_transpose(g)
+            result = ext().nepq_sparse_residual_backward_transpose_cuda(
                 g["residual_codebook"],
-                g["residual_first"],
-                g["residual_second"],
+                offsets,
+                rows,
+                dictionary,
                 gradient,
-                int(g["residual_position_bits"]),
-                int(g["residual_block_vectors"]),
+                g["rotation_signs"],
+                fuse_residual_rotation,
                 result,
             )
     block = int(g["rotation_block"])
-    if block:
+    if block and not fuse_residual_rotation:
         result = ext().nepq_hadamard_adjoint_cuda(
             result,
             g["rotation_signs"],
