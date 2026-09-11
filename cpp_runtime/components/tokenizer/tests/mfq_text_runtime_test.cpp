@@ -75,16 +75,16 @@ std::filesystem::path write_tokenizer_fixture() {
 
 }  // namespace
 
-int main() {
+int main() try {
     const auto path = write_tokenizer_fixture();
     std::ifstream input(path, std::ios::binary);
     std::vector<uint8_t> encoded(
         (std::istreambuf_iterator<char>(input)),
         std::istreambuf_iterator<char>());
     require(!encoded.empty(), "cannot read GGUF fixture");
+    input.close();
 
     mfq_text_context * context = mfq_text_load_file(path.string().c_str());
-    std::filesystem::remove(path);
     require(context != nullptr, "cannot load integrated tokenizer");
 
     const mfq_text_vocab * vocab = mfq_text_get_vocab(context);
@@ -122,7 +122,9 @@ int main() {
         "grammar filtering mismatch");
     mfq_text_grammar_accept_impl(*grammar, 107);
     mfq_text_grammar_free_impl(grammar);
+    templates.reset();
     mfq_text_free(context);
+    std::filesystem::remove(path);
 
     mfq_text_context * embedded = mfq_text_load_buffer(
         encoded.data(), encoded.size());
@@ -132,4 +134,7 @@ int main() {
         "embedded vocabulary size mismatch");
     mfq_text_free(embedded);
     return 0;
+} catch (const std::exception & error) {
+    std::fprintf(stderr, "mfq-tokenizer-test: %s\n", error.what());
+    return 1;
 }

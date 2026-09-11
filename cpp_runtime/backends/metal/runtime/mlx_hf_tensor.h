@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include <mlx/mlx.h>
@@ -19,11 +20,16 @@ namespace mfq::metal {
 // kernels without an intermediate MFQ file.
 class MlxHfTensorStore {
 public:
-    explicit MlxHfTensorStore(std::filesystem::path root);
-    explicit MlxHfTensorStore(std::shared_ptr<HfSafetensorStore> checkpoint);
+    explicit MlxHfTensorStore(
+        std::filesystem::path root,
+        std::string_view alias_architecture = {});
+    explicit MlxHfTensorStore(
+        std::shared_ptr<HfSafetensorStore> checkpoint,
+        std::string_view alias_architecture = {});
 
     const HfSafetensorStore& checkpoint() const noexcept;
     std::shared_ptr<HfSafetensorStore> shared_checkpoint() const noexcept;
+    std::string stored_name(std::string_view canonical) const;
 
     mlx::core::array load_dense(const std::string& name) const;
     MlxMxWeight load_mx(const std::string& name) const;
@@ -31,8 +37,7 @@ public:
     MlxEmbedding load_embedding(const std::string& name) const;
 
 private:
-    void initialize_aliases();
-    std::string resolve(std::string_view canonical) const;
+    void initialize_aliases(std::string_view alias_architecture);
 
     std::shared_ptr<HfSafetensorStore> checkpoint_;
     std::unordered_map<std::string, std::string> canonical_to_stored_;

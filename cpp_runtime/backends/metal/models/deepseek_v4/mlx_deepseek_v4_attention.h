@@ -150,6 +150,14 @@ public:
     MlxDeepseekV4PoolState snapshot() const;
     void restore_snapshot(MlxDeepseekV4PoolState snapshot);
 
+    // Speculative verification only appends pool rows. Keep the immutable
+    // pre-transaction state arrays and metadata, but do not copy the live
+    // pool prefix: rejected rows are hidden by restoring pool_len and are
+    // overwritten by the next contiguous update.
+    MlxDeepseekV4PoolState speculative_snapshot() const;
+    void restore_speculative_snapshot(
+        MlxDeepseekV4PoolState snapshot);
+
 private:
     MlxDeepseekV4PoolState(
         int ratio,
@@ -230,6 +238,11 @@ private:
         std::optional<MlxDeepseekV4PoolState> main,
         std::optional<MlxDeepseekV4PoolState> indexer);
 
+    void restore_speculative_snapshot(
+        MlxDeepseekV4LayerState snapshot,
+        int start_position,
+        int total_tokens);
+
     mlx::core::array local_;
     std::optional<MlxDeepseekV4PoolState> main_;
     std::optional<MlxDeepseekV4PoolState> indexer_;
@@ -277,7 +290,7 @@ struct MlxDeepseekV4ImageVisibility {
 // and one selected-position tensor for the following consumers. Persistent
 // arrays remain owned by the source layer state; this object only carries
 // non-owning references plus per-forward selection tensors.
-struct MlxDeepseekV41SharedAttentionState {
+struct MlxDeepseekV41HfSharedAttentionState {
     const MlxDeepseekV4PoolState* compressed_kv = nullptr;
     const MlxDeepseekV4PoolState* index_keys = nullptr;
     std::optional<mlx::core::array> topk;
@@ -351,7 +364,7 @@ public:
         int pos0,
         const MlxDeepseekV4ImageVisibility* visibility,
         std::vector<mlx::core::array>* debug_stages,
-        MlxDeepseekV41SharedAttentionState* shared = nullptr) const;
+        MlxDeepseekV41HfSharedAttentionState* shared = nullptr) const;
 
     void commit_speculative(
         MlxDeepseekV4LayerState& state) const noexcept;

@@ -202,6 +202,88 @@ __global__ void nepq_sparse_residual_grouped_kernel(
     }
 }
 
+__global__ void nepq_sparse_residual_backward_input_kernel(
+    const __half * dictionary,
+    const int16_t * first,
+    const int16_t * second,
+    const __half * output_gradient,
+    __half * input_gradient,
+    int input_rows,
+    int rows,
+    int width,
+    int blocks_per_row,
+    int position_bits,
+    int block_vectors) {
+    extern __shared__ float warp_gradients[];
+    const int input_row = static_cast<int>(blockIdx.y);
+    const int residual_block = static_cast<int>(blockIdx.x);
+    const int values_per_block = block_vectors * 8;
+    const int warp_count = static_cast<int>(blockDim.x) / kWarpSize;
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int row_group = lane / 8;
+    const int component = lane & 7;
+    for (int index = static_cast<int>(threadIdx.x);
+         index < warp_count * values_per_block;
+         index += static_cast<int>(blockDim.x)) {
+        warp_gradients[index] = 0.0f;
+    }
+    __syncthreads();
+
+    const int position_mask = (1 << position_bits) - 1;
+    for (int row_base = warp * 4;
+         row_base < rows;
+         row_base += warp_count * 4) {
+        const int row = row_base + row_group;
+        float gradient = 0.0f;
+        int first_record = -1;
+        int second_record = -1;
+        if (component == 0 && row < rows) {
+            gradient = __half2float(output_gradient[
+                static_cast<int64_t>(input_row) * rows + row]);
+            const int64_t record_index =
+                static_cast<int64_t>(row) * blocks_per_row + residual_block;
+            first_record = first[record_index];
+            second_record = second[record_index];
+        }
+        const int source_lane = row_group * 8;
+        gradient = __shfl_sync(0xffffffffu, gradient, source_lane);
+        first_record = __shfl_sync(0xffffffffu, first_record, source_lane);
+        second_record = __shfl_sync(0xffffffffu, second_record, source_lane);
+        const int records[2] = {first_record, second_record};
+#pragma unroll
+        for (int stream = 0; stream < 2; ++stream) {
+            const int record = records[stream];
+            if (record < 0) continue;
+            const int position = record & position_mask;
+            const int dictionary_id = record >> position_bits;
+            atomicAdd(
+                warp_gradients + warp * values_per_block +
+                    position * 8 + component,
+                gradient * __half2float(dictionary[
+                    static_cast<int64_t>(dictionary_id) * 8 + component]));
+        }
+    }
+    __syncthreads();
+
+    for (int index = static_cast<int>(threadIdx.x);
+         index < values_per_block;
+         index += static_cast<int>(blockDim.x)) {
+        const int column = residual_block * values_per_block + index;
+        if (column < width) {
+            float value = 0.0f;
+            for (int source_warp = 0; source_warp < warp_count; ++source_warp) {
+                value += warp_gradients[
+                    source_warp * values_per_block + index];
+            }
+            const int64_t logical =
+                static_cast<int64_t>(input_row) * width + column;
+            input_gradient[logical] = __float2half(
+                __half2float(input_gradient[logical]) + value);
+        }
+    }
+}
+
 void validate_residual(
     const mfq_tensor_backend::Tensor & dictionary,
     const mfq_tensor_backend::Tensor & first,
@@ -399,4 +481,59 @@ mfq_tensor_backend::Tensor nepq_sparse_residual_grouped_cuda(
     MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess,
                 "NEPQ-A residual grouped kernel launch failed");
     return output;
+}
+
+
+mfq_tensor_backend::Tensor nepq_sparse_residual_backward_input_cuda(
+    mfq_tensor_backend::Tensor dictionary,
+    mfq_tensor_backend::Tensor first,
+    mfq_tensor_backend::Tensor second,
+    mfq_tensor_backend::Tensor output_gradient,
+    int64_t position_bits,
+    int64_t block_vectors,
+    mfq_tensor_backend::Tensor input_gradient) {
+    MFQ_RUNTIME_CHECK(
+        output_gradient.is_cuda() &&
+        output_gradient.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        output_gradient.is_contiguous() && output_gradient.dim() == 2 &&
+        output_gradient.size(1) == first.size(0),
+        "NEPQ-A backward output gradient must be CUDA fp16 [M,rows]");
+    MFQ_RUNTIME_CHECK(
+        input_gradient.is_cuda() &&
+        input_gradient.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        input_gradient.is_contiguous() && input_gradient.dim() == 2 &&
+        input_gradient.size(0) == output_gradient.size(0),
+        "NEPQ-A backward input gradient must be CUDA fp16 [M,K]");
+    validate_residual(
+        dictionary, first, second, input_gradient.size(1),
+        position_bits, block_vectors);
+    MFQ_RUNTIME_CHECK(
+        dictionary.device() == output_gradient.device() &&
+        output_gradient.device() == input_gradient.device(),
+        "NEPQ-A backward tensors must share one CUDA device");
+    MfqCudaGuard guard(input_gradient.device());
+    if (input_gradient.numel() == 0) {
+        return input_gradient;
+    }
+    const int threads = output_gradient.size(0) <= 8 ? 1024 : 256;
+    const dim3 blocks(
+        static_cast<unsigned>(first.size(1)),
+        static_cast<unsigned>(output_gradient.size(0)));
+    const size_t shared_bytes =
+        static_cast<size_t>(threads / kWarpSize) * block_vectors * 8 * sizeof(float);
+    nepq_sparse_residual_backward_input_kernel<<<
+        blocks, threads, shared_bytes, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __half *>(dictionary.data_ptr<mfq_half>()),
+        first.data_ptr<int16_t>(), second.data_ptr<int16_t>(),
+        reinterpret_cast<const __half *>(
+            output_gradient.data_ptr<mfq_half>()),
+        reinterpret_cast<__half *>(input_gradient.data_ptr<mfq_half>()),
+        static_cast<int>(output_gradient.size(0)),
+        static_cast<int>(first.size(0)),
+        static_cast<int>(input_gradient.size(1)),
+        static_cast<int>(first.size(1)),
+        static_cast<int>(position_bits),
+        static_cast<int>(block_vectors));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return input_gradient;
 }

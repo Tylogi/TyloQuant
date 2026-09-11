@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,8 @@
 #include <iomanip>
 #include <iterator>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -91,9 +94,9 @@ std::uint64_t checked_product(
     std::uint64_t item_size,
     const std::string& name) {
     std::uint64_t result = item_size;
-    if (shape.empty()) {
-        throw std::runtime_error("Safetensors tensor has empty shape: " + name);
-    }
+    // Safetensors represents a scalar with an empty shape. Its dense payload
+    // still contains exactly one item, so the multiplicative identity above
+    // is already the correct byte count.
     for (const auto dimension : shape) {
         if (dimension <= 0 ||
             static_cast<std::uint64_t>(dimension) >
@@ -157,12 +160,25 @@ std::vector<std::uint8_t> mx_prefix(
         expected_storage = {rows, columns / 2};
         expected_scales = {rows, columns / 32};
     } else {
-        if (columns % 128 != 0) {
-            throw std::runtime_error("MXFP8 columns are not divisible by 128: " + name);
+        if (columns % 32 != 0) {
+            throw std::runtime_error("MXFP8 columns are not divisible by 32: " + name);
         }
         kind = 8;
         expected_storage = {rows, columns};
-        expected_scales = {(rows + 127) / 128, columns / 128};
+        const std::vector<std::int64_t> block128_scales{
+            (rows + 127) / 128, columns / 128};
+        const std::vector<std::int64_t> block32_scales{
+            (rows + 31) / 32, columns / 32};
+        const std::vector<std::int64_t> row_scales{
+            rows, columns / 32};
+        if (storage_shape != expected_storage ||
+            (scale_shape != block128_scales &&
+             scale_shape != block32_scales &&
+             scale_shape != row_scales)) {
+            throw std::runtime_error(
+                "invalid native MX storage geometry: " + name);
+        }
+        expected_scales = scale_shape;
     }
     if (storage_shape != expected_storage || scale_shape != expected_scales) {
         throw std::runtime_error("invalid native MX storage geometry: " + name);
@@ -347,6 +363,97 @@ void validate_entry_count(
 }
 
 } // namespace
+
+struct MfqContainer::RandomAccessFiles {
+    struct File {
+        explicit File(std::filesystem::path source)
+            : path(std::move(source)), size(checked_file_size(path)) {}
+
+        ~File() {
+            if (descriptor >= 0) {
+                ::close(descriptor);
+            }
+        }
+
+        int open() const {
+            std::scoped_lock lock(mutex);
+            if (descriptor >= 0) {
+                return descriptor;
+            }
+            descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (descriptor < 0) {
+                throw std::runtime_error(
+                    "cannot open MFQ record source: " + path.string() +
+                    ": " + std::strerror(errno));
+            }
+#if defined(__APPLE__) && defined(F_NOCACHE)
+            if (::fcntl(descriptor, F_NOCACHE, 1) != 0) {
+                const auto error = errno;
+                ::close(descriptor);
+                descriptor = -1;
+                throw std::runtime_error(
+                    "cannot enable direct MFQ record reads: " + path.string() +
+                    ": " + std::strerror(error));
+            }
+#endif
+            return descriptor;
+        }
+
+        std::filesystem::path path;
+        std::uint64_t size = 0;
+        mutable std::mutex mutex;
+        mutable int descriptor = -1;
+    };
+
+    void read(
+        const std::filesystem::path& path,
+        std::uint64_t offset,
+        std::span<std::byte> destination) {
+        std::shared_ptr<File> source;
+        {
+            std::scoped_lock lock(mutex);
+            const auto found = files.find(path);
+            if (found != files.end()) {
+                source = found->second;
+            } else {
+                source = std::make_shared<File>(path);
+                files.emplace(path, source);
+            }
+        }
+        if (offset > source->size ||
+            destination.size() > source->size - offset) {
+            throw std::runtime_error(
+                "MFQ record source was truncated: " + path.string());
+        }
+        std::size_t done = 0;
+        while (done < destination.size()) {
+            constexpr std::size_t maximum_read = std::size_t{32} << 20;
+            const auto requested = std::min(
+                destination.size() - done, maximum_read);
+            const auto count = ::pread(
+                source->open(),
+                destination.data() + done,
+                requested,
+                static_cast<off_t>(offset + done));
+            if (count < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(
+                    "failed reading MFQ record source: " + path.string() +
+                    ": " + std::strerror(errno));
+            }
+            if (count == 0) {
+                throw std::runtime_error(
+                    "MFQ record source was truncated: " + path.string());
+            }
+            done += static_cast<std::size_t>(count);
+        }
+    }
+
+    std::mutex mutex;
+    std::map<std::filesystem::path, std::shared_ptr<File>> files;
+};
 
 MfqHeader MfqContainer::load_records(
     const std::filesystem::path& path,
@@ -656,10 +763,6 @@ void MfqContainer::load_hf_directory(
                 throw std::runtime_error(
                     "native MX scale is not F8_E8M0: " + scale_name);
             }
-            if (values.shard != scales.shard) {
-                throw std::runtime_error(
-                    "native MX weight and scale are in different shards: " + name);
-            }
             std::vector<std::int64_t> logical_shape = values.shape;
             if (values.dtype == "I8") {
                 if (logical_shape.size() != 2 ||
@@ -713,7 +816,8 @@ void MfqContainer::load_hf_directory(
     header_.record_count = static_cast<std::uint32_t>(records_.size());
 }
 
-MfqContainer::MfqContainer(std::filesystem::path path) {
+MfqContainer::MfqContainer(std::filesystem::path path)
+    : random_access_files_(std::make_shared<RandomAccessFiles>()) {
     std::error_code directory_error;
     if (std::filesystem::is_directory(path, directory_error) &&
         !directory_error) {
@@ -907,7 +1011,25 @@ std::vector<std::uint8_t> MfqContainer::read_range(
     const std::string& name,
     std::uint64_t relative_offset,
     std::uint64_t nbytes) const {
+    if (nbytes > static_cast<std::uint64_t>(
+            std::numeric_limits<std::size_t>::max())) {
+        throw std::runtime_error(
+            "MFQ record byte range is too large: " + name);
+    }
+    std::vector<std::uint8_t> result(static_cast<std::size_t>(nbytes));
+    read_range_into(
+        name,
+        relative_offset,
+        std::as_writable_bytes(std::span<std::uint8_t>(result)));
+    return result;
+}
+
+void MfqContainer::read_range_into(
+    const std::string& name,
+    std::uint64_t relative_offset,
+    std::span<std::byte> destination) const {
     const auto& value = record(name);
+    const auto nbytes = static_cast<std::uint64_t>(destination.size());
     if (
         relative_offset > value.nbytes
         || nbytes > value.nbytes - relative_offset
@@ -916,9 +1038,6 @@ std::vector<std::uint8_t> MfqContainer::read_range(
             "MFQ record byte range is out of bounds: " + name);
     }
     if (nbytes >
-        static_cast<std::uint64_t>(
-            std::numeric_limits<std::size_t>::max())
-        || nbytes >
             static_cast<std::uint64_t>(
                 std::numeric_limits<std::streamsize>::max())
         || value.offset >
@@ -929,10 +1048,11 @@ std::vector<std::uint8_t> MfqContainer::read_range(
             "MFQ record byte range is too large: " + name);
     }
     if (nbytes == 0) {
-        return {};
+        return;
     }
     if (hf_store_) {
-        return read_hf_range(value.name, relative_offset, nbytes);
+        read_hf_range_into(value.name, relative_offset, destination);
+        return;
     }
     const auto absolute_offset =
         value.offset + relative_offset;
@@ -944,41 +1064,8 @@ std::vector<std::uint8_t> MfqContainer::read_range(
         throw std::runtime_error(
             "MFQ record byte offset is too large: " + name);
     }
-    std::ifstream stream(value.source_path, std::ios::binary);
-    if (!stream) {
-        throw std::runtime_error(
-            "cannot open MFQ record source: " + name);
-    }
-    stream.seekg(0, std::ios::end);
-    const auto source_end = stream.tellg();
-    if (
-        source_end < 0
-        || absolute_offset
-            > static_cast<std::uint64_t>(source_end)
-        || nbytes
-            > static_cast<std::uint64_t>(source_end)
-                - absolute_offset
-    ) {
-        throw std::runtime_error(
-            "MFQ record source was truncated: " + name);
-    }
-    stream.seekg(
-        static_cast<std::streamoff>(absolute_offset),
-        std::ios::beg);
-    if (!stream) {
-        throw std::runtime_error(
-            "failed seeking MFQ record: " + name);
-    }
-    std::vector<std::uint8_t> result(
-        static_cast<std::size_t>(nbytes));
-    stream.read(
-        reinterpret_cast<char*>(result.data()),
-        static_cast<std::streamsize>(result.size()));
-    if (!stream) {
-        throw std::runtime_error(
-            "failed reading MFQ record byte range: " + name);
-    }
-    return result;
+    random_access_files_->read(
+        value.source_path, absolute_offset, destination);
 }
 
 std::vector<std::uint8_t> MfqContainer::read_hf_range(
@@ -986,12 +1073,24 @@ std::vector<std::uint8_t> MfqContainer::read_hf_range(
     std::uint64_t relative_offset,
     std::uint64_t nbytes) const {
     std::vector<std::uint8_t> result(static_cast<std::size_t>(nbytes));
+    read_hf_range_into(
+        name,
+        relative_offset,
+        std::as_writable_bytes(std::span<std::uint8_t>(result)));
+    return result;
+}
+
+void MfqContainer::read_hf_range_into(
+    const std::string& name,
+    std::uint64_t relative_offset,
+    std::span<std::byte> destination) const {
+    const auto nbytes = static_cast<std::uint64_t>(destination.size());
     if (const auto asset = hf_assets_.find(name); asset != hf_assets_.end()) {
         std::copy_n(
             asset->second.begin() + static_cast<std::ptrdiff_t>(relative_offset),
             static_cast<std::size_t>(nbytes),
-            result.begin());
-        return result;
+            reinterpret_cast<std::uint8_t*>(destination.data()));
+        return;
     }
     const auto found = hf_records_.find(name);
     if (found == hf_records_.end()) {
@@ -1008,32 +1107,78 @@ std::vector<std::uint8_t> MfqContainer::read_hf_range(
             std::copy_n(
                 source.begin() + static_cast<std::ptrdiff_t>(begin - logical_offset),
                 static_cast<std::size_t>(end - begin),
-                result.begin() + static_cast<std::ptrdiff_t>(begin - relative_offset));
+                reinterpret_cast<std::uint8_t*>(destination.data()) +
+                    static_cast<std::ptrdiff_t>(begin - relative_offset));
         }
     };
     const auto copy_tensor = [&](std::uint64_t logical_offset,
-                                 const std::string& tensor_name) {
+                                 const std::string& tensor_name,
+                                 std::uint64_t tensor_offset = 0,
+                                 std::uint64_t tensor_nbytes = 0) {
         const auto& source = hf_store_->tensor(tensor_name);
-        const auto segment_end = logical_offset + source.nbytes;
+        const auto source_bytes = tensor_nbytes == 0
+            ? source.nbytes - tensor_offset
+            : tensor_nbytes;
+        if (tensor_offset > source.nbytes ||
+            source_bytes > source.nbytes - tensor_offset) {
+            throw std::runtime_error(
+                "virtual HF tensor segment is out of bounds: " + name);
+        }
+        const auto segment_end = checked_add(
+            logical_offset, source_bytes, "virtual HF segment");
         const auto begin = std::max(relative_offset, logical_offset);
         const auto end = std::min(request_end, segment_end);
         if (begin >= end) {
             return;
         }
-        auto destination = std::span<std::uint8_t>(result).subspan(
+        auto target = destination.subspan(
             static_cast<std::size_t>(begin - relative_offset),
             static_cast<std::size_t>(end - begin));
         hf_store_->read_range(
             source.shard,
-            source.offset + begin - logical_offset,
-            std::as_writable_bytes(destination));
+            source.offset + tensor_offset + begin - logical_offset,
+            target);
     };
+    if (!logical.segments.empty()) {
+        const auto segment_size = [](const HfVirtualRecord::Segment& segment) {
+            return segment.inline_bytes.empty()
+                ? segment.nbytes
+                : static_cast<std::uint64_t>(segment.inline_bytes.size());
+        };
+        const auto first = std::lower_bound(
+            logical.segments.begin(),
+            logical.segments.end(),
+            relative_offset,
+            [&](const HfVirtualRecord::Segment& segment,
+                std::uint64_t offset) {
+                return checked_add(
+                    segment.logical_offset,
+                    segment_size(segment),
+                    "virtual HF segment") <= offset;
+            });
+        for (auto item = first; item != logical.segments.end(); ++item) {
+            const auto& segment = *item;
+            if (segment.logical_offset >= request_end) break;
+            if (!segment.inline_bytes.empty()) {
+                copy_memory(segment.logical_offset, segment.inline_bytes);
+            } else if (!segment.tensor_name.empty()) {
+                copy_tensor(
+                    segment.logical_offset,
+                    segment.tensor_name,
+                    segment.tensor_offset,
+                    segment.nbytes);
+            } else if (segment.nbytes != 0) {
+                throw std::runtime_error(
+                    "virtual HF segment has no backing storage: " + name);
+            }
+        }
+        return;
+    }
     copy_memory(0, logical.prefix);
     copy_tensor(logical.values_offset, logical.values_name);
     if (!logical.scales_name.empty()) {
         copy_tensor(logical.scales_offset, logical.scales_name);
     }
-    return result;
 }
 
 std::string MfqContainer::read_text(const std::string& name) const {
@@ -1080,6 +1225,187 @@ void MfqContainer::install_legacy_aliases(
         std::make_move_iterator(canonical_to_stored.begin()),
         std::make_move_iterator(canonical_to_stored.end()));
     legacy_tensor_layout_ = layout;
+}
+
+void MfqContainer::install_hf_nintm_views(
+    const std::unordered_map<std::string, std::string>&
+        canonical_to_stored) {
+    if (!hf_store_) {
+        return;
+    }
+
+    struct Projection {
+        std::map<std::size_t, std::string> experts;
+    };
+    std::map<std::string, Projection> projections;
+    const auto collect = [&](std::string_view canonical,
+                             const std::string& stored) {
+        constexpr std::string_view marker = ".mlp.experts.";
+        const auto marker_offset = canonical.find(marker);
+        if (marker_offset == std::string_view::npos) {
+            return;
+        }
+        const auto expert_begin = marker_offset + marker.size();
+        const auto expert_end = canonical.find('.', expert_begin);
+        if (expert_end == std::string_view::npos ||
+            expert_end == expert_begin) {
+            return;
+        }
+        std::size_t expert = 0;
+        const auto id = canonical.substr(
+            expert_begin, expert_end - expert_begin);
+        const auto parsed = std::from_chars(
+            id.data(), id.data() + id.size(), expert);
+        if (parsed.ec != std::errc{} || parsed.ptr != id.data() + id.size()) {
+            return;
+        }
+        const auto projection_end = canonical.find('.', expert_end + 1);
+        if (projection_end == std::string_view::npos ||
+            canonical.substr(projection_end) != ".weight") {
+            return;
+        }
+        const auto projection = canonical.substr(
+            expert_end + 1,
+            projection_end - expert_end - 1);
+        if (projection != "gate" && projection != "up" &&
+            projection != "down") {
+            return;
+        }
+        const auto aggregate = std::string(canonical.substr(0, marker_offset)) +
+            std::string(marker) + std::string(projection) + ".weight";
+        projections[aggregate].experts.emplace(expert, stored);
+    };
+    for (const auto& [canonical, stored] : canonical_to_stored) {
+        collect(canonical, stored);
+    }
+    for (const auto& [name, _record] : records_) {
+        collect(name, name);
+    }
+
+    for (const auto& [name, projection] : projections) {
+        if (records_.find(name) != records_.end() ||
+            projection.experts.empty()) {
+            continue;
+        }
+        const auto expert_count = projection.experts.rbegin()->first + 1;
+        if (projection.experts.size() != expert_count) {
+            throw std::runtime_error(
+                "native HF expert projection has missing expert IDs: " + name);
+        }
+
+        std::string dtype;
+        std::uint64_t output = 0;
+        std::uint64_t input = 0;
+        std::uint64_t logical_offset = 0;
+        HfVirtualRecord aggregate;
+        const auto append_inline = [&](std::vector<std::uint8_t> bytes) {
+            if (bytes.empty()) return;
+            const auto count = static_cast<std::uint64_t>(bytes.size());
+            aggregate.segments.push_back({
+                .logical_offset = logical_offset,
+                .inline_bytes = std::move(bytes),
+                .nbytes = count,
+            });
+            logical_offset = checked_add(
+                logical_offset, count, "virtual NINTM metadata");
+        };
+        const auto append_tensor = [&](const std::string& tensor_name) {
+            const auto& tensor = hf_store_->tensor(tensor_name);
+            aggregate.segments.push_back({
+                .logical_offset = logical_offset,
+                .tensor_name = tensor_name,
+                .nbytes = tensor.nbytes,
+            });
+            logical_offset = checked_add(
+                logical_offset, tensor.nbytes, "virtual NINTM tensor");
+        };
+
+        std::vector<std::uint8_t> header;
+        header.insert(header.end(), {'N', 'I', 'M', '2'});
+        append_little<std::uint32_t>(
+            header, static_cast<std::uint32_t>(expert_count));
+        // Output/input dimensions are filled after validating the first
+        // native expert and patched before the segment is published.
+        append_little<std::uint32_t>(header, 0);
+        append_little<std::uint32_t>(header, 0);
+        append_little<std::uint32_t>(
+            header, static_cast<std::uint32_t>(expert_count));
+
+        for (const auto& [expert, stored] : projection.experts) {
+            const auto record = records_.find(stored);
+            const auto virtual_record = hf_records_.find(stored);
+            if (record == records_.end() ||
+                virtual_record == hf_records_.end() ||
+                (record->second.dtype != "MXFP4" &&
+                 record->second.dtype != "MXFP8")) {
+                throw std::runtime_error(
+                    "native HF expert is not an MX tensor: " + stored);
+            }
+            const auto& source = virtual_record->second;
+            if (!source.segments.empty() || source.prefix.size() != kMxHeaderBytes ||
+                std::memcmp(source.prefix.data(), "MXT1", 4) != 0 ||
+                source.values_name.empty() || source.scales_name.empty()) {
+                throw std::runtime_error(
+                    "invalid native HF MX expert view: " + stored);
+            }
+            std::uint64_t source_output = 0;
+            std::uint64_t source_input = 0;
+            std::memcpy(&source_output, source.prefix.data() + 8, sizeof(source_output));
+            std::memcpy(&source_input, source.prefix.data() + 16, sizeof(source_input));
+            if (source_output == 0 || source_input == 0 ||
+                source_output > std::numeric_limits<std::uint32_t>::max() ||
+                source_input > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error(
+                    "native HF expert geometry exceeds NINTM: " + stored);
+            }
+            if (dtype.empty()) {
+                dtype = record->second.dtype;
+                output = source_output;
+                input = source_input;
+                const auto output32 = static_cast<std::uint32_t>(output);
+                const auto input32 = static_cast<std::uint32_t>(input);
+                std::memcpy(
+                    header.data() + 8, &output32, sizeof(output32));
+                std::memcpy(
+                    header.data() + 12, &input32, sizeof(input32));
+                append_inline(std::move(header));
+            } else if (dtype != record->second.dtype || output != source_output ||
+                       input != source_input) {
+                throw std::runtime_error(
+                    "native HF expert projection has mixed geometry: " + name);
+            }
+
+            std::vector<std::uint8_t> pool;
+            append_little<std::uint32_t>(pool, 1);
+            append_little<std::uint32_t>(
+                pool, static_cast<std::uint32_t>(dtype.size()));
+            append_little<std::uint64_t>(pool, record->second.nbytes);
+            append_little<std::uint64_t>(pool, 0);
+            append_little<std::int32_t>(
+                pool, static_cast<std::int32_t>(expert));
+            pool.insert(pool.end(), dtype.begin(), dtype.end());
+            pool.insert(pool.end(), source.prefix.begin(), source.prefix.end());
+            append_inline(std::move(pool));
+            append_tensor(source.values_name);
+            append_tensor(source.scales_name);
+        }
+
+        MfqRecord record;
+        record.name = name;
+        record.dtype = "NINTM";
+        record.source_path = hf_store_->root();
+        record.nbytes = logical_offset;
+        if (!records_.emplace(name, std::move(record)).second ||
+            !hf_records_.emplace(name, std::move(aggregate)).second) {
+            throw std::runtime_error(
+                "duplicate virtual native NINTM projection: " + name);
+        }
+    }
+    if (records_.size() > kMaxRecordEntries) {
+        throw std::runtime_error(
+            "HF virtual NINTM projections exceed the record limit");
+    }
+    header_.record_count = static_cast<std::uint32_t>(records_.size());
 }
 
 } // namespace mfq::metal

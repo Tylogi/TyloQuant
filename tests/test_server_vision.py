@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import stat
 import wave
 from pathlib import Path
@@ -133,7 +134,7 @@ def test_deepseek_v4_request_defers_position_dependent_image_block() -> None:
     )
 
 
-def test_deepseek_v41_processor_uses_compact_row_major_layout() -> None:
+def test_deepseek_v41_processor_uses_released_row_major_contract() -> None:
     class TinyProcessor(DeepseekV41VisionProcessor):
         minimum_pixels = 0
 
@@ -143,6 +144,7 @@ def test_deepseek_v41_processor_uses_compact_row_major_layout() -> None:
             {
                 "role": "user",
                 "content": [
+                    {"type": "text", "text": "Describe this image."},
                     {"type": "image_url", "image_url": {"url": _data_url(image)}},
                 ],
             }
@@ -150,9 +152,13 @@ def test_deepseek_v41_processor_uses_compact_row_major_layout() -> None:
     )
 
     assert result is not None
+    assert result.tensors["version"] == 2
     assert result.tensors["processor"] == "deepseek_v41"
-    grid = _decode_tensor(result.tensors["vision_grid"])
-    np.testing.assert_array_equal(grid, [[3, 5, 1, 2]])
+    assert _decode_tensor(result.tensors["pixel_values"]).shape == (1, 15, 588)
+    np.testing.assert_array_equal(
+        _decode_tensor(result.tensors["vision_grid"]),
+        [[3, 5, 1, 2]],
+    )
     # START + two image cells + NEWLINE + END.
     assert TinyProcessor._grid_tokens(42, 70) == (1, 2, 5)
 
@@ -462,6 +468,10 @@ def test_multimodal_processor_registry_is_architecture_specific() -> None:
         DeepseekV4VisionProcessor,
     )
     assert isinstance(
+        multimodal_processor_for_architecture("deepseek-v41-vision"),
+        DeepseekV41VisionProcessor,
+    )
+    assert isinstance(
         multimodal_processor_for_architecture("qwen4_exp"),
         Qwen4ExpVisionProcessor,
     )
@@ -656,7 +666,8 @@ def test_binary_tensor_transport_matches_base64_and_uses_private_file() -> None:
         file_spec = binary.tensors["binary_file"]
         assert file_spec["path"] == str(path)
         assert path.stat().st_size == file_spec["size"]
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        if os.name != "nt":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
         with path.open("rb") as stream:
             header = stream.read(64)
         assert header[:8] == b"MFQMM01\0"

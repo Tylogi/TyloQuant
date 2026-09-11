@@ -68,6 +68,87 @@ def _reference(weight, x: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
     return result.to(torch.float16)
 
 
+def test_moe_route_plan_builds_fine_coarse_and_wide_maps():
+    experts = 17
+    ids = _ids(1024, experts, 8)
+    route = MoeRoutePlan.build(ids, experts)
+    counts = torch.bincount(ids.reshape(-1).long(), minlength=experts).to(torch.int32)
+
+    assert route.mma_tile_m == 64
+    assert route.wide_tile_m == 128
+    torch.testing.assert_close(route.counts, counts, rtol=0, atol=0)
+    for tile_m, bounds, tile_experts in (
+        (8, route.tile_bounds, route.tile_experts),
+        (64, route.mma_tile_bounds, route.mma_tile_experts),
+        (128, route.wide_tile_bounds, route.wide_tile_experts),
+    ):
+        tiles = torch.div(counts + tile_m - 1, tile_m, rounding_mode="floor")
+        expected_bounds = torch.cat(
+            (
+                torch.zeros(1, device="cuda", dtype=torch.int32),
+                tiles.cumsum(0).to(torch.int32),
+            )
+        )
+        expected_experts = torch.repeat_interleave(
+            torch.arange(experts, device="cuda", dtype=torch.int32), tiles.long()
+        )
+        torch.testing.assert_close(bounds, expected_bounds, rtol=0, atol=0)
+        torch.testing.assert_close(
+            tile_experts[: expected_experts.numel()], expected_experts, rtol=0, atol=0
+        )
+
+    legacy_maps = ext().moe_build_expert_maps_cuda(ids, experts, 8, 64)
+    assert len(legacy_maps) == 7
+    (
+        legacy_ids_dst,
+        legacy_expert_bounds,
+        legacy_tile_bounds,
+        legacy_tile_experts,
+        legacy_counts,
+        legacy_mma_bounds,
+        legacy_mma_experts,
+    ) = legacy_maps
+    torch.testing.assert_close(legacy_counts, counts, rtol=0, atol=0)
+    expected_expert_bounds = torch.cat(
+        (
+            torch.zeros(1, device="cuda", dtype=torch.int32),
+            counts.cumsum(0).to(torch.int32),
+        )
+    )
+    torch.testing.assert_close(
+        legacy_expert_bounds, expected_expert_bounds, rtol=0, atol=0
+    )
+    grouped_experts = ids.reshape(-1).index_select(0, legacy_ids_dst.long())
+    expected_grouped_experts = torch.repeat_interleave(
+        torch.arange(experts, device="cuda", dtype=torch.int32), counts.long()
+    )
+    torch.testing.assert_close(grouped_experts, expected_grouped_experts, rtol=0, atol=0)
+    torch.testing.assert_close(
+        legacy_ids_dst.sort().values,
+        torch.arange(ids.numel(), device="cuda", dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    for tile_m, bounds, tile_experts in (
+        (8, legacy_tile_bounds, legacy_tile_experts),
+        (64, legacy_mma_bounds, legacy_mma_experts),
+    ):
+        tiles = torch.div(counts + tile_m - 1, tile_m, rounding_mode="floor")
+        expected_bounds = torch.cat(
+            (
+                torch.zeros(1, device="cuda", dtype=torch.int32),
+                tiles.cumsum(0).to(torch.int32),
+            )
+        )
+        expected_experts = torch.repeat_interleave(
+            torch.arange(experts, device="cuda", dtype=torch.int32), tiles.long()
+        )
+        torch.testing.assert_close(bounds, expected_bounds, rtol=0, atol=0)
+        torch.testing.assert_close(
+            tile_experts[: expected_experts.numel()], expected_experts, rtol=0, atol=0
+        )
+
+
 def _legacy_grouped(weight, x: torch.Tensor, route: MoeRoutePlan) -> torch.Tensor:
     out = torch.empty(
         (route.tokens, route.routes, weight.out_per_expert),

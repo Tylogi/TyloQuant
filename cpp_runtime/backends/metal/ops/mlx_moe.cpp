@@ -6904,6 +6904,7 @@ struct MlxNintMoeWeight::Impl {
     array mx_scales;
     std::vector<RotationSpec> rotations;
     std::vector<std::int32_t> descriptor_values;
+    std::vector<std::shared_ptr<const Impl>> projection_views;
     std::optional<array> expert_order;
     std::vector<ReferenceMoeCohort> reference_cohorts;
     int experts = 0;
@@ -8105,6 +8106,13 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
         first.out_per_expert,
         first.neuron_len,
         projection_count);
+    impl->projection_views.reserve(weights.size());
+    for (const auto& weight : weights) {
+        // Keep each projection on its original packed pool.  Evaluating the
+        // combined stream would otherwise copy every expert's Gate and Up
+        // payload before a one-token decode can touch its selected experts.
+        impl->projection_views.push_back(weight.impl_);
+    }
     return MlxNintMoeWeight(std::move(impl));
 }
 
@@ -8173,17 +8181,35 @@ array MlxNintMoeWeight::routed_swiglu(
     const array& input,
     const array& expert_ids,
     float limit) const {
+    const bool split_gate_up = impl_->projections == 2;
     if (
-        impl_->projections != 1
+        (!split_gate_up && impl_->projections != 1)
         || impl_->out_per_expert <= 0
-        || (impl_->out_per_expert & 1) != 0
+        || (!split_gate_up && (impl_->out_per_expert & 1) != 0)
     ) {
         throw std::invalid_argument(
-            "fused NINTM SwiGLU requires one even-width gate/up projection");
+            "NINTM SwiGLU requires one fused or two split gate/up projections");
     }
     if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
             "NINTM SwiGLU limit must be finite and non-negative");
+    }
+    if (split_gate_up) {
+        std::vector<array> projections;
+        projections.reserve(impl_->projection_views.size());
+        for (const auto& projection : impl_->projection_views) {
+            projections.push_back(
+                MlxNintMoeWeight(projection).routed_matmul_impl(
+                    input,
+                    expert_ids,
+                    false,
+                    0.0f));
+        }
+        auto gate_up = mlx::core::concatenate(
+            std::move(projections), -1);
+        return limit > 0.0f
+            ? moe_limited_swiglu_split(gate_up, limit)
+            : moe_swiglu_split(gate_up);
     }
     return routed_matmul_impl(
         input,
@@ -8197,17 +8223,36 @@ array MlxNintMoeWeight::routed_swiglu_mapped(
     const array& expert_ids,
     const array& expert_map,
     float limit) const {
+    const bool split_gate_up = impl_->projections == 2;
     if (
-        impl_->projections != 1
+        (!split_gate_up && impl_->projections != 1)
         || impl_->out_per_expert <= 0
-        || (impl_->out_per_expert & 1) != 0
+        || (!split_gate_up && (impl_->out_per_expert & 1) != 0)
     ) {
         throw std::invalid_argument(
-            "fused NINTM SwiGLU requires one even-width gate/up projection");
+            "NINTM SwiGLU requires one fused or two split gate/up projections");
     }
     if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
             "NINTM SwiGLU limit must be finite and non-negative");
+    }
+    if (split_gate_up) {
+        std::vector<array> projections;
+        projections.reserve(impl_->projection_views.size());
+        for (const auto& projection : impl_->projection_views) {
+            projections.push_back(
+                MlxNintMoeWeight(projection).routed_matmul_impl(
+                    input,
+                    expert_ids,
+                    false,
+                    0.0f,
+                    &expert_map));
+        }
+        auto gate_up = mlx::core::concatenate(
+            std::move(projections), -1);
+        return limit > 0.0f
+            ? moe_limited_swiglu_split(gate_up, limit)
+            : moe_swiglu_split(gate_up);
     }
     return routed_matmul_impl(
         input,
@@ -8221,17 +8266,37 @@ array MlxNintMoeWeight::routed_swiglu_packed(
     const array& input,
     const array& packed_expert_ids,
     float limit) const {
+    const bool split_gate_up = impl_->projections == 2;
     if (
-        impl_->projections != 1
+        (!split_gate_up && impl_->projections != 1)
         || impl_->out_per_expert <= 0
-        || (impl_->out_per_expert & 1) != 0
+        || (!split_gate_up && (impl_->out_per_expert & 1) != 0)
     ) {
         throw std::invalid_argument(
-            "fused NINTM SwiGLU requires one even-width gate/up projection");
+            "NINTM SwiGLU requires one fused or two split gate/up projections");
     }
     if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
             "NINTM SwiGLU limit must be finite and non-negative");
+    }
+    if (split_gate_up) {
+        std::vector<array> projections;
+        projections.reserve(impl_->projection_views.size());
+        for (const auto& projection : impl_->projection_views) {
+            projections.push_back(
+                MlxNintMoeWeight(projection).routed_matmul_impl(
+                    input,
+                    packed_expert_ids,
+                    false,
+                    0.0f,
+                    nullptr,
+                    true));
+        }
+        auto gate_up = mlx::core::concatenate(
+            std::move(projections), -1);
+        return limit > 0.0f
+            ? moe_limited_swiglu_split(gate_up, limit)
+            : moe_swiglu_split(gate_up);
     }
     return routed_matmul_impl(
         input,
@@ -8330,8 +8395,15 @@ bool MlxNintMoeWeight::supports_grouped_mmq() const noexcept {
     // than the Metal 1024-thread limit even though a model routes to only a
     // small subset. They must use the ordinary mapped routed kernel until the
     // builder itself is made multi-threadgroup.
-    return impl_->projections == 1 && impl_->grouped_mmq &&
-        impl_->experts <= 1024;
+    if (impl_->experts > 1024) return false;
+    if (impl_->projections == 1) return impl_->grouped_mmq;
+    return !impl_->projection_views.empty()
+        && std::all_of(
+            impl_->projection_views.begin(),
+            impl_->projection_views.end(),
+            [](const auto& projection) {
+                return projection->grouped_mmq;
+            });
 }
 
 bool MlxNintMoeWeight::prefers_mxfp4_smallm_nax(
@@ -8349,6 +8421,16 @@ bool MlxNintMoeWeight::prefers_mxfp4_smallm_nax(
 int MlxNintMoeWeight::recommended_grouped_mmq_block_rows(
     int route_count,
     bool fused_swiglu) const noexcept {
+    if (!impl_->projection_views.empty()) {
+        int selected = 0;
+        for (const auto& projection : impl_->projection_views) {
+            const int candidate = MlxNintMoeWeight(projection)
+                .recommended_grouped_mmq_block_rows(route_count, false);
+            if (selected != 0 && selected != candidate) return 32;
+            selected = candidate;
+        }
+        return selected == 0 ? 32 : selected;
+    }
     const bool use_nax = nint_grouped_nax_enabled()
         && (impl_->grouped_nint4_group24
             || (!impl_->has_nepq_residual
@@ -8422,6 +8504,13 @@ MlxGroupedMmqPlan MlxNintMoeWeight::build_grouped_mmq_plan(
         throw std::invalid_argument(
             "weight does not support grouped MMQ");
     }
+    if (!impl_->projection_views.empty()) {
+        return MlxNintMoeWeight(impl_->projection_views.front())
+            .build_grouped_mmq_plan(
+                expert_ids,
+                route_order,
+                block_rows);
+    }
     return make_grouped_mmq_plan(
         expert_ids,
         route_order,
@@ -8439,6 +8528,35 @@ array MlxNintMoeWeight::routed_matmul_sorted(
     float swiglu_limit,
     const MlxGroupedMmqPlan* plan,
     bool force_mxfp4_nax) const {
+    if (!impl_->projection_views.empty()) {
+        if (fused_swiglu && impl_->projection_views.size() != 2) {
+            throw std::invalid_argument(
+                "split grouped SwiGLU requires exactly two projections");
+        }
+        if (!std::isfinite(swiglu_limit) || swiglu_limit < 0.0f) {
+            throw std::invalid_argument(
+                "grouped SwiGLU limit must be finite and non-negative");
+        }
+        std::vector<array> outputs;
+        outputs.reserve(impl_->projection_views.size());
+        for (const auto& projection : impl_->projection_views) {
+            outputs.push_back(
+                MlxNintMoeWeight(projection).routed_matmul_sorted(
+                    input,
+                    expert_ids,
+                    route_order_value,
+                    input_is_sorted,
+                    false,
+                    0.0f,
+                    plan,
+                    force_mxfp4_nax));
+        }
+        auto result = mlx::core::concatenate(std::move(outputs), 1);
+        if (!fused_swiglu) return result;
+        return swiglu_limit > 0.0f
+            ? moe_limited_swiglu_split(result, swiglu_limit)
+            : moe_swiglu_split(result);
+    }
     const bool direct_mxfp4_nax =
         force_mxfp4_nax &&
         impl_->mxfp4_slot_ids.has_value() &&
@@ -9014,6 +9132,7 @@ array MlxNintMoeWeight::routed_matmul_impl(
         sorted_routes
         && tokens >= 32
         && source.dtype() == mlx::core::float16
+        && impl_->projection_views.empty()
         && supports_grouped_mmq()
     ) {
         const bool use_grouped_nax = nint_grouped_nax_enabled()

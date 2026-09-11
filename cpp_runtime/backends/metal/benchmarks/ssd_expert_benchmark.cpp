@@ -1,4 +1,5 @@
 #include "hf_safetensors_store.h"
+#include "mlx_hf_tensor.h"
 
 #include <algorithm>
 #include <atomic>
@@ -120,10 +121,22 @@ int main(int argc, char** argv) {
     try {
         const auto options = parse_options(argc, argv);
         const auto index_begin = std::chrono::steady_clock::now();
-        mfq::metal::DeepseekV4NativeExpertStore store(
-            options.model,
-            43,
-            256);
+        mfq::metal::MlxHfTensorStore model(options.model);
+        std::vector<std::string> layer_prefixes;
+        layer_prefixes.reserve(43);
+        for (std::size_t layer = 0; layer < 43; ++layer) {
+            layer_prefixes.push_back(
+                "model.block." + std::to_string(layer));
+        }
+        mfq::metal::MlxNativeMxfp4ExpertStore store(
+            model.shared_checkpoint(),
+            std::move(layer_prefixes),
+            256,
+            4096,
+            2048,
+            [&model](std::string_view canonical) {
+                return model.stored_name(canonical);
+            });
         const auto index_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - index_begin).count();
         if (options.layer >= store.num_layers()) {

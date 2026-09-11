@@ -2,7 +2,7 @@
 
 #include "mlx_eval_timing.h"
 #include "mlx_moe_ops.h"
-#include "mlx_ssd_expert_arena.h"
+#include "mlx_deepseek_v4_hf_ssd_expert_arena.h"
 
 #include <mlx/memory.h>
 
@@ -32,17 +32,20 @@ MlxDeepseekV4SsdExpertWeights load_resident_hf_experts(
     const DeepseekV4Config& config,
     const std::string& prefix) {
     const auto count = static_cast<std::size_t>(config.n_experts);
-    DeepseekV4NativeExpertStore store(
-        model.checkpoint().root(),
+    MlxNativeMxfp4ExpertStore store(
+        model.shared_checkpoint(),
         std::vector<std::string>{prefix},
         count,
         static_cast<std::size_t>(config.hidden),
-        static_cast<std::size_t>(config.moe_inter));
+        static_cast<std::size_t>(config.moe_inter),
+        [&model](std::string_view canonical) {
+            return model.stored_name(canonical);
+        });
     MlxDeepseekV4SsdExpertArena arena(
         count,
         static_cast<std::size_t>(config.hidden),
         static_cast<std::size_t>(config.moe_inter));
-    std::vector<DeepseekV4NativeExpertDestination> destinations;
+    std::vector<MlxNativeMxfp4ExpertDestination> destinations;
     destinations.reserve(count);
     for (std::size_t expert = 0; expert < count; ++expert) {
         destinations.push_back(arena.destination(expert));

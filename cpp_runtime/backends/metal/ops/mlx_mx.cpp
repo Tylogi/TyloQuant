@@ -1094,15 +1094,36 @@ MlxMxWeight MlxMxWeight::from_arrays(
         (output_size + 127) / 128,
         input_size / 128,
     };
-    const bool valid_scales = bits == 4
-        ? scales.shape() == Shape{output_size, input_size / 32}
-        : scales.shape() == block32_scale_shape ||
-            (input_size % 128 == 0 &&
-             scales.shape() == block128_scale_shape);
-    if (values.size() != expected_values ||
-        values.shape() != expected_values_shape ||
-        !valid_scales) {
+    const Shape mxfp4_scale_shape{output_size, input_size / 32};
+    const auto shape_size = [](const Shape& shape) {
+        std::size_t result = 1;
+        for (const auto dimension : shape) {
+            result *= static_cast<std::size_t>(dimension);
+        }
+        return result;
+    };
+    std::optional<Shape> scale_shape;
+    if (bits == 4 && scales.size() == shape_size(mxfp4_scale_shape)) {
+        scale_shape = mxfp4_scale_shape;
+    } else if (bits == 8 && scales.size() == shape_size(block32_scale_shape)) {
+        scale_shape = block32_scale_shape;
+    } else if (bits == 8 && input_size % 128 == 0 &&
+               scales.size() == shape_size(block128_scale_shape)) {
+        scale_shape = block128_scale_shape;
+    }
+    if (values.size() != expected_values || !scale_shape) {
         throw std::invalid_argument("MX packed array size mismatch");
+    }
+    // SSD arenas expose zero-copy one-dimensional slices into their backing
+    // banks, while checkpoint tensors normally arrive with canonical matrix
+    // shapes. Normalize the view here so both sources share the same kernels.
+    if (values.shape() != expected_values_shape) {
+        values = mlx::core::reshape(
+            std::move(values), expected_values_shape);
+    }
+    if (scales.shape() != *scale_shape) {
+        scales = mlx::core::reshape(
+            std::move(scales), *scale_shape);
     }
     return MlxMxWeight(
         std::move(values),
@@ -1497,7 +1518,6 @@ array MlxMxWeight::grouped_row_matmul_inverse_rope(
         mlx::core::reshape(
             sin_values,
             Shape{static_cast<int>(rows) * rotary_dimension / 2}));
-
     if (mxfp8_scale_block_size_ == 32) {
         if (rows != 1 || input.dtype() != mlx::core::float32 ||
             !expanded_mxfp8_scales_.has_value() ||

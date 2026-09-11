@@ -15,7 +15,7 @@ using mlx::core::Shape;
 using mlx::core::array;
 
 void fill_slot(
-    mfq::metal::MlxDeepseekV4SsdExpertArena& arena,
+    mfq::metal::MlxMxfp4SsdExpertArena& arena,
     std::size_t slot,
     std::uint8_t code) {
     auto destination = arena.destination(slot);
@@ -72,7 +72,7 @@ array make_input(int rows, int columns) {
 
 int main() {
     try {
-        mfq::metal::MlxDeepseekV4SsdExpertArena arena(2);
+        mfq::metal::MlxMxfp4SsdExpertArena arena(2, 4096, 2048);
         // 0x22 is (+1,+1); 0x44 is (+2,+2) in E2M1 MXFP4.
         fill_slot(arena, 0, 0x22);
         fill_slot(arena, 1, 0x44);

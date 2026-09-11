@@ -17,7 +17,7 @@
 
 namespace mfq::metal {
 
-struct MlxDeepseekV41EngramBatch {
+struct MlxDeepseekV41HfEngramBatch {
     int batch = 0;
     int tokens = 0;
     int start_position = 0;
@@ -31,16 +31,16 @@ struct MlxDeepseekV41EngramBatch {
 // Model-wide V4.1 Engram adapter. Hashing happens once per input chunk; each
 // Engram layer then pulls only its selected rows through the bounded SSD cache
 // immediately before that layer executes.
-class MlxDeepseekV41Engram {
+class MlxDeepseekV41HfEngram {
 public:
-    static MlxDeepseekV41Engram load_hf(
+    static MlxDeepseekV41HfEngram load_hf(
         const MlxHfTensorStore& model,
         const DeepseekV4Config& config,
         const std::filesystem::path& hash_asset,
         std::size_t cache_bytes,
         std::size_t io_workers = 8);
 
-    MlxDeepseekV41EngramBatch prepare(
+    MlxDeepseekV41HfEngramBatch prepare(
         const mlx::core::array& token_ids,
         int start_position,
         bool prefetch_rows = false);
@@ -49,7 +49,7 @@ public:
     mlx::core::array apply(
         std::size_t layer,
         const mlx::core::array& hidden,
-        const MlxDeepseekV41EngramBatch& batch) const;
+        const MlxDeepseekV41HfEngramBatch& batch) const;
 
     void reset_hash() noexcept;
     void truncate_hash(int position);
@@ -61,7 +61,7 @@ public:
 
 private:
     struct Impl;
-    explicit MlxDeepseekV41Engram(std::shared_ptr<Impl> impl);
+    explicit MlxDeepseekV41HfEngram(std::shared_ptr<Impl> impl);
     std::shared_ptr<Impl> impl_;
 };
 

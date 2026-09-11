@@ -118,6 +118,10 @@ public:
 
     void reset_seed(std::uint64_t seed);
 
+    // Advance the persistent RNG when an adapter sampled one or more tokens
+    // before handing generation to the common MTP engine.
+    void discard_random(std::uint64_t draws);
+
     // Sample raw logits using this sampler's persistent seeded RNG stream.
     mlx::core::array sample(const mlx::core::array& logits);
 

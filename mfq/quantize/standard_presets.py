@@ -153,7 +153,11 @@ def normalize_preset(value: str) -> str:
 
 def _is_ple_path(name: str) -> bool:
     components = set(name.split("."))
-    return "ple" in components or bool(re.search(r"(?:^|\.)block\.\d+\.position_embedding\.", name))
+    return (
+        "ple" in components
+        or "associative_memory" in components
+        or bool(re.search(r"(?:^|\.)block\.\d+\.position_embedding\.", name))
+    )
 
 
 def _scope(name: str) -> TensorScope:
@@ -174,6 +178,7 @@ def _role(name: str, canonical_name: str | None) -> TensorRole:
     names = (name, canonical)
     if (
         ".position_embedding.ngram.shard." in canonical or ".ngram_embedding.shard_" in name
+        or canonical.endswith(".associative_memory.embedding.weight")
     ) and canonical.endswith(".weight"):
         return TensorRole.PLE_EMBEDDING
     if canonical in {"output.weight", "model.output.weight"} or name.endswith("lm_head.weight"):
@@ -321,7 +326,11 @@ def describe_tensor(
     # Root-level predictor fusion/projection matrices are small, shared, and
     # outside the repeated decoder stack.  Preserve them without naming a
     # particular speculative architecture.
-    quantizable &= not (scope is TensorScope.PREDICTOR and source_layer_match is None)
+    quantizable &= not (
+        scope is TensorScope.PREDICTOR
+        and source_layer_match is None
+        and role is not TensorRole.ROUTED_EXPERT
+    )
     return TensorDescriptor(role, scope, layer_index, bool(quantizable))
 
 

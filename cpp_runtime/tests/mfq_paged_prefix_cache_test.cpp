@@ -150,7 +150,7 @@ void run_benchmark() {
 
 } // namespace
 
-int main() {
+int main() try {
     using namespace mfq::cache;
     require(
         block_hash_hex(sha256("abc")) ==
@@ -383,4 +383,7 @@ int main() {
     }
     std::cout << "MFQ paged prefix cache tests passed\n";
     return 0;
+} catch (const std::exception& error) {
+    std::cerr << "mfq-paged-prefix-cache-test: " << error.what() << '\n';
+    return 1;
 }

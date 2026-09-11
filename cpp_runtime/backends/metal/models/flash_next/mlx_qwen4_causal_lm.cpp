@@ -43,6 +43,10 @@ using mlx::core::array;
 constexpr std::string_view kModelConfigAsset =
     "__mfq_asset__/model_config.json";
 
+// Qwen4/Flash-Next recursively reuses its single predictor layer to form a
+// draft chain. Predictor layer count and maximum draft depth are independent.
+constexpr int kQwen4MtpMaximumDraftDepth = 5;
+
 const json& text_config(const json& outer) {
     const auto found = outer.find("text_config");
     return found == outer.end() ? outer : *found;
@@ -138,6 +142,188 @@ MlxNintMoeWeight moe_weight(
     const auto mapped = model.map_record(name);
     return MlxNintMoeWeight::from_blob(mapped.view());
 }
+
+// A canonical routed projection may be stored either as a heterogeneous
+// NINTM container or as one dense [experts,out,in] tensor. Predictor heads
+// are intentionally left dense by the standard presets, so the model adapter
+// must dispatch by record representation rather than by architecture role.
+class Qwen4RoutedWeight {
+public:
+    static Qwen4RoutedWeight load(
+        const MfqContainer& model,
+        const std::string& name) {
+        if (model.record(name).dtype == "NINTM") {
+            return Qwen4RoutedWeight(moe_weight(model, name));
+        }
+        auto values = dense(model, name);
+        if (values.ndim() != 3 || values.shape(0) <= 0 ||
+            values.shape(1) <= 0 || values.shape(2) <= 0) {
+            throw std::runtime_error(
+                "Qwen4 dense routed tensor must use [experts,out,in]: " +
+                name);
+        }
+        return Qwen4RoutedWeight(std::move(values));
+    }
+
+    static Qwen4RoutedWeight load_gate_up(
+        const MfqContainer& model,
+        const std::string& prefix) {
+        const auto combined = prefix + ".experts.gate_up.weight";
+        if (model.contains(combined)) return load(model, combined);
+        const auto gate = prefix + ".experts.gate.weight";
+        const auto up = prefix + ".experts.up.weight";
+        if (model.record(gate).dtype == "NINTM" &&
+            model.record(up).dtype == "NINTM") {
+            return Qwen4RoutedWeight(
+                load_routed_gate_up_weight(model, prefix));
+        }
+        auto gate_values = dense(model, gate);
+        auto up_values = dense(model, up);
+        if (gate_values.ndim() != 3 ||
+            gate_values.shape() != up_values.shape()) {
+            throw std::runtime_error(
+                "Qwen4 split dense gate/up tensors disagree");
+        }
+        return Qwen4RoutedWeight(mlx::core::concatenate(
+            {std::move(gate_values), std::move(up_values)}, 1));
+    }
+
+    array routed_matmul(
+        const array& input,
+        const array& expert_ids) const {
+        if (packed_) return packed_->routed_matmul(input, expert_ids);
+        return dense_matmul(input, expert_ids);
+    }
+
+    array routed_swiglu(
+        const array& input,
+        const array& expert_ids) const {
+        if (packed_) return packed_->routed_swiglu(input, expert_ids);
+        return moe_swiglu_split(dense_matmul(input, expert_ids));
+    }
+
+    bool supports_grouped_mmq() const noexcept {
+        return packed_ && packed_->supports_grouped_mmq();
+    }
+
+    int recommended_grouped_mmq_block_rows(
+        int route_count,
+        bool fused_swiglu) const noexcept {
+        return packed_
+            ? packed_->recommended_grouped_mmq_block_rows(
+                  route_count, fused_swiglu)
+            : 0;
+    }
+
+    MlxGroupedMmqPlan build_grouped_mmq_plan(
+        const array& expert_ids,
+        const array& route_order,
+        int block_rows) const {
+        if (!packed_) {
+            throw std::runtime_error(
+                "dense routed projection has no grouped MMQ plan");
+        }
+        return packed_->build_grouped_mmq_plan(
+            expert_ids, route_order, block_rows);
+    }
+
+    array routed_matmul_sorted(
+        const array& input,
+        const array& expert_ids,
+        const array& route_order,
+        bool input_is_sorted,
+        bool fused_swiglu,
+        float swiglu_limit,
+        const MlxGroupedMmqPlan* plan) const {
+        if (!packed_) {
+            throw std::runtime_error(
+                "dense routed projection has no grouped MMQ path");
+        }
+        return packed_->routed_matmul_sorted(
+            input,
+            expert_ids,
+            route_order,
+            input_is_sorted,
+            fused_swiglu,
+            swiglu_limit,
+            plan);
+    }
+
+    int experts() const noexcept {
+        return packed_ ? packed_->experts() : dense_->shape(0);
+    }
+    int out_per_expert() const noexcept {
+        return packed_ ? packed_->out_per_expert() : dense_->shape(1);
+    }
+    int neuron_len() const noexcept {
+        return packed_ ? packed_->neuron_len() : dense_->shape(2);
+    }
+    int projections() const noexcept {
+        return packed_ ? packed_->projections() : 1;
+    }
+
+private:
+    explicit Qwen4RoutedWeight(MlxNintMoeWeight packed)
+        : packed_(std::move(packed)) {}
+    explicit Qwen4RoutedWeight(array dense_values)
+        : dense_(std::move(dense_values)) {}
+
+    array dense_matmul(
+        const array& input,
+        const array& expert_ids) const {
+        auto source = mlx::core::reshape(
+            input.dtype() == dense_->dtype()
+                ? input
+                : mlx::core::astype(input, dense_->dtype()),
+            Shape{
+                static_cast<int>(input.size() /
+                    static_cast<std::size_t>(neuron_len())),
+                neuron_len(),
+            });
+        if (source.shape(1) != neuron_len() || expert_ids.ndim() != 2 ||
+            expert_ids.shape(0) <= 0 || expert_ids.shape(1) <= 0) {
+            throw std::runtime_error(
+                "Qwen4 dense routed projection geometry disagrees");
+        }
+        const int source_rows = source.shape(0);
+        const int token_rows = expert_ids.shape(0);
+        const int routes = static_cast<int>(expert_ids.size());
+        const int routes_per_row = expert_ids.shape(1);
+        if (routes != token_rows * routes_per_row ||
+            (source_rows != token_rows && source_rows != routes)) {
+            throw std::runtime_error(
+                "Qwen4 dense routed IDs disagree with input rows");
+        }
+        auto lhs = source_rows == routes
+            ? mlx::core::arange(routes, mlx::core::int32)
+            : mlx::core::reshape(
+                  mlx::core::broadcast_to(
+                      mlx::core::expand_dims(
+                          mlx::core::arange(
+                              token_rows, mlx::core::int32),
+                          1),
+                      Shape{token_rows, routes_per_row}),
+                  Shape{routes});
+        auto rhs = mlx::core::contiguous(mlx::core::reshape(
+            expert_ids.dtype() == mlx::core::int32
+                ? expert_ids
+                : mlx::core::astype(expert_ids, mlx::core::int32),
+            Shape{routes}));
+        auto weights = mlx::core::transpose(*dense_, {0, 2, 1});
+        auto output = mlx::core::gather_mm(
+            mlx::core::reshape(
+                source, Shape{source_rows, 1, neuron_len()}),
+            weights,
+            lhs,
+            rhs);
+        return mlx::core::reshape(
+            output,
+            Shape{token_rows, routes_per_row, out_per_expert()});
+    }
+
+    std::optional<MlxNintMoeWeight> packed_;
+    std::optional<array> dense_;
+};
 
 
 class GatedResidual {
@@ -241,8 +427,9 @@ public:
         const std::string& prefix) {
         return Qwen4Moe(
             config,
-            load_routed_gate_up_weight(model, prefix),
-            moe_weight(model, prefix + ".experts.down.weight"),
+            Qwen4RoutedWeight::load_gate_up(model, prefix),
+            Qwen4RoutedWeight::load(
+                model, prefix + ".experts.down.weight"),
             MlxLinear::load(model, prefix + ".router.weight"),
             DenseFfn::load(model, prefix + ".shared_expert"),
             MlxLinear::load(model, prefix + ".shared_expert.router.weight"));
@@ -385,8 +572,8 @@ public:
 private:
     Qwen4Moe(
         Qwen4Config config,
-        MlxNintMoeWeight gate_up,
-        MlxNintMoeWeight down,
+        Qwen4RoutedWeight gate_up,
+        Qwen4RoutedWeight down,
         MlxLinear router,
         DenseFfn shared,
         MlxLinear shared_gate)
@@ -409,8 +596,8 @@ private:
     }
 
     Qwen4Config config_;
-    MlxNintMoeWeight gate_up_;
-    MlxNintMoeWeight down_;
+    Qwen4RoutedWeight gate_up_;
+    Qwen4RoutedWeight down_;
     MlxLinear router_;
     DenseFfn shared_;
     MlxLinear shared_gate_;
@@ -487,6 +674,58 @@ public:
         context_.assign(
             static_cast<std::size_t>(batch * (config_.ngram_size - 1)),
             config_.eos_token_id);
+    }
+
+    const std::vector<std::int64_t>& context() const noexcept {
+        return context_;
+    }
+
+    void restore_context(std::vector<std::int64_t> context) {
+        if (context.size() != context_.size()) {
+            throw std::runtime_error(
+                "Qwen4 PLE ngram rollback context disagrees");
+        }
+        context_ = std::move(context);
+    }
+
+    void advance_context(const array& token_ids, int retained_tokens) {
+        if (token_ids.ndim() != 2 || token_ids.shape(0) != batch_ ||
+            retained_tokens <= 0 || retained_tokens > token_ids.shape(1) ||
+            context_.empty()) {
+            throw std::runtime_error(
+                "Qwen4 PLE ngram retained prefix disagrees");
+        }
+        const bool int32_ids = token_ids.dtype() == mlx::core::int32;
+        auto host = int32_ids || token_ids.dtype() == mlx::core::int64
+            ? mlx::core::contiguous(token_ids)
+            : mlx::core::contiguous(
+                mlx::core::astype(token_ids, mlx::core::int64));
+        host.eval();
+        const auto* source32 = int32_ids
+            ? host.data<std::int32_t>() : nullptr;
+        const auto* source64 = int32_ids
+            ? nullptr : host.data<std::int64_t>();
+        const int source_tokens = token_ids.shape(1);
+        const int prefix = static_cast<int>(config_.ngram_size - 1);
+        std::vector<std::int64_t> history(
+            static_cast<std::size_t>(prefix + retained_tokens));
+        for (int bi = 0; bi < batch_; ++bi) {
+            std::copy_n(
+                context_.data() + static_cast<std::size_t>(bi * prefix),
+                prefix,
+                history.data());
+            for (int token = 0; token < retained_tokens; ++token) {
+                const auto source_index = static_cast<std::size_t>(
+                    bi * source_tokens + token);
+                history[static_cast<std::size_t>(prefix + token)] = int32_ids
+                    ? static_cast<std::int64_t>(source32[source_index])
+                    : source64[source_index];
+            }
+            std::copy_n(
+                history.data() + retained_tokens,
+                prefix,
+                context_.data() + static_cast<std::size_t>(bi * prefix));
+        }
     }
 
     array forward(const array& token_ids, bool use_cache) {
@@ -670,18 +909,21 @@ public:
     void reset(int batch) {
         embedding_.reset(batch);
         convolution_state_.reset();
+        rollback_.reset();
         batch_ = batch;
     }
 
     void clear() noexcept {
         convolution_state_.reset();
+        rollback_.reset();
         batch_ = 0;
     }
 
     array forward(
         const array& hidden_streams,
         const array& token_ids,
-        bool use_cache) {
+        bool use_cache,
+        int speculative_confirmed = 0) {
         const int batch = token_ids.shape(0);
         const int tokens = token_ids.shape(1);
         if (hidden_streams.ndim() != 3 || token_ids.ndim() != 2 ||
@@ -690,6 +932,36 @@ public:
             hidden_streams.shape(2) !=
                 config_.hidden_size * config_.hc_count) {
             throw std::runtime_error("Qwen4 PLE input geometry disagrees");
+        }
+        if (speculative_confirmed < 0 ||
+            speculative_confirmed > tokens ||
+            (speculative_confirmed != 0 &&
+             (!use_cache || speculative_confirmed == tokens))) {
+            throw std::runtime_error(
+                "Qwen4 PLE speculative boundary disagrees");
+        }
+        if (speculative_confirmed > 0) {
+            if (batch_ != batch) reset(batch);
+            rollback_.emplace(Rollback{
+                convolution_state_,
+                embedding_.context(),
+                token_ids,
+                std::nullopt,
+                speculative_confirmed,
+                tokens,
+            });
+            try {
+                // Evaluate every projection for the verify window as one
+                // small-M operation.  Only the cache recurrence is replayed
+                // if the speculative suffix is rejected.
+                return forward(hidden_streams, token_ids, true);
+            } catch (...) {
+                convolution_state_ = rollback_->convolution_state;
+                embedding_.restore_context(
+                    std::move(rollback_->ngram_context));
+                rollback_.reset();
+                throw;
+            }
         }
         if (use_cache && batch_ != batch) reset(batch);
         auto embeddings = embedding_.forward(token_ids, use_cache);
@@ -735,6 +1007,11 @@ public:
         auto normalized = qwen4_grouped_rms_norm(
             gated, norm_conv_, static_cast<int>(config_.hidden_size),
             static_cast<float>(config_.rms_norm_eps));
+        if (use_cache && rollback_ &&
+            rollback_->total_tokens == tokens &&
+            rollback_->confirmed_tokens > 0) {
+            rollback_->convolution_inputs = normalized;
+        }
         auto convolution = cached_depthwise_conv_silu(
             normalized,
             convolution_weight_,
@@ -744,6 +1021,39 @@ public:
         auto output = gated + convolution.output;
         return output.dtype() == hidden_streams.dtype()
             ? output : mlx::core::astype(output, hidden_streams.dtype());
+    }
+
+    void commit_speculative() noexcept {
+        rollback_.reset();
+    }
+
+    void rollback_speculative(int accepted_tokens) {
+        if (!rollback_ || !rollback_->token_ids ||
+            !rollback_->convolution_inputs) {
+            throw std::runtime_error(
+                "Qwen4 PLE has no speculative rollback state");
+        }
+        const int speculative_tokens =
+            rollback_->total_tokens - rollback_->confirmed_tokens;
+        if (accepted_tokens < 0 || accepted_tokens > speculative_tokens) {
+            throw std::runtime_error(
+                "Qwen4 PLE accepted prefix is outside the draft window");
+        }
+        const int keep = rollback_->confirmed_tokens + accepted_tokens;
+        const int batch = rollback_->token_ids->shape(0);
+        auto inputs = mlx::core::slice(
+            *rollback_->convolution_inputs,
+            Shape{0, 0, 0},
+            Shape{batch, keep, rollback_->convolution_inputs->shape(2)});
+        auto convolution = cached_depthwise_conv_silu(
+            inputs,
+            convolution_weight_,
+            rollback_->convolution_state,
+            static_cast<int>(config_.ngram_size));
+        convolution_state_ = std::move(convolution.state);
+        embedding_.restore_context(std::move(rollback_->ngram_context));
+        embedding_.advance_context(*rollback_->token_ids, keep);
+        rollback_.reset();
     }
 
 private:
@@ -766,6 +1076,14 @@ private:
           convolution_weight_(std::move(convolution_weight)) {}
 
     Qwen4Config config_;
+    struct Rollback {
+        std::optional<array> convolution_state;
+        std::vector<std::int64_t> ngram_context;
+        std::optional<array> token_ids;
+        std::optional<array> convolution_inputs;
+        int confirmed_tokens = 0;
+        int total_tokens = 0;
+    };
     Qwen4NgramEmbedding embedding_;
     MlxLinear key_;
     MlxLinear value_;
@@ -774,6 +1092,7 @@ private:
     array norm_conv_;
     array convolution_weight_;
     std::optional<array> convolution_state_;
+    std::optional<Rollback> rollback_;
     int batch_ = 0;
 };
 
@@ -785,9 +1104,16 @@ public:
         const array& hidden,
         const array& positions_current,
         const array& positions_full,
-        bool use_cache) = 0;
+        bool use_cache,
+        int speculative_confirmed = 0) = 0;
     virtual void reset(int batch) = 0;
     virtual void clear() noexcept = 0;
+    virtual void commit_speculative() noexcept = 0;
+    virtual void rollback_speculative(int accepted_tokens) = 0;
+    virtual void trim_cache_to(int) {
+        throw std::runtime_error(
+            "Qwen4 attention cache does not support arbitrary trimming");
+    }
 };
 
 class Qwen4Gdn final : public Qwen4Attention {
@@ -832,6 +1158,7 @@ public:
                 static_cast<int>(config_.linear_value_head_dim),
             },
             mlx::core::float32);
+        rollback_.reset();
         batch_ = batch;
         position_ = 0;
     }
@@ -839,6 +1166,7 @@ public:
     void clear() noexcept override {
         convolution_state_.reset();
         recurrent_state_.reset();
+        rollback_.reset();
         batch_ = 0;
         position_ = 0;
     }
@@ -847,13 +1175,53 @@ public:
         const array& hidden,
         const array&,
         const array&,
-        bool use_cache) override {
+        bool use_cache,
+        int speculative_confirmed = 0) override {
         if (hidden.ndim() != 3 || hidden.shape(0) <= 0 ||
             hidden.shape(1) <= 0 || hidden.shape(2) != config_.hidden_size) {
             throw std::runtime_error("Qwen4 GDN input geometry disagrees");
         }
         const int batch = hidden.shape(0);
         const int tokens = hidden.shape(1);
+        if (speculative_confirmed < 0 ||
+            speculative_confirmed > tokens ||
+            (speculative_confirmed != 0 &&
+             (!use_cache || speculative_confirmed == tokens))) {
+            throw std::runtime_error(
+                "Qwen4 GDN speculative boundary disagrees");
+        }
+        if (speculative_confirmed > 0) {
+            if (batch_ != batch || !convolution_state_) reset(batch);
+            if (!convolution_state_ || !recurrent_state_) {
+                throw std::runtime_error(
+                    "Qwen4 GDN recurrent state is unavailable");
+            }
+            rollback_.emplace(MlxGatedDeltaSpeculativeState{
+                *convolution_state_,
+                *recurrent_state_,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                position_,
+                batch_,
+                speculative_confirmed,
+                tokens,
+            });
+            try {
+                // Run all expensive projections and the transformer layer as
+                // one small-M graph.  The common recurrent transaction keeps
+                // projected inputs for a state-only prefix replay on reject.
+                return forward(hidden, array(0), array(0), true);
+            } catch (...) {
+                convolution_state_ = rollback_->convolution_state;
+                recurrent_state_ = rollback_->recurrent_state;
+                position_ = rollback_->position;
+                batch_ = rollback_->batch;
+                rollback_.reset();
+                throw;
+            }
+        }
         if (use_cache && (batch_ != batch || !convolution_state_)) reset(batch);
         auto projected = qkv_(hidden);
         detail::profile_eval("qwen4.gdn.qkv", projected);
@@ -886,6 +1254,16 @@ public:
             decay,
             Shape{1, 1, static_cast<int>(config_.linear_num_value_heads)}) *
             softplus;
+        auto recurrent_gate = mlx::core::transpose(decay, {0, 2, 1});
+        auto recurrent_beta = mlx::core::transpose(beta, {0, 2, 1});
+        if (use_cache && rollback_ &&
+            rollback_->position == position_ &&
+            rollback_->total_tokens == tokens) {
+            rollback_->qk = qk;
+            rollback_->value = value;
+            rollback_->gate = recurrent_gate;
+            rollback_->beta = recurrent_beta;
+        }
         auto convolved = linear_conv_qkv(
             use_cache
                 ? *convolution_state_
@@ -918,8 +1296,8 @@ public:
             convolved.query,
             convolved.key,
             convolved.value,
-            mlx::core::transpose(decay, {0, 2, 1}),
-            mlx::core::transpose(beta, {0, 2, 1}),
+            recurrent_gate,
+            recurrent_beta,
             use_cache ? recurrent_state_ : std::nullopt);
         detail::profile_eval(
             "qwen4.gdn.recurrent",
@@ -953,6 +1331,32 @@ public:
         auto output = output_(mlx::core::astype(normalized, hidden.dtype()));
         detail::profile_eval("qwen4.gdn.output", output);
         return output;
+    }
+
+    void commit_speculative() noexcept override {
+        rollback_.reset();
+    }
+
+    void rollback_speculative(int accepted_tokens) override {
+        if (!rollback_) {
+            throw std::runtime_error(
+                "Qwen4 GDN has no speculative rollback state");
+        }
+        auto restored = replay_gated_delta_speculative_prefix(
+            *rollback_,
+            accepted_tokens,
+            convolution_weight_,
+            static_cast<int>(config_.linear_num_key_heads),
+            static_cast<int>(config_.linear_num_value_heads),
+            static_cast<int>(config_.linear_key_head_dim),
+            static_cast<int>(config_.linear_value_head_dim),
+            std::nullopt,
+            1e-6f);
+        convolution_state_ = std::move(restored.convolution_state);
+        recurrent_state_ = std::move(restored.recurrent_state);
+        position_ = restored.position;
+        batch_ = rollback_->batch;
+        rollback_.reset();
     }
 
 private:
@@ -999,6 +1403,7 @@ private:
     MlxLinear output_;
     std::optional<array> convolution_state_;
     std::optional<array> recurrent_state_;
+    std::optional<MlxGatedDeltaSpeculativeState> rollback_;
     int batch_ = 0;
     int position_ = 0;
 };
@@ -1043,12 +1448,14 @@ public:
             maximum_,
             static_cast<int>(config_.head_dim));
         index_cache_.reset(batch);
+        speculative_trim_ = 0;
         batch_ = batch;
     }
 
     void clear() noexcept override {
         cache_.reset();
         index_cache_.clear();
+        speculative_trim_ = 0;
         batch_ = 0;
     }
 
@@ -1056,9 +1463,17 @@ public:
         const array& hidden,
         const array& positions_current,
         const array& positions_full,
-        bool use_cache) override {
+        bool use_cache,
+        int speculative_confirmed = 0) override {
         const int batch = hidden.shape(0);
         const int tokens = hidden.shape(1);
+        if (speculative_confirmed < 0 ||
+            speculative_confirmed > tokens ||
+            (speculative_confirmed != 0 &&
+             (!use_cache || speculative_confirmed == tokens))) {
+            throw std::runtime_error(
+                "Qwen4 QSA speculative boundary disagrees");
+        }
         auto query_full = query_(hidden);
         auto key_full = key_(hidden);
         auto value_full = value_(hidden);
@@ -1151,6 +1566,9 @@ public:
             if (index.second != query_offset) {
                 throw std::runtime_error("Qwen4 QSA caches diverged");
             }
+            speculative_trim_ = speculative_confirmed > 0
+                ? tokens - speculative_confirmed
+                : 0;
         }
         array attended = key_cache.shape(2) <= config_.indexer_budget
             ? qwen4_dense_gqa_attention(
@@ -1176,6 +1594,39 @@ public:
             mlx::core::sigmoid(
                 mlx::core::astype(output_gate, mlx::core::float32));
         return output_(mlx::core::astype(gated, hidden.dtype()));
+    }
+
+    void commit_speculative() noexcept override {
+        speculative_trim_ = 0;
+    }
+
+    void rollback_speculative(int accepted_tokens) override {
+        if (!cache_ || speculative_trim_ <= 0) {
+            throw std::runtime_error(
+                "Qwen4 QSA has no speculative rollback state");
+        }
+        if (accepted_tokens < 0 || accepted_tokens >= speculative_trim_) {
+            throw std::runtime_error(
+                "Qwen4 QSA accepted prefix is outside the draft window");
+        }
+        const int rejected = speculative_trim_ - accepted_tokens;
+        cache_->trim(rejected);
+        index_cache_.trim(rejected);
+        speculative_trim_ = 0;
+    }
+
+    void trim_cache_to(int position) override {
+        if (!cache_ || position < 0 || position > cache_->position() ||
+            index_cache_.position() != cache_->position()) {
+            throw std::runtime_error(
+                "Qwen4 QSA cache trim position is invalid");
+        }
+        const int count = cache_->position() - position;
+        if (count > 0) {
+            cache_->trim(count);
+            index_cache_.trim(count);
+        }
+        speculative_trim_ = 0;
     }
 
 private:
@@ -1326,6 +1777,7 @@ private:
     MlxRmsNorm index_key_norm_;
     std::unique_ptr<MlxKvCache> cache_;
     MlxSequenceCache index_cache_;
+    int speculative_trim_ = 0;
     int batch_ = 0;
 };
 
@@ -1365,6 +1817,24 @@ public:
             std::move(ple));
     }
 
+    static Qwen4Layer load_predictor(
+        const MfqContainer& model,
+        const Qwen4Config& config,
+        std::size_t index,
+        int maximum) {
+        const auto prefix =
+            "predictor.block." + std::to_string(index);
+        return Qwen4Layer(
+            GatedResidual::load(
+                model, config, prefix + ".attention.mhc.pre"),
+            GatedResidual::load(
+                model, config, prefix + ".mlp.mhc.pre"),
+            Qwen4Qsa::load(
+                model, config, prefix + ".attention", maximum),
+            Qwen4Moe::load(model, config, prefix + ".mlp"),
+            nullptr);
+    }
+
     void reset(int batch) {
         attention_->reset(batch);
         if (ple_) ple_->reset(batch);
@@ -1375,15 +1845,38 @@ public:
         if (ple_) ple_->clear();
     }
 
+    void commit_speculative() noexcept {
+        attention_->commit_speculative();
+        if (ple_) ple_->commit_speculative();
+    }
+
+    void rollback_speculative(int accepted_tokens) {
+        attention_->rollback_speculative(accepted_tokens);
+        if (ple_) ple_->rollback_speculative(accepted_tokens);
+    }
+
+    void trim_cache_to(int position) {
+        if (ple_) {
+            throw std::runtime_error(
+                "Qwen4 predictor layers cannot contain PLE state");
+        }
+        attention_->trim_cache_to(position);
+    }
+
     array forward(
         array hidden_streams,
         const array& token_ids,
         const array& positions_current,
         const array& positions_full,
-        bool use_cache) {
+        bool use_cache,
+        int speculative_confirmed = 0) {
         if (ple_) {
             hidden_streams = hidden_streams +
-                ple_->forward(hidden_streams, token_ids, use_cache);
+                ple_->forward(
+                    hidden_streams,
+                    token_ids,
+                    use_cache,
+                    speculative_confirmed);
             detail::profile_eval("qwen4.ple", hidden_streams);
         }
         auto attention_values = attention_gr_.pre(hidden_streams);
@@ -1394,7 +1887,8 @@ public:
             attention_values.branch,
             positions_current,
             positions_full,
-            use_cache);
+            use_cache,
+            speculative_confirmed);
         detail::profile_eval(attention_->profile_name(), branch);
         hidden_streams = attention_gr_.post(branch, attention_values);
         detail::profile_eval(
@@ -1427,6 +1921,201 @@ private:
     std::unique_ptr<Qwen4Attention> attention_;
     Qwen4Moe moe_;
     std::unique_ptr<Qwen4Ple> ple_;
+};
+
+struct Qwen4MtpForward {
+    array sample_hidden;
+    array hidden_streams;
+};
+
+class Qwen4Mtp {
+public:
+    static std::optional<Qwen4Mtp> load_if_present(
+        const MfqContainer& model,
+        const Qwen4Config& config,
+        int maximum) {
+        bool any = false;
+        for (const auto& [name, _] : model.records()) {
+            if (name.rfind("predictor.", 0) == 0) {
+                any = true;
+                break;
+            }
+        }
+        if (config.mtp_num_hidden_layers <= 0 ||
+            !model.contains("predictor.embedding_norm.weight")) {
+            if (any) {
+                throw std::runtime_error(
+                    "Qwen4 MFQ contains an incomplete or undeclared predictor");
+            }
+            return std::nullopt;
+        }
+        if (config.mtp_use_dedicated_embeddings) {
+            throw std::runtime_error(
+                "Qwen4 dedicated predictor embeddings are not supported");
+        }
+        std::vector<Qwen4Layer> layers;
+        layers.reserve(static_cast<std::size_t>(
+            config.mtp_num_hidden_layers));
+        for (std::int64_t index = 0;
+             index < config.mtp_num_hidden_layers;
+             ++index) {
+            layers.push_back(Qwen4Layer::load_predictor(
+                model,
+                config,
+                static_cast<std::size_t>(index),
+                maximum));
+        }
+        return Qwen4Mtp(
+            config,
+            MlxRmsNorm(
+                dense_vector(model, "predictor.embedding_norm.weight"),
+                static_cast<float>(config.rms_norm_eps),
+                1.0f),
+            MlxRmsNorm(
+                dense_vector(model, "predictor.hidden_norm.weight"),
+                static_cast<float>(config.rms_norm_eps),
+                1.0f),
+            MlxLinear::load(model, "predictor.fusion.embedding.weight"),
+            MlxLinear::load(model, "predictor.fusion.hidden.weight"),
+            std::move(layers),
+            GatedResidual::load(
+                model, config, "predictor.mhc.pre", false));
+    }
+
+    void reset(int batch = 1) {
+        if (batch <= 0) {
+            throw std::runtime_error(
+                "Qwen4 predictor cache batch must be positive");
+        }
+        for (auto& layer : layers_) layer.reset(batch);
+        batch_ = batch;
+        position_ = 0;
+    }
+
+    void clear() noexcept {
+        for (auto& layer : layers_) layer.clear();
+        batch_ = 0;
+        position_ = 0;
+    }
+
+    Qwen4MtpForward forward(
+        const array& previous_hidden,
+        const array& token_ids,
+        const MlxEmbedding& embedding,
+        bool use_cache) {
+        if (token_ids.ndim() != 2 || token_ids.shape(0) <= 0 ||
+            token_ids.shape(1) <= 0) {
+            throw std::runtime_error(
+                "Qwen4 predictor token IDs must have non-empty [B,T] shape");
+        }
+        if (previous_hidden.ndim() != 3) {
+            throw std::runtime_error(
+                "Qwen4 predictor hidden input must have [B,T,H] shape");
+        }
+        if (previous_hidden.shape(0) != token_ids.shape(0)) {
+            throw std::runtime_error(
+                "Qwen4 predictor hidden/token batch sizes disagree");
+        }
+        if (previous_hidden.shape(1) != token_ids.shape(1)) {
+            throw std::runtime_error(
+                "Qwen4 predictor hidden/token lengths disagree: hidden=" +
+                std::to_string(previous_hidden.shape(1)) + ", tokens=" +
+                std::to_string(token_ids.shape(1)));
+        }
+        if (previous_hidden.shape(2) !=
+            config_.hc_count * config_.hidden_size) {
+            throw std::runtime_error(
+                "Qwen4 predictor hidden width disagrees: got=" +
+                std::to_string(previous_hidden.shape(2)) + ", expected=" +
+                std::to_string(config_.hc_count * config_.hidden_size));
+        }
+        const int batch = token_ids.shape(0);
+        const int tokens = token_ids.shape(1);
+        if (use_cache && (batch_ == 0 || batch_ != batch)) reset(batch);
+        const int start = use_cache ? position_ : 0;
+        auto ids = token_ids.dtype() == mlx::core::int32
+            ? token_ids
+            : mlx::core::astype(token_ids, mlx::core::int32);
+        auto embeds = embedding(ids, mlx::core::float16);
+        auto embedding_branch = embedding_fusion_(embedding_norm_(embeds));
+        auto hidden = mlx::core::reshape(
+            hidden_norm_(previous_hidden),
+            Shape{
+                batch,
+                tokens,
+                static_cast<int>(config_.hc_count),
+                static_cast<int>(config_.hidden_size),
+            });
+        auto streams = mlx::core::reshape(
+            hidden_fusion_(hidden) +
+                mlx::core::expand_dims(embedding_branch, -2),
+            Shape{
+                batch,
+                tokens,
+                static_cast<int>(
+                    config_.hc_count * config_.hidden_size),
+            });
+        auto current_positions = mlx::core::arange(
+            start, start + tokens, 1, mlx::core::int32);
+        auto full_positions = mlx::core::arange(
+            0, start + tokens, 1, mlx::core::int32);
+        // Flash-Next currently ships one predictor block. Keep the depth
+        // selection explicit so additional checkpoint blocks remain a model
+        // property rather than an architecture-name switch.
+        auto& layer = layers_.at(0);
+        streams = layer.forward(
+            std::move(streams),
+            ids,
+            current_positions,
+            full_positions,
+            use_cache);
+        auto sample_hidden = final_mixer_.mix(streams);
+        if (use_cache) {
+            batch_ = batch;
+            position_ = start + tokens;
+        }
+        return {std::move(sample_hidden), std::move(streams)};
+    }
+
+    int cache_position() const noexcept {
+        return position_;
+    }
+
+    void trim_cache_to(int position) {
+        if (position < 0 || position > position_) {
+            throw std::runtime_error(
+                "Qwen4 predictor cache trim position is invalid");
+        }
+        for (auto& layer : layers_) layer.trim_cache_to(position);
+        position_ = position;
+    }
+
+private:
+    Qwen4Mtp(
+        Qwen4Config config,
+        MlxRmsNorm embedding_norm,
+        MlxRmsNorm hidden_norm,
+        MlxLinear embedding_fusion,
+        MlxLinear hidden_fusion,
+        std::vector<Qwen4Layer> layers,
+        GatedResidual final_mixer)
+        : config_(std::move(config)),
+          embedding_norm_(std::move(embedding_norm)),
+          hidden_norm_(std::move(hidden_norm)),
+          embedding_fusion_(std::move(embedding_fusion)),
+          hidden_fusion_(std::move(hidden_fusion)),
+          layers_(std::move(layers)),
+          final_mixer_(std::move(final_mixer)) {}
+
+    Qwen4Config config_;
+    MlxRmsNorm embedding_norm_;
+    MlxRmsNorm hidden_norm_;
+    MlxLinear embedding_fusion_;
+    MlxLinear hidden_fusion_;
+    std::vector<Qwen4Layer> layers_;
+    GatedResidual final_mixer_;
+    int batch_ = 0;
+    int position_ = 0;
 };
 
 } // namespace
@@ -1616,25 +2305,53 @@ struct MlxQwen4CausalLm::Impl {
         }
         auto mixer = GatedResidual::load(
             model, config, "model.mhc.pre", false);
+        auto mtp = Qwen4Mtp::load_if_present(model, config, maximum);
+        const auto* predictor = graph.component("predictor");
+        if (predictor != nullptr &&
+            (predictor->implementation != "next_token_prediction" ||
+             predictor->tensor_root != "predictor")) {
+            throw std::runtime_error(
+                "model graph declares an unsupported Qwen4 predictor");
+        }
+        if ((predictor != nullptr) != mtp.has_value()) {
+            throw std::runtime_error(
+                predictor != nullptr
+                    ? "model graph declares a missing Qwen4 predictor"
+                    : "Qwen4 predictor tensors are absent from the model graph");
+        }
+        if (mtp && graph.topology.predictor_layers !=
+                config.mtp_num_hidden_layers) {
+            throw std::runtime_error(
+                "Qwen4 predictor topology disagrees with model config");
+        }
         return std::unique_ptr<Impl>(new Impl(
             std::move(config),
             maximum,
             std::move(embedding),
             std::move(output),
             std::move(layers),
-            std::move(mixer)));
+            std::move(mixer),
+            std::move(mtp)));
     }
 
-    array forward(
+    std::pair<array, array> forward_with_hidden(
         const array& token_ids,
         bool use_cache,
-        bool last_token_only = false) {
+        bool last_token_only = false,
+        int speculative_confirmed = 0) {
         if (token_ids.ndim() != 2 || token_ids.shape(0) <= 0 ||
             token_ids.shape(1) <= 0) {
             throw std::runtime_error("Qwen4 token IDs must have [B,T] shape");
         }
         const int batch = token_ids.shape(0);
         const int tokens = token_ids.shape(1);
+        if (speculative_confirmed < 0 ||
+            speculative_confirmed >= tokens ||
+            (speculative_confirmed > 0 &&
+             (!use_cache || speculative_pending))) {
+            throw std::runtime_error(
+                "Qwen4 speculative forward configuration is invalid");
+        }
         if (use_cache && (cache_batch == 0 || cache_batch != batch)) {
             reset(batch);
         }
@@ -1669,7 +2386,8 @@ struct MlxQwen4CausalLm::Impl {
                 ids,
                 current_positions,
                 full_positions,
-                use_cache);
+                use_cache,
+                speculative_confirmed);
         }
         auto output_hidden = mixer.mix(streams);
         if (last_token_only && tokens > 1) {
@@ -1685,7 +2403,43 @@ struct MlxQwen4CausalLm::Impl {
             cache_position = start + tokens;
             cache_batch = batch;
         }
-        return logits;
+        if (speculative_confirmed > 0) {
+            speculative_pending = true;
+        }
+        return {std::move(logits), std::move(streams)};
+    }
+
+    array forward(
+        const array& token_ids,
+        bool use_cache,
+        bool last_token_only = false) {
+        return forward_with_hidden(
+            token_ids, use_cache, last_token_only).first;
+    }
+
+    void commit_speculative() {
+        if (!speculative_pending) {
+            throw std::runtime_error(
+                "Qwen4 has no speculative target transaction");
+        }
+        for (auto& layer : layers) layer.commit_speculative();
+        speculative_pending = false;
+    }
+
+    void rollback_speculative(
+        int accepted_drafts,
+        int draft_count) {
+        if (!speculative_pending || draft_count <= 0 ||
+            accepted_drafts < 0 || accepted_drafts >= draft_count ||
+            cache_position < draft_count - accepted_drafts) {
+            throw std::runtime_error(
+                "Qwen4 speculative rollback range is invalid");
+        }
+        for (auto& layer : layers) {
+            layer.rollback_speculative(accepted_drafts);
+        }
+        cache_position -= draft_count - accepted_drafts;
+        speculative_pending = false;
     }
 
     void reset(int batch) {
@@ -1693,14 +2447,18 @@ struct MlxQwen4CausalLm::Impl {
             throw std::runtime_error("Qwen4 cache batch must be positive");
         }
         for (auto& layer : layers) layer.reset(batch);
+        if (mtp) mtp->reset(batch);
         cache_batch = batch;
         cache_position = 0;
+        speculative_pending = false;
     }
 
     void clear() noexcept {
         for (auto& layer : layers) layer.clear();
+        if (mtp) mtp->clear();
         cache_batch = 0;
         cache_position = 0;
+        speculative_pending = false;
     }
 
 private:
@@ -1710,13 +2468,15 @@ private:
         MlxEmbedding selected_embedding,
         std::optional<MlxLinear> selected_output,
         std::vector<Qwen4Layer> selected_layers,
-        GatedResidual selected_mixer)
+        GatedResidual selected_mixer,
+        std::optional<Qwen4Mtp> selected_mtp)
         : config(std::move(selected_config)),
           maximum(selected_maximum),
           embedding(std::move(selected_embedding)),
           output(std::move(selected_output)),
           layers(std::move(selected_layers)),
-          mixer(std::move(selected_mixer)) {}
+          mixer(std::move(selected_mixer)),
+          mtp(std::move(selected_mtp)) {}
 
 public:
     Qwen4Config config;
@@ -1725,8 +2485,11 @@ public:
     std::optional<MlxLinear> output;
     std::vector<Qwen4Layer> layers;
     GatedResidual mixer;
+    std::optional<Qwen4Mtp> mtp;
+    MlxMtpGenerationStats last_mtp_stats;
     int cache_batch = 0;
     int cache_position = 0;
+    bool speculative_pending = false;
 };
 
 MlxQwen4CausalLm::MlxQwen4CausalLm(std::unique_ptr<Impl> impl)
@@ -1786,9 +2549,19 @@ std::int32_t MlxQwen4CausalLm::generate(
         values.push_back(static_cast<std::int32_t>(token));
     }
     if (max_tokens == 0) {
+        impl_->last_mtp_stats = {
+            impl_->mtp.has_value(), false, 0, 0, 0};
         reset_cache(1);
         return 0;
     }
+    const int limit = std::min<int>(
+        max_tokens,
+        impl_->maximum - static_cast<int>(prompt.size()) + 1);
+    const bool mtp_active =
+        impl_->mtp.has_value() && sampling.enable_mtp &&
+        !token_constraint && limit > 1;
+    impl_->last_mtp_stats = {
+        impl_->mtp.has_value(), mtp_active, 0, 0, 0};
     reset_cache(1);
     const array prompt_ids(
         values.begin(), Shape{1, static_cast<int>(values.size())},
@@ -1800,6 +2573,7 @@ std::int32_t MlxQwen4CausalLm::generate(
             prompt_ids);
     }
     double prefill_ms = 0.0;
+    std::optional<array> prefill_hidden;
     const bool profile_prefill = detail::component_profile_requested();
     detail::ComponentProfile component_profile;
     const auto profile_started = std::chrono::steady_clock::now();
@@ -1808,8 +2582,13 @@ std::int32_t MlxQwen4CausalLm::generate(
             profile_prefill ? &component_profile : nullptr);
         detail::ScopedMlxEvaluationTiming timing(
             prefill_callback ? &prefill_ms : nullptr);
+        auto prefill = impl_->forward_with_hidden(
+            prompt_ids, true, true);
+        if (mtp_active) {
+            prefill_hidden = std::move(prefill.second);
+        }
         auto value = mlx_last_token_logits(
-            impl_->forward(prompt_ids, true, true), vocab);
+            prefill.first, vocab);
         if (profile_prefill) {
             detail::profile_eval("qwen4.output", value);
         } else if (prefill_callback) {
@@ -1847,9 +2626,242 @@ std::int32_t MlxQwen4CausalLm::generate(
     if (prefill_callback) prefill_callback(prompt.size(), prefill_ms);
 
     MlxSampler sampler(sampling);
-    const int limit = std::min<int>(
-        max_tokens,
-        impl_->maximum - static_cast<int>(prompt.size()) + 1);
+    if (mtp_active) {
+        try {
+            if (!prefill_hidden) {
+                throw std::runtime_error(
+                    "Qwen4 MTP prefill did not retain hidden streams");
+            }
+            if (prompt_ids.shape(1) > 1) {
+                mlx_prime_mtp_history(
+                    *prefill_hidden,
+                    prompt_ids,
+                    [&](const array& hidden_rows,
+                        const array& shifted_ids,
+                        int) {
+                        return impl_->mtp->forward(
+                            hidden_rows,
+                            shifted_ids,
+                            impl_->embedding,
+                            true).sample_hidden;
+                    });
+            }
+            MlxSampler first_sampler(sampling);
+            auto sampled = counts
+                ? first_sampler.sample(logits, *counts)
+                : first_sampler.sample(logits);
+            sampled.eval();
+            const auto first = sampled.data<std::int32_t>()[0];
+            if (first < 0 || first >= vocab) {
+                throw std::runtime_error(
+                    "Qwen4 MTP sampler returned an invalid first token");
+            }
+            const array first_id(
+                {first}, Shape{1, 1}, mlx::core::int32);
+            if (counts) {
+                *counts = sample_token_counts_add(*counts, first_id);
+            }
+            const bool delivered = !callback || callback(first);
+            const bool first_is_eos =
+                impl_->config.eos_token_id > 0 &&
+                first == impl_->config.eos_token_id;
+            if (!delivered || first_is_eos || limit == 1) {
+                return 1;
+            }
+
+            // Complete the teacher-forced prompt seam. The common engine's
+            // first history fold starts at hidden(first), so the predictor
+            // cache must already contain (hidden(prompt[-1]), first).
+            auto prompt_last_hidden = mlx::core::slice(
+                *prefill_hidden,
+                Shape{0, prompt_ids.shape(1) - 1, 0},
+                Shape{
+                    1,
+                    prompt_ids.shape(1),
+                    static_cast<int>(
+                        impl_->config.hc_count * impl_->config.hidden_size),
+                });
+            auto seam = impl_->mtp->forward(
+                prompt_last_hidden,
+                first_id,
+                impl_->embedding,
+                true);
+            mlx::core::async_eval(
+                std::vector<array>{std::move(seam.sample_hidden)});
+            int predictor_history_position =
+                impl_->mtp->cache_position();
+
+            auto first_target = impl_->forward_with_hidden(
+                first_id, true, false);
+            auto next_logits = mlx_last_token_logits(
+                first_target.first, vocab);
+            auto initial_hidden = std::move(first_target.second);
+
+            MlxMtpEngineCallbacks mtp_callbacks;
+            mtp_callbacks.target_cache_position = [&] {
+                return impl_->cache_position;
+            };
+            mtp_callbacks.prepare_draft =
+                [&, initial_hidden](
+                    const MlxMtpDraftContext& context,
+                    const MlxMtpTokenSelector& select_token) {
+                    array hidden_rows = initial_hidden;
+                    std::vector<std::int32_t> next_ids{
+                        context.pending_token};
+                    if (!context.initial) {
+                        if (context.verified_hidden == nullptr ||
+                            context.next_token_ids.empty()) {
+                            throw std::runtime_error(
+                                "Qwen4 MTP verified history is unavailable");
+                        }
+                        const int committed = context.accepted_drafts + 1;
+                        if (context.next_token_ids.size() !=
+                            static_cast<std::size_t>(committed)) {
+                            throw std::runtime_error(
+                                "Qwen4 MTP shifted history is inconsistent");
+                        }
+                        hidden_rows = mlx::core::slice(
+                            *context.verified_hidden,
+                            Shape{0, 0, 0},
+                            Shape{
+                                1,
+                                committed,
+                                static_cast<int>(
+                                    impl_->config.hc_count *
+                                    impl_->config.hidden_size),
+                            });
+                        next_ids.assign(
+                            context.next_token_ids.begin(),
+                            context.next_token_ids.end());
+                    }
+                    const int committed = static_cast<int>(next_ids.size());
+                    // Draft-chain forwards append speculative QSA entries.
+                    // Keep the persistent predictor cache committed-only;
+                    // the verified history below rebuilds the next boundary.
+                    impl_->mtp->trim_cache_to(
+                        predictor_history_position);
+                    const array committed_ids(
+                        next_ids.begin(),
+                        Shape{1, committed},
+                        mlx::core::int32);
+                    auto predictor = impl_->mtp->forward(
+                        hidden_rows,
+                        committed_ids,
+                        impl_->embedding,
+                        true);
+                    predictor_history_position += committed;
+                    auto head_hidden = mlx::core::slice(
+                        predictor.sample_hidden,
+                        Shape{0, committed - 1, 0},
+                        Shape{
+                            1,
+                            committed,
+                            static_cast<int>(impl_->config.hidden_size),
+                        });
+                    auto chain_streams = mlx::core::slice(
+                        predictor.hidden_streams,
+                        Shape{0, committed - 1, 0},
+                        Shape{
+                            1,
+                            committed,
+                            static_cast<int>(
+                                impl_->config.hc_count *
+                                impl_->config.hidden_size),
+                        });
+                    for (int position = 0;
+                         position < context.requested_depth;
+                         ++position) {
+                        auto draft_logits = impl_->output
+                            ? (*impl_->output)(head_hidden)
+                            : impl_->embedding.project(head_hidden);
+                        auto token = select_token(mlx_last_token_logits(
+                            draft_logits, vocab));
+                        if (position + 1 == context.requested_depth) {
+                            break;
+                        }
+                        predictor = impl_->mtp->forward(
+                            chain_streams,
+                            mlx::core::reshape(token, Shape{1, 1}),
+                            impl_->embedding,
+                            true);
+                        head_hidden = std::move(predictor.sample_hidden);
+                        chain_streams = std::move(predictor.hidden_streams);
+                    }
+                };
+            mtp_callbacks.verify_target =
+                [&](std::int32_t pending_token,
+                    const array& draft_tokens,
+                    int draft_count) {
+                    const array pending_id(
+                        {pending_token}, Shape{1}, mlx::core::int32);
+                    auto verify_ids = mlx::core::reshape(
+                        mlx::core::concatenate(
+                            {
+                                pending_id,
+                                mlx::core::reshape(
+                                    draft_tokens, Shape{draft_count}),
+                            },
+                            0),
+                        Shape{1, draft_count + 1});
+                    auto verified = impl_->forward_with_hidden(
+                        verify_ids,
+                        true,
+                        false,
+                        draft_count > 0 ? 1 : 0);
+                    return MlxMtpTargetBatch{
+                        mlx::core::reshape(
+                            verified.first,
+                            Shape{draft_count + 1, vocab}),
+                        std::move(verified.second),
+                    };
+                };
+            mtp_callbacks.resolve_target =
+                [&](int accepted_drafts, int draft_count) {
+                    if (draft_count == 0) return;
+                    if (accepted_drafts == draft_count) {
+                        impl_->commit_speculative();
+                    } else {
+                        impl_->rollback_speculative(
+                            accepted_drafts, draft_count);
+                    }
+                };
+            mtp_callbacks.plain_decode =
+                [&](std::int32_t pending_token) {
+                    const array ids(
+                        {pending_token}, Shape{1, 1}, mlx::core::int32);
+                    return mlx_last_token_logits(
+                        impl_->forward(ids, true), vocab);
+                };
+
+            const std::array<std::int64_t, 1> eos{
+                impl_->config.eos_token_id};
+            const auto remainder = run_mlx_mtp_generation(
+                MlxMtpEngineRequest{
+                    vocab,
+                    limit - 1,
+                    impl_->maximum,
+                    kQwen4MtpMaximumDraftDepth,
+                    std::move(next_logits),
+                    sampling,
+                    std::move(counts),
+                    impl_->config.eos_token_id > 0
+                        ? std::span<const std::int64_t>(eos)
+                        : std::span<const std::int64_t>{},
+                    callback,
+                    sampling.greedy() ? 0u : 1u,
+                },
+                mtp_callbacks,
+                impl_->last_mtp_stats);
+            return 1 + remainder;
+        } catch (...) {
+            try {
+                impl_->reset(1);
+            } catch (...) {
+            }
+            throw;
+        }
+    }
+
     std::int32_t generated = 0;
     while (generated < limit) {
         auto sampled = counts
@@ -1908,6 +2920,15 @@ std::size_t MlxQwen4CausalLm::layer_count() const noexcept {
 
 int MlxQwen4CausalLm::cache_position() const noexcept {
     return impl_->cache_position;
+}
+
+bool MlxQwen4CausalLm::supports_mtp() const noexcept {
+    return impl_->mtp.has_value();
+}
+
+const MlxMtpGenerationStats&
+MlxQwen4CausalLm::last_mtp_stats() const noexcept {
+    return impl_->last_mtp_stats;
 }
 
 MlxQwen4TextSessionState MlxQwen4CausalLm::capture_text_session_state(

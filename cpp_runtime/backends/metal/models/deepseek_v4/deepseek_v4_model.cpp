@@ -992,11 +992,17 @@ void DeepseekV4Config::validate() const {
     if (n_mtp_layers > 0) {
         positive(n_mtp_layers, "n_mtp_layers");
         positive(dspark_markov_rank, "dspark_markov_rank");
-        positive(dspark_n_experts, "dspark_n_experts");
-        positive(dspark_top_k, "dspark_top_k");
-        if (dspark_top_k > std::min<std::int64_t>(16, dspark_n_experts)) {
-            throw std::runtime_error(
-                "DeepSeek-V4 DSpark top_k exceeds the Metal router limit");
+        // V4.1 gives the predictor its own expert topology. Legacy V4 uses
+        // the backbone expert count/top-k and legitimately leaves these
+        // V4.1-only fields unset.
+        if (is_v41()) {
+            positive(dspark_n_experts, "dspark_n_experts");
+            positive(dspark_top_k, "dspark_top_k");
+            if (dspark_top_k >
+                std::min<std::int64_t>(16, dspark_n_experts)) {
+                throw std::runtime_error(
+                    "DeepSeek-V4 DSpark top_k exceeds the Metal router limit");
+            }
         }
         if (mtp_compress_ratios.size() !=
             static_cast<std::size_t>(n_mtp_layers)) {

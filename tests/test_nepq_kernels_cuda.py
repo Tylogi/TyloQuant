@@ -22,6 +22,8 @@ from mfq.kernels.cuda.nepq_matmul import (  # noqa: E402
     nepq_gemm_f16,
     nepq_gemv,
     nepq_grouped_matmul,
+    nepq_backward_input,
+    nepq_matmul,
     nepq_mmq,
     to_gpu_nepq,
 )
@@ -149,6 +151,58 @@ def test_nepq_cuda_online_f16_matches_stored_weight(spec, m):
     actual = nepq_gemm_f16(gpu, x)
     relative = ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
     assert relative < 0.006, f"{spec.label} M={m} relative error {relative}"
+
+
+@pytest.mark.parametrize("spec", [NEPQ0_S, NEPQ0_L, NEPQ1_S, NEPQ1_L])
+def test_nepq_packed_backward_and_autograd_match_dequant(spec):
+    tensor = _dynamic_tensor(spec)
+    gpu = to_gpu_nepq(tensor)
+    dense = torch.as_tensor(
+        dequantize_nepq(tensor).reshape(-1, tensor.neuron_len),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    output_gradient = torch.randn(
+        3, dense.shape[0], device="cuda", dtype=torch.float16
+    )
+    stored_gradient = output_gradient @ dense
+    signs = torch.as_tensor(
+        rotation_signs(
+            tensor.neuron_len, tensor.rotation_block, tensor.rotation_seed
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    expected = stored_gradient
+    blocks = expected.reshape(-1, tensor.rotation_block).clone()
+    stride = 1
+    while stride < tensor.rotation_block:
+        paired = blocks.reshape(-1, 2, stride)
+        first = paired[:, 0].clone()
+        second = paired[:, 1].clone()
+        paired[:, 0] = first + second
+        paired[:, 1] = first - second
+        stride *= 2
+    expected = (
+        blocks.reshape_as(expected)
+        * (1.0 / math.sqrt(tensor.rotation_block))
+        * signs
+    ).to(torch.float16)
+    torch.testing.assert_close(
+        nepq_backward_input(gpu, output_gradient),
+        expected,
+        rtol=0.006,
+        atol=0.006,
+    )
+    source = torch.randn(
+        3,
+        tensor.neuron_len,
+        device="cuda",
+        dtype=torch.float16,
+        requires_grad=True,
+    )
+    (nepq_matmul(gpu, source).reshape(3, -1) * output_gradient).sum().backward()
+    torch.testing.assert_close(source.grad, expected, rtol=0.006, atol=0.006)
 
 
 @pytest.mark.parametrize("spec", [NEPQ0_S, NEPQ0_L, NEPQ1_S, NEPQ1_L])

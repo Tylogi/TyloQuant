@@ -123,6 +123,37 @@ int main() {
                 legacy_qwen.topology.predictor_layers == 1,
             "legacy Qwen topology was not recovered");
 
+        const std::unordered_set<std::string> legacy_v41_tensors{
+            "vision.patch_embedding.weight",
+            "predictor.stage.0.main_projection.weight",
+        };
+        const auto legacy_v41 = mfq::synthesize_legacy_model_graph(
+            "deepseek_v41",
+            R"json({
+              "model_type":"deepseek_v41",
+              "text_config":{
+                "model_type":"deepseek_v41_text",
+                "num_hidden_layers":40,
+                "num_nextn_predict_layers":3
+              },
+              "vision_config":{"num_hidden_layers":32}
+            })json",
+            [&](std::string_view name) {
+                return legacy_v41_tensors.count(std::string(name)) != 0;
+            });
+        require(
+            legacy_v41.architecture == "deepseek_v41" &&
+                legacy_v41.backbone == "deepseek_v41",
+            "legacy DeepSeek-V4.1 was folded into the V4 runtime");
+        require(
+            legacy_v41.component("vision") != nullptr &&
+                legacy_v41.component("vision")->implementation ==
+                    "deepseek_v41_vision" &&
+                legacy_v41.component("predictor") != nullptr &&
+                legacy_v41.component("predictor")->implementation ==
+                    "deepseek_v41_dspark",
+            "legacy DeepSeek-V4.1 components were not recovered");
+
         const auto generic = mfq::synthesize_legacy_model_graph(
             "qwen2_legacy",
             R"json({"model_type":"qwen2","num_hidden_layers":32})json",
@@ -244,6 +275,47 @@ int main() {
                 "predictor.stage.0.mlp.router.vision_bias") ==
                 "mtp.0.ffn.gate.bias_vl",
             "legacy DeepSeek-V4 aliases were not canonicalized");
+
+        const auto v41_aliases = mfq::make_legacy_tensor_aliases(
+            "deepseek_v41",
+            R"json({"model_type":"deepseek_v41"})json",
+            {
+                "layers.0.attn.wq_a.weight",
+                "layers.0.ffn.experts.3.w1.weight",
+                "layers.0.ffn.experts.3.w1.scale",
+                "mtp.0.markov_head.embed.weight",
+            });
+        require(
+            v41_aliases.canonical_to_stored.at(
+                "model.block.0.attention.query_a.weight") ==
+                "layers.0.attn.wq_a.weight" &&
+            v41_aliases.canonical_to_stored.at(
+                "model.block.0.mlp.experts.3.gate.weight") ==
+                "layers.0.ffn.experts.3.w1.weight" &&
+            v41_aliases.canonical_to_stored.at(
+                "model.block.0.mlp.experts.3.gate.weight_scale") ==
+                "layers.0.ffn.experts.3.w1.scale" &&
+            v41_aliases.canonical_to_stored.at(
+                "predictor.stage.0.markov.embedding.weight") ==
+                "mtp.0.markov_head.embed.weight",
+            "legacy DeepSeek-V4.1 aliases were not canonicalized");
+
+        const auto v41_raw_hf_aliases = mfq::make_legacy_tensor_aliases(
+            "deepseek_v4_raw_hf",
+            R"json({"model_type":"deepseek_v41"})json",
+            {
+                "layers.0.attn.wkv.weight",
+                "layers.0.attn.kv_norm.weight",
+            });
+        require(
+            v41_raw_hf_aliases.canonical_to_stored.at(
+                "model.block.0.attention.key_value_a.weight") ==
+                "layers.0.attn.wkv.weight" &&
+            v41_raw_hf_aliases.canonical_to_stored.at(
+                "model.block.0.attention.key_value_a_norm.weight") ==
+                "layers.0.attn.kv_norm.weight",
+            "raw-HF DeepSeek-V4.1 aliases did not preserve the tuned "
+            "Metal contract");
 
         const auto gemma_aliases = mfq::make_legacy_tensor_aliases(
             "gemma4",

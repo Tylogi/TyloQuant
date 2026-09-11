@@ -572,6 +572,119 @@ constexpr const char *kSq2Gemv = R"METAL(
     }
 )METAL";
 
+constexpr const char *kSq2BackwardMatrix = R"METAL(
+    constexpr uint BM = 8u;
+    constexpr uint BN = 64u;
+    constexpr uint BK = 32u;
+    constexpr uint BN_PAD = BN + 8u;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint local_thread = thread_index_in_threadgroup;
+    uint row_base = threadgroup_position_in_grid.y * BM;
+    uint block = threadgroup_position_in_grid.x;
+    uint column_base = block * BK;
+    threadgroup half gradient_tile[BM * BN_PAD];
+    threadgroup half weight_tile[BN * BK];
+    threadgroup float cached_scales[BN];
+    threadgroup uchar cached_palettes[BN];
+    metal::simdgroup_matrix<float, 8, 8> result;
+    result.thread_elements()[0] = 0.0f;
+    result.thread_elements()[1] = 0.0f;
+    uint quadrant = lane / 4u;
+    uint fragment_row = (quadrant & 4u) + ((lane / 2u) & 3u);
+    uint fragment_col = (quadrant & 2u) * 2u + (lane & 1u) * 2u;
+    uint simd_col = simd_group * 8u;
+    for (uint chunk = 0u; chunk < (uint(OUT) + BN - 1u) / BN; ++chunk) {
+        uint output_base = chunk * BN;
+        for (uint index = local_thread; index < BM * BN; index += 128u) {
+            uint local_row = index / BN;
+            uint local_output = index - local_row * BN;
+            uint row = row_base + local_row;
+            uint output = output_base + local_output;
+            gradient_tile[local_row * BN_PAD + local_output] =
+                row < uint(M) && output < uint(OUT)
+                ? half(x[row * uint(OUT) + output])
+                : half(0.0f);
+        }
+        for (uint local_output = local_thread;
+             local_output < BN;
+             local_output += 128u) {
+            uint output = output_base + local_output;
+            if (output < uint(OUT) && column_base < uint(K)) {
+                uint block_index = output * uint(BLOCKS) + block;
+                uint tag = mfq_sq2_scalar_block_tag(
+                    symbols, selectors, block_index);
+                uint state_index = output * uint(STATES) + tag;
+                cached_scales[local_output] =
+                    mfq_sq2_read_scale(state_scales, state_index);
+                cached_palettes[local_output] = uchar(
+                    mfq_sq2_read_palette(state_palettes, state_index));
+            } else {
+                cached_scales[local_output] = 0.0f;
+                cached_palettes[local_output] = 0u;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint task = local_thread; task < BN * 2u; task += 128u) {
+            uint local_output = task >> 1u;
+            uint half_block = task & 1u;
+            uint output = output_base + local_output;
+            uint packed_base = half_block * 4u;
+            if (output < uint(OUT) && column_base < uint(K)) {
+                uint block_index = output * uint(BLOCKS) + block;
+                float scale = cached_scales[local_output];
+                uint palette = uint(cached_palettes[local_output]) * 4u;
+                for (uint offset = 0u; offset < 4u; ++offset) {
+                    uint packed_index = packed_base + offset;
+                    uint packed = uint(
+                        symbols[block_index * 8u + packed_index]);
+                    half4 weights = half4(float4(
+                        mfq_sq2_palette_values[palette + (packed & 3u)],
+                        mfq_sq2_palette_values[
+                            palette + ((packed >> 2u) & 3u)],
+                        mfq_sq2_palette_values[
+                            palette + ((packed >> 4u) & 3u)],
+                        mfq_sq2_palette_values[palette + (packed >> 6u)]
+                    ) * scale);
+                    *(threadgroup half4*)(
+                        weight_tile + local_output * BK + packed_index * 4u
+                    ) = weights;
+                }
+            } else {
+                for (uint offset = 0u; offset < 4u; ++offset) {
+                    uint packed_index = packed_base + offset;
+                    *(threadgroup half4*)(
+                        weight_tile + local_output * BK + packed_index * 4u
+                    ) = half4(0.0h);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0u; kk < BN; kk += 8u) {
+            metal::simdgroup_matrix<half, 8, 8> a;
+            metal::simdgroup_matrix<half, 8, 8> b;
+            a.thread_elements()[0] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col];
+            a.thread_elements()[1] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col + 1u];
+            b.thread_elements()[0] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + fragment_col];
+            b.thread_elements()[1] = weight_tile[
+                (kk + fragment_row) * BK + simd_col + fragment_col + 1u];
+            simdgroup_multiply_accumulate(result, a, b, result);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint row = row_base + fragment_row;
+    uint column = column_base + simd_col + fragment_col;
+    if (row < uint(M) && column < uint(K)) {
+        y[row * uint(K) + column] = T(result.thread_elements()[0]);
+    }
+    if (row < uint(M) && column + 1u < uint(K)) {
+        y[row * uint(K) + column + 1u] = T(result.thread_elements()[1]);
+    }
+)METAL";
+
 mlx::core::fast::CustomKernelFunction
 make_sq2_matmul_kernel(std::string name, const char *source,
                        const char *header = kSq2Header) {
@@ -604,6 +717,12 @@ const mlx::core::fast::CustomKernelFunction &sq2_gemv_kernel() {
         {"symbols", "selectors", "state_scales", "state_palettes", "x"}, {"y"},
         kSq2Gemv, kSq2Header, true, false, options);
   }();
+  return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction &sq2_backward_matrix_kernel() {
+  static const auto kernel = make_sq2_matmul_kernel(
+      "mfq_cpp_mxfp4_sq2_backward_matrix", kSq2BackwardMatrix);
   return kernel;
 }
 
@@ -855,6 +974,46 @@ array MlxMxfp4Sq2Weight::matmul(const array &input) const {
                            {Shape{static_cast<int>(rows), output_size_}},
                            {source.dtype()}, grid, threadgroup,
                            std::move(arguments), std::nullopt, false, {});
+  return mlx::core::reshape(std::move(outputs.front()),
+                            std::move(output_shape));
+}
+
+array MlxMxfp4Sq2Weight::backward_input(
+    const array &output_gradient) const {
+  if (output_gradient.ndim() == 0 ||
+      output_gradient.shape(-1) != output_size_) {
+    throw std::runtime_error(
+        "MXFP4-SQ2 output-gradient width does not match packed weight");
+  }
+  const auto rows =
+      output_gradient.size() / static_cast<std::size_t>(output_size_);
+  if (rows == 0 ||
+      rows > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error("unsupported MXFP4-SQ2 backward row count");
+  }
+  Shape output_shape = output_gradient.shape();
+  output_shape.back() = input_size_;
+  auto source = output_gradient;
+  if (source.dtype() != mlx::core::float16 &&
+      source.dtype() != mlx::core::float32) {
+    source = mlx::core::astype(source, mlx::core::float16);
+  }
+  source = mlx::core::reshape(
+      source, Shape{static_cast<int>(rows), output_size_});
+  if (rows > 8 || source.dtype() == mlx::core::float32) {
+    auto result = mlx::core::matmul(source, dequantize(source.dtype()));
+    return mlx::core::reshape(std::move(result), std::move(output_shape));
+  }
+  auto arguments = mmq_templates(
+      source.dtype(), input_size_, output_size_,
+      static_cast<int>(rows), 8);
+  auto outputs = sq2_backward_matrix_kernel()(
+      {symbols_, block_selectors_, state_scale_stream_, state_palettes_, source},
+      {Shape{static_cast<int>(rows), input_size_}}, {source.dtype()},
+      {(input_size_ / 32) * 128,
+       (static_cast<int>(rows) + 7) / 8,
+       1},
+      {128, 1, 1}, std::move(arguments), std::nullopt, false, {});
   return mlx::core::reshape(std::move(outputs.front()),
                             std::move(output_shape));
 }

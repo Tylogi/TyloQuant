@@ -693,6 +693,14 @@ array MlxLinear::grouped_row_matmul(
                 -1);
         }
     }
+    if (const auto* packed = std::get_if<MlxNintWeight>(&weight_)) {
+        if (auto result = packed->grouped_row_matmul(input, group_count)) {
+            return input.dtype() == mlx::core::bfloat16
+                    && result->dtype() != input.dtype()
+                ? mlx::core::astype(*result, input.dtype())
+                : *result;
+        }
+    }
     if (const auto* packed =
             std::get_if<MlxTpqInt4Weight>(&weight_)) {
         return packed->grouped_row_matmul(

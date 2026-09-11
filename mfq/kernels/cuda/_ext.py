@@ -20,6 +20,10 @@ _REPOSITORY_ROOT = str(Path(_DIR).resolve().parents[2])
 _CUDA_RUNTIME_INCLUDE = str(
     Path(_REPOSITORY_ROOT) / "cpp_runtime" / "backends" / "cuda" / "include"
 )
+_GGML_ROOT = Path(_REPOSITORY_ROOT) / "cpp_runtime" / "components" / "ggml"
+_GGML_INCLUDE = str(_GGML_ROOT / "include")
+_GGML_SOURCE_INCLUDE = str(_GGML_ROOT / "src")
+_GGML_CUDA_INCLUDE = str(_GGML_ROOT / "src" / "ggml-cuda")
 _SOURCES = [
     os.path.join(_DIR, "norm.cu"),
     os.path.join(_DIR, "acc.cu"),
@@ -90,10 +94,25 @@ def ext():
         _module = load(
             name="mfq_cuda",
             sources=_SOURCES,
-            extra_include_paths=[_REPOSITORY_ROOT, _CUDA_RUNTIME_INCLUDE],
+            extra_include_paths=[
+                _REPOSITORY_ROOT,
+                _CUDA_RUNTIME_INCLUDE,
+                _GGML_INCLUDE,
+                _GGML_SOURCE_INCLUDE,
+                _GGML_CUDA_INCLUDE,
+            ],
             # Shared native tensor views require C++20 (span and comparisons).
             extra_cflags=["/std:c++20"] if os.name == "nt" else ["-std=c++20"],
-            extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20"],
+            extra_cuda_cflags=[
+                "-O3",
+                "--use_fast_math",
+                "--extended-lambda",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+                "-std=c++20",
+            ],
             extra_ldflags=["cublas.lib"] if os.name == "nt" else ["-lcublas"],
             verbose=False,
         )

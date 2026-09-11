@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "mfq_tensor_backend.h"
 #include <cuda_runtime.h>
 
@@ -11,7 +12,6 @@ namespace {
 constexpr int kHyperConnections = 4;
 constexpr int kHyperMixWidth =
     (2 + kHyperConnections) * kHyperConnections;
-constexpr int kHyperSinkhornIterations = 20;
 
 __device__ __forceinline__ float dsv4_sigmoid(float value) {
     return __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-value)));
@@ -46,6 +46,7 @@ __global__ void dsv4_hc_pre_finalize_kernel(
     float * __restrict__ combination,
     int rows,
     int hidden,
+    int iterations,
     float eps)
 {
     const int row = blockIdx.x;
@@ -129,7 +130,7 @@ __global__ void dsv4_hc_pre_finalize_kernel(
 
 #pragma unroll
         for (int iteration = 1;
-             iteration < kHyperSinkhornIterations;
+             iteration < iterations;
              ++iteration) {
             if (thread < kHyperConnections) {
                 const int offset = thread * kHyperConnections;
@@ -258,8 +259,8 @@ std::vector<mfq_tensor_backend::Tensor> dsv4_hc_pre_cuda(
         x.is_cuda() && x.is_contiguous() &&
             x.scalar_type() == mfq_tensor_backend::kFloat16 &&
             x.dim() == 4 && x.size(2) == kHyperConnections &&
-            x.size(3) == 4096,
-        "dsv4_hc_pre: x must be contiguous CUDA f16 [B,T,4,4096]");
+            x.size(3) > 0 && x.size(3) <= INT_MAX,
+        "dsv4_hc_pre: x must be contiguous CUDA f16 [B,T,4,H]");
     MFQ_RUNTIME_CHECK(
         mixes.is_cuda() && mixes.is_contiguous() &&
             mixes.scalar_type() == mfq_tensor_backend::kFloat32 &&
@@ -274,7 +275,7 @@ std::vector<mfq_tensor_backend::Tensor> dsv4_hc_pre_cuda(
             base.is_cuda() && base.is_contiguous() &&
             base.scalar_type() == mfq_tensor_backend::kFloat32 &&
             base.numel() == kHyperMixWidth &&
-            iterations == kHyperSinkhornIterations &&
+            iterations > 0 && iterations <= INT_MAX &&
             std::isfinite(eps) && eps > 0.0,
         "dsv4_hc_pre: invalid scale, base, iterations, or epsilon");
     const int64_t rows64 = x.size(0) * x.size(1);
@@ -299,7 +300,7 @@ std::vector<mfq_tensor_backend::Tensor> dsv4_hc_pre_cuda(
         base.data_ptr<float>(),
         reinterpret_cast<half *>(reduced.data_ptr<mfq_half>()),
         post.data_ptr<float>(), combination.data_ptr<float>(),
-        rows, hidden, static_cast<float>(eps));
+        rows, hidden, static_cast<int>(iterations), static_cast<float>(eps));
     const cudaError_t status = cudaGetLastError();
     MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
@@ -316,8 +317,8 @@ mfq_tensor_backend::Tensor dsv4_hc_post_cuda(
     MFQ_RUNTIME_CHECK(
         x.is_cuda() && x.is_contiguous() &&
             x.scalar_type() == mfq_tensor_backend::kFloat16 &&
-            x.dim() == 3 && x.size(2) == 4096,
-        "dsv4_hc_post: x must be contiguous CUDA f16 [B,T,4096]");
+            x.dim() == 3 && x.size(2) > 0 && x.size(2) <= INT_MAX,
+        "dsv4_hc_post: x must be contiguous CUDA f16 [B,T,H]");
     MFQ_RUNTIME_CHECK(
         residual.is_cuda() && residual.is_contiguous() &&
             residual.scalar_type() == mfq_tensor_backend::kFloat16 &&

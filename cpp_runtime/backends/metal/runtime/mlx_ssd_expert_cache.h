@@ -13,7 +13,7 @@
 
 namespace mfq::metal {
 
-struct MlxDeepseekV4SsdCacheStats {
+struct MlxSsdExpertCacheStats {
     std::uint64_t requests = 0;
     std::uint64_t hits = 0;
     std::uint64_t misses = 0;
@@ -52,68 +52,64 @@ struct MlxDeepseekV4SsdCacheStats {
     }
 };
 
-struct MlxDeepseekV4SsdRouteSelection {
+struct MlxSsdExpertRouteSelection {
     std::size_t layer = 0;
     std::vector<std::int32_t> experts;
     bool all_hit = false;
 };
 
-struct MlxDeepseekV4SsdRouteTransactionResult {
-    std::vector<MlxDeepseekV4SsdRouteSelection> routes;
+struct MlxSsdExpertRouteTransactionResult {
+    std::vector<MlxSsdExpertRouteSelection> routes;
     bool all_hit = true;
 };
 
-class MlxDeepseekV4SsdPrefetchedLayer {
+class MlxSsdPrefetchedExpertLayer {
 public:
-    MlxDeepseekV4SsdPrefetchedLayer(
-        MlxDeepseekV4SsdPrefetchedLayer&&) noexcept;
-    MlxDeepseekV4SsdPrefetchedLayer& operator=(
-        MlxDeepseekV4SsdPrefetchedLayer&&) noexcept;
-    ~MlxDeepseekV4SsdPrefetchedLayer();
+    MlxSsdPrefetchedExpertLayer(
+        MlxSsdPrefetchedExpertLayer&&) noexcept;
+    MlxSsdPrefetchedExpertLayer& operator=(
+        MlxSsdPrefetchedExpertLayer&&) noexcept;
+    ~MlxSsdPrefetchedExpertLayer();
 
-    MlxDeepseekV4SsdPrefetchedLayer(
-        const MlxDeepseekV4SsdPrefetchedLayer&) = delete;
-    MlxDeepseekV4SsdPrefetchedLayer& operator=(
-        const MlxDeepseekV4SsdPrefetchedLayer&) = delete;
+    MlxSsdPrefetchedExpertLayer(
+        const MlxSsdPrefetchedExpertLayer&) = delete;
+    MlxSsdPrefetchedExpertLayer& operator=(
+        const MlxSsdPrefetchedExpertLayer&) = delete;
 
-    const MlxDeepseekV4SsdExpertWeights& wait();
+    const MlxSsdExpertWeights& wait();
     std::size_t layer() const noexcept;
 
 private:
     struct Impl;
-    explicit MlxDeepseekV4SsdPrefetchedLayer(std::unique_ptr<Impl> impl);
+    explicit MlxSsdPrefetchedExpertLayer(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 
-    friend class MlxDeepseekV4SsdExpertCache;
+    friend class MlxMoeSsdExpertCache;
 };
 
-class MlxDeepseekV4SsdPreparedExperts {
+class MlxSsdPreparedExperts {
 public:
-    MlxDeepseekV4SsdPreparedExperts(
-        MlxDeepseekV4SsdPreparedExperts&&) noexcept;
-    MlxDeepseekV4SsdPreparedExperts& operator=(
-        MlxDeepseekV4SsdPreparedExperts&&) noexcept;
-    ~MlxDeepseekV4SsdPreparedExperts();
+    MlxSsdPreparedExperts(MlxSsdPreparedExperts&&) noexcept;
+    MlxSsdPreparedExperts& operator=(MlxSsdPreparedExperts&&) noexcept;
+    ~MlxSsdPreparedExperts();
 
-    MlxDeepseekV4SsdPreparedExperts(
-        const MlxDeepseekV4SsdPreparedExperts&) = delete;
-    MlxDeepseekV4SsdPreparedExperts& operator=(
-        const MlxDeepseekV4SsdPreparedExperts&) = delete;
+    MlxSsdPreparedExperts(const MlxSsdPreparedExperts&) = delete;
+    MlxSsdPreparedExperts& operator=(const MlxSsdPreparedExperts&) = delete;
 
-    const MlxDeepseekV4SsdExpertWeights& weights() const noexcept;
+    const MlxSsdExpertWeights& weights() const noexcept;
     std::span<const std::int32_t> slot_for_expert() const noexcept;
 
 private:
-    MlxDeepseekV4SsdPreparedExperts(
-        MlxDeepseekV4SsdExpertWeights weights,
+    MlxSsdPreparedExperts(
+        MlxSsdExpertWeights weights,
         std::vector<std::int32_t> slot_for_expert,
         std::function<void()> release);
 
-    std::unique_ptr<MlxDeepseekV4SsdExpertWeights> weights_;
+    std::unique_ptr<MlxSsdExpertWeights> weights_;
     std::vector<std::int32_t> slot_for_expert_;
     std::function<void()> release_;
 
-    friend class MlxDeepseekV4SsdExpertCache;
+    friend class MlxMoeSsdExpertCache;
 };
 
 // Immutable resident page-table view for one routed-expert layer. While this
@@ -121,20 +117,19 @@ private:
 // reused. Readiness is represented explicitly and a missing expert maps to
 // slot -1, which routed Metal kernels treat as a zero-output route. Call
 // finish() only after all arrays using the page table have been evaluated.
-class MlxDeepseekV4SsdPageTableSnapshot {
+class MlxSsdExpertPageTableSnapshot {
 public:
-    MlxDeepseekV4SsdPageTableSnapshot(
-        MlxDeepseekV4SsdPageTableSnapshot&&) noexcept;
-    MlxDeepseekV4SsdPageTableSnapshot& operator=(
-        MlxDeepseekV4SsdPageTableSnapshot&&) noexcept;
-    ~MlxDeepseekV4SsdPageTableSnapshot();
+    MlxSsdExpertPageTableSnapshot(MlxSsdExpertPageTableSnapshot&&) noexcept;
+    MlxSsdExpertPageTableSnapshot& operator=(
+        MlxSsdExpertPageTableSnapshot&&) noexcept;
+    ~MlxSsdExpertPageTableSnapshot();
 
-    MlxDeepseekV4SsdPageTableSnapshot(
-        const MlxDeepseekV4SsdPageTableSnapshot&) = delete;
-    MlxDeepseekV4SsdPageTableSnapshot& operator=(
-        const MlxDeepseekV4SsdPageTableSnapshot&) = delete;
+    MlxSsdExpertPageTableSnapshot(
+        const MlxSsdExpertPageTableSnapshot&) = delete;
+    MlxSsdExpertPageTableSnapshot& operator=(
+        const MlxSsdExpertPageTableSnapshot&) = delete;
 
-    const MlxDeepseekV4SsdExpertWeights& weights() const noexcept;
+    const MlxSsdExpertWeights& weights() const noexcept;
     const mlx::core::array& slot_ids() const noexcept;
     const mlx::core::array& generations() const noexcept;
     const mlx::core::array& readiness() const noexcept;
@@ -153,11 +148,11 @@ public:
 
 private:
     struct Impl;
-    explicit MlxDeepseekV4SsdPageTableSnapshot(
+    explicit MlxSsdExpertPageTableSnapshot(
         std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 
-    friend class MlxDeepseekV4SsdExpertCache;
+    friend class MlxMoeSsdExpertCache;
 };
 
 // Concurrent exact-expert LRU over the shared MLX UMA arena. Safetensors on
@@ -167,45 +162,49 @@ private:
 // reads before waiting, so the configured IO workers expose the SSD queue
 // depth. The returned object pins its slots until destruction; callers must
 // materialize the lazy Metal graph before releasing it.
-class MlxDeepseekV4SsdExpertCache {
+class MfqContainer;
+
+class MlxMoeSsdExpertCache {
 public:
-    MlxDeepseekV4SsdExpertCache(
-        std::filesystem::path model_root,
+    MlxMoeSsdExpertCache(
+        const MfqContainer& model,
+        std::vector<std::string> layer_prefixes,
+        std::size_t hidden_size,
+        std::size_t intermediate_size,
+        std::vector<std::size_t> experts_per_layer,
         std::size_t cache_bytes,
         std::size_t io_workers = 8,
         bool prefill_overlap = false);
-    MlxDeepseekV4SsdExpertCache(
-        std::filesystem::path model_root,
+    MlxMoeSsdExpertCache(
+        const MfqContainer& model,
         std::vector<std::string> layer_prefixes,
+        std::size_t hidden_size,
+        std::size_t intermediate_size,
+        std::size_t num_experts,
         std::size_t cache_bytes,
         std::size_t io_workers = 8,
-        bool prefill_overlap = false,
-        std::size_t num_experts = 256,
-        std::size_t hidden_size = 4096,
-        std::size_t intermediate_size = 2048);
-    ~MlxDeepseekV4SsdExpertCache();
+        bool prefill_overlap = false);
+    ~MlxMoeSsdExpertCache();
 
-    MlxDeepseekV4SsdExpertCache(
-        const MlxDeepseekV4SsdExpertCache&) = delete;
-    MlxDeepseekV4SsdExpertCache& operator=(
-        const MlxDeepseekV4SsdExpertCache&) = delete;
+    MlxMoeSsdExpertCache(const MlxMoeSsdExpertCache&) = delete;
+    MlxMoeSsdExpertCache& operator=(const MlxMoeSsdExpertCache&) = delete;
 
-    MlxDeepseekV4SsdPreparedExperts prepare(
+    MlxSsdPreparedExperts prepare(
         std::size_t layer,
         std::span<const std::int32_t> active_experts,
         std::function<void(
-            const MlxDeepseekV4SsdExpertWeights&,
+            const MlxSsdExpertWeights&,
             std::span<const std::int32_t> ready_experts,
             std::span<const std::int32_t> slot_for_expert)> overlap = {},
         std::function<void(
-            const MlxDeepseekV4SsdExpertWeights&,
+            const MlxSsdExpertWeights&,
             std::span<const std::int32_t> pending_experts,
             std::span<const std::int32_t> slot_for_expert)> gate_up_ready = {});
 
     // Freeze the current resident mapping for a layer and expose it as device
     // arrays. This is the decode fast path: routing IDs can be remapped to
     // arena slots without a host synchronization before routed MoE execution.
-    MlxDeepseekV4SsdPageTableSnapshot snapshot_page_table(
+    MlxSsdExpertPageTableSnapshot snapshot_page_table(
         std::size_t layer);
 
     // A decode route transaction keeps all page-table generations frozen
@@ -216,19 +215,19 @@ public:
     void begin_route_transaction();
     bool route_transaction_active() const noexcept;
     bool route_layer_likely_hit(std::size_t layer) const noexcept;
-    MlxDeepseekV4SsdRouteTransactionResult resolve_route_transaction();
+    MlxSsdExpertRouteTransactionResult resolve_route_transaction();
     void cancel_route_transaction() noexcept;
 
     // Start loading a complete routed-expert layer into one of two alternating
     // buffers. Resident LRU rows are pinned and reused in place; only misses
     // consume SSD bandwidth. Call wait() before submitting the layer's Metal
     // graph and keep the returned object alive until that graph is evaluated.
-    MlxDeepseekV4SsdPrefetchedLayer prefetch_layer(std::size_t layer);
+    MlxSsdPrefetchedExpertLayer prefetch_layer(std::size_t layer);
 
     std::size_t cache_limit_bytes() const noexcept;
     std::size_t cache_slots() const noexcept;
     bool prefill_overlap_enabled() const noexcept;
-    MlxDeepseekV4SsdCacheStats stats() const;
+    MlxSsdExpertCacheStats stats() const;
 
     void record_route_timing(
         double sync_seconds,
@@ -245,8 +244,8 @@ private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
 
-    friend class MlxDeepseekV4SsdPrefetchedLayer;
-    friend class MlxDeepseekV4SsdPageTableSnapshot;
+    friend class MlxSsdPrefetchedExpertLayer;
+    friend class MlxSsdExpertPageTableSnapshot;
 };
 
 } // namespace mfq::metal

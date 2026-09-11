@@ -129,6 +129,409 @@ _NINT_MATMUL_SOURCE = r"""
     }
 """
 
+_NINT_BACKWARD_INPUT_SOURCE = r"""
+    constexpr uint BM = uint(BM_TILE);
+    constexpr uint BN = 64u;
+    constexpr uint BK = uint(GS) * uint(GPC);
+    constexpr uint BK_STORAGE = 128u;
+    constexpr uint BN_PAD = BN + 8u;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint local_thread = thread_index_in_threadgroup;
+    uint row_base = threadgroup_position_in_grid.y * BM;
+    uint column_base = threadgroup_position_in_grid.x * BK;
+
+    threadgroup half gradient_tile[BM * BN_PAD];
+    threadgroup half weight_tile[BN * BK_STORAGE];
+
+    metal::simdgroup_matrix<float, 8, 8> c00;
+    metal::simdgroup_matrix<float, 8, 8> c01;
+    metal::simdgroup_matrix<float, 8, 8> c10;
+    metal::simdgroup_matrix<float, 8, 8> c11;
+    c00.thread_elements()[0] = 0.0f;
+    c00.thread_elements()[1] = 0.0f;
+    c01.thread_elements()[0] = 0.0f;
+    c01.thread_elements()[1] = 0.0f;
+    c10.thread_elements()[0] = 0.0f;
+    c10.thread_elements()[1] = 0.0f;
+    c11.thread_elements()[0] = 0.0f;
+    c11.thread_elements()[1] = 0.0f;
+
+    uint quadrant = lane / 4u;
+    uint fragment_row = (quadrant & 4u) + ((lane / 2u) & 3u);
+    uint fragment_col = (quadrant & 2u) * 2u + (lane & 1u) * 2u;
+    uint simd_col = simd_group * 16u;
+
+    uint chunks = (uint(OUT) + BN - 1u) / BN;
+    for (uint chunk = 0u; chunk < chunks; ++chunk) {
+        uint output_base = chunk * BN;
+        for (uint index = local_thread; index < BM * BN; index += 256u) {
+            uint local_row = index / BN;
+            uint local_output = index - local_row * BN;
+            uint row = row_base + local_row;
+            uint output = output_base + local_output;
+            gradient_tile[local_row * BN_PAD + local_output] =
+                row < uint(M) && output < uint(OUT)
+                ? half(x[row * uint(OUT) + output])
+                : half(0.0f);
+        }
+        for (
+            uint index = local_thread;
+            index < BN * BK_STORAGE;
+            index += 256u
+        ) {
+            uint local_output = index / BK_STORAGE;
+            uint local_column = index - local_output * BK_STORAGE;
+            uint output = output_base + local_output;
+            uint column = column_base + local_column;
+            float value = 0.0f;
+            if (
+                local_column < BK && output < uint(OUT)
+                && column < uint(K)
+            ) {
+                uint group = column / uint(GS);
+                uint element = column - group * uint(GS);
+                uint metadata_index = output * uint(NG) + group;
+                uint quantized = mfq_nint_read_value(
+                    q_packed,
+                    metadata_index * uint(GS) + element,
+                    uint(BITS),
+                    uint(GS),
+                    uint(Q5_EXEC));
+                float scale =
+                    neuron_scale[output] * float(sub_scale[metadata_index]);
+                float minimum =
+                    neuron_min[output] * float(sub_min[metadata_index]);
+                value = scale * float(quantized) - minimum;
+            }
+            weight_tile[local_output * BK_STORAGE + local_column] =
+                half(value);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0u; kk < BN; kk += 8u) {
+            metal::simdgroup_matrix<half, 8, 8> a0;
+            metal::simdgroup_matrix<half, 8, 8> a1;
+            metal::simdgroup_matrix<half, 8, 8> b0;
+            metal::simdgroup_matrix<half, 8, 8> b1;
+            a0.thread_elements()[0] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col];
+            a0.thread_elements()[1] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col + 1u];
+            if (BM == 16u) {
+                a1.thread_elements()[0] = gradient_tile[
+                    (8u + fragment_row) * BN_PAD + kk + fragment_col];
+                a1.thread_elements()[1] = gradient_tile[
+                    (8u + fragment_row) * BN_PAD + kk + fragment_col + 1u];
+            }
+            b0.thread_elements()[0] = weight_tile[
+                (kk + fragment_row) * BK_STORAGE
+                + simd_col + fragment_col];
+            b0.thread_elements()[1] = weight_tile[
+                (kk + fragment_row) * BK_STORAGE
+                + simd_col + fragment_col + 1u];
+            b1.thread_elements()[0] = weight_tile[
+                (kk + fragment_row) * BK_STORAGE
+                + simd_col + 8u + fragment_col];
+            b1.thread_elements()[1] = weight_tile[
+                (kk + fragment_row) * BK_STORAGE
+                + simd_col + 8u + fragment_col + 1u];
+            simdgroup_multiply_accumulate(c00, a0, b0, c00);
+            simdgroup_multiply_accumulate(c01, a0, b1, c01);
+            if (BM == 16u) {
+                simdgroup_multiply_accumulate(c10, a1, b0, c10);
+                simdgroup_multiply_accumulate(c11, a1, b1, c11);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint local_col0 = simd_col + fragment_col;
+    uint local_col1 = local_col0 + 8u;
+    uint row0 = row_base + fragment_row;
+    uint row1 = row0 + 8u;
+    uint col0 = column_base + local_col0;
+    uint col1 = column_base + local_col1;
+    if (row0 < uint(M)) {
+        if (local_col0 < BK && col0 < uint(K)) {
+            y[row0 * uint(K) + col0] = T(c00.thread_elements()[0]);
+        }
+        if (local_col0 + 1u < BK && col0 + 1u < uint(K)) {
+            y[row0 * uint(K) + col0 + 1u] = T(c00.thread_elements()[1]);
+        }
+        if (local_col1 < BK && col1 < uint(K)) {
+            y[row0 * uint(K) + col1] = T(c01.thread_elements()[0]);
+        }
+        if (local_col1 + 1u < BK && col1 + 1u < uint(K)) {
+            y[row0 * uint(K) + col1 + 1u] = T(c01.thread_elements()[1]);
+        }
+    }
+    if (BM == 16u && row1 < uint(M)) {
+        if (local_col0 < BK && col0 < uint(K)) {
+            y[row1 * uint(K) + col0] = T(c10.thread_elements()[0]);
+        }
+        if (local_col0 + 1u < BK && col0 + 1u < uint(K)) {
+            y[row1 * uint(K) + col0 + 1u] = T(c10.thread_elements()[1]);
+        }
+        if (local_col1 < BK && col1 < uint(K)) {
+            y[row1 * uint(K) + col1] = T(c11.thread_elements()[0]);
+        }
+        if (local_col1 + 1u < BK && col1 + 1u < uint(K)) {
+            y[row1 * uint(K) + col1 + 1u] = T(c11.thread_elements()[1]);
+        }
+    }
+"""
+
+_NINT_BACKWARD_INPUT_PRECISE_SOURCE = r"""
+    uint lane = thread_index_in_simdgroup;
+    uint column = threadgroup_position_in_grid.x;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || first_row >= uint(M)) {
+        return;
+    }
+    float accumulators[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators[local_row] = 0.0f;
+    }
+    uint group = column / uint(GS);
+    uint element = column - group * uint(GS);
+    for (uint output = lane; output < uint(OUT); output += 32u) {
+        uint metadata_index = output * uint(NG) + group;
+        uint quantized = mfq_nint_read_value(
+            q_packed,
+            metadata_index * uint(GS) + element,
+            uint(BITS),
+            uint(GS),
+            uint(Q5_EXEC));
+        float scale = neuron_scale[output] * float(sub_scale[metadata_index]);
+        float minimum = neuron_min[output] * float(sub_min[metadata_index]);
+        float weight = scale * float(quantized) - minimum;
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = first_row + local_row;
+            if (row < uint(M)) {
+                accumulators[local_row] = fma(
+                    float(x[row * uint(OUT) + output]),
+                    weight,
+                    accumulators[local_row]);
+            }
+        }
+    }
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        uint row = first_row + local_row;
+        float total = simd_sum(accumulators[local_row]);
+        if (lane == 0u && row < uint(M)) {
+            y[row * uint(K) + column] = T(total);
+        }
+    }
+"""
+
+_NINT_BACKWARD_PAIR_SOURCE = r"""
+    uint pair = thread_position_in_grid.x;
+    uint column = pair * 2u;
+    uint row_base = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || row_base >= uint(M)) {
+        return;
+    }
+    uint group = column / uint(GS);
+    uint element = column - group * uint(GS);
+    float accumulators0[TILE_M];
+    float accumulators1[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators0[local_row] = 0.0f;
+        accumulators1[local_row] = 0.0f;
+    }
+    for (uint output = 0u; output < uint(OUT); ++output) {
+        uint metadata_index = output * uint(NG) + group;
+        uint quantized0;
+        uint quantized1;
+        if (BITS == 5 && Q5_EXEC != 0) {
+            constexpr uint low_bytes = (uint(GS) + 1u) >> 1;
+            constexpr uint high_bytes = (uint(GS) + 7u) >> 3;
+            constexpr uint group_bytes = low_bytes + high_bytes;
+            uint group_offset = metadata_index * group_bytes;
+            uint low = uint(q_packed[group_offset + (element >> 1)]);
+            uint high = uint(
+                q_packed[group_offset + low_bytes + (element >> 3)]
+            ) >> (element & 7u);
+            quantized0 = (low & 15u) | ((high & 1u) << 4u);
+            quantized1 = (low >> 4u) | (((high >> 1u) & 1u) << 4u);
+        } else {
+            uint value_index = metadata_index * uint(GS) + element;
+            uint residual_bits = (value_index & 7u) * uint(BITS);
+            uint byte_index =
+                (value_index >> 3) * uint(BITS) + (residual_bits >> 3);
+            uint shift = residual_bits & 7u;
+            uint packed = uint(q_packed[byte_index]);
+            if (shift + 2u * uint(BITS) > 8u) {
+                packed |= uint(q_packed[byte_index + 1u]) << 8u;
+            }
+            if (shift + 2u * uint(BITS) > 16u) {
+                packed |= uint(q_packed[byte_index + 2u]) << 16u;
+            }
+            constexpr uint mask = (1u << uint(BITS)) - 1u;
+            quantized0 = (packed >> shift) & mask;
+            quantized1 = (packed >> (shift + uint(BITS))) & mask;
+        }
+        float scale = neuron_scale[output] * float(sub_scale[metadata_index]);
+        float minimum = neuron_min[output] * float(sub_min[metadata_index]);
+        float weight0 = float(half(scale * float(quantized0) - minimum));
+        float weight1 = float(half(scale * float(quantized1) - minimum));
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = row_base + local_row;
+            if (row < uint(M)) {
+                float gradient = float(x[row * uint(OUT) + output]);
+                accumulators0[local_row] = fma(
+                    gradient,
+                    weight0,
+                    accumulators0[local_row]);
+                accumulators1[local_row] = fma(
+                    gradient,
+                    weight1,
+                    accumulators1[local_row]);
+            }
+        }
+    }
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        uint row = row_base + local_row;
+        if (row < uint(M)) {
+            y[row * uint(K) + column] = T(accumulators0[local_row]);
+            if (column + 1u < uint(K)) {
+                y[row * uint(K) + column + 1u] = T(accumulators1[local_row]);
+            }
+        }
+    }
+"""
+
+_NINT_BACKWARD_QUAD_SOURCE = r"""
+    uint quad = thread_position_in_grid.x;
+    uint column = quad * 4u;
+    uint row_base = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || row_base >= uint(M)) {
+        return;
+    }
+    uint group = column / uint(GS);
+    uint element = column - group * uint(GS);
+    float accumulators[TILE_M][4];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        for (uint component = 0u; component < 4u; ++component) {
+            accumulators[local_row][component] = 0.0f;
+        }
+    }
+    for (uint output = 0u; output < uint(OUT); ++output) {
+        uint metadata_index = output * uint(NG) + group;
+        uint quantized[4];
+        if (BITS == 5 && Q5_EXEC != 0) {
+            constexpr uint low_bytes = (uint(GS) + 1u) >> 1;
+            constexpr uint high_bytes = (uint(GS) + 7u) >> 3;
+            constexpr uint group_bytes = low_bytes + high_bytes;
+            uint group_offset = metadata_index * group_bytes;
+            uint low0 = uint(q_packed[
+                group_offset + (element >> 1u)]);
+            uint low1 = uint(q_packed[
+                group_offset + (element >> 1u) + 1u]);
+            uint high = uint(q_packed[
+                group_offset + low_bytes + (element >> 3u)]
+            ) >> (element & 7u);
+            quantized[0] = (low0 & 15u) | ((high & 1u) << 4u);
+            quantized[1] = (low0 >> 4u) | (((high >> 1u) & 1u) << 4u);
+            quantized[2] = (low1 & 15u) | (((high >> 2u) & 1u) << 4u);
+            quantized[3] = (low1 >> 4u) | (((high >> 3u) & 1u) << 4u);
+        } else {
+            uint value_index = metadata_index * uint(GS) + element;
+            uint residual_bits = (value_index & 7u) * uint(BITS);
+            uint byte_index =
+                (value_index >> 3u) * uint(BITS) + (residual_bits >> 3u);
+            uint shift = residual_bits & 7u;
+            uint packed = uint(q_packed[byte_index]);
+            if (shift + 4u * uint(BITS) > 8u) {
+                packed |= uint(q_packed[byte_index + 1u]) << 8u;
+            }
+            if (shift + 4u * uint(BITS) > 16u) {
+                packed |= uint(q_packed[byte_index + 2u]) << 16u;
+            }
+            if (shift + 4u * uint(BITS) > 24u) {
+                packed |= uint(q_packed[byte_index + 3u]) << 24u;
+            }
+            constexpr uint mask = (1u << uint(BITS)) - 1u;
+            for (uint component = 0u; component < 4u; ++component) {
+                quantized[component] =
+                    (packed >> (shift + component * uint(BITS))) & mask;
+            }
+        }
+        float scale = neuron_scale[output] * float(sub_scale[metadata_index]);
+        float minimum = neuron_min[output] * float(sub_min[metadata_index]);
+        float weights[4];
+        for (uint component = 0u; component < 4u; ++component) {
+            weights[component] = float(half(
+                scale * float(quantized[component]) - minimum));
+        }
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = row_base + local_row;
+            if (row < uint(M)) {
+                float gradient = float(x[row * uint(OUT) + output]);
+                for (uint component = 0u; component < 4u; ++component) {
+                    accumulators[local_row][component] = fma(
+                        gradient,
+                        weights[component],
+                        accumulators[local_row][component]);
+                }
+            }
+        }
+    }
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        uint row = row_base + local_row;
+        if (row < uint(M)) {
+            for (uint component = 0u; component < 4u; ++component) {
+                if (column + component < uint(K)) {
+                    y[row * uint(K) + column + component] =
+                        T(accumulators[local_row][component]);
+                }
+            }
+        }
+    }
+"""
+
+_NINT_BACKWARD_DIRECT_SOURCE = r"""
+    uint column = thread_position_in_grid.x;
+    uint row_base = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || row_base >= uint(M)) {
+        return;
+    }
+    uint group = column / uint(GS);
+    uint element = column - group * uint(GS);
+    float accumulators[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators[local_row] = 0.0f;
+    }
+    for (uint output = 0u; output < uint(OUT); ++output) {
+        uint metadata_index = output * uint(NG) + group;
+        uint quantized = mfq_nint_read_value(
+            q_packed,
+            metadata_index * uint(GS) + element,
+            uint(BITS),
+            uint(GS),
+            uint(Q5_EXEC));
+        float scale = neuron_scale[output] * float(sub_scale[metadata_index]);
+        float minimum = neuron_min[output] * float(sub_min[metadata_index]);
+        float weight = float(half(scale * float(quantized) - minimum));
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = row_base + local_row;
+            if (row < uint(M)) {
+                accumulators[local_row] = fma(
+                    float(x[row * uint(OUT) + output]),
+                    weight,
+                    accumulators[local_row]);
+            }
+        }
+    }
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        uint row = row_base + local_row;
+        if (row < uint(M)) {
+            y[row * uint(K) + column] = T(accumulators[local_row]);
+        }
+    }
+"""
 
 _NINT4_MATMUL_SOURCE = r"""
     uint lane = thread_index_in_simdgroup;
@@ -1609,6 +2012,26 @@ _NINT_GEMM_MATRIX_KERNEL = _nint_kernel(
     "mfq_nint_packed_gemm_matrix",
     _NINT_GEMM_MATRIX_SOURCE,
 )
+_NINT_BACKWARD_INPUT_KERNEL = _nint_kernel(
+    "mfq_nint_packed_backward_input",
+    _NINT_BACKWARD_INPUT_SOURCE,
+)
+_NINT_BACKWARD_INPUT_PRECISE_KERNEL = _nint_kernel(
+    "mfq_nint_packed_backward_input_precise",
+    _NINT_BACKWARD_INPUT_PRECISE_SOURCE,
+)
+_NINT_BACKWARD_PAIR_KERNEL = _nint_kernel(
+    "mfq_nint_packed_backward_pair",
+    _NINT_BACKWARD_PAIR_SOURCE,
+)
+_NINT_BACKWARD_QUAD_KERNEL = _nint_kernel(
+    "mfq_nint_packed_backward_quad",
+    _NINT_BACKWARD_QUAD_SOURCE,
+)
+_NINT_BACKWARD_DIRECT_KERNEL = _nint_kernel(
+    "mfq_nint_packed_backward_direct",
+    _NINT_BACKWARD_DIRECT_SOURCE,
+)
 _NINT_SWIGLU_KERNEL = _nint_pair_kernel(
     "mfq_nint_packed_swiglu",
     _NINT_SWIGLU_SOURCE,
@@ -2193,6 +2616,177 @@ def nint_gemm(weight: MetalNintWeight, x: mx.array | np.ndarray) -> mx.array:
     return _nint_matmul_path(weight, x, path="gemm")
 
 
+def nint_backward_input(
+    weight: MetalNintWeight,
+    output_gradient: mx.array | np.ndarray,
+) -> mx.array:
+    """Compute ``dX = dY @ W`` directly from a packed NINT matrix."""
+
+    gradient = output_gradient if isinstance(output_gradient, mx.array) else mx.array(output_gradient)
+    if gradient.ndim < 1 or int(gradient.shape[-1]) != weight.out:
+        raise ValueError(
+            f"NINT output-gradient width must be {weight.out}, got "
+            f"{gradient.shape if gradient.ndim else ()}"
+        )
+    if gradient.dtype not in (mx.float16, mx.float32):
+        gradient = gradient.astype(mx.float16)
+    prefix = tuple(int(value) for value in gradient.shape[:-1])
+    rows = int(gradient.size) // weight.out
+    if rows == 0:
+        return mx.zeros((*prefix, weight.neuron_len), dtype=gradient.dtype)
+    gradient = mx.contiguous(gradient.reshape((rows, weight.out)))
+    if rows > 16:
+        dense = nint_dequantize(weight, dtype=gradient.dtype)
+        return (gradient @ dense).reshape((*prefix, weight.neuron_len))
+    if gradient.dtype != mx.float16:
+        tile_rows = min(rows, 4)
+        result = _NINT_BACKWARD_INPUT_PRECISE_KERNEL(
+            inputs=[
+                weight.q_packed,
+                weight.sub_scale,
+                weight.sub_min,
+                weight.neuron_scale,
+                weight.neuron_min,
+                gradient,
+            ],
+            template=[
+                ("T", gradient.dtype),
+                ("BITS", weight.bits),
+                ("GS", weight.groupsize),
+                ("NG", weight.groups),
+                ("K", weight.neuron_len),
+                ("OUT", weight.out),
+                ("M", rows),
+                ("TILE_M", tile_rows),
+                ("Q5_EXEC", int(weight.q5_exec)),
+                ("BM_TILE", 32),
+            ],
+            grid=(
+                weight.neuron_len * 32,
+                (rows + tile_rows - 1) // tile_rows,
+                1,
+            ),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(rows, weight.neuron_len)],
+            output_dtypes=[gradient.dtype],
+        )[0]
+        return result.reshape((*prefix, weight.neuron_len))
+    if rows >= 5 and weight.groupsize <= 128:
+        tile_rows = 8 if rows <= 8 else 16
+        groups_per_tile = 128 // weight.groupsize
+        columns_per_tile = groups_per_tile * weight.groupsize
+        result = _NINT_BACKWARD_INPUT_KERNEL(
+            inputs=[
+                weight.q_packed,
+                weight.sub_scale,
+                weight.sub_min,
+                weight.neuron_scale,
+                weight.neuron_min,
+                gradient,
+            ],
+            template=[
+                ("T", gradient.dtype),
+                ("BITS", weight.bits),
+                ("GS", weight.groupsize),
+                ("GPC", groups_per_tile),
+                ("NG", weight.groups),
+                ("K", weight.neuron_len),
+                ("OUT", weight.out),
+                ("M", rows),
+                ("BM_TILE", tile_rows),
+                ("Q5_EXEC", int(weight.q5_exec)),
+            ],
+            grid=(
+                ((weight.neuron_len + columns_per_tile - 1) // columns_per_tile)
+                * 256,
+                (rows + tile_rows - 1) // tile_rows,
+                1,
+            ),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(rows, weight.neuron_len)],
+            output_dtypes=[gradient.dtype],
+        )[0]
+        return result.reshape((*prefix, weight.neuron_len))
+    tile_rows = min(rows, 4)
+    if (
+        weight.groupsize % 4 == 0
+        and not (rows == 1 and weight.bits == 5 and weight.q5_exec)
+    ):
+        kernel = _NINT_BACKWARD_QUAD_KERNEL
+        columns_per_thread = 4
+    elif weight.groupsize % 2 == 0:
+        kernel = _NINT_BACKWARD_PAIR_KERNEL
+        columns_per_thread = 2
+    else:
+        kernel = _NINT_BACKWARD_DIRECT_KERNEL
+        columns_per_thread = 1
+    result = kernel(
+        inputs=[
+            weight.q_packed,
+            weight.sub_scale,
+            weight.sub_min,
+            weight.neuron_scale,
+            weight.neuron_min,
+            gradient,
+        ],
+        template=[
+            ("T", gradient.dtype),
+            ("BITS", weight.bits),
+            ("GS", weight.groupsize),
+            ("NG", weight.groups),
+            ("K", weight.neuron_len),
+            ("OUT", weight.out),
+            ("M", rows),
+            ("TILE_M", tile_rows),
+            ("Q5_EXEC", int(weight.q5_exec)),
+            ("BM_TILE", tile_rows),
+        ],
+        grid=(
+            (
+                (weight.neuron_len + columns_per_thread * 32 - 1)
+                // (columns_per_thread * 32)
+            )
+            * 32,
+            (rows + tile_rows - 1) // tile_rows,
+            1,
+        ),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(rows, weight.neuron_len)],
+        output_dtypes=[gradient.dtype],
+    )[0]
+    return result.reshape((*prefix, weight.neuron_len))
+
+
+def _nint_matmul_with_vjp(
+    weight: MetalNintWeight,
+    source: mx.array,
+    *,
+    dequantize_threshold: int | None,
+) -> mx.array:
+    @mx.custom_function
+    def operation(value: mx.array) -> mx.array:
+        width = int(value.shape[-1])
+        rows = int(value.size) // width
+        if (
+            dequantize_threshold is not None
+            and rows >= int(dequantize_threshold)
+            and value.dtype == mx.float16
+        ):
+            return nint_dequantize_matmul(weight, value)
+        if rows == 1:
+            return _nint_matmul_path(weight, value, path="gemv")
+        if rows <= 16:
+            return _nint_matmul_path(weight, value, path="mmq")
+        return _nint_matmul_path(weight, value, path="gemm")
+
+    @operation.vjp
+    def operation_vjp(primals, cotangent, output):
+        del primals, output
+        return nint_backward_input(weight, cotangent)
+
+    return operation(source)
+
+
 def nint_matmul(
     weight: MetalNintWeight,
     x: mx.array | np.ndarray,
@@ -2204,19 +2798,11 @@ def nint_matmul(
     source = x if isinstance(x, mx.array) else mx.array(x)
     if source.ndim < 1:
         raise ValueError("NINT matmul input must have at least one dimension")
-    width = int(source.shape[-1])
-    rows = int(source.size) // width
-    if (
-        dequantize_threshold is not None
-        and rows >= int(dequantize_threshold)
-        and source.dtype == mx.float16
-    ):
-        return nint_dequantize_matmul(weight, source)
-    if rows == 1:
-        return nint_gemv(weight, source)
-    if rows <= 16:
-        return nint_mmq(weight, source)
-    return nint_gemm(weight, source)
+    return _nint_matmul_with_vjp(
+        weight,
+        source,
+        dequantize_threshold=dequantize_threshold,
+    )
 
 
 def nint_dequantize(
@@ -2367,6 +2953,7 @@ def nint_embedding(
 
 __all__ = [
     "MetalNintWeight",
+    "nint_backward_input",
     "nint_dequantize",
     "nint_dequantize_matmul",
     "nint_embedding",

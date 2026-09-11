@@ -17,6 +17,22 @@ set(MFQ_CUDA_ARCHITECTURES "86" CACHE STRING
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
+add_library(mfq-cuda-storage STATIC
+    ${MFQ_CUDA_ROOT}/storage/nintm_expert_store.cpp
+)
+add_library(mfq::cuda-storage ALIAS mfq-cuda-storage)
+target_include_directories(mfq-cuda-storage PUBLIC
+    ${MFQ_CUDA_ROOT}/storage
+)
+target_link_libraries(mfq-cuda-storage PUBLIC Threads::Threads)
+target_compile_features(mfq-cuda-storage PUBLIC cxx_std_20)
+set_target_properties(mfq-cuda-storage PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+if(MSVC)
+    target_compile_options(mfq-cuda-storage PRIVATE /utf-8 /EHsc)
+endif()
+
 add_library(mfq-cuda-core STATIC
     ${MFQ_CUDA_ROOT}/src/mfq_cuda_context.cu
     ${MFQ_CUDA_ROOT}/src/mfq_native_tensor.cpp
@@ -48,6 +64,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/attention_mma.cu
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v4_attention.cu
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v4_hc.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v41.cu
     ${MFQ_CUDA_KERNEL_ROOT}/embedding.cu
     ${MFQ_CUDA_KERNEL_ROOT}/flash_next.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gated_delta_net.cu
@@ -119,6 +136,14 @@ if(BUILD_TESTING)
         set_tests_properties(${target} PROPERTIES SKIP_RETURN_CODE 77)
     endfunction()
 
+    add_executable(mfq-cuda-nintm-expert-store-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_nintm_expert_store_test.cpp)
+    target_link_libraries(mfq-cuda-nintm-expert-store-test PRIVATE
+        mfq-cuda-storage)
+    target_compile_features(mfq-cuda-nintm-expert-store-test PRIVATE cxx_std_20)
+    add_test(NAME mfq-cuda-nintm-expert-store-test
+        COMMAND mfq-cuda-nintm-expert-store-test)
+
     add_executable(mfq-mxfp4-sq-test ${MFQ_CUDA_ROOT}/tests/mfq_mxfp4_sq_test.cu)
     target_compile_definitions(mfq-mxfp4-sq-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-mxfp4-sq-test PRIVATE ${MFQ_REPOSITORY_ROOT})
@@ -158,6 +183,13 @@ if(BUILD_TESTING)
         mfq-cuda-native-kernels)
     target_compile_definitions(mfq-paged-kv-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1)
+    mfq_add_cuda_test(mfq-deepseek-v41-hc-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_deepseek_v41_hc_test.cu
+        mfq-cuda-native-kernels)
+    target_compile_definitions(mfq-deepseek-v41-hc-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1)
+    target_include_directories(mfq-deepseek-v41-hc-test PRIVATE
+        ${MFQ_REPOSITORY_ROOT})
     mfq_add_cuda_test(mfq-native-tensor-cuda-test
         ${MFQ_CUDA_ROOT}/tests/mfq_native_tensor_cuda_test.cu)
     mfq_add_cuda_test(mfq-flash-next-test
@@ -224,6 +256,7 @@ target_link_libraries(mfq-decode PRIVATE
     CUDA::cublas
     mfq-cuda-core
     mfq-cuda-native-kernels
+    mfq-cuda-storage
 )
 target_compile_definitions(mfq-decode PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1
@@ -242,6 +275,11 @@ set_target_properties(mfq-decode PROPERTIES
     CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
     CUDA_RUNTIME_LIBRARY Shared
 )
+if(BUILD_TESTING)
+    add_test(
+        NAME mfq-deepseek-v41-runtime-check
+        COMMAND mfq-decode --check-deepseek-v41)
+endif()
 
 option(MFQ_BUILD_TORCH_REFERENCE_RUNTIME
     "Build the optional LibTorch CUDA runtime used only for A/B validation"
@@ -275,6 +313,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         CUDA::cuda_driver
         CUDA::cudart
         CUDA::cublas
+        mfq-cuda-storage
     )
     target_compile_definitions(mfq-decode-torch PRIVATE NOMINMAX)
     target_compile_options(mfq-decode-torch PRIVATE

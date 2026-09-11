@@ -24,6 +24,7 @@ from mfq.kernels.metal.nint import (  # noqa: E402
     _can_use_nint5_gs28_decode,
     _can_use_nint6_gs24_decode,
     _maximum_scalar_gemm_rows,
+    nint_backward_input,
     nint_dequantize,
     nint_dequantize_matmul,
     nint_embedding,
@@ -203,6 +204,49 @@ def test_packed_nint_matmul_supports_fp16_input():
     expected = source.astype(np.float32) @ nint_quant.dequantize(tensor).T
     assert actual.dtype == np.float16
     np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("bits", range(1, 9))
+def test_packed_nint_backward_and_custom_vjp(bits: int):
+    spec = NintSpec(bits, 24, 7)
+    tensor = nint_quant.quantize(_random(7100 + bits, (11, 77)), spec)
+    packed = MetalNintWeight.from_tensor(tensor)
+    dense = nint_quant.dequantize(tensor)
+    gradient = _random(7200 + bits, (3, 11))
+    expected = gradient @ dense
+
+    actual = _array(nint_backward_input(packed, gradient))
+    np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-5)
+
+    source = mx.array(_random(7300 + bits, (3, 77)))
+    cotangent = mx.array(gradient)
+    differentiated = mx.grad(
+        lambda value: mx.sum(nint_matmul(packed, value) * cotangent)
+    )(source)
+    np.testing.assert_allclose(
+        _array(differentiated), expected, rtol=3e-5, atol=3e-5
+    )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        NINT2_SPEC,
+        NintSpec(3, 24, 5),
+        NintSpec(4, 24, 6),
+        NintSpec(5, 28, 7),
+        NintSpec(6, 26, 7),
+        NintSpec(8, 48, 7),
+    ],
+)
+@pytest.mark.parametrize("rows", [1, 2, 4, 6, 16])
+def test_fp16_packed_nint_backward_paths(spec: NintSpec, rows: int):
+    tensor = nint_quant.quantize(_random(7400 + spec.bits, (67, 144)), spec)
+    packed = MetalNintWeight.from_tensor(tensor)
+    gradient = _random(7500 + spec.bits + rows, (rows, 67)).astype(np.float16)
+    actual = _array(nint_backward_input(packed, gradient))
+    expected = gradient.astype(np.float32) @ nint_quant.dequantize(tensor)
+    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
 
 
 def test_nint5_gs28_decode_subsimd_matches_two_level_dequant():

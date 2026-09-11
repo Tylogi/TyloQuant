@@ -10,3 +10,7 @@ mfq_tensor_backend::Tensor mxfp4_sq_dequant_cuda(
 mfq_tensor_backend::Tensor mxfp4_sq_matmul_cuda(
     mfq_tensor_backend::Tensor blob, mfq_tensor_backend::Tensor input,
     std::int64_t bits, std::int64_t outputs, std::int64_t width, std::int64_t base);
+mfq_tensor_backend::Tensor mxfp4_sq_backward_input_cuda(
+    mfq_tensor_backend::Tensor blob, mfq_tensor_backend::Tensor output_gradient,
+    std::int64_t bits, std::int64_t outputs, std::int64_t width,
+    std::int64_t base);

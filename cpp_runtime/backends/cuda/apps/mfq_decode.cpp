@@ -1,10 +1,14 @@
 #include "mfq_tensor_backend.h"
+#include "mfq/kernels/cuda/deepseek_v4_attention.h"
+#include "mfq/kernels/cuda/deepseek_v4_hc.h"
+#include "mfq/kernels/cuda/deepseek_v41.h"
 #include "mfq_cuda_model_plan.h"
 #include "mfq_cuda_mtp.h"
 #include "mfq_cuda_paged_kv.h"
 #include "flash_next/config.h"
 #include "flash_next/state.h"
 #include "flash_next/qwen4.h"
+#include "models/deepseek_v41.h"
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 
@@ -19,6 +23,7 @@
 #include "moe_cache_transfer.h"
 #include "moe_cache_policy.h"
 #include "moe_cache_profile.h"
+#include "nintm_expert_store.h"
 #include "tensor_parallel.h"
 #include "nvq_codebooks.generated.h"
 #include "nlohmann/json.hpp"
@@ -41,6 +46,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -213,40 +219,6 @@ mfq_tensor_backend::Tensor glm_dsa_indexer_scores_decode_cuda(
 mfq_tensor_backend::Tensor attention_glm_mla_sparse_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor indices,
     mfq_tensor_backend::Tensor meta, double scale);
-mfq_tensor_backend::Tensor dsv4_compress_cuda(
-    mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor ape,
-    mfq_tensor_backend::Tensor norm, mfq_tensor_backend::Tensor prev_kv, mfq_tensor_backend::Tensor prev_gate,
-    mfq_tensor_backend::Tensor positions, mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
-    int64_t ratio, bool overlap, int64_t quant_mode, double eps);
-mfq_tensor_backend::Tensor dsv4_fp4_sim_cuda(mfq_tensor_backend::Tensor input);
-std::vector<mfq_tensor_backend::Tensor> dsv4_hc_pre_cuda(
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor mixes, mfq_tensor_backend::Tensor scale,
-    mfq_tensor_backend::Tensor base, int64_t iterations, double eps);
-mfq_tensor_backend::Tensor dsv4_hc_post_cuda(
-    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor post,
-    mfq_tensor_backend::Tensor combination);
-mfq_tensor_backend::Tensor dsv4_decode_pool_update_cuda(
-    mfq_tensor_backend::Tensor kv_token, mfq_tensor_backend::Tensor gate_token,
-    mfq_tensor_backend::Tensor ape, mfq_tensor_backend::Tensor norm,
-    mfq_tensor_backend::Tensor state_kv, mfq_tensor_backend::Tensor state_gate,
-    mfq_tensor_backend::Tensor prev_kv, mfq_tensor_backend::Tensor prev_gate,
-    mfq_tensor_backend::Tensor pool, mfq_tensor_backend::Tensor seq_len,
-    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
-    int64_t ratio, bool overlap, int64_t quant_mode, double eps);
-mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
-    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor weights,
-    int64_t query_offset, int64_t ratio);
-mfq_tensor_backend::Tensor dsv4_topk512_cuda(mfq_tensor_backend::Tensor scores);
-std::vector<mfq_tensor_backend::Tensor> dsv4_build_prefill_plan_cuda(
-    mfq_tensor_backend::Tensor topk, int64_t query_offset, int64_t local_history,
-    int64_t pool_len, int64_t ratio, int64_t window);
-std::vector<mfq_tensor_backend::Tensor> dsv4_build_decode_plan_cuda(
-    mfq_tensor_backend::Tensor topk, mfq_tensor_backend::Tensor seq_len, int64_t pool_len,
-    int64_t ratio, int64_t window);
-mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda(
-    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor indices,
-    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor sinks, mfq_tensor_backend::Tensor meta,
-    double scale);
 mfq_tensor_backend::Tensor mfq_attention_mma256_swa_decode_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,
@@ -277,7 +249,7 @@ std::vector<mfq_tensor_backend::Tensor> moe_build_expert_map_cuda(
     mfq_tensor_backend::Tensor ids, int64_t n_experts, int64_t tile_m);
 std::vector<mfq_tensor_backend::Tensor> moe_build_expert_maps_cuda(
     mfq_tensor_backend::Tensor ids, int64_t n_experts, int64_t tile_m,
-    int64_t secondary_tile_m);
+    int64_t secondary_tile_m, int64_t tertiary_tile_m);
 void nint_moe_quantize_input_ws_cuda(
     mfq_tensor_backend::Tensor x, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 void nint_moe_quantize_24_28_ws_cuda(
@@ -367,6 +339,22 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
     int64_t sub_bits, int64_t format, int64_t sign_mode,
     mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
     mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor weight_sizes,
+    mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor expert_pool,
+    mfq_tensor_backend::Tensor expert_local, mfq_tensor_backend::Tensor x,
+    int64_t n_experts, int64_t out_per_expert, int64_t neuron_len,
+    int64_t route_tile_m, mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor ids_dst,
+    mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor weight_sizes,
+    mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor expert_pool,
+    mfq_tensor_backend::Tensor expert_local, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor ids, int64_t n_experts, int64_t out_per_expert,
+    int64_t neuron_len, bool input_quantized, mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
     mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor table_pool, mfq_tensor_backend::Tensor bank_ids,
@@ -3664,10 +3652,13 @@ struct MoeRoutePlan {
     mfq_tensor_backend::Tensor tile_experts;
     mfq_tensor_backend::Tensor mma_tile_bounds;
     mfq_tensor_backend::Tensor mma_tile_experts;
+    mfq_tensor_backend::Tensor wide_tile_bounds;
+    mfq_tensor_backend::Tensor wide_tile_experts;
     mfq_tensor_backend::Tensor counts;
     mfq_tensor_backend::Tensor cursors;
     int n_experts = 0;
     int mma_tile_m = 8;
+    int wide_tile_m = 8;
     bool map_ready = false;
     uint64_t generation = 0;
     mutable std::shared_ptr<std::vector<int32_t>>
@@ -3741,10 +3732,21 @@ private:
             copy_tensor(destination.mma_tile_bounds, source.mma_tile_bounds, device);
             copy_tensor(destination.mma_tile_experts, source.mma_tile_experts, device);
         }
+        if (source.wide_tile_m == 8) {
+            destination.wide_tile_bounds = destination.tile_bounds;
+            destination.wide_tile_experts = destination.tile_experts;
+        } else if (source.wide_tile_m == source.mma_tile_m) {
+            destination.wide_tile_bounds = destination.mma_tile_bounds;
+            destination.wide_tile_experts = destination.mma_tile_experts;
+        } else {
+            copy_tensor(destination.wide_tile_bounds, source.wide_tile_bounds, device);
+            copy_tensor(destination.wide_tile_experts, source.wide_tile_experts, device);
+        }
         copy_tensor(destination.counts, source.counts, device);
         copy_tensor(destination.cursors, source.cursors, device);
         destination.n_experts = source.n_experts;
         destination.mma_tile_m = source.mma_tile_m;
+        destination.wide_tile_m = source.wide_tile_m;
         destination.map_ready = source.map_ready;
         destination.generation = source.generation;
         destination.host_unique_experts = source.host_unique_experts;
@@ -3776,12 +3778,14 @@ static MoeRoutePlan build_moe_route_plan(mfq_tensor_backend::Tensor ids, int n_e
     result.tile_experts = empty;
     result.mma_tile_bounds = empty;
     result.mma_tile_experts = empty;
+    result.wide_tile_bounds = empty;
+    result.wide_tile_experts = empty;
     result.counts = empty;
     result.cursors = empty;
     if (result.ids.size(0) > 8) {
         const bool use_coarse_mma = result.ids.numel() >= 8192;
         auto mapped = use_coarse_mma
-            ? moe_build_expert_maps_cuda(result.ids, n_experts, 8, 64)
+            ? moe_build_expert_maps_cuda(result.ids, n_experts, 8, 64, 128)
             : moe_build_expert_map_cuda(result.ids, n_experts, 8);
         result.ids_dst = mapped.at(0);
         result.expert_bounds = mapped.at(1);
@@ -3792,10 +3796,16 @@ static MoeRoutePlan build_moe_route_plan(mfq_tensor_backend::Tensor ids, int n_e
             result.mma_tile_bounds = mapped.at(5);
             result.mma_tile_experts = mapped.at(6);
             result.mma_tile_m = 64;
+            result.wide_tile_bounds = mapped.at(7);
+            result.wide_tile_experts = mapped.at(8);
+            result.wide_tile_m = 128;
         } else {
             result.mma_tile_bounds = result.tile_bounds;
             result.mma_tile_experts = result.tile_experts;
             result.mma_tile_m = 8;
+            result.wide_tile_bounds = result.tile_bounds;
+            result.wide_tile_experts = result.tile_experts;
+            result.wide_tile_m = 8;
         }
     }
     result.map_ready = result.ids.size(0) <= 8 ||
@@ -6674,6 +6684,15 @@ struct MixedMoeActivationKeyHash {
     }
 };
 
+struct MixedNvqDispatch {
+    mfq_tensor_backend::Tensor weight_ptrs;
+    mfq_tensor_backend::Tensor weight_sizes;
+    mfq_tensor_backend::Tensor pool_params;
+    mfq_tensor_backend::Tensor expert_pool;
+    mfq_tensor_backend::Tensor expert_local;
+    int pool_count = 0;
+};
+
 struct MixedMoeRuntime {
     int n_experts = 0;
     int out_per_expert = 0;
@@ -6681,6 +6700,7 @@ struct MixedMoeRuntime {
     bool partial_experts = false;
     std::vector<MixedMoePool> pools;
     std::shared_ptr<NintMoeWeight> nint_dispatch;
+    std::shared_ptr<MixedNvqDispatch> nvq_dispatch;
     MoeActivationWorkspace & activation_workspace(
             mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
             MixedMoeTransformKey transform) const {
@@ -6772,6 +6792,21 @@ struct MixedMoeRuntime {
             const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_MIN_TOKENS");
             return value == nullptr ? 256 : std::max(9, std::atoi(value));
         }();
+        static const bool disable_nvq_hetero_decode = [] {
+            const char * disabled =
+                std::getenv("MFQ_DISABLE_MOE_NVQ_HETERO_DECODE");
+            const char * exact =
+                std::getenv("MFQ_NVQ_MOE_EXACT_REDUCTION");
+            const char * rows =
+                std::getenv("MFQ_NVQ_MOE_ROWS_PER_BLOCK");
+            const char * warps =
+                std::getenv("MFQ_NVQ_MOE_WARPS");
+            const char * shared =
+                std::getenv("MFQ_NVQ_MOE_SHARE_GROUP_STATE");
+            return (disabled != nullptr && std::atoi(disabled) != 0) ||
+                (exact != nullptr && std::atoi(exact) != 0) ||
+                rows != nullptr || warps != nullptr || shared != nullptr;
+        }();
         const bool use_f16_mma =
             !disable_prefill_mma && !g_force_moe_prefill_mma_off &&
             tokens >= prefill_mma_min_tokens && route.map_ready &&
@@ -6783,6 +6818,12 @@ struct MixedMoeRuntime {
         const bool use_nint_decode =
             !use_f16_mma && !use_kl_mmq && nint_dispatch &&
             nint_dispatch->hetero_supported;
+        const bool use_nvq_prefill =
+            use_f16_mma && !use_kl_mmq && nvq_dispatch;
+        const bool use_nvq_decode =
+            !use_f16_mma && !use_kl_mmq && nvq_dispatch &&
+            tokens <= 8 && !g_force_moe_pool_path &&
+            !disable_nvq_hetero_decode;
         if (input_prequantized && use_kl_mmq) {
             throw std::runtime_error(
                 "mixed prequantized activation reuse is unavailable in KLD MMQ mode");
@@ -6809,6 +6850,18 @@ struct MixedMoeRuntime {
                 ? nint_dispatch->forward_prequantized(x, route)
                 : nint_dispatch->forward(x, route);
         }
+        if (use_nvq_prefill) {
+            nvq_moe_grouped_matmul_hetero_f16_cuda(
+                nvq_dispatch->weight_ptrs,
+                nvq_dispatch->weight_sizes,
+                nvq_dispatch->pool_params,
+                nvq_dispatch->expert_pool,
+                nvq_dispatch->expert_local,
+                x, n_experts, out_per_expert, neuron_len,
+                route.wide_tile_m, output,
+                route.ids_dst, route.expert_bounds,
+                route.wide_tile_bounds, route.wide_tile_experts);
+        }
 
         mfq_tensor_backend::Tensor shared_nint_qx;
         mfq_tensor_backend::Tensor shared_nint_xscale;
@@ -6831,10 +6884,39 @@ struct MixedMoeRuntime {
                 }
             }
         }
+        if (use_nvq_decode) {
+            const int groups = (neuron_len + 23) / 24;
+            const MixedMoeActivationKey activation_key{
+                input_rows, groups, 24, x.get_device(), identity};
+            auto & workspace = activation_workspace(
+                x, input_rows, groups, 24, identity);
+            auto qx = workspace.qx;
+            auto xscale = workspace.xscale;
+            bool input_quantized = input_prequantized;
+            if (shared_nint_qx.defined() &&
+                    shared_nint_groups == groups && shared_nint_gs == 24) {
+                qx = shared_nint_qx;
+                xscale = shared_nint_xscale;
+                input_quantized = true;
+            }
+            nvq_moe_grouped_matmul_hetero_ws_cuda(
+                nvq_dispatch->weight_ptrs,
+                nvq_dispatch->weight_sizes,
+                nvq_dispatch->pool_params,
+                nvq_dispatch->expert_pool,
+                nvq_dispatch->expert_local,
+                x, route.ids, n_experts, out_per_expert, neuron_len,
+                input_quantized, output, qx, xscale);
+            quantized.insert(activation_key);
+        }
 
         for (const auto & pool : pools) {
             if (pool.family == MixedMoeFamily::Nint &&
                     (use_nint_prefill || use_nint_decode)) {
+                continue;
+            }
+            if (pool.family == MixedMoeFamily::Nvq &&
+                    (use_nvq_prefill || use_nvq_decode)) {
                 continue;
             }
             int gs = 24;
@@ -7183,6 +7265,126 @@ static void initialize_mixed_nint_dispatch(
         std::make_shared<NintMoeWeight>(std::move(dispatch));
 }
 
+static void initialize_mixed_nvq_dispatch(
+        MixedMoeRuntime & runtime) {
+    runtime.nvq_dispatch.reset();
+    const char * disabled =
+        std::getenv("MFQ_DISABLE_MOE_NVQ_HETERO");
+    if (disabled != nullptr && std::atoi(disabled) != 0) return;
+
+    int nvq_pools = 0;
+    for (const auto & pool : runtime.pools) {
+        if (pool.family == MixedMoeFamily::Nvq) ++nvq_pools;
+    }
+    if (nvq_pools < 2) return;
+
+    std::vector<int64_t> weight_ptrs;
+    std::vector<int64_t> weight_sizes;
+    std::vector<int32_t> pool_params;
+    std::vector<int32_t> expert_pool(
+        static_cast<size_t>(runtime.n_experts), -1);
+    std::vector<int32_t> expert_local(
+        static_cast<size_t>(runtime.n_experts), -1);
+    weight_ptrs.reserve(static_cast<size_t>(nvq_pools) * 5);
+    weight_sizes.reserve(static_cast<size_t>(nvq_pools) * 3);
+    pool_params.reserve(static_cast<size_t>(nvq_pools) * 7);
+
+    mfq_tensor_backend::Device target = mfq_tensor_backend::Device(
+        mfq_tensor_backend::kCUDA, mfq_current_cuda_device());
+    int dispatch_pool = 0;
+    for (const auto & pool : runtime.pools) {
+        if (pool.family != MixedMoeFamily::Nvq) continue;
+        const auto & weight = pool.nvq;
+        if (weight.gs != 24 || weight.ng <= 0 ||
+                weight.ng > std::numeric_limits<int32_t>::max() ||
+                weight.sub_bits < 1 || weight.sub_bits > 8 ||
+                weight.kernel_format < 1 || weight.kernel_format > 17 ||
+                weight.sign_mode < 0 || weight.sign_mode > 1) {
+            return;
+        }
+        if (dispatch_pool == 0) target = weight.indices_packed.device();
+        if (weight.indices_packed.device() != target ||
+                weight.aux_packed.device() != target ||
+                weight.sub_scale_packed.device() != target ||
+                weight.neuron_scale.device() != target ||
+                weight.codebook.device() != target) {
+            return;
+        }
+        weight_ptrs.push_back(static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(
+                weight.indices_packed.data_ptr<uint8_t>())));
+        weight_ptrs.push_back(static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(
+                weight.aux_packed.data_ptr<uint8_t>())));
+        weight_ptrs.push_back(static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(
+                weight.sub_scale_packed.data_ptr<uint8_t>())));
+        weight_ptrs.push_back(static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(
+                weight.neuron_scale.data_ptr<float>())));
+        weight_ptrs.push_back(static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(
+                weight.codebook.data_ptr<int8_t>())));
+        weight_sizes.push_back(weight.indices_packed.numel());
+        weight_sizes.push_back(weight.aux_packed.numel());
+        weight_sizes.push_back(weight.sub_scale_packed.numel());
+        const int format = static_cast<int>(weight.kernel_format);
+        const bool d4 =
+            format == 3 || format == 10 || format == 11 ||
+            format == 12 || format == 15 || format == 17;
+        const int nvec =
+            (runtime.neuron_len + (d4 ? 3 : 7)) / (d4 ? 4 : 8);
+        const int nsign = (runtime.neuron_len + 7) / 8;
+        pool_params.push_back(pool.local_experts);
+        pool_params.push_back(static_cast<int32_t>(weight.ng));
+        pool_params.push_back(nvec);
+        pool_params.push_back(nsign);
+        pool_params.push_back(static_cast<int32_t>(weight.sub_bits));
+        pool_params.push_back(static_cast<int32_t>(weight.sign_mode));
+        pool_params.push_back(format);
+
+        auto local_host = pool.expert_local
+            .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt32)
+            .contiguous();
+        const int32_t * local = local_host.data_ptr<int32_t>();
+        for (int expert = 0; expert < runtime.n_experts; ++expert) {
+            if (local[expert] < 0) continue;
+            if (local[expert] >= pool.local_experts ||
+                    expert_pool[static_cast<size_t>(expert)] >= 0) {
+                throw std::runtime_error(
+                    "mixed NVQ prefill has invalid expert ownership");
+            }
+            expert_pool[static_cast<size_t>(expert)] = dispatch_pool;
+            expert_local[static_cast<size_t>(expert)] = local[expert];
+        }
+        ++dispatch_pool;
+    }
+
+    auto dispatch = std::make_shared<MixedNvqDispatch>();
+    dispatch->pool_count = dispatch_pool;
+    dispatch->weight_ptrs = mfq_tensor_backend::from_blob(
+        weight_ptrs.data(), {dispatch_pool, 5},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+        .clone().to(target).contiguous();
+    dispatch->weight_sizes = mfq_tensor_backend::from_blob(
+        weight_sizes.data(), {dispatch_pool, 3},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+        .clone().to(target).contiguous();
+    dispatch->pool_params = mfq_tensor_backend::from_blob(
+        pool_params.data(), {dispatch_pool, 7},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone().to(target).contiguous();
+    dispatch->expert_pool = mfq_tensor_backend::from_blob(
+        expert_pool.data(), {runtime.n_experts},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone().to(target).contiguous();
+    dispatch->expert_local = mfq_tensor_backend::from_blob(
+        expert_local.data(), {runtime.n_experts},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone().to(target).contiguous();
+    runtime.nvq_dispatch = std::move(dispatch);
+}
+
 static int64_t tensor_storage_bytes(const mfq_tensor_backend::Tensor & value) {
     return value.defined()
         ? value.numel() * (int64_t)value.element_size()
@@ -7196,6 +7398,13 @@ static int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
         bytes += tensor_storage_bytes(runtime.nint_dispatch->pool_params);
         bytes += tensor_storage_bytes(runtime.nint_dispatch->expert_pool);
         bytes += tensor_storage_bytes(runtime.nint_dispatch->expert_local);
+    }
+    if (runtime.nvq_dispatch) {
+        bytes += tensor_storage_bytes(runtime.nvq_dispatch->weight_ptrs);
+        bytes += tensor_storage_bytes(runtime.nvq_dispatch->weight_sizes);
+        bytes += tensor_storage_bytes(runtime.nvq_dispatch->pool_params);
+        bytes += tensor_storage_bytes(runtime.nvq_dispatch->expert_pool);
+        bytes += tensor_storage_bytes(runtime.nvq_dispatch->expert_local);
     }
     for (const auto & pool : runtime.pools) {
         bytes += tensor_storage_bytes(pool.expert_local);
@@ -7323,7 +7532,10 @@ static std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
         }
         runtime->pools.push_back(std::move(pool));
     }
-    if (cuda) initialize_mixed_nint_dispatch(*runtime);
+    if (cuda) {
+        initialize_mixed_nint_dispatch(*runtime);
+        initialize_mixed_nvq_dispatch(*runtime);
+    }
     return runtime;
 }
 
@@ -7478,6 +7690,7 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
             "expert-parallel MoE shard has no owned experts");
     }
     initialize_mixed_nint_dispatch(*runtime);
+    initialize_mixed_nvq_dispatch(*runtime);
     return wrap_mixed_moe_runtime(runtime);
 }
 
@@ -7647,6 +7860,7 @@ static NintMoeWeight stage_cpu_mixed_moe(
         runtime->pools.push_back(std::move(pool));
     }
     initialize_mixed_nint_dispatch(*runtime);
+    initialize_mixed_nvq_dispatch(*runtime);
     return wrap_mixed_moe_runtime(runtime);
 }
 
@@ -7686,16 +7900,56 @@ static NintMoeCpu load_nint_moe_cpu(
     return cpu;
 }
 
+static std::shared_ptr<MixedMoeRuntime> make_mxfp4_range_runtime(
+        const mfq::cuda::NintMxfp4ExpertStore & store) {
+    auto runtime = std::make_shared<MixedMoeRuntime>();
+    runtime->n_experts = store.num_experts();
+    runtime->out_per_expert = store.out_per_expert();
+    runtime->neuron_len = store.neuron_len();
+    MixedMoePool pool;
+    pool.family = MixedMoeFamily::Mxfp4;
+    pool.local_experts = store.num_experts();
+    pool.mxfp4.out =
+        static_cast<int64_t>(store.num_experts()) * store.out_per_expert();
+    pool.mxfp4.neuron_len = store.neuron_len();
+    std::vector<int32_t> local(static_cast<size_t>(store.num_experts()));
+    std::iota(local.begin(), local.end(), int32_t{0});
+    pool.expert_local = mfq_tensor_backend::from_blob(
+        local.data(),
+        {static_cast<int64_t>(local.size())},
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone();
+    runtime->pools.push_back(std::move(pool));
+    return runtime;
+}
+
 struct MoeCacheTransfer {
     const uint8_t * source = nullptr;
     uint8_t * destination = nullptr;
     int64_t nbytes = 0;
     bool packed_weight = false;
     const uint8_t * mapped_source = nullptr;
+    const mfq::cuda::NintMxfp4ExpertStore * range_store = nullptr;
+    const mfq::cuda::NintMxfp4ExpertPart * range_part = nullptr;
+};
+
+struct MoeCacheNewLease {
+    mfq::MoeCacheSlotBook * book = nullptr;
+    mfq::MoeCacheKey key;
+    int slot = -1;
+    uint64_t generation = 0;
 };
 
 struct MoeCachedCohort;
 class MoeCachedSource;
+
+struct MoeCacheFieldLayout {
+    mfq_tensor_backend::ScalarType scalar_type =
+        mfq_tensor_backend::kUInt8;
+    std::vector<int64_t> slot_shape;
+    int64_t elements = 0;
+    int64_t element_size = 0;
+};
 
 static int64_t tensor_nbytes(const mfq_tensor_backend::Tensor & value) {
     return value.defined()
@@ -7746,6 +8000,31 @@ static std::vector<mfq_tensor_backend::Tensor> moe_cache_fields(
         fields.push_back(pool.nepq.residual_second);
     }
     return fields;
+}
+
+static std::vector<MoeCacheFieldLayout> moe_cache_field_layouts(
+        const MixedMoePool & pool) {
+    const auto fields = moe_cache_fields(pool);
+    std::vector<MoeCacheFieldLayout> result;
+    result.reserve(fields.size());
+    for (const auto & field : fields) {
+        if (!field.defined() || !field.is_cpu() || !field.is_contiguous() ||
+                field.dim() < 1 || pool.local_experts <= 0 ||
+                field.size(0) % pool.local_experts != 0 ||
+                field.numel() % pool.local_experts != 0) {
+            throw std::runtime_error(
+                "MoE cache source fields must be contiguous, expert-major CPU tensors");
+        }
+        auto shape = field.sizes().vec();
+        shape[0] /= pool.local_experts;
+        result.push_back({
+            field.scalar_type(),
+            std::move(shape),
+            field.numel() / pool.local_experts,
+            static_cast<int64_t>(field.element_size()),
+        });
+    }
+    return result;
 }
 
 static void validate_nepq_expert_boundaries(
@@ -7845,7 +8124,8 @@ static void validate_tpq_expert_boundaries(
 static std::string moe_cache_signature(
         const MixedMoePool & pool,
         int out_per_expert,
-        int neuron_len) {
+        int neuron_len,
+        const std::vector<MoeCacheFieldLayout> & layouts) {
     std::ostringstream stream;
     stream << static_cast<int>(pool.family)
            << ":o" << out_per_expert
@@ -7880,18 +8160,9 @@ static std::string moe_cache_signature(
                    << ":v" << pool.nepq.residual_block_vectors;
         }
     }
-    const auto fields = moe_cache_fields(pool);
-    for (const auto & field : fields) {
-        if (!field.defined() || !field.is_cpu() || !field.is_contiguous()) {
-            throw std::runtime_error(
-                "MoE cache source fields must be contiguous CPU tensors");
-        }
-        if (field.numel() % pool.local_experts != 0) {
-            throw std::runtime_error(
-                "MoE cache source field cannot be split by expert");
-        }
-        stream << ":" << static_cast<int>(field.scalar_type())
-               << "x" << field.numel() / pool.local_experts;
+    for (const auto & layout : layouts) {
+        stream << ":" << static_cast<int>(layout.scalar_type)
+               << "x" << layout.elements;
     }
     return stream.str();
 }
@@ -7901,10 +8172,8 @@ struct MoeGpuArena {
     int64_t slot_bytes = 0;
     int minimum_slots = 0;
     int registered_experts = 0;
-    int prototype_experts = 0;
     int slots = 0;
-    std::vector<mfq_tensor_backend::Tensor> prototypes;
-    std::vector<int64_t> elements_per_expert;
+    std::vector<MoeCacheFieldLayout> layouts;
     std::vector<mfq_tensor_backend::Tensor> fields;
     std::unique_ptr<mfq::MoeCacheSlotBook> book;
 };
@@ -7914,6 +8183,15 @@ struct MoePinnedStage {
     mfq_tensor_backend::Tensor device;
     cudaEvent_t done = nullptr;
     bool pending = false;
+};
+
+struct MoePendingRangeRead {
+    mfq_tensor_backend::Tensor host;
+    std::vector<MoeCacheTransfer> transfers;
+    std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> held_slots;
+    std::vector<MoeCacheNewLease> new_leases;
+    mfq::cuda::NintMxfp4ReadTicket ticket;
+    bool replaced_occupied = false;
 };
 
 struct MoeCacheStats {
@@ -7931,6 +8209,12 @@ struct MoeCacheStats {
     int64_t mapped_gather_bytes = 0;
     int64_t mapped_gather_submissions = 0;
     int64_t mapped_gather_descriptors = 0;
+    int64_t range_read_bytes = 0;
+    int64_t range_read_calls = 0;
+    int64_t range_file_opens = 0;
+    int64_t range_read_nanoseconds = 0;
+    int64_t range_overlap_batches = 0;
+    int64_t range_overlap_wait_nanoseconds = 0;
 };
 
 class MoeExpertCache : public std::enable_shared_from_this<MoeExpertCache> {
@@ -7967,6 +8251,19 @@ public:
             mapped_copy_blocks_ = std::max(
                 4, std::min(128, std::atoi(blocks)));
         }
+        int range_workers = 8;
+        const char * workers =
+            std::getenv("MFQ_MOE_SSD_IO_WORKERS");
+        if (workers != nullptr) {
+            range_workers = std::max(
+                1, std::min(64, std::atoi(workers)));
+        }
+        range_read_pool_ =
+            std::make_unique<mfq::cuda::NintMxfp4ReadPool>(range_workers);
+        const char * disable_overlap =
+            std::getenv("MFQ_DISABLE_MOE_SSD_OVERLAP");
+        range_overlap_enabled_ =
+            disable_overlap == nullptr || std::atoi(disable_overlap) == 0;
     }
 
     ~MoeExpertCache() {
@@ -8005,6 +8302,14 @@ public:
         int layer_id,
         std::string projection_role);
 
+    std::shared_ptr<MoeCachedSource> register_range_source(
+        const std::string & name,
+        std::shared_ptr<MixedMoeRuntime> metadata,
+        std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> store,
+        int minimum_slots,
+        int layer_id,
+        std::string projection_role);
+
     MoeGpuArena * register_cohort(
             const MixedMoePool & pool,
             int out_per_expert,
@@ -8018,25 +8323,48 @@ public:
             pool, out_per_expert, neuron_len);
         validate_tpq_expert_boundaries(
             pool, out_per_expert, neuron_len);
+        return register_cohort_layout(
+            pool,
+            out_per_expert,
+            neuron_len,
+            minimum_slots,
+            pool.local_experts,
+            moe_cache_field_layouts(pool));
+    }
+
+    MoeGpuArena * register_cohort_layout(
+            const MixedMoePool & pool,
+            int out_per_expert,
+            int neuron_len,
+            int minimum_slots,
+            int registered_experts,
+            std::vector<MoeCacheFieldLayout> layouts) {
+        if (finalized_) {
+            throw std::runtime_error(
+                "cannot register a MoE source after cache finalization");
+        }
+        if (registered_experts <= 0 || layouts.empty()) {
+            throw std::runtime_error("invalid MoE cache cohort layout");
+        }
         const std::string signature =
-            moe_cache_signature(pool, out_per_expert, neuron_len);
-        const auto fields = moe_cache_fields(pool);
+            moe_cache_signature(pool, out_per_expert, neuron_len, layouts);
         auto found = arenas_.find(signature);
         if (found == arenas_.end()) {
             auto arena = std::make_unique<MoeGpuArena>();
             arena->signature = signature;
             arena->minimum_slots =
-                std::min(minimum_slots, pool.local_experts);
-            arena->registered_experts = pool.local_experts;
-            arena->prototype_experts = pool.local_experts;
-            for (const auto & field : fields) {
-                const int64_t elements =
-                    field.numel() / pool.local_experts;
-                arena->prototypes.push_back(field);
-                arena->elements_per_expert.push_back(elements);
+                std::min(minimum_slots, registered_experts);
+            arena->registered_experts = registered_experts;
+            for (const auto & layout : layouts) {
+                if (layout.slot_shape.empty() || layout.elements < 0 ||
+                        layout.element_size <= 0) {
+                    throw std::runtime_error(
+                        "invalid MoE cache field layout");
+                }
                 arena->slot_bytes +=
-                    elements * static_cast<int64_t>(field.element_size());
+                    layout.elements * layout.element_size;
             }
+            arena->layouts = std::move(layouts);
             MoeGpuArena * result = arena.get();
             arenas_.emplace(signature, std::move(arena));
             return result;
@@ -8044,11 +8372,22 @@ public:
         MoeGpuArena * arena = found->second.get();
         arena->minimum_slots = std::max(
             arena->minimum_slots,
-            std::min(minimum_slots, pool.local_experts));
-        arena->registered_experts += pool.local_experts;
-        if (arena->prototypes.size() != fields.size()) {
+            std::min(minimum_slots, registered_experts));
+        arena->registered_experts += registered_experts;
+        if (arena->layouts.size() != layouts.size()) {
             throw std::runtime_error(
                 "MoE cache signature merged incompatible field counts");
+        }
+        for (size_t index = 0; index < layouts.size(); ++index) {
+            const auto & left = arena->layouts[index];
+            const auto & right = layouts[index];
+            if (left.scalar_type != right.scalar_type ||
+                    left.slot_shape != right.slot_shape ||
+                    left.elements != right.elements ||
+                    left.element_size != right.element_size) {
+                throw std::runtime_error(
+                    "MoE cache signature merged incompatible field layouts");
+            }
         }
         return arena;
     }
@@ -8136,6 +8475,11 @@ public:
 
     bool prepare_bundle(
         const std::vector<MoeCachedSource *> & sources,
+        const std::vector<int32_t> & experts);
+
+    bool prepare_bundle_deferred(
+        const std::vector<MoeCachedSource *> & ready_sources,
+        MoeCachedSource & deferred_source,
         const std::vector<int32_t> & experts);
 
     void prewarm();
@@ -8278,6 +8622,22 @@ public:
                << stats_.mapped_gather_submissions
                << " mapped_gather_descriptors="
                << stats_.mapped_gather_descriptors
+               << " range_read_bytes="
+               << stats_.range_read_bytes
+               << " range_read_calls="
+               << stats_.range_read_calls
+               << " range_file_opens="
+               << stats_.range_file_opens
+               << " range_io_workers="
+               << range_read_pool_->workers()
+               << " range_read_ms="
+               << static_cast<double>(stats_.range_read_nanoseconds) /
+                    1.0e6
+               << " range_overlap_batches="
+               << stats_.range_overlap_batches
+               << " range_overlap_wait_ms="
+               << static_cast<double>(
+                    stats_.range_overlap_wait_nanoseconds) / 1.0e6
                << "\n";
     }
 
@@ -8290,7 +8650,29 @@ private:
         bool prefetch,
         std::vector<MoeCacheTransfer> & transfers,
         bool & replaced_occupied,
-        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots);
+        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots,
+        std::vector<MoeCacheNewLease> * new_leases);
+
+    void rollback_preparation(
+        const std::vector<MoeCacheNewLease> & new_leases,
+        const std::vector<
+            std::pair<mfq::MoeCacheSlotBook *, int>> & held_slots) noexcept;
+
+    bool begin_deferred_range_read(
+        MoeCachedSource & source,
+        const std::vector<int32_t> & experts);
+
+    void finish_deferred_range_read(MoeCachedSource & source);
+
+    void record_range_read(
+        const mfq::cuda::NintMxfp4ReadBatchStats & range_stats) {
+        stats_.range_read_bytes += static_cast<int64_t>(range_stats.bytes);
+        stats_.range_read_calls += static_cast<int64_t>(range_stats.calls);
+        stats_.range_file_opens +=
+            static_cast<int64_t>(range_stats.file_opens);
+        stats_.range_read_nanoseconds +=
+            static_cast<int64_t>(range_stats.wall_nanoseconds);
+    }
 
     MoePinnedStage & acquire_stage(
             int64_t required_bytes,
@@ -8362,15 +8744,49 @@ private:
             const std::vector<MoeCacheTransfer> & transfers,
             bool waits_for_compute,
             bool wait_on_compute_stream) {
+        std::vector<mfq::cuda::NintMxfp4ReadRequest> range_requests;
+        auto materialize_source = [&range_requests](
+                const MoeCacheTransfer & transfer,
+                uint8_t * destination) {
+            if (transfer.range_store != nullptr) {
+                range_requests.push_back({
+                    transfer.range_store,
+                    transfer.range_part,
+                    std::span<uint8_t>(
+                        destination,
+                        static_cast<size_t>(transfer.nbytes)),
+                });
+            } else {
+                std::memcpy(
+                    destination,
+                    transfer.source,
+                    static_cast<size_t>(transfer.nbytes));
+            }
+        };
+        auto finish_range_reads = [this, &range_requests]() {
+            if (range_requests.empty()) return;
+            const auto range_stats = range_read_pool_->read(range_requests);
+            record_range_read(range_stats);
+            range_requests.clear();
+        };
         int64_t staged_payload_bytes = 0;
         int transfer_count = 0;
         int staged_count = 0;
         int mapped_count = 0;
         for (const auto & transfer : transfers) {
+            const bool range_source =
+                transfer.range_store != nullptr &&
+                transfer.range_part != nullptr;
             if (transfer.nbytes < 0 ||
                 (transfer.nbytes > 0 &&
-                 (transfer.source == nullptr ||
-                  transfer.destination == nullptr))) {
+                 ((!range_source && transfer.source == nullptr) ||
+                  transfer.destination == nullptr)) ||
+                ((transfer.range_store == nullptr) !=
+                 (transfer.range_part == nullptr)) ||
+                (range_source &&
+                 (transfer.mapped_source != nullptr ||
+                  transfer.range_part->nbytes !=
+                    static_cast<uint64_t>(transfer.nbytes)))) {
                 throw std::runtime_error(
                     "invalid MoE cache transfer");
             }
@@ -8411,10 +8827,14 @@ private:
             for (const auto & transfer : transfers) {
                 if (transfer.nbytes == 0) continue;
                 offset = (offset + 15) & ~int64_t{15};
-                std::memcpy(
-                    staging + offset,
-                    transfer.source,
-                    static_cast<size_t>(transfer.nbytes));
+                materialize_source(transfer, staging + offset);
+                offset += transfer.nbytes;
+            }
+            finish_range_reads();
+            offset = 0;
+            for (const auto & transfer : transfers) {
+                if (transfer.nbytes == 0) continue;
+                offset = (offset + 15) & ~int64_t{15};
                 MFQ_CUDA_CHECK(cudaMemcpyAsync(
                     transfer.destination,
                     staging + offset,
@@ -8492,10 +8912,7 @@ private:
                 stats_.mapped_gather_bytes += transfer.nbytes;
             } else {
                 offset = (offset + 15) & ~int64_t{15};
-                std::memcpy(
-                    staging + offset,
-                    transfer.source,
-                    static_cast<size_t>(transfer.nbytes));
+                materialize_source(transfer, staging + offset);
                 scatter_descriptors[scatter_descriptor++] = {
                     static_cast<uint64_t>(
                         reinterpret_cast<uintptr_t>(
@@ -8509,6 +8926,7 @@ private:
                 stats_.h2d_bytes += transfer.nbytes;
             }
         }
+        finish_range_reads();
         if (scatter_descriptor != staged_count ||
                 mapped_descriptor != mapped_count) {
             throw std::runtime_error(
@@ -8593,6 +9011,10 @@ private:
     int64_t mapped_registered_bytes_ = 0;
     std::vector<RegisteredHostField> registered_host_fields_;
     std::unordered_map<void *, const uint8_t *> mapped_host_lookup_;
+    std::unique_ptr<mfq::cuda::NintMxfp4ReadPool> range_read_pool_;
+    std::unordered_map<int, std::unique_ptr<MoePendingRangeRead>>
+        pending_range_reads_;
+    bool range_overlap_enabled_ = true;
 };
 
 struct MoeCachedCohort {
@@ -8604,6 +9026,7 @@ struct MoeCachedCohort {
     std::vector<int64_t> bytes_per_expert;
     std::vector<int32_t> expert_to_local;
     std::vector<int32_t> host_map;
+    std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> range_store;
     bool map_dirty = false;
     MixedMoePool active;
 };
@@ -8617,13 +9040,15 @@ public:
             std::shared_ptr<MixedMoeRuntime> cpu,
             int minimum_slots,
             int layer_id,
-            std::string projection_role)
+            std::string projection_role,
+            std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> range_store)
         : cache_(cache),
           id_(id),
           name_(std::move(name)),
           layer_id_(layer_id),
           projection_role_(std::move(projection_role)),
           cpu_(std::move(cpu)),
+          range_store_(std::move(range_store)),
           expert_to_cohort_(
               static_cast<size_t>(cpu_->n_experts), -1),
           expert_to_local_(
@@ -8633,51 +9058,109 @@ public:
                 "MoE cache source minimum slots must be positive");
         }
         cohorts_.reserve(cpu_->pools.size());
-        for (int cohort_index = 0;
-             cohort_index < static_cast<int>(cpu_->pools.size());
-             ++cohort_index) {
-            const auto & pool =
-                cpu_->pools.at(static_cast<size_t>(cohort_index));
+        if (range_store_) {
+            if (cpu_->pools.size() != 1 ||
+                    cpu_->pools.front().family != MixedMoeFamily::Mxfp4 ||
+                    cpu_->n_experts != range_store_->num_experts() ||
+                    cpu_->out_per_expert != range_store_->out_per_expert() ||
+                    cpu_->neuron_len != range_store_->neuron_len() ||
+                    range_store_->values_bytes_per_expert() >
+                        static_cast<uint64_t>(
+                            std::numeric_limits<int64_t>::max()) ||
+                    range_store_->scales_bytes_per_expert() >
+                        static_cast<uint64_t>(
+                            std::numeric_limits<int64_t>::max())) {
+                throw std::runtime_error(
+                    "invalid exact-range MXFP4 cache metadata");
+            }
+            const auto & pool = cpu_->pools.front();
             MoeCachedCohort cohort;
-            cohort.index = cohort_index;
+            cohort.index = 0;
             cohort.cpu = &pool;
-            cohort.arena = cache_->register_cohort(
-                pool, cpu_->out_per_expert, cpu_->neuron_len,
-                minimum_slots);
-            cohort.cpu_fields = moe_cache_fields(pool);
-            cohort.expert_to_local.assign(
-                static_cast<size_t>(cpu_->n_experts), -1);
+            cohort.range_store = range_store_;
+            const int64_t values = static_cast<int64_t>(
+                range_store_->values_bytes_per_expert());
+            const int64_t scales = static_cast<int64_t>(
+                range_store_->scales_bytes_per_expert());
+            cohort.arena = cache_->register_cohort_layout(
+                pool,
+                cpu_->out_per_expert,
+                cpu_->neuron_len,
+                minimum_slots,
+                cpu_->n_experts,
+                {
+                    {
+                        mfq_tensor_backend::kUInt8,
+                        {cpu_->out_per_expert, cpu_->neuron_len / 2},
+                        values,
+                        1,
+                    },
+                    {
+                        mfq_tensor_backend::kUInt8,
+                        {cpu_->out_per_expert, cpu_->neuron_len / 32},
+                        scales,
+                        1,
+                    },
+                });
+            cohort.bytes_per_expert = {values, scales};
+            cohort.mapped_fields = {nullptr, nullptr};
+            cohort.expert_to_local.resize(
+                static_cast<size_t>(cpu_->n_experts));
             cohort.host_map.assign(
                 static_cast<size_t>(cpu_->n_experts), -1);
-            const auto * local =
-                pool.expert_local.data_ptr<int32_t>();
             for (int expert = 0; expert < cpu_->n_experts; ++expert) {
-                const int local_index = local[expert];
-                cohort.expert_to_local[
-                    static_cast<size_t>(expert)] = local_index;
-                if (local_index < 0) continue;
-                if (expert_to_cohort_[
-                        static_cast<size_t>(expert)] >= 0) {
-                    throw std::runtime_error(
-                        "MoE cache source has duplicate expert ownership");
-                }
-                expert_to_cohort_[
-                    static_cast<size_t>(expert)] = cohort_index;
-                expert_to_local_[
-                    static_cast<size_t>(expert)] = local_index;
-            }
-            for (const auto & field : cohort.cpu_fields) {
-                const int64_t nbytes = tensor_nbytes(field);
-                if (nbytes % pool.local_experts != 0) {
-                    throw std::runtime_error(
-                        "MoE cache field byte count is not expert aligned");
-                }
-                cohort.bytes_per_expert.push_back(
-                    nbytes / pool.local_experts);
-                cohort.mapped_fields.push_back(
-                    cache_->register_mapped_field(field));
+                cohort.expert_to_local[static_cast<size_t>(expert)] = expert;
+                expert_to_cohort_[static_cast<size_t>(expert)] = 0;
+                expert_to_local_[static_cast<size_t>(expert)] = expert;
             }
             cohorts_.push_back(std::move(cohort));
+        } else {
+            for (int cohort_index = 0;
+                 cohort_index < static_cast<int>(cpu_->pools.size());
+                 ++cohort_index) {
+                const auto & pool =
+                    cpu_->pools.at(static_cast<size_t>(cohort_index));
+                MoeCachedCohort cohort;
+                cohort.index = cohort_index;
+                cohort.cpu = &pool;
+                cohort.arena = cache_->register_cohort(
+                    pool, cpu_->out_per_expert, cpu_->neuron_len,
+                    minimum_slots);
+                cohort.cpu_fields = moe_cache_fields(pool);
+                cohort.expert_to_local.assign(
+                    static_cast<size_t>(cpu_->n_experts), -1);
+                cohort.host_map.assign(
+                    static_cast<size_t>(cpu_->n_experts), -1);
+                const auto * local =
+                    pool.expert_local.data_ptr<int32_t>();
+                for (int expert = 0; expert < cpu_->n_experts; ++expert) {
+                    const int local_index = local[expert];
+                    cohort.expert_to_local[
+                        static_cast<size_t>(expert)] = local_index;
+                    if (local_index < 0) continue;
+                    if (expert_to_cohort_[
+                            static_cast<size_t>(expert)] >= 0) {
+                        throw std::runtime_error(
+                            "MoE cache source has duplicate expert ownership");
+                    }
+                    expert_to_cohort_[
+                        static_cast<size_t>(expert)] = cohort_index;
+                    expert_to_local_[
+                        static_cast<size_t>(expert)] = local_index;
+                }
+                for (const auto & field : cohort.cpu_fields) {
+                    const int64_t nbytes = tensor_nbytes(field);
+                    if (nbytes % pool.local_experts != 0) {
+                        throw std::runtime_error(
+                            "MoE cache field byte count is not expert aligned");
+                    }
+                    cohort.bytes_per_expert.push_back(
+                        nbytes / pool.local_experts);
+                    cohort.mapped_fields.push_back(
+                        cache_->register_mapped_field(field));
+                }
+                cohorts_.push_back(std::move(cohort));
+            }
         }
         if (std::any_of(
                 expert_to_cohort_.begin(),
@@ -8756,6 +9239,14 @@ public:
 
     int64_t host_bytes() const {
         return mixed_moe_storage_bytes(*cpu_);
+    }
+
+    int64_t logical_weight_bytes() const {
+        if (!range_store_) return host_bytes();
+        return range_store_->record().nbytes >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+            ? std::numeric_limits<int64_t>::max()
+            : static_cast<int64_t>(range_store_->record().nbytes);
     }
 
     void finalize() {
@@ -8929,7 +9420,7 @@ public:
     }
 
     bool use_full_projection(const MoeRoutePlan & route) const {
-        return route.ids.size(0) > 8;
+        return !range_store_ && route.ids.size(0) > 8;
     }
 
     mfq_tensor_backend::Tensor forward(
@@ -8937,17 +9428,13 @@ public:
             const MoeRoutePlan & route) {
         if (use_full_projection(route)) {
             cache_->count_full_projection_fallback();
-            auto staged = pure_nint_candidate_
-                ? stage_cpu_nint_moe(cpu_)
-                : stage_cpu_mixed_moe(cpu_);
+            auto staged = stage_fallback_runtime();
             return staged.forward(x, route);
         }
         if (!cache_->prepare(
                 *this, route_experts(route), false)) {
             cache_->count_full_projection_fallback();
-            auto staged = pure_nint_candidate_
-                ? stage_cpu_nint_moe(cpu_)
-                : stage_cpu_mixed_moe(cpu_);
+            auto staged = stage_fallback_runtime();
             return staged.forward(x, route);
         }
         mfq_tensor_backend::Tensor output;
@@ -8971,9 +9458,7 @@ public:
         if (!cache_->prepare(
                 *this, route_experts(route), false)) {
             cache_->count_full_projection_fallback();
-            auto staged = pure_nint_candidate_
-                ? stage_cpu_nint_moe(cpu_)
-                : stage_cpu_mixed_moe(cpu_);
+            auto staged = stage_fallback_runtime();
             return staged.forward(x, route);
         }
         mfq_tensor_backend::Tensor output;
@@ -9086,6 +9571,25 @@ public:
             }
             raw_sources.push_back(source.get());
         }
+        if (raw_sources.size() == 3 &&
+                raw_sources[0]->projection_role_ == "gate" &&
+                raw_sources[1]->projection_role_ == "up" &&
+                raw_sources[2]->projection_role_ == "down" &&
+                raw_sources[2]->range_store_) {
+            return first.cache_->prepare_bundle_deferred(
+                {raw_sources[0], raw_sources[1]},
+                *raw_sources[2],
+                first.route_experts(route));
+        }
+        if (raw_sources.size() == 2 &&
+                raw_sources[0]->projection_role_ == "gate_up" &&
+                raw_sources[1]->projection_role_ == "down" &&
+                raw_sources[1]->range_store_) {
+            return first.cache_->prepare_bundle_deferred(
+                {raw_sources[0]},
+                *raw_sources[1],
+                first.route_experts(route));
+        }
         return first.cache_->prepare_bundle(
             raw_sources, first.route_experts(route));
     }
@@ -9093,12 +9597,32 @@ public:
 private:
     friend class MoeExpertCache;
 
+    std::shared_ptr<MixedMoeRuntime> fallback_runtime() {
+        if (!range_store_) return cpu_;
+        std::lock_guard<std::mutex> guard(fallback_mutex_);
+        if (!fallback_cpu_) {
+            fallback_cpu_ = make_mixed_moe_runtime(
+                unpack_nint_moe(range_store_->read_blob()), false);
+        }
+        return fallback_cpu_;
+    }
+
+    NintMoeWeight stage_fallback_runtime() {
+        auto runtime = fallback_runtime();
+        return pure_nint_candidate_
+            ? stage_cpu_nint_moe(runtime)
+            : stage_cpu_mixed_moe(runtime);
+    }
+
     MoeExpertCache * cache_ = nullptr;
     int id_ = -1;
     std::string name_;
     int layer_id_ = -1;
     std::string projection_role_;
     std::shared_ptr<MixedMoeRuntime> cpu_;
+    std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> range_store_;
+    std::mutex fallback_mutex_;
+    std::shared_ptr<MixedMoeRuntime> fallback_cpu_;
     std::vector<MoeCachedCohort> cohorts_;
     std::vector<int> expert_to_cohort_;
     std::vector<int> expert_to_local_;
@@ -9118,7 +9642,23 @@ std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(
     const int id = static_cast<int>(sources_.size());
     auto source = std::make_shared<MoeCachedSource>(
         this, id, name, std::move(cpu), minimum_slots,
-        layer_id, std::move(projection_role));
+        layer_id, std::move(projection_role), nullptr);
+    host_bytes_ += source->host_bytes();
+    sources_.push_back(source);
+    return source;
+}
+
+std::shared_ptr<MoeCachedSource> MoeExpertCache::register_range_source(
+        const std::string & name,
+        std::shared_ptr<MixedMoeRuntime> metadata,
+        std::shared_ptr<mfq::cuda::NintMxfp4ExpertStore> store,
+        int minimum_slots,
+        int layer_id,
+        std::string projection_role) {
+    const int id = static_cast<int>(sources_.size());
+    auto source = std::make_shared<MoeCachedSource>(
+        this, id, name, std::move(metadata), minimum_slots,
+        layer_id, std::move(projection_role), std::move(store));
     host_bytes_ += source->host_bytes();
     sources_.push_back(source);
     return source;
@@ -9333,27 +9873,22 @@ void MoeExpertCache::finalize() {
     for (auto & item : arenas_) {
         auto & arena = *item.second;
         arena.slots = plan.at(arena.signature);
-        arena.fields.reserve(arena.prototypes.size());
+        arena.fields.reserve(arena.layouts.size());
         for (size_t index = 0;
-             index < arena.prototypes.size();
+             index < arena.layouts.size();
              ++index) {
-            const auto & prototype = arena.prototypes[index];
-            if (prototype.dim() < 1 ||
-                    prototype.size(0) %
-                        arena.prototype_experts != 0) {
+            const auto & layout = arena.layouts[index];
+            if (layout.slot_shape.empty()) {
                 throw std::runtime_error(
                     "MoE cache field has no expert-major leading dimension");
             }
-            auto shape = prototype.sizes().vec();
-            shape[0] =
-                prototype.size(0) /
-                arena.prototype_experts *
-                arena.slots;
+            auto shape = layout.slot_shape;
+            shape[0] *= arena.slots;
             arena.fields.push_back(mfq_tensor_backend::empty(
                 shape,
                 mfq_tensor_backend::TensorOptions()
                     .device(mfq_tensor_backend::kCUDA)
-                    .dtype(prototype.scalar_type())));
+                    .dtype(layout.scalar_type)));
         }
         arena.book =
             std::make_unique<mfq::MoeCacheSlotBook>(
@@ -9444,6 +9979,11 @@ void MoeExpertCache::prewarm() {
         std::chrono::duration<double, std::milli>(
             stopped - started).count();
     const int64_t prewarm_h2d_bytes = stats_.h2d_bytes;
+    const int64_t prewarm_range_read_bytes = stats_.range_read_bytes;
+    const int64_t prewarm_range_read_calls = stats_.range_read_calls;
+    const int64_t prewarm_range_file_opens = stats_.range_file_opens;
+    const double prewarm_range_read_ms =
+        static_cast<double>(stats_.range_read_nanoseconds) / 1.0e6;
     const int64_t projection_entries =
         stats_.prefetch_misses;
     const int64_t unfilled_bytes =
@@ -9455,6 +9995,10 @@ void MoeExpertCache::prewarm() {
         << " expert_bundles=" << prewarm_selected_.size()
         << " projection_entries=" << projection_entries
         << " h2d_bytes=" << prewarm_h2d_bytes
+        << " range_read_bytes=" << prewarm_range_read_bytes
+        << " range_read_calls=" << prewarm_range_read_calls
+        << " range_file_opens=" << prewarm_range_file_opens
+        << " range_read_ms=" << prewarm_range_read_ms
         << " time_ms=" << elapsed_ms
         << " unfilled_bytes=" << unfilled_bytes
         << "\n";
@@ -9479,7 +10023,8 @@ void MoeExpertCache::append_source_transfers(
         bool prefetch,
         std::vector<MoeCacheTransfer> & transfers,
         bool & replaced_occupied,
-        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots) {
+        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots,
+        std::vector<MoeCacheNewLease> * new_leases) {
     for (int expert : experts) {
         const int cohort_index =
             source.expert_to_cohort_.at(
@@ -9506,6 +10051,14 @@ void MoeExpertCache::append_source_transfers(
                 ++stats_.demand_hits;
             }
         } else {
+            if (new_leases != nullptr) {
+                new_leases->push_back({
+                    arena.book.get(),
+                    key,
+                    lease.slot,
+                    lease.generation,
+                });
+            }
             if (prefetch) {
                 ++stats_.prefetch_misses;
             } else {
@@ -9517,15 +10070,31 @@ void MoeExpertCache::append_source_transfers(
                 invalidate(*lease.replaced, lease.slot);
             }
             for (size_t field = 0;
-                 field < cohort.cpu_fields.size();
+                 field < cohort.bytes_per_expert.size();
                  ++field) {
                 const int64_t nbytes =
                     cohort.bytes_per_expert[field];
                 if (nbytes == 0) continue;
-                const auto & cpu_field =
-                    cohort.cpu_fields[field];
                 auto & gpu_field =
                     arena.fields[field];
+                if (cohort.range_store) {
+                    const auto & part =
+                        cohort.range_store->part(expert, field);
+                    transfers.push_back({
+                        nullptr,
+                        reinterpret_cast<uint8_t *>(
+                            gpu_field.data_ptr()) +
+                            static_cast<int64_t>(lease.slot) * nbytes,
+                        nbytes,
+                        true,
+                        nullptr,
+                        cohort.range_store.get(),
+                        &part,
+                    });
+                    continue;
+                }
+                const auto & cpu_field =
+                    cohort.cpu_fields[field];
                 transfers.push_back({
                     reinterpret_cast<const uint8_t *>(
                         cpu_field.data_ptr()) +
@@ -9596,6 +10165,174 @@ void MoeExpertCache::append_source_transfers(
     }
 }
 
+void MoeExpertCache::rollback_preparation(
+        const std::vector<MoeCacheNewLease> & new_leases,
+        const std::vector<
+            std::pair<mfq::MoeCacheSlotBook *, int>> & held_slots) noexcept {
+    (void)cudaStreamSynchronize(weight_stream_);
+    for (auto lease = new_leases.rbegin();
+         lease != new_leases.rend();
+         ++lease) {
+        try {
+            invalidate(lease->key, lease->slot);
+            (void)lease->book->discard(
+                lease->key, lease->slot, lease->generation);
+        } catch (...) {
+        }
+    }
+    for (const auto & held : held_slots) {
+        try {
+            held.first->clear_inflight(held.second);
+        } catch (...) {
+        }
+    }
+}
+
+bool MoeExpertCache::begin_deferred_range_read(
+        MoeCachedSource & source,
+        const std::vector<int32_t> & experts) {
+    if (!range_overlap_enabled_ || prewarming_ || !source.range_store_ ||
+            experts.empty()) {
+        return false;
+    }
+    finish_deferred_range_read(source);
+
+    std::unordered_map<
+        MoeGpuArena *,
+        std::unordered_set<mfq::MoeCacheKey, mfq::MoeCacheKeyHash>>
+        arena_demands;
+    for (int expert : experts) {
+        if (expert < 0 || expert >= source.n_experts()) return false;
+        const int cohort_index = source.expert_to_cohort_.at(
+            static_cast<size_t>(expert));
+        auto & cohort = source.cohorts_.at(
+            static_cast<size_t>(cohort_index));
+        arena_demands[cohort.arena].insert(
+            {source.id_, cohort_index, expert});
+    }
+    for (const auto & item : arena_demands) {
+        if (item.second.size() >
+                static_cast<size_t>(item.first->book->capacity())) {
+            return false;
+        }
+    }
+
+    auto pending = std::make_unique<MoePendingRangeRead>();
+    for (const auto & item : arena_demands) {
+        auto * book = item.first->book.get();
+        for (const auto & key : item.second) {
+            const int slot = book->slot_for(key);
+            if (slot >= 0 && !book->inflight(slot)) {
+                book->mark_inflight(slot);
+                pending->held_slots.emplace_back(book, slot);
+            }
+        }
+    }
+
+    try {
+        append_source_transfers(
+            source,
+            experts,
+            true,
+            pending->transfers,
+            pending->replaced_occupied,
+            &pending->held_slots,
+            &pending->new_leases);
+
+        int64_t range_bytes = 0;
+        size_t range_count = 0;
+        for (const auto & transfer : pending->transfers) {
+            if (transfer.range_store == nullptr) continue;
+            range_bytes = (range_bytes + 15) & ~int64_t{15};
+            if (transfer.nbytes >
+                    std::numeric_limits<int64_t>::max() - range_bytes) {
+                throw std::overflow_error(
+                    "deferred MoE range byte count overflows int64");
+            }
+            range_bytes += transfer.nbytes;
+            ++range_count;
+        }
+        if (range_count == 0) {
+            submit_transfers(
+                pending->transfers,
+                pending->replaced_occupied,
+                false);
+            for (const auto & held : pending->held_slots) {
+                held.first->clear_inflight(held.second);
+            }
+            return true;
+        }
+
+        pending->host = mfq_tensor_backend::empty(
+            {range_bytes},
+            mfq_tensor_backend::TensorOptions()
+                .device(mfq_tensor_backend::kCPU)
+                .dtype(mfq_tensor_backend::kUInt8)
+                .pinned_memory(true));
+        auto * staging = pending->host.data_ptr<uint8_t>();
+        std::vector<mfq::cuda::NintMxfp4ReadRequest> requests;
+        requests.reserve(range_count);
+        int64_t offset = 0;
+        for (auto & transfer : pending->transfers) {
+            if (transfer.range_store == nullptr) continue;
+            offset = (offset + 15) & ~int64_t{15};
+            requests.push_back({
+                transfer.range_store,
+                transfer.range_part,
+                std::span<uint8_t>(
+                    staging + offset,
+                    static_cast<size_t>(transfer.nbytes)),
+            });
+            transfer.source = staging + offset;
+            transfer.range_store = nullptr;
+            transfer.range_part = nullptr;
+            offset += transfer.nbytes;
+        }
+        pending->ticket = range_read_pool_->submit(requests);
+        const auto inserted = pending_range_reads_.try_emplace(
+            source.id_, std::move(pending));
+        if (!inserted.second) {
+            throw std::runtime_error(
+                "MoE source already has a deferred range read");
+        }
+        ++stats_.range_overlap_batches;
+        return true;
+    } catch (...) {
+        if (pending) {
+            rollback_preparation(
+                pending->new_leases, pending->held_slots);
+        }
+        throw;
+    }
+}
+
+void MoeExpertCache::finish_deferred_range_read(
+        MoeCachedSource & source) {
+    const auto found = pending_range_reads_.find(source.id_);
+    if (found == pending_range_reads_.end()) return;
+    auto pending = std::move(found->second);
+    pending_range_reads_.erase(found);
+    try {
+        const auto wait_begin = std::chrono::steady_clock::now();
+        const auto range_stats = pending->ticket.wait();
+        stats_.range_overlap_wait_nanoseconds +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_begin).count();
+        record_range_read(range_stats);
+        submit_transfers(
+            pending->transfers,
+            pending->replaced_occupied,
+            true);
+    } catch (...) {
+        rollback_preparation(
+            pending->new_leases, pending->held_slots);
+        throw;
+    }
+    for (const auto & held : pending->held_slots) {
+        held.first->clear_inflight(held.second);
+    }
+}
+
 bool MoeExpertCache::prepare(
         MoeCachedSource & source,
         const std::vector<int32_t> & experts,
@@ -9604,6 +10341,7 @@ bool MoeExpertCache::prepare(
         throw std::runtime_error(
             "MoE cache must be finalized before inference");
     }
+    finish_deferred_range_read(source);
     if (experts.empty()) return false;
 
     std::unordered_map<
@@ -9638,19 +10376,18 @@ bool MoeExpertCache::prepare(
         }
     }
     std::vector<MoeCacheTransfer> transfers;
+    std::vector<MoeCacheNewLease> new_leases;
     bool replaced_occupied = false;
     try {
         append_source_transfers(
             source, experts, prefetch, transfers,
-            replaced_occupied, &held_slots);
+            replaced_occupied, &held_slots, &new_leases);
         submit_transfers(
             transfers,
             replaced_occupied,
             !prefetch);
     } catch (...) {
-        for (const auto & held : held_slots) {
-            held.first->clear_inflight(held.second);
-        }
+        rollback_preparation(new_leases, held_slots);
         throw;
     }
     for (const auto & held : held_slots) {
@@ -9665,6 +10402,11 @@ bool MoeExpertCache::prepare_bundle(
     if (!finalized_) {
         throw std::runtime_error(
             "MoE cache must be finalized before inference");
+    }
+    for (auto * source : sources) {
+        if (source != nullptr && source->cache_ == this) {
+            finish_deferred_range_read(*source);
+        }
     }
     if (sources.empty() || experts.empty()) return false;
 
@@ -9703,19 +10445,18 @@ bool MoeExpertCache::prepare_bundle(
         }
     }
     std::vector<MoeCacheTransfer> transfers;
+    std::vector<MoeCacheNewLease> new_leases;
     bool replaced_occupied = false;
     try {
         for (auto * source : sources) {
             append_source_transfers(
                 *source, experts, true, transfers,
-                replaced_occupied, &held_slots);
+                replaced_occupied, &held_slots, &new_leases);
         }
         submit_transfers(
             transfers, replaced_occupied, false);
     } catch (...) {
-        for (const auto & held : held_slots) {
-            held.first->clear_inflight(held.second);
-        }
+        rollback_preparation(new_leases, held_slots);
         throw;
     }
     for (const auto & held : held_slots) {
@@ -9724,11 +10465,25 @@ bool MoeExpertCache::prepare_bundle(
     return true;
 }
 
+bool MoeExpertCache::prepare_bundle_deferred(
+        const std::vector<MoeCachedSource *> & ready_sources,
+        MoeCachedSource & deferred_source,
+        const std::vector<int32_t> & experts) {
+    if (!range_overlap_enabled_ || !deferred_source.range_store_) {
+        auto sources = ready_sources;
+        sources.push_back(&deferred_source);
+        return prepare_bundle(sources, experts);
+    }
+    if (!prepare_bundle(ready_sources, experts)) return false;
+    return begin_deferred_range_read(deferred_source, experts);
+}
+
 static NintMoeWeight wrap_cached_moe_source(
         const std::shared_ptr<MoeCachedSource> & source,
         const std::shared_ptr<MixedMoeRuntime> & cpu) {
     NintMoeWeight result =
         cpu_mixed_moe_metadata(cpu);
+    result.mixed_weight_bytes = source->logical_weight_bytes();
     result.hetero_supported =
         source->supports_nint_hetero();
     result.activation_workspace_domain =
@@ -9795,11 +10550,53 @@ static bool prefetch_cached_moe_projection_bundle(
         route);
 }
 
+static bool prefetch_cached_moe_projection_bundle(
+        const NintMoeWeight & gate_up,
+        const NintMoeWeight & down,
+        const MoeRoutePlan & route) {
+    if (!gate_up.cached_source || !down.cached_source) {
+        return false;
+    }
+    return MoeCachedSource::prefetch_bundle(
+        {gate_up.cached_source, down.cached_source}, route);
+}
+
 static NintMoeWeight load_nint_moe_gpu(
         const MfqFile & mfq, const std::string & name,
         bool cacheable,
         int layer_id,
         const std::string & projection_role) {
+    const char * disable_ranges =
+        std::getenv("MFQ_DISABLE_MOE_SSD_RANGES");
+    if (g_moe_expert_cache && cacheable &&
+            !moe_parallel_config().enabled() &&
+            !mfq.has_expert_overlay(name) &&
+            (disable_ranges == nullptr || std::atoi(disable_ranges) == 0)) {
+        const auto & record = mfq.record(name);
+        try {
+            auto store =
+                std::make_shared<mfq::cuda::NintMxfp4ExpertStore>(
+                    mfq::cuda::MfqRecordRange{
+                        name,
+                        record.dtype,
+                        record.source_path,
+                        record.offset,
+                        record.nbytes,
+                    });
+            auto runtime = make_mxfp4_range_runtime(*store);
+            auto source = g_moe_expert_cache->register_range_source(
+                name,
+                runtime,
+                std::move(store),
+                std::min(
+                    g_moe_cache_registration_min_slots,
+                    runtime->n_experts),
+                layer_id,
+                projection_role);
+            return wrap_cached_moe_source(source, runtime);
+        } catch (const mfq::cuda::NintMxfp4Unsupported &) {
+        }
+    }
     auto cpu = load_nint_moe_cpu(mfq, name);
     if (moe_parallel_config().enabled()) {
         auto slices = plan_moe_expert_parallel_slices(
@@ -13978,6 +14775,7 @@ struct Config {
     std::vector<int64_t> compress_ratios;
     std::optional<mfq::flash_next::GlmConfig> glm5_next;
     std::optional<mfq::flash_next::QwenConfig> qwen4;
+    std::optional<mfq::models::deepseek_v41::Config> deepseek_v41;
     bool is_qwen4() const { return runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::qwen4_exp; }
     bool is_flash_next() const { return is_qwen4() || is_glm5_next(); }
     bool is_glm5_next() const {
@@ -13991,6 +14789,9 @@ struct Config {
     }
     bool is_dsv4() const {
         return runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::deepseek_v4;
+    }
+    bool is_deepseek_v41() const {
+        return runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::deepseek_v41;
     }
     bool is_minicpmo45() const {
         return runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::minicpmo45;
@@ -14168,6 +14969,56 @@ static Config parse_config_json(
         c.tie_word_embeddings=parsed.tied_embeddings;c.layer_types=parsed.layer_types;
         c.num_experts=parsed.experts;c.num_experts_per_tok=parsed.topk;c.moe_intermediate_size=parsed.moe_width;
         c.mtp_num_hidden_layers=parsed.predictor_layers;
+        return c;
+    }
+    if (runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::deepseek_v41) {
+        const auto parsed = mfq::models::deepseek_v41::Config::from_json(s);
+        c.deepseek_v41 = parsed;
+        c.model_type = parsed.text_model_type;
+        c.vocab_size = parsed.vocab;
+        c.hidden_size = parsed.hidden;
+        c.num_hidden_layers = parsed.n_layers;
+        c.num_attention_heads = parsed.n_heads;
+        c.num_key_value_heads = parsed.n_kv_heads;
+        c.max_position_embeddings = parsed.max_position_embeddings;
+        c.head_dim = parsed.head_dim;
+        c.rope_base = parsed.rope_theta;
+        c.rotary_dim = parsed.rope_head_dim;
+        c.sliding_window = parsed.sliding_window;
+        c.rms_norm_eps = parsed.rms_eps;
+        c.norm_weight_offset = 0.0;
+        c.tie_word_embeddings = document.value("tie_word_embeddings", false);
+        c.mtp_num_hidden_layers = parsed.n_mtp_layers;
+        c.num_experts = parsed.n_experts;
+        c.num_experts_per_tok = parsed.top_k;
+        c.moe_intermediate_size = parsed.moe_inter;
+        c.n_shared_experts = parsed.n_shared;
+        c.shared_expert_intermediate_size = parsed.n_shared * parsed.moe_inter;
+        c.q_lora_rank = parsed.q_lora_rank;
+        c.qk_nope_head_dim = parsed.head_dim - parsed.rope_head_dim;
+        c.qk_rope_head_dim = parsed.rope_head_dim;
+        c.v_head_dim = parsed.head_dim;
+        c.index_head_dim = parsed.index_head_dim;
+        c.index_n_heads = parsed.index_n_heads;
+        c.index_topk = parsed.index_topk;
+        c.hc_mult = parsed.hc_mult;
+        c.hc_sinkhorn_iters = parsed.hc_sinkhorn_iters;
+        c.hc_eps = parsed.hc_eps;
+        c.o_groups = parsed.o_groups;
+        c.o_lora_rank = parsed.o_lora_rank;
+        c.swiglu_limit = parsed.swiglu_limit;
+        c.compress_rope_base = parsed.compress_rope_theta;
+        c.rope_original_positions =
+            parsed.rope_scaling.original_max_position_embeddings;
+        c.rope_factor = parsed.rope_scaling.factor;
+        c.rope_beta_fast = parsed.rope_scaling.beta_fast;
+        c.rope_beta_slow = parsed.rope_scaling.beta_slow;
+        c.compress_ratios = parsed.compress_ratios;
+        c.routed_scaling_factor = parsed.routed_scaling;
+        c.norm_topk_prob = parsed.norm_topk_prob;
+        c.expert_gating_func = "sqrtsoftplus";
+        c.layer_types.assign(
+            static_cast<std::size_t>(parsed.n_layers), "deepseek_v41");
         return c;
     }
     c.model_type = json_string(s, "model_type");
@@ -15062,17 +15913,44 @@ struct FFN {
                     std::getenv("MFQ_MOE_DELAYED_ROUTE_READBACK");
                 return value == nullptr || std::atoi(value) != 0;
             }();
+            static const bool disable_projection_bundle = [] {
+                const char * value = std::getenv(
+                    "MFQ_DISABLE_MOE_PROJECTION_BUNDLE_PREFETCH");
+                return value != nullptr && std::atoi(value) != 0;
+            }();
+            auto prefetch_projection_bundle = [&]() {
+                if (disable_projection_bundle || cpu_moe_down) {
+                    return false;
+                }
+                if (moe_split_gate_up) {
+                    if (cpu_moe_gate || cpu_moe_up) return false;
+                    return prefetch_cached_moe_projection_bundle(
+                        moe_gate, moe_up, moe_down, route);
+                }
+                if (cpu_moe_gate_up) return false;
+                return prefetch_cached_moe_projection_bundle(
+                    moe_gate_up, moe_down, route);
+            };
+            bool projection_bundle_prefetched = false;
             if (moe_split_gate_up) {
                 if (delayed_route_readback) {
                     moe_gate.prefetch_begin(route);
                 } else {
-                    moe_gate.prefetch(route);
+                    projection_bundle_prefetched =
+                        prefetch_projection_bundle();
+                    if (!projection_bundle_prefetched) {
+                        moe_gate.prefetch(route);
+                    }
                 }
             } else {
                 if (delayed_route_readback) {
                     moe_gate_up.prefetch_begin(route);
                 } else {
-                    moe_gate_up.prefetch(route);
+                    projection_bundle_prefetched =
+                        prefetch_projection_bundle();
+                    if (!projection_bundle_prefetched) {
+                        moe_gate_up.prefetch(route);
+                    }
                 }
             }
             auto shared_output = g_profiler.measure(
@@ -15088,25 +15966,15 @@ struct FFN {
                         .contiguous();
                 });
             }
-            bool projection_bundle_prefetched = false;
             if (delayed_route_readback) {
-                if (moe_split_gate_up) {
-                    static const bool disable_projection_bundle = [] {
-                        const char * value = std::getenv(
-                            "MFQ_DISABLE_MOE_PROJECTION_BUNDLE_PREFETCH");
-                        return value != nullptr && std::atoi(value) != 0;
-                    }();
-                    if (!disable_projection_bundle &&
-                            !cpu_moe_gate && !cpu_moe_up && !cpu_moe_down) {
-                        projection_bundle_prefetched =
-                            prefetch_cached_moe_projection_bundle(
-                                moe_gate, moe_up, moe_down, route);
-                    }
-                    if (!projection_bundle_prefetched) {
+                projection_bundle_prefetched =
+                    prefetch_projection_bundle();
+                if (!projection_bundle_prefetched) {
+                    if (moe_split_gate_up) {
                         moe_gate.prefetch(route);
+                    } else {
+                        moe_gate_up.prefetch(route);
                     }
-                } else {
-                    moe_gate_up.prefetch(route);
                 }
             }
             std::optional<NintMoeWeight> staged_gate_up;
@@ -15753,6 +16621,7 @@ struct Block {
     virtual void reset(int64_t B) = 0;
     virtual void set_token_ids(const mfq_tensor_backend::Tensor &) {}
     virtual bool supports_speculation() const noexcept { return false; }
+    virtual void begin_speculative(int64_t) {}
     virtual void commit_speculative() {}
     virtual void rollback_speculative(int64_t) {}
     virtual mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
@@ -17272,6 +18141,9 @@ struct FullBlock : Block {
             auto route = g_profiler.measure("gemma.route_map", [&]() {
                 return build_moe_route_plan(selected.at(0), gemma_moe_gate_up.n_experts);
             });
+            const bool projection_bundle_prefetched =
+                prefetch_cached_moe_projection_bundle(
+                    gemma_moe_gate_up, gemma_moe_down, route);
             mfq_tensor_backend::Tensor down_pair;
             const bool tracing_layer =
                 g_gemma_stage_trace != nullptr && layer == g_gemma_trace_layer;
@@ -17280,7 +18152,9 @@ struct FullBlock : Block {
                 auto moe_hidden = g_profiler.measure("gemma.moe_gate_up_geglu", [&]() {
                     return gemma_moe_gate_up.forward_glu_output(moe_input, route, true);
                 });
-                gemma_moe_down.prefetch(route);
+                if (!projection_bundle_prefetched) {
+                    gemma_moe_down.prefetch(route);
+                }
                 down_pair = g_profiler.measure("gemma.moe_down", [&]() {
                     return gemma_moe_down.forward(moe_hidden, route);
                 });
@@ -17288,7 +18162,9 @@ struct FullBlock : Block {
                 auto gate_up_pair = g_profiler.measure("gemma.moe_gate_up", [&]() {
                     return gemma_moe_gate_up.forward(moe_input, route);
                 });
-                gemma_moe_down.prefetch(route);
+                if (!projection_bundle_prefetched) {
+                    gemma_moe_down.prefetch(route);
+                }
                 trace_gemma_stage(layer, "moe_gate_up", gate_up_pair);
                 if (tracing_layer || gate_up_pair.size(0) > 4 ||
                     !gemma_moe_down.hetero_supported) {
@@ -18639,6 +19515,9 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i) {
     return f;
 }
 
+#include "deepseek_v41/deepseek_v41_engram.inc"
+#include "deepseek_v41/deepseek_v41_runtime.inc"
+
 #include "flash_next/flash_next_layers.h"
 
 static std::unique_ptr<Block> load_block(
@@ -18647,7 +19526,9 @@ static std::unique_ptr<Block> load_block(
     int i,
     const std::string & type,
     const std::shared_ptr<GlmDsaSharedState> & glm_state = nullptr,
-    const std::shared_ptr<Dsv4SharedState> & dsv4_state = nullptr) {
+    const std::shared_ptr<Dsv4SharedState> & dsv4_state = nullptr,
+    const std::shared_ptr<mfq::cuda::deepseek_v41_runtime::SharedState> &
+        deepseek_v41_state = nullptr) {
     if (c.is_glm5_next()) {
         MFQ_RUNTIME_CHECK(c.glm5_next.has_value(), "missing GLM Flash-Next configuration");
         return std::make_unique<Glm5NextBlock>(mfq,*c.glm5_next,i);
@@ -18655,6 +19536,13 @@ static std::unique_ptr<Block> load_block(
     if (c.is_qwen4()) {
         MFQ_RUNTIME_CHECK(c.qwen4.has_value(),"missing Qwen4 configuration");
         return std::make_unique<Qwen4Block>(mfq,*c.qwen4,i);
+    }
+    if (c.is_deepseek_v41()) {
+        MFQ_RUNTIME_CHECK(
+            type == "deepseek_v41" && deepseek_v41_state,
+            "invalid DeepSeek-V4.1 block loader state");
+        return mfq::cuda::deepseek_v41_runtime::load_block(
+            mfq, c, i, deepseek_v41_state);
     }
     if (c.is_dsv4()) {
         if (type != "deepseek_v4" || !dsv4_state) {
@@ -19735,9 +20623,12 @@ struct Model {
     int64_t cache_pos = 0;
     int64_t speculative_start = -1;
     int64_t speculative_confirmed = 0;
+    bool speculative_suffix_forward = false;
     std::unique_ptr<flash_runtime::Gr> qwen4_final_mixer;
     mfq_tensor_backend::Tensor qwen4_positions;
     int64_t qwen4_batch=0;
+    std::shared_ptr<mfq::cuda::deepseek_v41_runtime::SharedState>
+        deepseek_v41_state;
 
     bool supports_qwen_speculation() const {
         return (c.runtime_plan.backbone==mfq::cuda::MfqCudaBackbone::generic_qwen || c.is_flash_next()) &&
@@ -19745,11 +20636,57 @@ struct Model {
                 [](const auto& block) {return block->supports_speculation();});
     }
 
+    bool supports_deepseek_v41_speculation() const {
+        return c.is_deepseek_v41() && !blocks.empty() &&
+            std::all_of(
+                blocks.begin(), blocks.end(),
+                [](const auto& block) {
+                    return block->supports_speculation();
+                });
+    }
+
+    void begin_speculative_suffix(int64_t draft_tokens) {
+        MFQ_RUNTIME_CHECK(
+            supports_deepseek_v41_speculation() &&
+                speculative_start < 0 && draft_tokens > 0 &&
+                cache_pos + draft_tokens <= c.max_position_embeddings &&
+                deepseek_v41_state,
+            "invalid DeepSeek-V4.1 speculative suffix");
+        speculative_start = cache_pos;
+        speculative_confirmed = 0;
+        deepseek_v41_state->begin_speculative();
+        std::size_t begun = 0;
+        try {
+            for (auto& block : blocks) {
+                MfqCudaGuard guard(block->cuda_device);
+                block->begin_speculative(draft_tokens);
+                ++begun;
+            }
+        } catch (...) {
+            for (std::size_t index = 0; index < begun; ++index) {
+                try {
+                    MfqCudaGuard guard(blocks[index]->cuda_device);
+                    blocks[index]->commit_speculative();
+                } catch (...) {}
+            }
+            try { deepseek_v41_state->rollback_speculative(); } catch (...) {}
+            speculative_start = -1;
+            speculative_confirmed = 0;
+            throw;
+        }
+    }
+
     void commit_speculative() {
         MFQ_RUNTIME_CHECK(speculative_start >= 0, "no speculative transaction to commit");
         for (auto& block : blocks) {
             MfqCudaGuard guard(block->cuda_device);
             block->commit_speculative();
+        }
+        if (c.is_deepseek_v41()) {
+            MFQ_RUNTIME_CHECK(
+                deepseek_v41_state,
+                "DeepSeek-V4.1 speculative state is unavailable");
+            deepseek_v41_state->commit_speculative();
         }
         speculative_start = -1;
         speculative_confirmed = 0;
@@ -19760,6 +20697,12 @@ struct Model {
         for (auto& block : blocks) {
             MfqCudaGuard guard(block->cuda_device);
             block->rollback_speculative(speculative_start+speculative_confirmed);
+        }
+        if (c.is_deepseek_v41()) {
+            MFQ_RUNTIME_CHECK(
+                deepseek_v41_state,
+                "DeepSeek-V4.1 speculative state is unavailable");
+            deepseek_v41_state->rollback_speculative();
         }
         // Full-attention KV slots beyond this logical length are overwritten
         // by the next pass; no history-sized cache copy is needed.
@@ -19782,6 +20725,7 @@ struct Model {
         qwen4_positions={};qwen4_batch=B;
         speculative_start = -1;
         speculative_confirmed = 0;
+        speculative_suffix_forward = false;
         for (auto & b : blocks) {
             MfqCudaGuard guard(b->cuda_device);
             b->reset(B);
@@ -20053,6 +20997,15 @@ struct Model {
                     .sum(2).to(mfq_tensor_backend::kFloat16).contiguous();
             });
         }
+        if (c.is_deepseek_v41()) {
+            MFQ_RUNTIME_CHECK(
+                deepseek_v41_state && c.deepseek_v41.has_value(),
+                "DeepSeek-V4.1 final state is unavailable");
+            x = g_profiler.measure("model.deepseek_v41.final_collapse", [&]() {
+                return deepseek_v41_state->final_collapse(
+                    x, c.deepseek_v41->n_layers);
+            });
+        }
         return g_profiler.measure("model.output_norm", [&]() {
             return c.is_minicpmo45()
                 ? qwen_rms_norm_bf16(
@@ -20082,6 +21035,26 @@ struct Model {
             mfq_nullopt, false, cache_positions_override, raw_hidden, confirmed_prefix);
     }
 
+    mfq_tensor_backend::Tensor hidden_forward_speculative_suffix(
+            mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor* raw_hidden = nullptr) {
+        MFQ_RUNTIME_CHECK(
+            speculative_start >= 0 && speculative_confirmed == 0 &&
+                !speculative_suffix_forward,
+            "DeepSeek-V4.1 speculative suffix is not active");
+        speculative_suffix_forward = true;
+        try {
+            auto result = hidden_forward(
+                std::move(ids), mfq_nullopt, mfq_nullopt,
+                nullptr, mfq_nullopt, raw_hidden);
+            speculative_suffix_forward = false;
+            return result;
+        } catch (...) {
+            speculative_suffix_forward = false;
+            throw;
+        }
+    }
+
     mfq_tensor_backend::Tensor hidden_forward_inputs(
             mfq_tensor_backend::Tensor ids,
             mfq_tensor_backend::Tensor input_embeddings,
@@ -20107,10 +21080,12 @@ struct Model {
         }
         const int64_t B = ids.size(0);
         const int64_t T = ids.size(1);
-        if (c.is_glm5_next()) {
+        if (c.is_glm5_next() || c.is_deepseek_v41()) {
             MFQ_RUNTIME_CHECK(T > 0 && cache_pos + T <= c.max_position_embeddings &&
                 !pos_override.has_value() && !cache_positions_override.has_value() && !attention_mask.has_value(),
-                "GLM Flash-Next currently requires contiguous causal cache positions without an external mask");
+                c.is_deepseek_v41()
+                    ? "DeepSeek-V4.1 currently requires contiguous causal cache positions without an external mask"
+                    : "GLM Flash-Next currently requires contiguous causal cache positions without an external mask");
         }
         if (c.is_qwen4()) {
             if (qwen4_batch!=0 && qwen4_batch!=B) reset(B);
@@ -20118,7 +21093,7 @@ struct Model {
                 !cache_positions_override.has_value() && !attention_mask.has_value(),
                 "Qwen4 requires unpadded causal cache positions");
         }
-        MFQ_RUNTIME_CHECK(speculative_start < 0,
+        MFQ_RUNTIME_CHECK(speculative_start < 0 || speculative_suffix_forward,
             "commit or roll back the pending speculative pass before forwarding");
         MFQ_RUNTIME_CHECK(confirmed_prefix >= 0 &&
             (confirmed_prefix == 0 || (confirmed_prefix < T && B == 1 && cache_pos > 0 &&
@@ -20203,11 +21178,19 @@ struct Model {
                 return x * c.embed_scale;
             });
         }
-        if (c.is_dsv4() || c.is_glm5_next()) {
+        if (c.is_dsv4() || c.is_glm5_next() || c.is_deepseek_v41()) {
             x = x.to(mfq_tensor_backend::kFloat16)
                 .unsqueeze(2)
                 .expand({B, T, c.hc_mult, c.hidden_size})
                 .contiguous();
+        }
+        if (c.is_deepseek_v41()) {
+            MFQ_RUNTIME_CHECK(
+                deepseek_v41_state && c.deepseek_v41.has_value(),
+                "DeepSeek-V4.1 target capture state is unavailable");
+            deepseek_v41_state->begin_forward(
+                raw_hidden != nullptr,
+                c.deepseek_v41->dspark_target_layer_ids.size());
         }
         if (c.is_qwen4()) x=x.to(mfq_tensor_backend::kFloat16).repeat({1,1,c.hc_mult});
         if (block_trace != nullptr) block_trace->push_back(x.to(mfq_tensor_backend::kFloat32).clone());
@@ -20272,7 +21255,11 @@ struct Model {
         }
         x = tensor_to_cuda_device(x, primary);
         auto finalized=finalize_hidden(x, B, T);
-        if (raw_hidden != nullptr) *raw_hidden = c.is_glm5_next()?finalized:x;
+        if (raw_hidden != nullptr) {
+            *raw_hidden = c.is_deepseek_v41()
+                ? deepseek_v41_state->dspark_target_hidden()
+                : (c.is_glm5_next() ? finalized : x);
+        }
         return finalized;
     }
 
@@ -20411,7 +21398,8 @@ struct Model {
 
 static Model load_model(const std::string & mfq_path, const std::string & config_path,
                         int64_t context_size_override = 0,
-                        bool load_blocks = true) {
+                        bool load_blocks = true,
+                        bool defer_moe_cache_finalize = false) {
     Model m;
     MfqFile mfq(mfq_path);
     m.c = load_config(mfq, config_path);
@@ -20420,6 +21408,13 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         throw std::runtime_error(
             "Flash-Next native adapter supports expert parallelism, but "
             "tensor/layer parallelism and offload still require a different placement path");
+    }
+    if (m.c.is_deepseek_v41() &&
+            (g_tensor_parallel.enabled() || g_layer_placement.enabled() ||
+             g_n_gpu_layers >= 0)) {
+        throw std::runtime_error(
+            "DeepSeek-V4.1 native CUDA currently supports single-device dense "
+            "placement or expert parallelism");
     }
     if (g_expert_parallel.enabled() && m.c.num_experts <= 0) {
         throw std::runtime_error(
@@ -20483,7 +21478,8 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         if (m.c.glm5_next) m.c.glm5_next->maximum=context_size_override;
         if (m.c.qwen4) m.c.qwen4->maximum=context_size_override;
     }
-    if (!m.c.is_gemma4() && !m.c.is_dsv4() && !m.c.is_flash_next()) {
+    if (!m.c.is_gemma4() && !m.c.is_dsv4() && !m.c.is_flash_next() &&
+            !m.c.is_deepseek_v41()) {
         m.rope = RopeCache(m.c);
         if (g_dense_cpu_layer_count > 0) {
             m.cpu_rope = RopeCache(
@@ -20497,7 +21493,8 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         }
     }
     m.c.norm_weight_offset =
-        (m.c.is_gemma4() || m.c.is_glm_dsa() || m.c.is_minicpmo45() || m.c.is_flash_next())
+        (m.c.is_gemma4() || m.c.is_glm_dsa() || m.c.is_minicpmo45() ||
+         m.c.is_flash_next() || m.c.is_deepseek_v41())
         ? 0.0 : m.c.legacy_tensor_layout.norm_weight_offset;
     const std::string embed_name = "model.token_embedding.weight";
     const std::string norm_name = "model.output_norm.weight";
@@ -20553,6 +21550,16 @@ static Model load_model(const std::string & mfq_path, const std::string & config
             glm_states;
         std::unordered_map<int, std::shared_ptr<Dsv4SharedState>>
             dsv4_states;
+        if (m.c.is_deepseek_v41()) {
+            m.deepseek_v41_state = std::make_shared<
+                mfq::cuda::deepseek_v41_runtime::SharedState>();
+            MFQ_RUNTIME_CHECK(
+                m.c.deepseek_v41.has_value(),
+                "missing DeepSeek-V4.1 configuration");
+            m.deepseek_v41_state->engram_hash =
+                mfq::cuda::deepseek_v41_runtime::EngramHashState::load(
+                    mfq, *m.c.deepseek_v41);
+        }
         for (int i = 0; i < m.c.num_hidden_layers; ++i) {
             const int device = g_layer_placement.device_for_layer(i);
             const bool cpu_offloaded = i < g_dense_cpu_layer_count;
@@ -20576,7 +21583,7 @@ static Model load_model(const std::string & mfq_path, const std::string & config
                       << (cpu_offloaded ? "CPU" : "CUDA") << std::endl;
             auto block = load_block(
                 mfq, m.c, i, m.c.layer_types[(size_t)i],
-                glm_state, dsv4_state);
+                glm_state, dsv4_state, m.deepseek_v41_state);
             block->cuda_device = device;
             block->cpu_offloaded = cpu_offloaded;
             m.blocks.push_back(std::move(block));
@@ -20587,7 +21594,8 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         g_layer_placement.primary_device();
     if (g_moe_expert_cache &&
             g_moe_expert_cache->has_sources() &&
-            !g_moe_expert_cache->finalized()) {
+            !g_moe_expert_cache->finalized() &&
+            !defer_moe_cache_finalize) {
         g_moe_expert_cache->finalize();
     }
     return m;
@@ -20596,6 +21604,7 @@ static Model load_model(const std::string & mfq_path, const std::string & config
 #include "minicpmo45_runtime.inc"
 
 #include "../runtime/mtp.h"
+#include "deepseek_v41/deepseek_v41_dspark.inc"
 #include "qwen35/mtp.h"
 #include "flash_next/flash_next_mtp.h"
 #include "../runtime/server_components.h"
@@ -22364,11 +23373,15 @@ static int32_t generate_mtp_tokens(
         const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling,
         const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill) {
     using Tensor = mfq_tensor_backend::Tensor;
+    using Clock = std::chrono::steady_clock;
     namespace policy = mfq::cuda::mtp;
     MFQ_RUNTIME_CHECK(!prompt.empty() && prompt.size() <= static_cast<size_t>(model.c.max_position_embeddings),
         "invalid Qwen MTP prompt length");
     for (auto token : prompt) MFQ_RUNTIME_CHECK(token >= 0 && token < model.c.vocab_size,
         "Qwen MTP prompt token outside vocabulary");
+    mtp.last_stats = {};
+    mtp.last_stats.available = true;
+    mtp.last_stats.used = true;
     mtp.last_cycles = mtp.last_accepted = mtp.last_rejected = 0;
     const int32_t limit = static_cast<int32_t>(std::min<int64_t>(sampling.max_tokens,
         model.c.max_position_embeddings - static_cast<int64_t>(prompt.size())));
@@ -22393,13 +23406,15 @@ static int32_t generate_mtp_tokens(
         return static_cast<int32_t>(sample_server_logits(logits, sampling, token_counts,
             random_host, random_gpu, rng, {}).item<int64_t>());
     };
-    auto probabilities = [&](Tensor logits, Tensor token_counts) {
+    auto probabilities = [&](Tensor logits, Tensor token_counts,
+                             const MfqSamplingParams& parameters) {
         logits = logits.contiguous().reshape({1, -1});
         if (penalties) sample_apply_penalties_cuda(logits, token_counts,
-            sampling.presence_penalty, sampling.frequency_penalty, sampling.repetition_penalty);
+            parameters.presence_penalty, parameters.frequency_penalty,
+            parameters.repetition_penalty);
         auto host = logits.to(mfq_tensor_backend::kFloat32).cpu().contiguous();
         return policy::distribution(std::span<const float>(host.data_ptr<float>(), host.numel()),
-            sampling.temperature, sampling.top_k, sampling.top_p);
+            parameters.temperature, parameters.top_k, parameters.top_p);
     };
     auto logits_for = [&](Tensor normalized) {
         return model.logits_from_hidden((mtp.preserve_output_dtype()?normalized:
@@ -22412,15 +23427,25 @@ static int32_t generate_mtp_tokens(
         if (penalties) sample_token_counts_add_cuda(counts, ids_for({token}));
         return !on_token || on_token(token);
     };
-    struct Draft { int32_t token; std::vector<float> probabilities; };
-    auto make_draft = [&](Tensor raw_hidden, int32_t pending) {
-        auto hidden = mtp.forward(model, raw_hidden, ids_for({pending}));
-        auto logits = logits_for(hidden).reshape({1, -1});
-        if (greedy) return Draft{sample_normal(logits, counts), {}};
-        auto q = probabilities(logits, counts);
-        auto token = policy::sample(q, uniform(rng));
-        return Draft{token, std::move(q)};
+    struct DraftChain {
+        std::vector<int32_t> tokens;
+        std::vector<std::vector<float>> probabilities;
     };
+    const bool compact_stochastic =
+        !greedy && sampling.top_k > 0 && sampling.top_k <= 64;
+    auto draft_sampling = sampling;
+    if (compact_stochastic) {
+        draft_sampling.temperature = 0.6;
+        draft_sampling.top_p = 0.95;
+    }
+    const int maximum_depth = std::min(
+        mtp.maximum_draft_depth(),
+        (!greedy && !compact_stochastic)
+            ? 1
+            : std::clamp<int>(sampling.mtp_max_draft_tokens, 1,
+                              policy::kMaximumDraftDepth));
+    policy::DepthController depth_controller(maximum_depth);
+
     auto generate = [&]() {
         model.reset(1);
         mtp.reset(1);
@@ -22434,65 +23459,309 @@ static int32_t generate_mtp_tokens(
         const double prefill_ms = timer.elapsed_ms();
         if (on_prefill) on_prefill(MfqPrefillTiming{prompt.size(), prefill_ms, 0., prefill_ms});
         if (!emit(pending) || generated == limit) return generated;
-        if (!mtp.teacher_forced_prompt_prime()) {
-            // Flash-Next starts an empty draft cache after the first target
-            // decode. This differs from Qwen3.5's teacher-forced prompt prime.
-            auto next_hidden=model.hidden_forward(ids_for({pending}),mfq_nullopt,mfq_nullopt,
-                nullptr,mfq_nullopt,&raw);
-            pending=sample_normal(logits_for(next_hidden),counts);
-            if (!emit(pending) || generated==limit) return generated;
-        } else if (prompt.size() > 1) {
-            (void)mtp.forward(model, raw.narrow(1, 0, raw.size(1) - 1),
-                input_ids.narrow(1, 1, input_ids.size(1) - 1));
+
+        if (mtp.blockwise_drafting()) {
+            mtp.append_target_context(raw, 0);
         }
-        auto draft = make_draft(raw.narrow(1, raw.size(1) - 1, 1), pending);
-        raw = Tensor{};
+
+        if (mtp.teacher_forced_prompt_prime() && prompt.size() > 1) {
+            constexpr int64_t chunk_size = 512;
+            const int64_t pairs = raw.size(1) - 1;
+            for (int64_t offset = 0; offset < pairs; offset += chunk_size) {
+                const int64_t count = std::min(chunk_size, pairs - offset);
+                (void)mtp.step(
+                    model,
+                    raw.narrow(1, offset, count),
+                    input_ids.narrow(1, offset + 1, count));
+            }
+        }
+
+        auto initial_hidden = raw.narrow(1, raw.size(1) - 1, 1);
+        if (mtp.target_bootstrap_decode()) {
+            if (mtp.teacher_forced_prompt_prime()) {
+                // Qwen4's predictor consumes the prompt/first-token seam
+                // before the target advances to hidden(first_token).
+                (void)mtp.step(model, initial_hidden, ids_for({pending}));
+            }
+            auto next_hidden = model.hidden_forward(
+                ids_for({pending}), mfq_nullopt, mfq_nullopt,
+                nullptr, mfq_nullopt, &raw);
+            pending = sample_normal(logits_for(next_hidden), counts);
+            if (!emit(pending) || generated == limit) return generated;
+            initial_hidden = raw.narrow(1, raw.size(1) - 1, 1);
+        }
+
+        int64_t predictor_history_position = mtp.cache_position();
+        auto bounded_depth = [&](int desired) {
+            const auto context_depth = std::max<int64_t>(
+                0, model.c.max_position_embeddings - model.cache_pos - 1);
+            const auto output_depth = std::max<int64_t>(
+                0, static_cast<int64_t>(limit - generated - 1));
+            return static_cast<int>(std::min<int64_t>(
+                desired, std::min(context_depth, output_depth)));
+        };
+        auto prepare_draft = [&](Tensor hidden_rows,
+                                 const std::vector<int32_t>& next_ids,
+                                 int requested_depth,
+                                 bool initial) {
+            MFQ_RUNTIME_CHECK(
+                hidden_rows.dim() == 3 && hidden_rows.size(0) == 1 &&
+                    hidden_rows.size(1) == static_cast<int64_t>(next_ids.size()) &&
+                    !next_ids.empty() && requested_depth >= 0 &&
+                    requested_depth <= maximum_depth,
+                "CUDA MTP committed history is incompatible");
+            mtp.trim_cache_to(predictor_history_position);
+            auto prospective_counts = penalties ? counts.clone() : Tensor{};
+            DraftChain result;
+            result.tokens.reserve(static_cast<size_t>(requested_depth));
+            result.probabilities.reserve(static_cast<size_t>(requested_depth));
+            auto select_draft = [&](Tensor draft_logits) {
+                draft_logits = draft_logits.reshape({1, -1});
+                int32_t token = -1;
+                if (greedy) {
+                    token = sample_normal(draft_logits, prospective_counts);
+                } else {
+                    auto proposal = probabilities(
+                        draft_logits, prospective_counts, draft_sampling);
+                    token = policy::sample(proposal, uniform(rng));
+                    result.probabilities.push_back(std::move(proposal));
+                }
+                result.tokens.push_back(token);
+                if (penalties) {
+                    sample_token_counts_add_cuda(
+                        prospective_counts, ids_for({token}));
+                }
+                return token;
+            };
+            if (mtp.blockwise_drafting()) {
+                if (!initial) {
+                    mtp.append_target_context(
+                        hidden_rows, predictor_history_position);
+                    predictor_history_position +=
+                        static_cast<int64_t>(next_ids.size());
+                }
+                MFQ_RUNTIME_CHECK(
+                    mtp.cache_position() == predictor_history_position,
+                    "CUDA block predictor cache did not advance");
+                if (requested_depth > 0) {
+                    auto block = mtp.draft_block(
+                        model,
+                        ids_for({next_ids.back()}),
+                        select_draft,
+                        requested_depth);
+                    MFQ_RUNTIME_CHECK(
+                        block.tokens.numel() == requested_depth &&
+                            block.logits.size(1) == requested_depth &&
+                            block.confidence.numel() == requested_depth &&
+                            result.tokens.size() ==
+                                static_cast<size_t>(requested_depth),
+                        "CUDA block predictor returned an incomplete draft");
+                }
+                return result;
+            }
+            std::vector<int64_t> shifted(next_ids.begin(), next_ids.end());
+            auto head = mtp.step(model, hidden_rows, ids_for(std::move(shifted)));
+            predictor_history_position += static_cast<int64_t>(next_ids.size());
+            MFQ_RUNTIME_CHECK(
+                mtp.cache_position() == predictor_history_position,
+                "CUDA MTP predictor cache did not advance");
+            auto sample_hidden = head.sample_hidden.narrow(
+                1, head.sample_hidden.size(1) - 1, 1);
+            auto chain_hidden = head.chain_hidden.narrow(
+                1, head.chain_hidden.size(1) - 1, 1);
+            for (int position = 0; position < requested_depth; ++position) {
+                auto draft_logits = logits_for(sample_hidden).reshape({1, -1});
+                const int32_t token = select_draft(draft_logits);
+                if (position + 1 < requested_depth) {
+                    auto next = mtp.step(
+                        model, chain_hidden, ids_for({token}));
+                    sample_hidden = std::move(next.sample_hidden);
+                    chain_hidden = std::move(next.chain_hidden);
+                }
+            }
+            return result;
+        };
+
+        auto draft = prepare_draft(
+            initial_hidden, {pending},
+            bounded_depth(depth_controller.depth()), true);
         while (generated < limit) {
-            if (limit - generated == 1 || model.cache_pos + 2 > model.c.max_position_embeddings) {
-                auto next = sample_server_token(model, ids_for({pending}), sampling, counts,
-                    random_host, random_gpu, rng, {});
-                emit(static_cast<int32_t>(next.item<int64_t>()));
+            const auto cycle_started = Clock::now();
+            const int draft_count = static_cast<int>(draft.tokens.size());
+            Tensor verified_raw;
+            std::vector<int64_t> verify_ids{pending};
+            verify_ids.insert(
+                verify_ids.end(), draft.tokens.begin(), draft.tokens.end());
+            Tensor verified;
+            if (mtp.split_target_verification()) {
+                Tensor pending_raw;
+                auto pending_hidden = model.hidden_forward(
+                    ids_for({pending}), mfq_nullopt, mfq_nullopt,
+                    nullptr, mfq_nullopt, &pending_raw);
+                if (draft_count > 0) {
+                    model.begin_speculative_suffix(draft_count);
+                    std::vector<int64_t> draft_ids(
+                        draft.tokens.begin(), draft.tokens.end());
+                    Tensor draft_raw;
+                    auto draft_hidden = model.hidden_forward_speculative_suffix(
+                        ids_for(std::move(draft_ids)), &draft_raw);
+                    verified = mfq_tensor_backend::cat(
+                        {pending_hidden, draft_hidden}, 1).contiguous();
+                    verified_raw = mfq_tensor_backend::cat(
+                        {pending_raw, draft_raw}, 1).contiguous();
+                } else {
+                    verified = std::move(pending_hidden);
+                    verified_raw = std::move(pending_raw);
+                }
+            } else {
+                verified = model.hidden_forward(
+                    ids_for(std::move(verify_ids)), mfq_nullopt, mfq_nullopt,
+                    nullptr, mfq_nullopt, &verified_raw,
+                    draft_count > 0 ? 1 : 0);
+            }
+            auto targets = logits_for(verified).reshape(
+                {draft_count + 1, model.c.vocab_size});
+
+            ++mtp.last_stats.cycles;
+            mtp.last_stats.drafted_tokens += static_cast<uint64_t>(draft_count);
+            ++mtp.last_stats.depth_cycles.at(static_cast<size_t>(draft_count));
+            for (int position = 0; position < draft_count; ++position) {
+                ++mtp.last_stats.position_drafted.at(static_cast<size_t>(position));
+            }
+
+            auto row_counts = penalties ? counts.clone() : Tensor{};
+            policy::ChainVerification result;
+            if (draft_count == 0) {
+                result = {
+                    0,
+                    greedy
+                        ? sample_normal(targets.narrow(0, 0, 1), row_counts)
+                        : policy::sample(
+                              probabilities(
+                                  targets.narrow(0, 0, 1), row_counts, sampling),
+                              uniform(rng)),
+                    true};
+            } else if (greedy) {
+                std::vector<int32_t> target_tokens;
+                target_tokens.reserve(static_cast<size_t>(draft_count + 1));
+                for (int row = 0; row <= draft_count; ++row) {
+                    target_tokens.push_back(sample_normal(
+                        targets.narrow(0, row, 1), row_counts));
+                    if (row < draft_count && penalties) {
+                        sample_token_counts_add_cuda(
+                            row_counts, ids_for({draft.tokens[static_cast<size_t>(row)]}));
+                    }
+                }
+                result = policy::verify_greedy(draft.tokens, target_tokens);
+            } else {
+                std::vector<std::vector<float>> target_probabilities;
+                target_probabilities.reserve(static_cast<size_t>(draft_count + 1));
+                for (int row = 0; row <= draft_count; ++row) {
+                    target_probabilities.push_back(probabilities(
+                        targets.narrow(0, row, 1), row_counts, sampling));
+                    if (row < draft_count && penalties) {
+                        sample_token_counts_add_cuda(
+                            row_counts, ids_for({draft.tokens[static_cast<size_t>(row)]}));
+                    }
+                }
+                std::vector<double> acceptance_uniforms(
+                    static_cast<size_t>(draft_count));
+                std::generate(
+                    acceptance_uniforms.begin(), acceptance_uniforms.end(),
+                    [&] { return uniform(rng); });
+                result = policy::verify_stochastic_chain(
+                    draft.tokens, draft.probabilities, target_probabilities,
+                    acceptance_uniforms, uniform(rng));
+            }
+
+            const int accepted = static_cast<int>(result.accepted_drafts);
+            MFQ_RUNTIME_CHECK(
+                accepted >= 0 && accepted <= draft_count &&
+                    result.next_token >= 0 && result.next_token < model.c.vocab_size,
+                "CUDA MTP verification returned invalid data");
+            mtp.last_stats.accepted_tokens += static_cast<uint64_t>(accepted);
+            for (int position = 0; position < accepted; ++position) {
+                ++mtp.last_stats.position_accepted.at(static_cast<size_t>(position));
+            }
+
+            int emitted_accepted = 0;
+            bool continue_generation = true;
+            for (int position = 0; position < accepted; ++position) {
+                ++emitted_accepted;
+                if (!emit(draft.tokens[static_cast<size_t>(position)])) {
+                    continue_generation = false;
+                    break;
+                }
+            }
+            if (draft_count > 0) {
+                if (emitted_accepted == draft_count) {
+                    model.commit_speculative();
+                } else {
+                    model.rollback_speculative();
+                    if (emitted_accepted > 0) {
+                        std::vector<int64_t> replay(
+                            draft.tokens.begin(),
+                            draft.tokens.begin() + emitted_accepted);
+                        (void)model.hidden_forward(ids_for(std::move(replay)));
+                    }
+                }
+            }
+            if (!continue_generation) return generated;
+            if (!emit(result.next_token)) return generated;
+
+            const double cycle_ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - cycle_started).count();
+            depth_controller.observe(draft_count, accepted, cycle_ms);
+            mtp.last_stats.selected_depth = depth_controller.depth();
+            for (int depth = 0; depth <= depth_controller.maximum_depth(); ++depth) {
+                if (const auto measured = depth_controller.measured_cycle_ms(depth)) {
+                    mtp.last_stats.measured_depth_ms.at(
+                        static_cast<size_t>(depth)) = *measured;
+                }
+            }
+
+            if (draft_count > 0) {
+                if (accepted == draft_count) {
+                    mtp.last_accepted += static_cast<uint64_t>(accepted);
+                } else {
+                    mtp.last_accepted += static_cast<uint64_t>(accepted);
+                    ++mtp.last_rejected;
+                }
+            }
+            ++mtp.last_cycles;
+            pending = result.next_token;
+            if (depth_controller.should_exit()) {
+                while (generated < limit) {
+                    auto next = sample_server_token(
+                        model, ids_for({pending}), sampling, counts,
+                        random_host, random_gpu, rng, {});
+                    pending = static_cast<int32_t>(next.item<int64_t>());
+                    if (!emit(pending)) break;
+                }
                 return generated;
             }
-            Tensor verified_raw;
-            auto verified = model.hidden_forward(ids_for({pending, draft.token}), mfq_nullopt,
-                mfq_nullopt, nullptr, mfq_nullopt, &verified_raw, 1);
-            auto targets = logits_for(verified).reshape({2, model.c.vocab_size});
-            ++mtp.last_cycles;
-            auto bonus_counts = penalties ? counts.clone() : Tensor{};
-            if (penalties) sample_token_counts_add_cuda(bonus_counts, ids_for({draft.token}));
-            policy::Verification result;
-            if (greedy) {
-                const auto expected = sample_normal(targets.narrow(0, 0, 1), counts);
-                const bool accepted = expected == draft.token;
-                result = {accepted, accepted ? sample_normal(targets.narrow(0, 1, 1), bonus_counts) : expected};
-            } else {
-                auto target = probabilities(targets.narrow(0, 0, 1), counts);
-                auto bonus = probabilities(targets.narrow(0, 1, 1), bonus_counts);
-                const double acceptance_uniform = uniform(rng);
-                const double sample_uniform = uniform(rng);
-                result = policy::verify(draft.token, draft.probabilities, target, bonus,
-                    acceptance_uniform, sample_uniform);
-            }
-            if (result.accepted) {
-                ++mtp.last_accepted;
-                model.commit_speculative();
-                if (!emit(draft.token) || generated == limit) return generated;
-                if (!emit(result.next_token) || generated == limit) return generated;
-            } else {
-                ++mtp.last_rejected;
-                model.rollback_speculative();
-                if (!emit(result.next_token) || generated == limit) return generated;
-            }
-            pending = result.next_token;
-            draft = make_draft(verified_raw.narrow(1, result.accepted ? 1 : 0, 1), pending);
+
+            std::vector<int32_t> next_ids;
+            next_ids.reserve(static_cast<size_t>(accepted + 1));
+            next_ids.insert(
+                next_ids.end(), draft.tokens.begin(),
+                draft.tokens.begin() + accepted);
+            next_ids.push_back(pending);
+            draft = prepare_draft(
+                verified_raw.narrow(1, 0, accepted + 1),
+                next_ids,
+                bounded_depth(depth_controller.depth()),
+                false);
         }
         return generated;
     };
     try {
         const auto result = generate();
         std::cerr << "mtp generated=" << result << " cycles=" << mtp.last_cycles
-            << " accepted=" << mtp.last_accepted << " rejected=" << mtp.last_rejected << '\n';
+            << " drafted=" << mtp.last_stats.drafted_tokens
+            << " accepted=" << mtp.last_accepted
+            << " rejected=" << mtp.last_rejected
+            << " depth=" << mtp.last_stats.selected_depth << '\n';
         return result;
     } catch (...) {
         // A failed partial pass must never become the next request's history.
@@ -26117,9 +27386,12 @@ static int run_gemma_moe_check(
                           packed.sub_min, packed.neuron_scale,
                           packed.neuron_min, packed.neuron_len,
                           packed.gs, packed.bits);
+            } else if (pool.dtype == "MXFP4") {
+                local_flat = dequant_mxfp4_cpu(pool.mxfp4)
+                    .to(mfq_tensor_backend::kCUDA).contiguous();
             } else {
                 throw std::runtime_error(
-                    "Gemma dense MoE reference requires NINT cohorts");
+                    "Gemma dense MoE reference requires NINT or MXFP4 cohorts");
             }
             auto local = local_flat.reshape({
                 static_cast<int64_t>(pool.expert_ids.size()),
@@ -26210,28 +27482,44 @@ static int run_gemma_moe_check(
             mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
         auto forward_materialized = [&]() {
             auto route = build_moe_route_plan(ids, experts);
+            const bool projection_bundle_prefetched =
+                prefetch_cached_moe_projection_bundle(
+                    gate_up, down, route);
             auto gate_pair = gate_up.forward(x, route);
             auto hidden = moe_geglu_split_cuda(gate_pair);
+            if (!projection_bundle_prefetched) down.prefetch(route);
             auto down_pair = down.forward(hidden, route);
             return moe_weighted_reduce_cuda(down_pair, weights);
         };
         auto forward_gate_glu = [&]() {
             auto route = build_moe_route_plan(ids, experts);
+            const bool projection_bundle_prefetched =
+                prefetch_cached_moe_projection_bundle(
+                    gate_up, down, route);
             auto hidden = gate_up.forward_glu_output(x, route, true);
+            if (!projection_bundle_prefetched) down.prefetch(route);
             auto down_pair = down.forward(hidden, route);
             return moe_weighted_reduce_cuda(down_pair, weights);
         };
+        const bool gate_glu_supported =
+            tokens <= 4 && gate_up.hetero_supported;
         auto forward = [&]() {
-            return tokens <= 4 ? forward_gate_glu() : forward_materialized();
+            return gate_glu_supported
+                ? forward_gate_glu()
+                : forward_materialized();
         };
         auto fused_check = forward();
         auto materialized_check = forward_materialized();
-        auto gate_glu_check = tokens <= 4 ? forward_gate_glu() : fused_check;
+        auto gate_glu_check = gate_glu_supported
+            ? forward_gate_glu()
+            : fused_check;
         mfq_cuda_synchronize();
         auto fused_diff = (fused_check - materialized_check).abs().to(mfq_tensor_backend::kFloat32);
         auto fused_time = time_ms(forward, reps);
         auto materialized_time = time_ms(forward_materialized, reps);
-        auto gate_glu_time = tokens <= 4 ? time_ms(forward_gate_glu, reps) : fused_time;
+        auto gate_glu_time = gate_glu_supported
+            ? time_ms(forward_gate_glu, reps)
+            : fused_time;
         auto gate_glu_diff = (gate_glu_check - materialized_check).abs().to(mfq_tensor_backend::kFloat32);
         std::cout << std::fixed << std::setprecision(6)
                   << "gemma_moe_geglu_quant_fusion"
@@ -26241,6 +27529,7 @@ static int run_gemma_moe_check(
                   << " fused_ms=" << fused_time.first
                   << " materialized_ms=" << materialized_time.first
                   << " speedup=" << materialized_time.first / fused_time.first
+                  << " gate_glu_supported=" << (gate_glu_supported ? 1 : 0)
                   << " gate_glu_equal=" << (gate_glu_check.equal(materialized_check) ? 1 : 0)
                   << " gate_glu_max_abs=" << gate_glu_diff.max().item<float>()
                   << " gate_glu_ms=" << gate_glu_time.first << "\n";
@@ -28196,6 +29485,7 @@ int main(int argc, char ** argv) {
         bool check_glm_dsa = false;
         bool check_dsv4_attention = false;
         bool check_dsv4_hc = false;
+        bool check_deepseek_v41 = false;
         bool check_text_session_state = false;
         bool check_qwen35_mtp = false;
         bool check_continuous_batching = false;
@@ -28329,6 +29619,7 @@ int main(int argc, char ** argv) {
             else if (a == "--check-glm-dsa") check_glm_dsa = true;
             else if (a == "--check-dsv4-attention") check_dsv4_attention = true;
             else if (a == "--check-dsv4-hc") check_dsv4_hc = true;
+            else if (a == "--check-deepseek-v41") check_deepseek_v41 = true;
             else if (a == "--check-text-session-state") {
                 check_text_session_state = true;
             }
@@ -28781,6 +30072,9 @@ int main(int argc, char ** argv) {
         if (check_dsv4_hc) {
             return run_dsv4_hc_check(check_attention_reps);
         }
+        if (check_deepseek_v41) {
+            return mfq::cuda::deepseek_v41_runtime::run_self_check();
+        }
         if (check_text_session_state) {
             return run_text_session_state_check();
         }
@@ -29090,10 +30384,23 @@ int main(int argc, char ** argv) {
             }
         }
         auto t0 = std::chrono::steady_clock::now();
-        Model model = load_model(mfq_path, config_path, context_size);
+        const bool load_optional_components =
+            server_mode || check_qwen35_mtp || check_flash_next_mtp ||
+            !bench_qwen35_mtp.empty();
+        Model model = load_model(
+            mfq_path,
+            config_path,
+            context_size,
+            true,
+            load_optional_components);
         CudaRuntimeComponents server_components =
             load_cuda_runtime_components(model, mfq_path,
-                server_mode || check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty(), config_path);
+                load_optional_components, config_path);
+        if (g_moe_expert_cache &&
+                g_moe_expert_cache->has_sources() &&
+                !g_moe_expert_cache->finalized()) {
+            g_moe_expert_cache->finalize();
+        }
         mfq_cuda_synchronize();
         auto t1 = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");

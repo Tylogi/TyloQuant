@@ -40,6 +40,21 @@ def test_moe_cache_capacity_failure_uses_full_projection_path() -> None:
     assert "stage_cpu_mixed_moe(cpu_)" in DECODE
 
 
+def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:
+    load_model = DECODE[
+        DECODE.index("static Model load_model(") : DECODE.index(
+            '#include "deepseek_v41/deepseek_v41_dspark.inc"'
+        )
+    ]
+    main = DECODE[DECODE.index("int main(int argc, char ** argv)") :]
+    assert "bool defer_moe_cache_finalize = false" in load_model
+    assert "!defer_moe_cache_finalize" in load_model
+    assert "const bool load_optional_components" in main
+    assert main.index("load_cuda_runtime_components(") < main.index(
+        "g_moe_expert_cache->finalize();"
+    )
+
+
 def test_reload_and_request_registration_share_one_gate() -> None:
     assert "std::mutex reload_gate;" in SERVER
     assert SERVER.count("std::lock_guard<std::mutex> gate(reload_gate);") >= 2
@@ -61,6 +76,14 @@ def test_cuda_kl_rejects_context_larger_than_model_capacity() -> None:
 
 
 def test_unified_cuda_extension_can_include_runtime_headers() -> None:
-    assert "_REPOSITORY_ROOT" in UNIFIED_CUDA_EXT
-    assert "_CUDA_RUNTIME_INCLUDE" in UNIFIED_CUDA_EXT
-    assert "extra_include_paths=[_REPOSITORY_ROOT, _CUDA_RUNTIME_INCLUDE]" in UNIFIED_CUDA_EXT
+    for include in (
+        "_REPOSITORY_ROOT",
+        "_CUDA_RUNTIME_INCLUDE",
+        "_GGML_INCLUDE",
+        "_GGML_SOURCE_INCLUDE",
+        "_GGML_CUDA_INCLUDE",
+    ):
+        assert include in UNIFIED_CUDA_EXT
+    assert "extra_include_paths=[" in UNIFIED_CUDA_EXT
+    assert '"--extended-lambda"' in UNIFIED_CUDA_EXT
+    assert '"-U__CUDA_NO_HALF_CONVERSIONS__"' in UNIFIED_CUDA_EXT

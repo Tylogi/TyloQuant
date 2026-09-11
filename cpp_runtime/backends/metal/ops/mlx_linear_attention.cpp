@@ -1264,4 +1264,98 @@ MlxLinearConvQkvResult linear_conv_qkv(
     };
 }
 
+MlxGatedDeltaCacheState replay_gated_delta_speculative_prefix(
+    const MlxGatedDeltaSpeculativeState& transaction,
+    int accepted_tokens,
+    const array& convolution_weight,
+    int key_heads,
+    int value_heads,
+    int key_head_dimension,
+    int value_head_dimension,
+    const std::optional<array>& convolution_bias,
+    float eps,
+    bool transposed_state,
+    bool tiled_heads) {
+    const int speculative_tokens =
+        transaction.total_tokens - transaction.confirmed_tokens;
+    if (transaction.batch <= 0 || transaction.position < 0 ||
+        transaction.confirmed_tokens <= 0 || speculative_tokens <= 0 ||
+        accepted_tokens < 0 || accepted_tokens > speculative_tokens ||
+        !transaction.qk || !transaction.value || !transaction.gate ||
+        !transaction.beta) {
+        throw std::runtime_error(
+            "Gated DeltaNet speculative replay transaction is invalid");
+    }
+    const int keep = transaction.confirmed_tokens + accepted_tokens;
+    const auto& qk_source = *transaction.qk;
+    const auto& value_source = *transaction.value;
+    const auto& gate_source = *transaction.gate;
+    const auto& beta_source = *transaction.beta;
+    if (qk_source.ndim() != 3 || value_source.ndim() != 3 ||
+        gate_source.ndim() < 3 || gate_source.ndim() > 4 ||
+        beta_source.ndim() != 3 ||
+        qk_source.shape(0) != transaction.batch ||
+        value_source.shape(0) != transaction.batch ||
+        gate_source.shape(0) != transaction.batch ||
+        beta_source.shape(0) != transaction.batch ||
+        qk_source.shape(1) != transaction.total_tokens ||
+        value_source.shape(1) != transaction.total_tokens ||
+        gate_source.shape(2) != transaction.total_tokens ||
+        beta_source.shape(2) != transaction.total_tokens) {
+        throw std::runtime_error(
+            "Gated DeltaNet speculative replay tensors disagree");
+    }
+    auto qk = mlx::core::slice(
+        qk_source,
+        Shape{0, 0, 0},
+        Shape{transaction.batch, keep, qk_source.shape(2)});
+    auto value = mlx::core::slice(
+        value_source,
+        Shape{0, 0, 0},
+        Shape{transaction.batch, keep, value_source.shape(2)});
+    auto gate = gate_source.ndim() == 3
+        ? mlx::core::slice(
+              gate_source,
+              Shape{0, 0, 0},
+              Shape{transaction.batch, gate_source.shape(1), keep})
+        : mlx::core::slice(
+              gate_source,
+              Shape{0, 0, 0, 0},
+              Shape{
+                  transaction.batch,
+                  gate_source.shape(1),
+                  keep,
+                  gate_source.shape(3),
+              });
+    auto beta = mlx::core::slice(
+        beta_source,
+        Shape{0, 0, 0},
+        Shape{transaction.batch, beta_source.shape(1), keep});
+    auto convolved = linear_conv_qkv(
+        transaction.convolution_state,
+        qk,
+        value,
+        convolution_weight,
+        key_heads,
+        value_heads,
+        key_head_dimension,
+        value_head_dimension,
+        convolution_bias,
+        eps);
+    auto recurrent = gated_delta_net(
+        convolved.query,
+        convolved.key,
+        convolved.value,
+        gate,
+        beta,
+        transaction.recurrent_state,
+        transposed_state,
+        tiled_heads);
+    return {
+        std::move(convolved.state),
+        std::move(recurrent.state),
+        transaction.position + keep,
+    };
+}
+
 } // namespace mfq::metal

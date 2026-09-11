@@ -35,6 +35,22 @@ int main() {
                 "Streaming Omni Conversation.",
             "registry duplex system prompt missing");
 
+    const auto deepseek_registry = resolve_mfq_runtime_profile(
+        "", "deepseek-v4-flash", "deepseek_v4", "test");
+    require(deepseek_registry.chat.mtp_max_draft_tokens.value_or(-1) == 5,
+            "DeepSeek-V4 registry MTP depth mismatch");
+
+    const auto deepseek_v41_registry = resolve_mfq_runtime_profile(
+        "", "deepseek-v4.1-flash", "deepseek_v41_vision", "test");
+    require(
+        deepseek_v41_registry.source ==
+            "architecture-registry:deepseek_v41",
+        "DeepSeek-V4.1 was folded into the V4 registry");
+    require(
+        std::abs(deepseek_v41_registry.chat.top_p.value_or(-1.0) - 0.95) <
+            1e-12,
+        "DeepSeek-V4.1 registry sampling mismatch");
+
     const auto root = std::filesystem::temp_directory_path() /
         "mfq-runtime-profile-test";
     std::filesystem::remove_all(root);

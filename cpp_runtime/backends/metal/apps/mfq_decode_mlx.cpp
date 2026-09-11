@@ -1,5 +1,6 @@
 #include "mfq_container.h"
 #include "mlx_deepseek_v4_causal_lm.h"
+#include "mlx_deepseek_v41_causal_lm.h"
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_minicpmo45.h"
 #include "mlx_moe.h"
@@ -322,7 +323,7 @@ std::size_t requested_cache_bytes(
             static_cast<long double>(
                 std::numeric_limits<std::size_t>::max())) {
             throw std::runtime_error(
-                "DeepSeek-V4 expert cache exceeds addressable memory");
+                "MoE expert cache exceeds addressable memory");
         }
         const auto bytes = static_cast<std::size_t>(requested);
         // An explicit zero keeps native HF expert banks fully resident.
@@ -1289,6 +1290,36 @@ std::int32_t generate_with_prefill_metrics(
 }
 
 std::int32_t generate_with_prefill_metrics(
+    mfq::metal::MlxDeepseekV41CausalLm& runtime,
+    const std::vector<std::int64_t>& prompt,
+    const mfq::metal::MlxSamplingParams& sampling,
+    std::int32_t max_tokens,
+    const MfqTokenCallback& callback,
+    const MfqPrefillCallback& on_prefill,
+    const MfqPromptCachePlan& cache_plan,
+    const MfqTokenConstraintPtr& token_constraint,
+    int prefill_chunk_size) {
+    std::function<void(std::size_t, double)> report_prefill;
+    if (on_prefill) {
+        report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
+            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+        };
+    }
+    return runtime.generate(
+        prompt,
+        sampling,
+        max_tokens,
+        callback,
+        report_prefill,
+        token_constraint,
+        cache_plan.stable_prefix_tokens > 0
+            ? std::optional<std::size_t>(
+                  cache_plan.stable_prefix_tokens)
+            : std::nullopt,
+        prefill_chunk_size);
+}
+
+std::int32_t generate_with_prefill_metrics(
     mfq::metal::MlxQwen4CausalLm& runtime,
     const std::vector<std::int64_t>& prompt,
     const mfq::metal::MlxSamplingParams& sampling,
@@ -1927,6 +1958,69 @@ int run_native_server(
         std::chrono::steady_clock::now();
     const auto graph = mfq::metal::effective_model_graph(container);
     const auto& backbone = graph.backbone;
+    const bool native_hf =
+        container.header().extra_json.count("source.format") != 0 &&
+        container.header().extra_json.at("source.format") ==
+            "hf-safetensors";
+    if (backbone == "deepseek_v41") {
+        const auto config =
+            mfq::metal::DeepseekV41Config::from_mfq(container, graph);
+        const int context = static_cast<int>(
+            std::min<std::int64_t>(
+                arguments.context_size,
+                config.max_position_embeddings));
+        std::optional<std::size_t> expert_cache_bytes;
+        if (arguments.expert_cache_gb.has_value() || native_hf) {
+            const auto bytes = requested_cache_bytes(
+                arguments.expert_cache_gb, native_hf);
+            if (bytes > 0) expert_cache_bytes = bytes;
+        }
+        std::cout
+            << "Loading native C++/MLX DeepSeek-V4.1 model "
+               "on Apple GPU..."
+            << std::endl;
+        auto runtime =
+            mfq::metal::MlxDeepseekV41CausalLm::load(
+                container, context, expert_cache_bytes);
+        runtime.prewarm_ssd_expert_arena();
+        release_model_load_staging_memory();
+        const auto load_seconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+        std::cout
+            << "Loaded " << runtime.layer_count()
+            << " DeepSeek-V4.1 layers in "
+            << load_seconds << " s; runtime=native-cpp"
+            << " expert_backing="
+            << (expert_cache_bytes.has_value()
+                    ? "nintm-ssd"
+                    : "full-resident")
+            << std::endl;
+        const auto load_runtime =
+            [&container, expert_cache_bytes](std::int64_t requested_context) {
+                if (requested_context < 1 ||
+                    requested_context >
+                        std::numeric_limits<int>::max()) {
+                    throw std::invalid_argument(
+                        "Metal runtime context is out of range");
+                }
+                return mfq::metal::MlxDeepseekV41CausalLm::load(
+                    container,
+                    static_cast<int>(requested_context),
+                    expert_cache_bytes);
+            };
+        return serve_loaded_runtime(
+            arguments,
+            &container,
+            std::move(runtime),
+            load_runtime,
+            config.has_vision()
+                ? std::string("deepseek_v41_vision")
+                : config.text_model_type,
+            config.max_position_embeddings,
+            config.vocab,
+            runtime_stream);
+    }
     if (backbone == "deepseek_v4") {
         const auto config =
             mfq::metal::DeepseekV4Config::from_mfq(
@@ -1936,25 +2030,10 @@ int run_native_server(
                 arguments.context_size,
                 config.max_position_embeddings));
         std::optional<std::size_t> expert_cache_bytes;
-        if (arguments.expert_cache_gb.has_value()) {
-            constexpr long double bytes_per_gib =
-                static_cast<long double>(
-                    std::uint64_t{1} << 30);
-            const long double requested_cache =
-                static_cast<long double>(
-                    *arguments.expert_cache_gb) *
-                bytes_per_gib;
-            if (requested_cache >
-                static_cast<long double>(
-                    std::numeric_limits<
-                        std::size_t>::max())) {
-                throw std::runtime_error(
-                    "DeepSeek-V4 expert cache exceeds "
-                    "addressable memory");
-            }
-            expert_cache_bytes =
-                static_cast<std::size_t>(
-                    requested_cache);
+        if (arguments.expert_cache_gb.has_value() || native_hf) {
+            const auto bytes = requested_cache_bytes(
+                arguments.expert_cache_gb, native_hf);
+            if (bytes > 0) expert_cache_bytes = bytes;
         }
         std::cout
             << "Loading native C++/MLX DeepSeek-V4 model "
@@ -1974,10 +2053,11 @@ int run_native_server(
             << "Loaded " << runtime.layer_count()
             << " DeepSeek-V4 layers in "
             << load_seconds << " s";
-        if (arguments.expert_cache_gb.has_value()) {
+        if (expert_cache_bytes.has_value()) {
             std::cout
                 << " nintm_load=disk-cache cache_gb="
-                << *arguments.expert_cache_gb;
+                << static_cast<double>(*expert_cache_bytes) /
+                    static_cast<double>(std::uint64_t{1} << 30);
         } else {
             std::cout << " nintm_load=full-resident";
         }
@@ -2161,6 +2241,10 @@ int main(int argc, char** argv) {
             return EXIT_SUCCESS;
         }
 
+        // Raw Hugging Face DeepSeek checkpoints use the M3 Ultra tuned path:
+        // native Safetensors streaming, SSD Engram, and the exact fused HC
+        // kernels. Converted MFQ containers continue through the portable
+        // architecture-specific runtimes below.
         if (std::filesystem::is_directory(arguments.mfq)) {
             if (arguments.server) {
                 configure_mlx_metal();

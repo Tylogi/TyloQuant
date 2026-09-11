@@ -769,62 +769,26 @@ void MlxQwen35LinearAttentionBlock::rollback_speculative(
         throw std::runtime_error(
             "Qwen3.5 speculative recurrent checkpoint is unavailable");
     }
-    const auto& rollback = *speculative_rollback_;
-    const int speculative_tokens =
-        rollback.total_tokens - rollback.confirmed_tokens;
-    if (accepted_tokens < 0 || accepted_tokens > speculative_tokens ||
-        !rollback.qk || !rollback.value || !rollback.gate ||
-        !rollback.beta) {
-        throw std::runtime_error(
-            "Qwen3.5 speculative recurrent replay is invalid");
-    }
-    const int keep = rollback.confirmed_tokens + accepted_tokens;
-    const int key_size = static_cast<int>(config_.linear_key_size());
-    const int value_size = static_cast<int>(config_.linear_value_size());
     const int key_heads = static_cast<int>(config_.linear_key_heads());
     const int value_heads = static_cast<int>(config_.linear_value_heads());
     const int dimension =
         static_cast<int>(config_.linear_value_head_dim);
-    auto qk = mlx::core::slice(
-        *rollback.qk,
-        Shape{0, 0, 0},
-        Shape{rollback.batch, keep, 2 * key_size});
-    auto value = mlx::core::slice(
-        *rollback.value,
-        Shape{0, 0, 0},
-        Shape{rollback.batch, keep, value_size});
-    auto gate = mlx::core::slice(
-        *rollback.gate,
-        Shape{0, 0, 0},
-        Shape{rollback.batch, value_heads, keep});
-    auto beta = mlx::core::slice(
-        *rollback.beta,
-        Shape{0, 0, 0},
-        Shape{rollback.batch, value_heads, keep});
-    auto convolved = linear_conv_qkv(
-        rollback.convolution_state,
-        qk,
-        value,
+    auto restored = replay_gated_delta_speculative_prefix(
+        *speculative_rollback_,
+        accepted_tokens,
         convolution_weight_,
         key_heads,
         value_heads,
         static_cast<int>(config_.linear_key_head_dim),
         dimension,
         convolution_bias_,
-        static_cast<float>(config_.rms_norm_eps));
-    auto recurrent = gated_delta_net(
-        convolved.query,
-        convolved.key,
-        convolved.value,
-        gate,
-        beta,
-        rollback.recurrent_state,
+        static_cast<float>(config_.rms_norm_eps),
         false,
         gguf_layout_);
-    convolution_state_ = std::move(convolved.state);
-    recurrent_state_ = std::move(recurrent.state);
-    cache_position_ = rollback.position + keep;
-    cache_batch_ = rollback.batch;
+    convolution_state_ = std::move(restored.convolution_state);
+    recurrent_state_ = std::move(restored.recurrent_state);
+    cache_position_ = restored.position;
+    cache_batch_ = speculative_rollback_->batch;
     speculative_rollback_.reset();
 }
 

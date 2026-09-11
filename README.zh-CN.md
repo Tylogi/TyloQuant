@@ -4,275 +4,298 @@
 
 <img src="./docs/figures/tylogi-ai-lab.svg" alt="Tylogi AI Lab" width="520">
 
-**神经元锚定的混合格式量化与高保真大语言模型推理**
+### 新一代量化与推理基础设施
 
-**Every Bit. Maximum Fidelity.**
+**每一比特，极致保真。**
 
-NINT · NVQ/NPQ · NEPQ · TPQ · 逐专家 MoE · CUDA · Metal · C++ 运行时
+MFQ 将面向实用率失真前沿设计的神经网络感知 SQ/VQ 格式、高质量的
+细粒度混合精度校准量化，以及高效的 CUDA/Metal 推理融为一体。我们的
+目标是在内存、存储和延迟约束内，让现有硬件运行尽可能高质量的模型。
+
+<p>
+  <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache 2.0 许可证">
+  <img src="https://img.shields.io/badge/runtime-C%2B%2B-black" alt="C++ 运行时">
+  <img src="https://img.shields.io/badge/backends-CUDA%20%7C%20Metal-6b57ff" alt="CUDA 和 Metal">
+</p>
+
+<p>
+  <a href="./README.md">English</a> · <strong>中文</strong>
+</p>
+
+<p>
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#功能特性">功能特性</a> ·
+  <a href="#模型">模型</a> ·
+  <a href="#性能与质量">性能与质量</a> ·
+  <a href="./docs/README.md">文档</a>
+</p>
 
 </div>
 
-<p align="center">
-  <a href="./README.md">English</a> | <strong>中文</strong>
-</p>
+MFQ 覆盖从源模型到可部署打包模型的完整流程。它测量激活与损失敏感度，
+在精确的序列化大小预算内，按张量、专家和投影粒度分配精度，将结果保存为
+自包含的 `.mfq` 容器，并通过优化的 C++ 内核直接执行打包权重。量化格式与
+运行时协同设计，使每一比特带来的保真度收益能够真正转化为高速 CUDA/Metal
+推理和一条命令即可启动的服务。
 
 <p align="center">
-  <a href="https://huggingface.co/Tylogi">Hugging Face 模型主页</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope 模型主页</a>
+  <img src="./docs/figures/tyloquant-mfq-webui-zh.png" alt="MFQ Studio 运行本地模型" width="900">
 </p>
 
-## 项目简介
+## 快速开始
 
-**TyloQuant MFQ**（简称 **MFQ**）是一套面向高保真大语言模型部署的混合格式量化与推理方案。它在设计量化格式时同时考虑精度分配和推理内核，支持让每个权重平均占用 `0.84–8.30` 位（bpw）的自定义编码，可按计算组或混合专家模型（MoE）中的单个专家分配精度。C++ 运行时可通过原生 CUDA 和 Metal 路径直接计算量化后的权重，无需先将其完整还原为高精度权重。
+### 使用预编译包
 
-公开的 MFQ 模型采用统一的 `V`/`S` 命名：对应 llama.cpp `IQ*` 的向量量化模型使用 `V`，对应 `Q*_K*` 的标量量化模型使用 `S`。例如：`IQ3_XXS → V3-XXS`，`Q4_K_XL → S4-L`。
+Apple 芯片上最简单的使用方式是安装预编译的 **MFQ Studio**。预编译包会在
+可用时发布到项目的 [Releases](https://github.com/Tylogi/TyloQuant/releases)，
+其中包含桌面控制台、MFQ Server 和 C++ 运行时。打开 Studio，注册模型目录，
+即可加载任意受支持的 `.mfq` 模型。
 
-<img src="./docs/figures/tyloquant-mfq-webui-zh.png" alt="TyloQuant MFQ 本地推理网页界面" width="100%">
+也可以直接为服务器指定预编译的 C++ worker：
 
-## 可用模型
+```bash
+uv run mfq serve \
+  --running-executable /path/to/mfq-decode-metal \
+  --model /models/model.mfq
+```
 
-Tylogi 的模型主页目前提供以下可下载的 `.mfq` 模型。
+### 从源码构建
 
-| 模型 | 可用 MFQ 档位 | Hugging Face | ModelScope |
-|---|---|---|---|
-| DeepSeek-V4-Flash-0731 | `EW-V2-S`、`EW-V2-M`、`EW-V2-L` | [下载](https://huggingface.co/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) | [下载](https://www.modelscope.cn/models/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) |
-| Qwen3.8-27B | `V1-S`、`V1-M`、`V2-XXS`、`V2-S`、`V3-XXS`、`V3-S`、`V4-XS`、`S4-M`、`S5-M`、`S6-M` | — | [下载](https://www.modelscope.cn/models/Tylogi/Qwen3.8-27B-MFQ) |
-| Qwen3.6-27B | `V2-XXS`、`V2-M`、`V3-XXS`、`S2-L`、`S3-L`、`S4-L`、`S5-L`、`S6-L` | [下载](https://huggingface.co/Tylogi/Qwen3.6-27B-MFQ) | — |
-| MiniCPM-o 4.5 | `S4`、`S4-S`、`S4-M`、`S5-S`、`S5-M`、`S6`、`S8` | — | [下载](https://www.modelscope.cn/models/Tylogi/MiniCPM-o-4_5-MFQ) |
+MFQ 需要 Git、[uv](https://docs.astral.sh/uv/)、CMake 3.26+ 和 C++ 工具链。
+NVIDIA 平台使用 CUDA 12+，Apple 芯片使用 Metal。
 
-## 安装
-
-### 环境要求
-
-#### 通用
-
-- Git
-- [uv](https://docs.astral.sh/uv/)
-- CMake `>=3.26` 与原生 C++ 工具链
-
-#### 推理后端（二选一）
-
-- **CUDA：** Linux 或 Windows、NVIDIA GPU，以及包含 `nvcc`、cuBLAS 和 CUDA 运行库的 CUDA Toolkit `>=12`。
-- **Metal：** Apple 芯片与 macOS；`metal` 可选依赖组会安装 MLX 及其原生运行时文件。
-
-#### 可选
-
-- 仅在 MFQ 需要从源码构建浏览器界面时才需要 Node.js 与 npm；缺少它们时，`mfq serve` 仍可提供 API。
-
-`uv` 会在需要时自动配置 MFQ 要求的 Python `>=3.10` 运行环境，无需单独安装 Python。
-
-### 从源码安装
-
-命令行统一使用 `mfq`。在 PowerShell 中，请将多行命令写成一行，或用反引号替换末尾的 `\`。
-
-```shell
+```bash
 git clone https://github.com/Tylogi/TyloQuant.git MFQ
 cd MFQ
-```
 
-#### CUDA（Windows 或 Linux）
-
-原生 CUDA 推理不需要 PyTorch 或 LibTorch。
-
-```shell
+# NVIDIA / CUDA
 uv sync --extra daemon
 uv run mfq build --backend cuda
-```
 
-#### Metal（Apple 芯片）
-
-```shell
+# Apple 芯片 / Metal
 uv sync --extra daemon --extra metal
 uv run mfq build --backend metal
 ```
 
-需要离线量化或校准时，安装相应的可选依赖组：
+启动一个暂未加载模型的本地服务器，并打开 <http://127.0.0.1:8090/>：
 
-```shell
-# CUDA
-uv sync --extra daemon --extra train --extra calibration
-
-# Apple 芯片
-uv sync --extra daemon --extra metal --extra train --extra calibration
-```
-
-`mfq build` 会自动探测操作系统和推理加速器。自定义 CMake 配置参数放在 `--` 之后，例如：
-
-```shell
-uv run mfq build -- -DCMAKE_CUDA_ARCHITECTURES=90
-```
-
-`mfq build` 会把可执行文件和 CMake 参数写入 `build/mfq-runtime.json`。`mfq serve` 会复用该构建；即使使用了自定义 `--build-dir`，可执行文件丢失时也会按原配置重建。
-
-验证安装：
-
-```shell
-uv run mfq --help
-uv run mfq build --help
-```
-
-## 快速开始
-
-暂不加载模型，先启动服务：
-
-```shell
+```bash
 uv run mfq serve
 ```
 
-打开 <http://127.0.0.1:8090/>，并在另一个终端检查 API：
+更详细的环境要求和自定义 CMake 选项请参阅
+[`mfq build` 指南](./docs/cli/build.md)。
 
-```shell
-curl http://127.0.0.1:8090/health
-```
+## 量化并运行模型
 
-从 [Hugging Face](https://huggingface.co/Tylogi) 或 [ModelScope](https://www.modelscope.cn/profile/Tylogi) 下载 MFQ 文件。可以在 Studio 模型目录中加载，也可以重启服务并传入模型路径：
+使用 MFQ 的 **`S4-M` 混合精度预设**。它会为敏感张量保留更高精度，并默认
+保持视觉和 MTP 组件的源精度。
 
-```shell
-uv run mfq serve --model /absolute/path/to/model.mfq
-```
-
-模型状态变为 `ready` 后即可开始对话。模型目录、身份认证和 API 用法见 [`mfq serve`](./docs/cli/serve.md)。
-
-## 网页界面
-
-`mfq serve` 启动对外 API 和网页界面，并通过本机私有端口管理 C++ 工作进程。可以暂不加载模型，也可以在启动时直接加载：
-
-```shell
-uv run mfq serve
-uv run mfq serve --model path/to/model.mfq --host 127.0.0.1 --port 8090
-uv run mfq serve --model-dir path/to/models --host 127.0.0.1 --port 8090
-```
-
-`--host` 和 `--port` 控制对外 API 的监听地址，默认是 `127.0.0.1:8090`。打开命令输出的网页地址即可。
-
-桌面版 Studio 的 **Models and jobs**（模型与任务）页面可直接加载本地 `.mfq` 文件，不会复制模型。选择任一分片时，会自动加载同一模型的全部分片。
-
-## 量化
-
-`mfq quantize` 接受 Hugging Face（HF）的 `safetensors` 模型目录、满精度 MFQ 或满精度 GGUF。仅执行量化时，安装 `train` 可选依赖组：
-
-```shell
+```bash
+# 量化依赖
 uv sync --extra train
+
+# Hugging Face safetensors -> 自包含 MFQ
+uv run mfq quantize \
+  /models/Qwen3.8-27B \
+  /models/Qwen3.8-27B-MFQ-S4-M.mfq \
+  --preset S4-M \
+  --backend auto
 ```
 
-将 Hugging Face 模型权重量化为统一 NINT4：
+加载并启动量化后的模型：
 
-```shell
-uv run mfq quantize model-hf model-NINT4.mfq \
-  --bits 4 --groupsize 24 --sub-bits 6 --backend auto
+```bash
+uv sync --extra daemon                 # Apple 芯片还需添加 --extra metal
+uv run mfq build --backend auto
+uv run mfq serve \
+  --model /models/Qwen3.8-27B-MFQ-S4-M.mfq \
+  --context-size 32768
 ```
 
-不做量化，直接把原始模型权重写入满精度 MFQ：
+MFQ 还可以量化满精度 MFQ 和 GGUF 源模型，读取逐张量或逐专家精度映射及激活
+重要性矩阵，并输出分片模型。详见
+[`mfq quantize`](./docs/cli/quantize.md) 和
+[`mfq calibrate`](./docs/cli/calibrate.md)。
 
-```shell
-uv run mfq quantize model-hf model-full.mfq --full-precision
-```
+## 功能特性
 
-混合 GGUF 量化方案、逐专家覆盖规则、MTP 预测头补全、重要神经元、分片和断点续作见 [`mfq quantize`](./docs/cli/quantize.md)；激活重要性矩阵（imatrix）和校准见 [`mfq calibrate`](./docs/cli/calibrate.md)。
+### 量化
 
-## 核心结果
+- **神经元锚定的 SQ 和 VQ 基础格式。** NINT、NVQ、NPQ 和 NEPQ 的每个短
+  子分组仍保留各自的缩放与偏置。MFQ 对通用二级缩放机制的改进，是将其中的
+  高精度缩放与偏置参数按神经元仅保存一组，从而以更少的元数据 bit 表达同一
+  层次。节省出的 bit 可在相同 BPW 下用于更小的 group size，或者更高的子分组
+  精度，使基础格式本身获得更高的 SNR 与更低的 SSE，而不依赖内部精度分配
+  方法或跨张量位宽分配策略。在真实模型权重上，它们也在几乎所有测试中优于
+  其他主流量化格式。
 
-### DeepSeek-V4-Flash-0731
+- **最高质量的免校准、免 QAT 量化。** MFQ 持续吸收 DSQ 等现代高效方法，
+  在无需校准数据或训练的一键量化场景中，将基础量化质量推到尽可能高的水平。
 
-<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ 与 Unsloth Dynamic 模型大小和平均 KLD 对比" width="100%">
+- **高质量校准模型。** MFQ 提供高质量的细粒度混合精度校准量化，在每个目标
+  体积下尽可能保留源模型质量。发布的校准模型会在一致的模型级协议下与源模型
+  对比验证。
 
-**评测：** 官方 0731 权重，WikiText-2 共 573 个评测片段、146,115 个计分词元，`ctx=512`。
+- **亚专家级和亚张量级混合精度。** MFQ 可以为每个专家中的每个张量分配
+  不同精度，将单个 FFN 切分为多个不同精度的 Chunk，或者以更高精度保留其中
+  最重要的 N 个神经元。
+  每种选择都按实际序列化大小精确计入预算，并由专用的批处理与融合内核高效
+  执行这些异构布局。这些能力已经贯通生产推理，而不只停留在理论分配方案或
+  研究原型中。
 
-| 发布档位 | 大小 | 平均 KLD ↓ | 首选词元一致率（same-top）↑ |
-|---|---:|---:|---:|
-| S | 77.519 GiB | `0.313576` | `82.2913%` |
-| M | 88.007 GiB | `0.244488` | `84.5300%` |
-| L | 98.007 GiB | `0.201444` | `86.0753%` |
+- **量化格式反向传播与训练器。** MFQ 为量化格式提供反向传播算子和开箱即用
+  的训练工具，方便进行 QAT 与量化模型微调。
 
-**同体积对比：** 与三组大小最接近的 Unsloth Dynamic（UD）基线相比，MFQ 将平均 KLD 降低 **34.24–51.42%**。
+### 推理
 
-### Qwen3.5-9B：文件大小与平均 KLD
+- **高效打包权重内核。** 后端专用的 GEMV、小 M MMQ 和大 M 路径直接使用
+  MFQ 打包存储，无需常驻 FP16 副本，从而降低预填充、解码和 MTP 工作负载中
+  的内存流量。
 
-<img src="./docs/figures/qwen35-9b-mfq-vs-ud-size-kld.svg" alt="Qwen3.5-9B MFQ 与 Unsloth Dynamic 文件大小和原始平均 KLD 对比" width="100%">
+- **高效异构 MoE 执行。** MFQ 将每个专家投影的逻辑精度与物理内核实现解耦。
+  运行时会针对模型中实际存在的精度组合编译并分派融合路径，使异构
+  Gate/Up/Down 执行仍保持高效。
 
-- **评测：** 完整 WikiText-2，共 145 个评测片段、148,335 个计分词元；所有档位使用同一 BF16 参考模型。
-- **结果：** 上图每个匹配精度档位中，MFQ 的原始平均 KLD 均更低。
+- **优化的 CUDA 与 Metal 后端。** 共享的 C++ 模型图与运行时契约驱动后端
+  专用内核，在 NVIDIA 和 Apple 硬件上高效执行量化线性代数、注意力、卷积与
+  循环状态以及缓存操作。
 
-### Qwen3.6-27B：文件大小与质量
+- **广泛且与时俱进的架构支持。** MFQ 覆盖多种 Dense、MoE、多模态、循环与
+  稀疏注意力模型系列，并紧跟重要模型发布，第一时间支持重要的新模型架构。
 
-<img src="./docs/figures/qwen36-27b-mfq-vs-ud-size-quality.png" alt="Qwen3.6-27B MFQ 与 Unsloth Dynamic 文件大小、原始平均 KLD 和首选词元一致率对比" width="100%">
+- **连续批处理。** 请求到达和完成时动态接入请求并压缩活跃序列，结合分页 KV
+  存储和可复用执行图，持续提高并发生成效率。
 
-- **评测：** 完整评测包含 145 个片段，统一使用 `ubatch=2048`；图中每个档位均覆盖全部评测片段。
-- **对比：** 每个 MFQ 文件均与大小相近的 Unsloth Dynamic 基线模型配对。
-- **指标：** 平均 KLD 越低，说明输出分布越接近参考模型；首选词元一致率越高越好。
+- **RAM/SSD 前缀 KV Cache。** 精确的前缀块可以保留在高速内存层或持久化 SSD
+  层，使后续请求乃至进程重启后都能复用已经完成的预填充计算。
 
-## 工作原理
+- **可组合的多模态与 MTP 执行。** 视觉、音频、实时全双工和草稿组件由模型图
+  自动启用并共享同一套运行时，无需为每种架构维护独立的服务栈。
 
-| 层次 | 设计 | 作用 |
-|---|---|---|
-| 权重格式 | NINT、NVQ、NPQ、NEPQ、TPQ | 提供从 8 位到不足 1 位的不同质量档位 |
-| 稠密层分配 | 重要性感知分配 | 按计算组选择精度 |
-| MoE 分配 | 逐专家精度分配 | 将更多码率分配给预期输出贡献更高的专家 |
-| 专家容器 | NINTM v2 | 在同一 MoE 张量中保存不同格式 |
-| 运行时资源 | 保留的 `BLOB` 记录 | 在 MFQ 文件中保存配置、分词器、对话模板和特殊词元元数据 |
-| 推理 | CUDA/Metal 内核与 C++ 运行时 | 不还原完整的 FP16 权重，直接计算量化后的权重 |
+- **超越内存容量的 SSD 流式推理。** 混合 LRU/LFU Cache 让近期使用和高频路由
+  的专家常驻内存，路由感知预取则通过并行 I/O 合并冷数据读取。双缓冲暂存和
+  依赖感知调度用有效计算覆盖 SSD 延迟；带宽自适应策略会根据命中率与存储
+  吞吐，在常驻、预取和按需专家之间分配工作。这样既能限制 RAM 或 VRAM 占用，
+  又不会让每个路由层都退化为同步磁盘等待。
 
-NINT 在每个输出神经元的权重行内共享仿射元数据，并把节省的空间用于更短的局部分组。低于 4 位时，NVQ、NPQ 与 NEPQ 使用短向量编码，并采用感知专家差异的码本共享方式。分配器依据序列化后的实际字节数选择格式，NINTM 再将兼容的专家分组，直接计算量化后的权重。
+| 模型 | 模型大小 | 专家预算 | 精度 | 硬件 | 预填充 | 解码 |
+| --- | ---: | ---: | --- | --- | ---: | ---: |
+| DeepSeek-V4-Flash-0731 | ~160 GiB | 85.3 GiB | 官方原生 QAT 精度 | Apple M5 Max, 128 GB | **312.4 tok/s** | **18.6 tok/s** |
 
-## 当前支持范围
+MFQ 在当前支持的两种精度粒度下都能保持高效的异构 MoE 执行：
 
-> [!NOTE]
-> 运行时仍处于实验阶段。CUDA 默认使用单块 GPU。
+| 模型 | 精度粒度 | 平均 BPW | 预填充 | 解码 |
+| --- | --- | ---: | ---: | ---: |
+| Qwen3.8-Flash-Next | 每个专家一种精度 | **5.80** | **1.13K tok/s** | **25.4 tok/s** |
+| Qwen3.8-Flash-Next | 每个专家的 Gate/Up/Down 分别使用独立精度 | **5.79** | **1.12K tok/s** | **24.4 tok/s** |
 
-- `端到端`：原生 MFQ 加载、提示词预填充、逐词解码与文本生成。
-- `部分支持`：已有架构相关组件，但没有完整的公开模型运行时。
-- `专用路径`：使用独立的 TPQ/MFQ 执行路径。
+*Apple M5 Max（40 核 GPU、128 GB）上的预热端到端吞吐。*
 
-| 模型或系列 | 转换与封装 | CUDA 推理 | Metal 推理 | 支持范围或当前限制 |
-|---|---|---|---|---|
-| Qwen3.5 | HF/GGUF/满精度 MFQ | 端到端 | 端到端 | 全注意力/线性注意力混合因果语言模型 |
-| Qwen3.6 | HF/GGUF/满精度 MFQ | 部分支持 | 部分支持 | 路由 MoE 组件；暂无公开端到端运行时 |
-| Gemma4 | HF/GGUF 与 MFQ 分片 | 端到端 | 端到端 | 混合全注意力/滑动窗口注意力 |
-| DeepSeek-V4-Flash | HF/GGUF、逐专家 MFQ 与 TPQ | 端到端 | 端到端 | 压缩、索引器与稀疏注意力路径 |
-| MiniCPM-o 4.5 | 官方复合 HF 计算图转换为 MFQ | 端到端 | 端到端 | 运行时需要官方模型目录 |
-| GLM-MoE-DSA | 原生 MFQ 与混合精度 | 端到端 | 端到端 | 稠密/稀疏 MLA 路径 |
-| Kimi-K3 | TPQ/MFQ 封装 | 专用路径 | 专用路径 | 仅使用 TPQ/MFQ 执行路径 |
+### 未来方向
 
-通用能力：
+MFQ 是一个开放且持续演进的项目。我们会不断探索、验证并吸收新的量化与推理
+技术，通过严格校准带来质量更高的量化模型和更好的本地推理体验。我们也非常
+欢迎社区参与贡献，详见[贡献指南](./CONTRIBUTING.md)。
 
-- NINTM v2 流式转换；
-- 自包含与分片 MFQ 文件；
-- Python 与 C++ 加载；
-- 支持服务器发送事件（SSE）的 OpenAI 兼容 API。
+## 模型
 
-内核和模型细节：[运行时支持矩阵](./docs/runtime-support.md)。
+已发布的 `.mfq` 模型可从
+[Hugging Face](https://huggingface.co/Tylogi) 和
+[ModelScope](https://www.modelscope.cn/profile/Tylogi) 下载。
+
+| 模型 | 已发布精度系列 | 下载 |
+| --- | --- | --- |
+| DeepSeek-V4-Flash-0731 | 逐专家 `V2` 档位 | [Hugging Face](https://huggingface.co/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) · [ModelScope](https://www.modelscope.cn/models/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) |
+| Qwen3.8-27B | `V1`–`V4`、`S4`–`S6` 档位 | [ModelScope](https://www.modelscope.cn/models/Tylogi/Qwen3.8-27B-MFQ) |
+| Qwen3.6-27B | `V2`–`V3`、`S2`–`S6` 档位 | [Hugging Face](https://huggingface.co/Tylogi/Qwen3.6-27B-MFQ) |
+| MiniCPM-o 4.5 | `S4`–`S8` 多模态档位 | [ModelScope](https://www.modelscope.cn/models/Tylogi/MiniCPM-o-4_5-MFQ) |
+
+C++ 运行时目前覆盖以下架构系列。具体支持范围取决于模型版本、内嵌组件与后端。
+
+| 架构系列 | 后端 |
+| --- | --- |
+| Qwen3.5–3.8 | CUDA、Metal |
+| Qwen Flash-Next / Qwen4 风格 | CUDA、Metal |
+| DeepSeek-V4-Flash Series | CUDA、Metal |
+| MiniCPM-o 4.5 | CUDA、Metal |
+| GLM5–5.3 | CUDA、Metal |
+| Gemma 4 | CUDA、Metal |
+
+部署具体模型前，请查看[运行时支持矩阵](./docs/runtime-support.md)。
+
+## 工具与 API
+
+| 接口 | 用途 |
+| --- | --- |
+| **MFQ Studio** | 本地模型目录、加载生命周期、推理 Playground、服务器状态与资源控制 |
+| `mfq build` | 检测平台并编译优化的 CUDA 或 Metal C++ worker |
+| `mfq quantize` | 对 HF、GGUF 或满精度 MFQ 源模型应用统一或混合精度，并写出打包 `.mfq` 模型 |
+| `mfq calibrate` / `mfq solve-ew` | 收集激活与损失敏感度数据，评估并验证打包候选格式，并按精确序列化字节预算分配精度 |
+| `mfq serve` | 运行 MFQ Server、Studio/Web UI、模型 worker、Cache 与持久化服务 |
+| `mfq inspect` / `mfq optimize-layout` | 检查容器，并将张量重新打包为针对后端优化的布局 |
+
+MFQ 为应用与工具提供多种接口：
+
+- `/api/v1` 下的 **HTTP 控制 API**，用于管理模型、Session、Response、任务、
+  数据集、评测、Cache 和运行时状态；
+- 用于 token 与任务流式传输的 **Server-Sent Events**；
+- 用于音频与全双工 Session 的 **WebSocket 实时 API**；
+- 由受管 C++ worker 和运行时适配器提供的
+  **OpenAI 兼容 `/v1/models` 与 `/v1/chat/completions` 接口**；
+- 通过服务器工具注册表提供的 **MCP 与函数工具执行**。
+
+可以从 [HTTP API](./docs/api/http.md)、
+[WebSocket API](./docs/api/websocket.md) 或
+[`mfq serve` 参考](./docs/cli/serve.md)开始。
+
+## 性能与质量
+
+### DeepSeek-V4-Flash-0731：模型大小与分布保真度
+
+<p align="center">
+  <img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash MFQ 与相近大小基线的平均 KLD 对比" width="900">
+</p>
+
+评测使用官方 0731 权重和固定 WikiText-2 协议，在 `ctx=512` 下覆盖 573 个片段
+与 146,115 个计分 token。
+
+| 发布档位 | 大小 | 平均 KLD ↓ | Top-1 一致率 ↑ |
+| --- | ---: | ---: | ---: |
+| `EW-V2-S` | 77.519 GiB | `0.313576` | `82.2913%` |
+| `EW-V2-M` | 88.007 GiB | `0.244488` | `84.5300%` |
+| `EW-V2-L` | 98.007 GiB | `0.201444` | `86.0753%` |
+
+与本次评测中大小最接近的 Unsloth Dynamic 基线相比，MFQ 将平均 KLD 降低了
+**34.24–51.42%**。
+
+### Qwen3.5-9B：相同精度档位对比
+
+<p align="center">
+  <img src="./docs/figures/qwen35-9b-mfq-vs-ud-size-kld.svg" alt="Qwen3.5-9B MFQ 与相近大小基线的平均 KLD 对比" width="900">
+</p>
+
+图中所有档位使用同一个 BF16 教师模型，并采用覆盖完整 145 个片段、148,335 个
+计分 token 的评测。MFQ 在图示每个匹配精度点上都取得了更低的原始平均 KLD。
 
 ## 文档
 
-### CLI 与服务
-
-- [`mfq build`](./docs/cli/build.md)
-- [`mfq quantize`](./docs/cli/quantize.md)
-- [`mfq calibrate`](./docs/cli/calibrate.md)
-- [`mfq serve` 与模型管理](./docs/cli/serve.md)
-- [HTTP API](./docs/api/http.md)
-- [WebSocket API](./docs/api/websocket.md)
-
-### 运行时与验证
-
-- [开发守则与架构边界](./CONTRIBUTING.md)
-- [运行时支持矩阵](./docs/runtime-support.md)
-- [运行时采样配置](./docs/runtime-sampling-profiles.md)
-- [原生 CUDA 运行时验证](./docs/cuda-native-runtime-validation.md)
-
-### 量化与模型集成
-
-- [逐专家联合预算求解器](./docs/ew-joint-solver.md)
-- [MiniCPM-o 4.5 运行时](./docs/minicpmo45.md)
-- [自包含发布包](./docs/release.md)
+- [文档索引](./docs/README.md)
+- [构建 C++ 运行时](./docs/cli/build.md)
+- [量化模型](./docs/cli/quantize.md)
+- [运行 MFQ Server](./docs/cli/serve.md)
+- [运行时支持范围](./docs/runtime-support.md)
+- [MiniCPM-o 4.5 多模态运行时](./docs/minicpmo45.md)
+- [贡献指南与架构规范](./CONTRIBUTING.md)
 
 ## 致谢
 
-MFQ 使用或参考了以下项目：
+MFQ 深受以下项目启发，并从中学习：
+[llama.cpp](https://github.com/ggml-org/llama.cpp)、
+[oMLX](https://github.com/jundot/omlx)、
+[MLX](https://github.com/ml-explore/mlx)、
+[PyTorch](https://github.com/pytorch/pytorch)、
+[Transformers](https://github.com/huggingface/transformers) 和
+[Unsloth](https://github.com/unslothai/unsloth)。
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp)：GGUF 互操作、推理后端和评测工具。
-- [oMLX](https://github.com/jundot/omlx)：Apple 芯片性能与运行时设计参考。
-- [MLX](https://github.com/ml-explore/mlx)：macOS 路径使用的 Apple 芯片数组计算框架与 Metal 运行时。
-- [PyTorch](https://github.com/pytorch/pytorch) 与 [Transformers](https://github.com/huggingface/transformers)：模型接入与量化基础设施。
-- [Unsloth](https://github.com/unslothai/unsloth)：用于对比的动态量化模型。
-
-许可证：[Apache License 2.0](./LICENSE)。
+MFQ 使用 [Apache License 2.0](./LICENSE) 许可证。

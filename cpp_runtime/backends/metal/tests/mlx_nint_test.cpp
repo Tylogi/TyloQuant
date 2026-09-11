@@ -518,6 +518,88 @@ void test_nint4_gs24_decode() {
     verify_nint_gs24_decode(4, 65'539, 25, false);
 }
 
+void test_nint4_gs24_grouped_small_m() {
+    using namespace mlx::core;
+    constexpr int projection_groups = 2;
+    constexpr int output_per_group = 16;
+    constexpr int output_size = projection_groups * output_per_group;
+    constexpr int input_size = 47;
+    constexpr int quant_group_size = 24;
+    constexpr int quant_groups = 2;
+    const auto fixture = make_nint_gs24_scaled_blob(
+        4, output_size, input_size);
+    const auto weight =
+        mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+
+    for (int rows = 1; rows <= 5; ++rows) {
+        std::vector<float> input_values(
+            static_cast<std::size_t>(rows) *
+            projection_groups * input_size);
+        for (std::size_t index = 0; index < input_values.size(); ++index) {
+            input_values[index] = static_cast<float>(
+                static_cast<int>((index * 11 + rows) % 31) - 15) /
+                512.0f;
+        }
+        const auto input = astype(
+            array(
+                input_values.begin(),
+                Shape{1, rows, projection_groups, input_size}),
+            float16);
+        auto grouped = weight.grouped_row_matmul(
+            input, projection_groups);
+        if (!grouped || grouped->shape() !=
+                Shape{1, rows, projection_groups, output_per_group}) {
+            throw std::runtime_error(
+                "NINT4 grouped small-M kernel was unavailable");
+        }
+        auto output = astype(*grouped, float32);
+        eval(output);
+        const auto* actual = output.data<float>();
+        for (int row = 0; row < rows; ++row) {
+            for (int projection = 0;
+                 projection < projection_groups;
+                 ++projection) {
+                for (int local_output = 0;
+                     local_output < output_per_group;
+                     ++local_output) {
+                    const int weight_output =
+                        projection * output_per_group + local_output;
+                    float expected = 0.0f;
+                    for (int column = 0; column < input_size; ++column) {
+                        const int quant_group =
+                            column / quant_group_size;
+                        const auto metadata_index =
+                            static_cast<std::size_t>(weight_output) *
+                                quant_groups +
+                            quant_group;
+                        const auto quantized_index =
+                            metadata_index * quant_group_size +
+                            static_cast<std::size_t>(
+                                column % quant_group_size);
+                        const float decoded =
+                            0.125f * fixture.sub_scales[metadata_index] *
+                                fixture.quantized[quantized_index] -
+                            0.0625f * fixture.sub_mins[metadata_index];
+                        const auto input_index = (
+                            static_cast<std::size_t>(row) *
+                                projection_groups +
+                            projection) * input_size + column;
+                        expected += input_values[input_index] * decoded;
+                    }
+                    const auto output_index = (
+                        static_cast<std::size_t>(row) *
+                            projection_groups +
+                        projection) * output_per_group + local_output;
+                    require_close(
+                        actual[output_index],
+                        expected,
+                        0.007f + 0.001f * std::fabs(expected));
+                }
+            }
+        }
+    }
+}
+
 void test_nint3_gs24_decode() {
     // Exercise the standard S3 profile across the specialized M=2..6 route,
     // plus the retained single-row and FP32 paths.
@@ -848,6 +930,7 @@ int main() {
         test_nint5_gs28_decode();
         test_nint3_gs24_decode();
         test_nint4_gs24_decode();
+        test_nint4_gs24_grouped_small_m();
         test_nint6_gs24_decode();
         test_nint4_swiglu();
         std::cout

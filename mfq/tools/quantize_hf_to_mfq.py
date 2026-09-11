@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
+from mfq.architectures.deepseek_v41 import parse_deepseek_v41_config
 from mfq.architectures.tensor_schema import (
     TensorComponent,
     graph_spec_for_plan,
@@ -41,12 +42,14 @@ from mfq.calibration.artifact import (
 from mfq.formats.assets import (
     ASSET_DTYPE,
     ASSET_MANIFEST_KEY,
+    DEEPSEEK_V41_ENGRAM_ASSET,
     HF_TOKENIZER_JSON_ASSET,
     MINICPMO45_RESAMPLER_POS_EMBED_ASSET,
     MODEL_CONFIG_ASSET,
     MODEL_GRAPH_ASSET,
     TOKENIZER_GGUF_ASSET,
     RuntimeAsset,
+    deepseek_v41_engram_asset,
     gguf_metadata_asset,
     hf_runtime_assets,
     is_asset_record,
@@ -473,13 +476,7 @@ class _RawSafeTensorSlice:
 
 
 class _ScaledFp8TensorSlice:
-    """Expose a ModelOpt float8 tensor as dequantized floating-point rows.
-
-    Current Qwen4-Exp and GLM-5-Next checkpoints use ordinary E4M3 bytes
-    together with either a 128x128 block multiplier named
-    ``weight_scale_inv`` or one shared per-tensor multiplier.  These are not
-    MXFP8/E8M0 tensors and must be multiplied out before MFQ quantization.
-    """
+    """Expose a scaled float8 tensor as dequantized floating-point rows."""
 
     def __init__(
         self,
@@ -505,10 +502,18 @@ class _ScaledFp8TensorSlice:
             if scale.dtype_name == "F8_E8M0"
             else raw_scale.to(torch.float32)
         )
-        if scheme in {"fp8_block128_inv", "mxfp8_block128"}:
+        block_match = re.fullmatch(
+            r"(?:fp8|mxfp8)_block(\d+)(?:x(\d+))?(?:_inv)?",
+            scheme,
+        )
+        self._block_shape: tuple[int, int] | None = None
+        if block_match is not None:
+            row_block = int(block_match.group(1))
+            column_block = int(block_match.group(2) or row_block)
+            self._block_shape = (row_block, column_block)
             expected = (
-                math.ceil(self.rows / 128),
-                math.ceil(self.columns / 128),
+                math.ceil(self.rows / row_block),
+                math.ceil(self.columns / column_block),
             )
             if tuple(self._scale.shape) != expected:
                 raise ValueError(
@@ -535,10 +540,14 @@ class _ScaledFp8TensorSlice:
         scale = self._scale.to(device=device)
         if self.scheme == "fp8_tensor_scale":
             return output * scale.reshape(())
-        row_blocks = torch.div(row_ids.to(device=device), 128, rounding_mode="floor")
+        assert self._block_shape is not None
+        row_block, column_block = self._block_shape
+        row_blocks = torch.div(
+            row_ids.to(device=device), row_block, rounding_mode="floor"
+        )
         column_blocks = torch.div(
             torch.arange(self.columns, device=device),
-            128,
+            column_block,
             rounding_mode="floor",
         )
         return output * scale[row_blocks[:, None], column_blocks[None, :]]
@@ -784,19 +793,60 @@ def _source_quantization(
             )
         return None
 
+    configured_blocks: list[tuple[int, int]] = []
+    if config is not None:
+        quantization = config.get("quantization_config")
+        if isinstance(quantization, dict):
+            raw_block = quantization.get("weight_block_size")
+            if (
+                isinstance(raw_block, (list, tuple))
+                and len(raw_block) == 2
+                and all(int(value) > 0 for value in raw_block)
+            ):
+                configured_blocks.append((int(raw_block[0]), int(raw_block[1])))
+
+    def block_scheme(prefix: str, row_block: int, column_block: int) -> str:
+        block = (
+            str(row_block)
+            if row_block == column_block
+            else f"{row_block}x{column_block}"
+        )
+        return f"{prefix}_block{block}"
+
     for scale_name in scale_names:
         block_scale = inventory.get(scale_name)
         if block_scale is None:
             continue
-        expected = (
-            math.ceil(metadata.shape[0] / 128),
-            math.ceil(metadata.shape[1] / 128),
+        candidates = list(
+            dict.fromkeys(
+                (
+                    *configured_blocks,
+                    (128, 128),
+                    (32, 32),
+                    (1, 32),
+                    (16, 16),
+                    (64, 64),
+                )
+            )
         )
-        if block_scale.shape == expected:
+        matched_block = next(
+            (
+                (row_block, column_block)
+                for row_block, column_block in candidates
+                if block_scale.shape
+                == (
+                    math.ceil(metadata.shape[0] / row_block),
+                    math.ceil(metadata.shape[1] / column_block),
+                )
+            ),
+            None,
+        )
+        if matched_block is not None:
+            row_block, column_block = matched_block
             if block_scale.dtype == "F8_E8M0":
-                scheme = "mxfp8_block128"
+                scheme = block_scheme("mxfp8", row_block, column_block)
             elif block_scale.dtype in {"BF16", "F16", "F32"}:
-                scheme = "fp8_block128_inv"
+                scheme = block_scheme("fp8", row_block, column_block) + "_inv"
             else:
                 raise ValueError(
                     f"float8 block scale has unsupported dtype for {name}: {block_scale.dtype}"
@@ -2841,6 +2891,8 @@ def _plan(
         )
     else:
         raw_config = source_config
+    if str(raw_config.get("model_type", "")).lower() == "deepseek_v41":
+        parse_deepseek_v41_config(raw_config)
     # Full-precision MFQ v2 files may predate canonical tensor names. Keep this
     # compatibility at the import boundary only; newly written artifacts still
     # use canonical names whenever a registered mapping exists.
@@ -2857,6 +2909,7 @@ def _plan(
     is_glm_dsa = model_config.get("model_type") == "glm_moe_dsa"
     is_glm5_next = model_config.get("model_type") == "glm5_next_text"
     is_flash_next = model_config.get("model_type") in _FLASH_NEXT_TEXT_TYPES
+    is_deepseek_v41 = model_config.get("model_type") == "deepseek_v41_text"
     is_minicpmo45 = _is_minicpmo45_config(raw_config)
     source_exclusions = _source_quantization_exclusions(raw_config) if is_flash_next else ()
     if is_glm_dsa and recipe_types is not None:
@@ -2865,6 +2918,11 @@ def _plan(
         raise ValueError(
             "Qwen4-Exp/GLM-5-Next GGUF recipe mapping is not implemented; "
             "use the native HF conversion policy or a calibration scheme"
+        )
+    if is_deepseek_v41 and recipe_types is not None:
+        raise ValueError(
+            "DeepSeek-V4.1 has no GGUF recipe mapping; use an MFQ standard "
+            "preset or a calibration scheme"
         )
     source_quantizations, source_auxiliaries = _source_quantizations(inventory, raw_config)
     preserved_ple_scale_names: set[str] = set()
@@ -2914,14 +2972,22 @@ def _plan(
             or name in separate_expert_sources
         ):
             continue
-        if text_only and not (
-            name.startswith("model.language_model.")
-            or (mtp_included and name.startswith("mtp."))
-            or (is_glm_dsa and name.startswith("model."))
-            or name == "lm_head.weight"
-            or (is_minicpmo45 and name.startswith("llm."))
-        ):
-            continue
+        if text_only:
+            source_component = map_source_tensor_name(name, raw_config)
+            if canonical_schema is not None:
+                if source_component is not None and source_component.component not in {
+                    TensorComponent.MODEL,
+                    TensorComponent.PREDICTOR,
+                }:
+                    continue
+            elif not (
+                name.startswith("model.language_model.")
+                or (mtp_included and name.startswith("mtp."))
+                or (is_glm_dsa and name.startswith("model."))
+                or name == "lm_head.weight"
+                or (is_minicpmo45 and name.startswith("llm."))
+            ):
+                continue
         if is_glm_dsa:
             layer_index = _glm_layer_index(name)
             if layer_index is not None and layer_index >= glm_layers:
@@ -3060,7 +3126,11 @@ def _plan(
                 target = source_dtype if source_dtype in {"BF16", "F16", "F32"} else dense_dtype
             elif descriptor.role is TensorRole.PLE_EMBEDDING and not quantize_ple:
                 target = (
-                    "F8_E4M3"
+                    "MXFP8"
+                    if source_dtype == "F8_E4M3"
+                    and source_quantization is not None
+                    and source_quantization.scheme.startswith("mxfp8_block")
+                    else "F8_E4M3"
                     if source_dtype == "F8_E4M3"
                     and source_quantization is not None
                     and source_quantization.scheme == "fp8_tensor_scale"
@@ -3397,6 +3467,84 @@ def _write_float8_e4m3_axis0_blob(
                 )
             raw = chunk.contiguous().view(torch.uint8).numpy()
             target.write(np.ascontiguousarray(raw, dtype=np.uint8).tobytes())
+    return blob_path.stat().st_size
+
+
+_MXFP8_SOURCE_BLOCKS = {
+    "mxfp8_block128": (128, 128),
+    "mxfp8_block32": (32, 32),
+    "mxfp8_block1x32": (1, 32),
+}
+
+
+def _mxfp8_scale_shape(
+    shape: tuple[int, ...],
+    source_quantization: str | None,
+) -> tuple[int, int]:
+    if len(shape) != 2:
+        raise ValueError(f"native MXFP8 preservation requires a matrix, got {shape}")
+    block = _MXFP8_SOURCE_BLOCKS.get(source_quantization or "")
+    if block is None:
+        raise ValueError(
+            "native MXFP8 preservation requires an explicit supported source geometry, "
+            f"got {source_quantization!r}"
+        )
+    rows, columns = (int(value) for value in shape)
+    row_block, column_block = block
+    if rows <= 0 or columns <= 0 or columns % column_block:
+        raise ValueError(
+            f"invalid {source_quantization} logical shape for native MXFP8: {shape}"
+        )
+    return (
+        (rows + row_block - 1) // row_block,
+        (columns + column_block - 1) // column_block,
+    )
+
+
+def _copy_raw_safetensor_payload(source: _RawSafeTensorSlice, output) -> None:
+    remaining = source.data_nbytes
+    with source.path.open("rb", buffering=0) as handle:
+        handle.seek(source.data_offset)
+        while remaining:
+            chunk = handle.read(min(16 * 1024 * 1024, remaining))
+            if not chunk:
+                raise EOFError(f"short safetensors payload read for {source.name}")
+            output.write(chunk)
+            remaining -= len(chunk)
+
+
+def _write_native_mxfp8_blob(
+    weight: _RawSafeTensorSlice,
+    scale: _RawSafeTensorSlice,
+    shape: tuple[int, ...],
+    source_quantization: str | None,
+    blob_path: Path,
+) -> int:
+    """Copy a native E4M3+E8M0 matrix without decoding or staging it."""
+
+    rows, columns = (int(value) for value in shape)
+    scale_shape = _mxfp8_scale_shape(shape, source_quantization)
+    if weight.dtype_name != "F8_E4M3" or tuple(weight.shape) != (rows, columns):
+        raise ValueError(
+            "native MXFP8 value storage must be an E4M3 matrix matching "
+            f"{shape}: {weight.name} {weight.dtype_name} {weight.shape}"
+        )
+    if scale.dtype_name != "F8_E8M0" or tuple(scale.shape) != scale_shape:
+        raise ValueError(
+            "native MXFP8 scale storage must be an E8M0 matrix matching "
+            f"{scale_shape}: {scale.name} {scale.dtype_name} {scale.shape}"
+        )
+    with blob_path.open("wb") as output:
+        output.write(
+            mx_header_bytes(
+                "MXFP8",
+                (rows, columns),
+                (rows, columns),
+                scale_shape,
+            )
+        )
+        _copy_raw_safetensor_payload(weight, output)
+        _copy_raw_safetensor_payload(scale, output)
     return blob_path.stat().st_size
 
 
@@ -5048,6 +5196,8 @@ def _estimate_bytes(
                 nvq3_jsc_banks=nvq3_jsc_banks,
                 nvq_jsc_banks=nvq_jsc_banks,
             )
+        elif item.target_dtype == "MXFP8":
+            nint_total += _plan_blob_nbytes(item, spec, artifact_root)
         else:
             item_size = {
                 "BF16": 2,
@@ -5123,6 +5273,20 @@ def _plan_blob_nbytes(
             jsc_banks=jsc_banks,
             expert_artifact_root=artifact_root,
         )
+    if item.target_dtype == "MXFP8":
+        rows, columns = (int(value) for value in item.shape)
+        scale_rows, scale_columns = _mxfp8_scale_shape(
+            item.shape,
+            item.source_quantization,
+        )
+        return len(
+            mx_header_bytes(
+                "MXFP8",
+                (rows, columns),
+                (rows, columns),
+                (scale_rows, scale_columns),
+            )
+        ) + rows * columns + scale_rows * scale_columns
     item_size = {
         "BF16": 2,
         "F8_E4M3": 1,
@@ -5644,7 +5808,12 @@ def convert(args: argparse.Namespace) -> None:
                 else:
                     source_name = item.source_name or item.name
                     preserve_raw_e4m3 = item.target_dtype == "F8_E4M3"
+                    preserve_native_mxfp8 = item.target_dtype == "MXFP8"
                     if mfq_checkpoint is not None:
+                        if preserve_native_mxfp8:
+                            raise ValueError(
+                                "native MXFP8 pass-through from an MFQ input is not yet supported"
+                            )
                         raw_source = mfq_checkpoint.tensor_source(source_name)
                         if item.source_quantization is not None and not preserve_raw_e4m3:
                             if item.source_scale_name is None or item.source_scale_shard is None:
@@ -5657,11 +5826,22 @@ def convert(args: argparse.Namespace) -> None:
                                 item.source_quantization,
                             )
                     else:
-                        raw_source = (
-                            _RawSafeTensorSlice(root / item.shard, source_name)
-                            if preserve_raw_e4m3
-                            else _raw_source_for_plan(root, item)
-                        )
+                        if preserve_native_mxfp8:
+                            if item.source_scale_name is None or item.source_scale_shard is None:
+                                raise ValueError(
+                                    f"native MXFP8 source lacks scale metadata: {item.name}"
+                                )
+                            raw_source = _RawSafeTensorSlice(root / item.shard, source_name)
+                            native_mxfp8_scale = _RawSafeTensorSlice(
+                                root / item.source_scale_shard,
+                                item.source_scale_name,
+                            )
+                        else:
+                            raw_source = (
+                                _RawSafeTensorSlice(root / item.shard, source_name)
+                                if preserve_raw_e4m3
+                                else _raw_source_for_plan(root, item)
+                            )
                     if item.target_dtype == "NINTM":
                         if item.expert_shape is None or item.expert_precisions is None:
                             raise ValueError(f"NINTM plan lacks expert metadata: {item.name}")
@@ -5699,6 +5879,19 @@ def convert(args: argparse.Namespace) -> None:
                             item.shape,
                             blob_path,
                             row_chunk,
+                        )
+                        source = raw_source
+                    elif preserve_native_mxfp8:
+                        if item.row_start is not None or item.row_end is not None:
+                            raise ValueError(
+                                f"native MXFP8 preservation does not support split rows: {item.name}"
+                            )
+                        nbytes = _write_native_mxfp8_blob(
+                            raw_source,
+                            native_mxfp8_scale,
+                            item.shape,
+                            item.source_quantization,
+                            blob_path,
                         )
                         source = raw_source
                     elif item.target_dtype == "NINT8-0":
@@ -5974,6 +6167,19 @@ def convert(args: argparse.Namespace) -> None:
         ):
             position_asset = minicpmo45_resampler_pos_embed_asset()
             assets_by_name[position_asset.name] = position_asset
+        if (
+            str(config.get("model_type", "")).lower() == "deepseek_v41"
+            and DEEPSEEK_V41_ENGRAM_ASSET not in assets_by_name
+        ):
+            tokenizer_path = root / "tokenizer.json"
+            if not tokenizer_path.is_file():
+                raise FileNotFoundError(
+                    "DeepSeek-V4.1 conversion requires tokenizer.json to build its Engram hash asset"
+                )
+            if not isinstance(config_text, dict):
+                raise ValueError("DeepSeek-V4.1 text_config must be an object")
+            engram_asset = deepseek_v41_engram_asset(tokenizer_path, config_text)
+            assets_by_name[engram_asset.name] = engram_asset
         if mfq_checkpoint is None and (
             (root / "tokenizer.json").is_file() or (root / "tokenizer_config.json").is_file()
         ):

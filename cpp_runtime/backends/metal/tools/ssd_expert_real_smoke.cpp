@@ -1,7 +1,9 @@
 #include "hf_safetensors_store.h"
+#include "mlx_hf_tensor.h"
 #include "mlx_ssd_expert_arena.h"
 #include "mlx_ssd_expert_cache.h"
 #include "mlx_moe_ops.h"
+#include "mfq_container.h"
 
 #include <algorithm>
 #include <chrono>
@@ -75,8 +77,24 @@ int main(int argc, char** argv) {
         if (layer < 0 || layer >= 43 || expert < 0 || expert >= 256) {
             throw std::runtime_error("layer/expert is out of range");
         }
-        mfq::metal::DeepseekV4NativeExpertStore store(argv[1], 43, 256);
-        mfq::metal::MlxDeepseekV4SsdExpertArena arena(1);
+        mfq::metal::MlxHfTensorStore hf_model(argv[1]);
+        mfq::metal::MfqContainer model(argv[1]);
+        std::vector<std::string> layer_prefixes;
+        layer_prefixes.reserve(43);
+        for (std::size_t index = 0; index < 43; ++index) {
+            layer_prefixes.push_back(
+                "model.block." + std::to_string(index));
+        }
+        mfq::metal::MlxNativeMxfp4ExpertStore store(
+            hf_model.shared_checkpoint(),
+            layer_prefixes,
+            256,
+            4096,
+            2048,
+            [&hf_model](std::string_view canonical) {
+                return hf_model.stored_name(canonical);
+            });
+        mfq::metal::MlxMxfp4SsdExpertArena arena(1, 4096, 2048);
         store.checkpoint().drop_file_cache();
         const auto begin = std::chrono::steady_clock::now();
         const auto stats = store.load_scatter(
@@ -129,8 +147,12 @@ int main(int argc, char** argv) {
             throw std::runtime_error("official MXFP4 routed validation failed");
         }
 
-        mfq::metal::MlxDeepseekV4SsdExpertCache cache(
-            argv[1],
+        mfq::metal::MlxMoeSsdExpertCache cache(
+            model,
+            layer_prefixes,
+            4096,
+            2048,
+            256,
             8 * store.slot_bytes(),
             6);
         std::vector<std::int32_t> cache_active;
@@ -170,8 +192,12 @@ int main(int argc, char** argv) {
             throw std::runtime_error("SSD expert cache validation failed");
         }
 
-        mfq::metal::MlxDeepseekV4SsdExpertCache prefill_cache(
-            argv[1],
+        mfq::metal::MlxMoeSsdExpertCache prefill_cache(
+            model,
+            layer_prefixes,
+            4096,
+            2048,
+            256,
             (512 + 8) * store.slot_bytes(),
             8,
             true);

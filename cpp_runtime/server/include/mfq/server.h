@@ -77,6 +77,7 @@ struct MfqPromptCachePlan {
 enum class MfqMultimodalProcessor {
     minicpmo,
     deepseek_v4,
+    deepseek_v41,
     grid_vision,
 };
 

@@ -84,7 +84,7 @@ void test_config_contract() {
     require(config.ple_layer_ids == std::vector<std::int64_t>{2},
         "PLE schedule mismatch");
     require(config.eos_token_id == 7, "EOS token mismatch");
-    require(config.mtp_num_hidden_layers == 1, "MTP depth mismatch");
+    require(config.mtp_num_hidden_layers == 1, "MTP layer count mismatch");
     require(!config.output_gate_silu, "sigmoid output gate mismatch");
 }
 

@@ -80,7 +80,7 @@ _ARCHITECTURE_REGISTRY: dict[str, dict[str, Any]] = {
             "top_p": 0.95,
             "presence_penalty": 0.0,
             "enable_mtp": False,
-            "mtp_max_draft_tokens": 4,
+            "mtp_max_draft_tokens": 5,
         },
         source="architecture-registry:deepseek_v41",
     ),
@@ -90,7 +90,7 @@ _ARCHITECTURE_REGISTRY: dict[str, dict[str, Any]] = {
             "top_p": 0.8,
             "repetition_penalty": 1.05,
             "presence_penalty": 0.0,
-            "mtp_max_draft_tokens": 4,
+            "mtp_max_draft_tokens": 5,
         },
         source="architecture-registry:deepseek_v4",
     ),
@@ -235,9 +235,19 @@ def _validate_section(
         raise ValueError(f"runtime profile {name}.top_p must be in [0, 1]")
     if "top_k" in result and result["top_k"] < 0:
         raise ValueError(f"runtime profile {name}.top_k must be non-negative")
-    for key in ("max_tokens", "text_repetition_window_size", "max_new_speak_tokens_per_chunk", "token2wav_steps"):
+    for key in (
+        "max_tokens",
+        "mtp_max_draft_tokens",
+        "text_repetition_window_size",
+        "max_new_speak_tokens_per_chunk",
+        "token2wav_steps",
+    ):
         if key in result and result[key] <= 0:
             raise ValueError(f"runtime profile {name}.{key} must be positive")
+    if "mtp_max_draft_tokens" in result and result["mtp_max_draft_tokens"] > 5:
+        raise ValueError(
+            "runtime profile chat.mtp_max_draft_tokens must be in [1, 5]"
+        )
     for key in ("repetition_penalty", "text_repetition_penalty", "length_penalty"):
         if key in result and result[key] <= 0.0:
             raise ValueError(f"runtime profile {name}.{key} must be positive")

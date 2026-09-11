@@ -27,7 +27,7 @@ def test_architecture_registry_is_partial() -> None:
 
     deepseek = architecture_profile("deepseek_v4_vision")
     assert deepseek is not None
-    assert deepseek["chat"]["mtp_max_draft_tokens"] == 4
+    assert deepseek["chat"]["mtp_max_draft_tokens"] == 5
 
     deepseek_v41 = architecture_profile("DeepseekV41ForCausalLM")
     assert deepseek_v41 is not None
@@ -95,6 +95,8 @@ def test_invalid_profile_fails_closed() -> None:
         validate_runtime_profile({"version": 2, "chat": {"top_p": 0.8}})
     with pytest.raises(ValueError, match="boolean"):
         validate_runtime_profile({"chat": {"enable_thinking": 0}})
+    with pytest.raises(ValueError, match="mtp_max_draft_tokens"):
+        validate_runtime_profile({"chat": {"mtp_max_draft_tokens": 6}})
 
 
 def test_metadata_key_is_versioned() -> None:

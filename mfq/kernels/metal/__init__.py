@@ -83,12 +83,14 @@ from mfq.kernels.metal.moe_ops import (
 )
 from mfq.kernels.metal.mx import (
     MetalMxWeight,
+    mx_backward_input,
     mx_dequantize,
     mx_embedding,
     mx_matmul,
 )
 from mfq.kernels.metal.nint import (
     MetalNintWeight,
+    nint_backward_input,
     nint_dequantize,
     nint_dequantize_matmul,
     nint_embedding,
@@ -104,6 +106,7 @@ from mfq.kernels.metal.nint8_one import (
 )
 from mfq.kernels.metal.nint8_zero import (
     MetalNint8ZeroWeight,
+    nint8_zero_backward_input,
     nint8_zero_dequantize,
     nint8_zero_embedding,
     nint8_zero_gemm,
@@ -146,7 +149,9 @@ from mfq.kernels.metal.tpq import (
 )
 from mfq.kernels.metal.vq import (
     MetalVqWeight,
+    inverse_signed_hadamard,
     signed_hadamard,
+    vq_backward_input,
     vq_dequantize,
     vq_dequantize_matmul,
     vq_embedding,
@@ -225,9 +230,11 @@ __all__ = [
     "kimi_route_experts",
     "kimi_short_conv3",
     "moe_topk",
+    "mx_backward_input",
     "mx_dequantize",
     "mx_embedding",
     "mx_matmul",
+    "nint_backward_input",
     "nint_dequantize",
     "nint_dequantize_matmul",
     "nint_embedding",
@@ -236,6 +243,7 @@ __all__ = [
     "nint_matmul",
     "nint_mmq",
     "nint_swiglu",
+    "nint8_zero_backward_input",
     "nint8_zero_dequantize",
     "nint8_zero_embedding",
     "nint8_zero_gemm",
@@ -244,6 +252,7 @@ __all__ = [
     "nint8_zero_mmq",
     "nint8_zero_packed_matmul",
     "nint8_one_quantize_reconstruct",
+    "inverse_signed_hadamard",
     "prepare_linear_conv_qkv",
     "residual_add",
     "residual_rms_norm",
@@ -270,6 +279,7 @@ __all__ = [
     "situ_mul",
     "situ_split",
     "swiglu_split",
+    "vq_backward_input",
     "vq_dequantize",
     "vq_dequantize_matmul",
     "vq_embedding",

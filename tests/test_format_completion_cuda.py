@@ -21,12 +21,14 @@ from mfq.formats.tpq import (  # noqa: E402
 from mfq.kernels.cuda._ext import ext  # noqa: E402
 from mfq.kernels.cuda.moe import MoeRoutePlan, grouped_matmul, to_gpu  # noqa: E402
 from mfq.kernels.cuda.mx_matmul import (  # noqa: E402
+    mx_backward_input,
     mx_dequantize,
     mx_embedding,
     mx_matmul,
     to_gpu_mx,
 )
 from mfq.kernels.cuda.nint8_zero_matmul import (  # noqa: E402
+    nint8_zero_backward_input,
     nint8_zero_dequantize,
     nint8_zero_matmul,
     to_gpu_nint8_zero,
@@ -170,6 +172,34 @@ def test_mxfp8_matmul_matches_packed_reference(activation_rows: int):
     )
 
 
+@pytest.mark.parametrize("factory", [_mxfp4, _mxfp8])
+def test_mx_packed_backward_and_autograd_match_dequant(factory):
+    tensor, dense = factory()
+    weight = to_gpu_mx(tensor)
+    rows = 3
+    output_gradient = torch.randn(
+        rows, tensor.shape[0], device="cuda", dtype=torch.float16
+    )
+    expected = output_gradient.float() @ torch.as_tensor(dense, device="cuda")
+    torch.testing.assert_close(
+        mx_backward_input(weight, output_gradient).float(),
+        expected,
+        rtol=0.006,
+        atol=0.03,
+    )
+    source = torch.randn(
+        rows,
+        tensor.shape[1],
+        device="cuda",
+        dtype=torch.float16,
+        requires_grad=True,
+    )
+    (mx_matmul(weight, source) * output_gradient).sum().backward()
+    torch.testing.assert_close(
+        source.grad.float(), expected, rtol=0.006, atol=0.03
+    )
+
+
 @pytest.mark.parametrize("activation_rows", [16, 65])
 def test_mxfp8_native_fp32_output_matches_packed_reference(activation_rows: int):
     tensor, dense = _mxfp8()
@@ -221,6 +251,35 @@ def test_nint8_zero_native_matmul_matches_packed_reference(
     else:
         expected = source.float() @ dense.float().T
     torch.testing.assert_close(actual, expected.half().float(), rtol=0.004, atol=0.02)
+
+
+def test_nint8_zero_packed_backward_and_autograd_match_dequant():
+    rng = np.random.default_rng(1608)
+    rows, width = 13, 96
+    tensor = Nint8ZeroTensor(
+        shape=(rows, width),
+        axis=0,
+        scale=rng.uniform(0.001, 0.02, (rows, width // 32)).astype(np.float16),
+        q=rng.integers(-127, 128, (rows, width // 32, 32)).astype(np.int8),
+        neuron_len=width,
+    )
+    weight = to_gpu_nint8_zero(tensor)
+    dense = nint8_zero_dequantize(weight)
+    output_gradient = torch.randn(3, rows, device="cuda", dtype=torch.float16)
+    expected = output_gradient.float() @ dense.float()
+    torch.testing.assert_close(
+        nint8_zero_backward_input(weight, output_gradient).float(),
+        expected,
+        rtol=0.004,
+        atol=0.02,
+    )
+    source = torch.randn(
+        3, width, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    (nint8_zero_matmul(weight, source) * output_gradient).sum().backward()
+    torch.testing.assert_close(
+        source.grad.float(), expected, rtol=0.004, atol=0.02
+    )
 
 
 @pytest.mark.parametrize("activation_rows", [1, 16, 65])

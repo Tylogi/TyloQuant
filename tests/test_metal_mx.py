@@ -16,6 +16,7 @@ from mfq.formats.io import save  # noqa: E402
 from mfq.formats.mx import MxTensor  # noqa: E402
 from mfq.kernels.metal.mx import (  # noqa: E402
     MetalMxWeight,
+    mx_backward_input,
     mx_dequantize,
     mx_embedding,
     mx_matmul,
@@ -106,6 +107,47 @@ def test_mx_dequantize_and_embedding(dtype: str):
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize("dtype", ["MXFP4", "MXFP8"])
+def test_mx_packed_backward_and_custom_vjp(dtype: str):
+    tensor, dense = _fixture(dtype, out=7)
+    packed = MetalMxWeight.from_tensor(tensor)
+    gradient = np.random.default_rng(2001).normal(
+        0.0, 0.1, size=(3, 7)
+    ).astype(np.float32)
+    expected = gradient @ dense
+    np.testing.assert_allclose(
+        _array(mx_backward_input(packed, gradient)),
+        expected,
+        rtol=3e-5,
+        atol=3e-5,
+    )
+
+    source = mx.array(
+        np.random.default_rng(2002).normal(
+            0.0, 0.1, size=(3, tensor.shape[1])
+        ).astype(np.float32)
+    )
+    cotangent = mx.array(gradient)
+    differentiated = mx.grad(
+        lambda value: mx.sum(mx_matmul(packed, value) * cotangent)
+    )(source)
+    np.testing.assert_allclose(
+        _array(differentiated), expected, rtol=3e-5, atol=3e-5
+    )
+
+
+@pytest.mark.parametrize("dtype", ["MXFP4", "MXFP8"])
+@pytest.mark.parametrize("rows", [1, 2, 4, 6, 16])
+def test_mx_fp16_backward_paths(dtype: str, rows: int):
+    tensor, dense = _fixture(dtype, out=67)
+    gradient = np.random.default_rng(2100 + rows).normal(
+        0.0, 0.03, size=(rows, 67)
+    ).astype(np.float16)
+    actual = _array(mx_backward_input(MetalMxWeight.from_tensor(tensor), gradient))
+    expected = gradient.astype(np.float32) @ dense
+    np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
 
 
 def test_mmap_model_constructs_native_mx_layers(tmp_path):

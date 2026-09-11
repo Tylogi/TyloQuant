@@ -29,7 +29,7 @@ def nint8_zero_dequantize(weight: dict[str, object]) -> torch.Tensor:
     return ext().nint8_zero_dequant_cuda(weight["q"], weight["scale"], int(weight["neuron_len"]))
 
 
-def nint8_zero_matmul(
+def _nint8_zero_matmul_forward(
     weight: dict[str, object],
     x: torch.Tensor,
 ) -> torch.Tensor:
@@ -56,6 +56,46 @@ def nint8_zero_matmul(
     return output.reshape(*original[:-1], int(weight["out"]))
 
 
+def nint8_zero_backward_input(
+    weight: dict[str, object],
+    output_gradient: torch.Tensor,
+) -> torch.Tensor:
+    """Compute ``dX = dY @ W`` directly from packed Q8_0 storage."""
+
+    gradient = output_gradient.reshape(-1, output_gradient.shape[-1]).contiguous()
+    return ext().nint8_zero_backward_input_cuda(
+        weight["q"],
+        weight["scale"],
+        gradient,
+        int(weight["neuron_len"]),
+    )
+
+
+class _Nint8ZeroMatmulAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: dict[str, object]) -> torch.Tensor:
+        ctx.weight = weight
+        ctx.input_shape = tuple(x.shape)
+        ctx.input_dtype = x.dtype
+        return _nint8_zero_matmul_forward(weight, x)
+
+    @staticmethod
+    def backward(ctx, output_gradient: torch.Tensor):
+        gradient = nint8_zero_backward_input(ctx.weight, output_gradient)
+        return gradient.reshape(ctx.input_shape).to(ctx.input_dtype), None
+
+
+def nint8_zero_matmul(
+    weight: dict[str, object],
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Apply Q8_0 with a direct packed input-gradient kernel."""
+
+    if not torch.is_grad_enabled() or not x.requires_grad:
+        return _nint8_zero_matmul_forward(weight, x)
+    return _Nint8ZeroMatmulAutograd.apply(x, weight)
+
+
 def nint8_zero_embedding(
     weight: dict[str, object],
     token_ids: torch.Tensor,
@@ -70,6 +110,7 @@ def nint8_zero_embedding(
 
 
 __all__ = [
+    "nint8_zero_backward_input",
     "nint8_zero_dequantize",
     "nint8_zero_embedding",
     "nint8_zero_matmul",

@@ -361,6 +361,10 @@ int main(int argc, char **argv) {
                 });
           }
         }
+        print_trial("MXFP4-SQ3", "backward_input_fp16", trial, input_rows,
+                    sq3.packed_nbytes(), output_nbytes, 2,
+                    multirow_repetitions,
+                    [&] { return sq3.backward_input(multirow_input); });
       }
     }
     return 0;

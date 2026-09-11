@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from mfq.formats.shards import (
     SPLIT_RECORDS_COUNT_KEY,
     SPLIT_TENSORS_COUNT_KEY,
     StreamingBlobShardWriter,
+    copy_sparse_range,
     format_shard_path,
     parse_shard_path,
     parse_size,
@@ -53,6 +55,23 @@ def _blob_record(root: Path, name: str, dtype: str, data: bytes) -> _BlobRecord:
     path = root / f"{len(list(root.iterdir())):02d}.blob"
     path.write_bytes(data)
     return _BlobRecord(name, dtype, len(data), path)
+
+
+def test_sparse_copy_falls_back_when_extent_seek_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "source.bin"
+    target_path = tmp_path / "target.bin"
+    source_path.write_bytes(b"prefix-payload-suffix")
+    monkeypatch.delattr(os, "SEEK_DATA", raising=False)
+    monkeypatch.delattr(os, "SEEK_HOLE", raising=False)
+
+    with source_path.open("rb") as source, target_path.open("w+b") as target:
+        target.write(b"head-")
+        copy_sparse_range(source, target, len(b"payload"), offset=len(b"prefix-"))
+
+    assert target_path.read_bytes() == b"head-payload"
 
 
 def test_shard_name_round_trip(tmp_path: Path) -> None:

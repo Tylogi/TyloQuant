@@ -7,9 +7,10 @@ import hashlib
 import json
 import time
 import types
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -35,6 +36,311 @@ class ImatrixTarget:
             raise ValueError(f"unsupported imatrix target kind: {self.kind}")
 
 
+def _activation_kind(value: Any) -> str | None:
+    if isinstance(value, str):
+        name = value
+    else:
+        name = " ".join(
+            (
+                str(getattr(value, "__name__", "")),
+                type(value).__name__,
+                str(value),
+            )
+        )
+    lowered = name.lower()
+    if "silu" in lowered or "swish" in lowered:
+        return "silu"
+    if "gelu" in lowered:
+        return "gelu"
+    if "relu" in lowered:
+        return "relu"
+    if "sigmoid" in lowered:
+        return "sigmoid"
+    if "tanh" in lowered:
+        return "tanh"
+    return None
+
+
+def _activation_derivative(kind: str, value: torch.Tensor) -> torch.Tensor:
+    value = value.float()
+    if kind == "silu":
+        probability = torch.sigmoid(value)
+        return probability * (1.0 + value * (1.0 - probability))
+    if kind == "gelu":
+        inv_sqrt_two = 2.0**-0.5
+        inv_sqrt_two_pi = (2.0 * torch.pi) ** -0.5
+        return 0.5 * (1.0 + torch.erf(value * inv_sqrt_two)) + (
+            value * torch.exp(-0.5 * value.square()) * inv_sqrt_two_pi
+        )
+    if kind == "relu":
+        return (value > 0).to(value.dtype)
+    if kind == "sigmoid":
+        probability = torch.sigmoid(value)
+        return probability * (1.0 - probability)
+    if kind == "tanh":
+        activated = torch.tanh(value)
+        return 1.0 - activated.square()
+    raise ValueError(f"unsupported AAQ activation derivative: {kind}")
+
+
+def _normalized_aaq(
+    coupled: torch.Tensor,
+    downstream_norm2: torch.Tensor,
+    standard: torch.Tensor,
+    count: int,
+) -> torch.Tensor:
+    if count <= 0:
+        raise RuntimeError("AAQ target received no activations")
+    value = coupled.float() * downstream_norm2.float().reshape(-1, 1)
+    value.div_(float(count))
+    mean = value.mean()
+    if not torch.isfinite(mean) or float(mean) <= 1e-30:
+        return standard.float().reshape(1, -1).expand(value.shape[0], -1).clone()
+    value.mul_(standard.float().mean() / mean)
+    if not torch.isfinite(value).all() or bool((value < 0).any()):
+        raise FloatingPointError("AAQ importance contains invalid values")
+    return value
+
+
+class _AaqBinding:
+    category = "nonlinear"
+
+    def __init__(self, collector: ActivationImatrixCollector, target: ImatrixTarget) -> None:
+        self.collector = collector
+        self.target = target
+        self.handles: list[Any] = []
+        self.cache: dict[str, torch.Tensor] = {}
+
+    def remove(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def entry(self) -> ImportanceEntry | None:
+        raise NotImplementedError
+
+    def _standard(self) -> tuple[torch.Tensor, int]:
+        count = int(self.collector.counts[self.target.name][0].item())
+        if count <= 0:
+            return torch.empty(0, device=self.collector.device), 0
+        standard = self.collector.sums[self.target.name][0].float() / float(count)
+        return standard, count
+
+
+class _DenseFfnAaqBinding(_AaqBinding):
+    category = "ffn_gate"
+
+    def __init__(
+        self,
+        collector: ActivationImatrixCollector,
+        target: ImatrixTarget,
+        gate: nn.Module,
+        up: nn.Module,
+        down: nn.Module,
+        activation_kind: str,
+    ) -> None:
+        super().__init__(collector, target)
+        gate_weight = gate.weight
+        down_weight = down.weight
+        self.rows = int(gate_weight.shape[0])
+        self.width = int(gate_weight.shape[1])
+        self.activation_kind = activation_kind
+        self.coupled = torch.zeros(
+            (self.rows, self.width), device=collector.device, dtype=torch.float32
+        )
+        self.downstream_norm2 = down_weight.detach().float().square().sum(0)
+        self.observations = 0
+        self.handles.extend(
+            (
+                gate.register_forward_pre_hook(self._gate_pre),
+                gate.register_forward_hook(self._gate_post),
+                up.register_forward_hook(self._up_post),
+                down.register_forward_pre_hook(self._down_pre),
+            )
+        )
+
+    def _gate_pre(self, _module, inputs) -> None:
+        self.cache["x"] = self.collector._matrix(inputs[0], self.width, self.target.name)
+
+    def _gate_post(self, _module, _inputs, output) -> None:
+        self.cache["gate"] = self.collector._matrix(output, self.rows, self.target.name)
+
+    def _up_post(self, _module, _inputs, output) -> None:
+        self.cache["up"] = self.collector._matrix(output, self.rows, self.target.name)
+
+    def _down_pre(self, _module, _inputs) -> None:
+        x = self.cache.pop("x")
+        gate = self.cache.pop("gate")
+        up = self.cache.pop("up")
+        if gate.shape != up.shape or gate.shape[0] != x.shape[0]:
+            raise RuntimeError(f"inconsistent AAQ FFN observations for {self.target.name}")
+        sensitivity = up.float() * _activation_derivative(self.activation_kind, gate)
+        self.coupled.addmm_(sensitivity.square().T, x.float().square())
+        self.observations += int(x.shape[0])
+
+    def entry(self) -> ImportanceEntry | None:
+        standard, count = self._standard()
+        if count <= 0:
+            return None
+        if self.cache or self.observations != count:
+            raise RuntimeError(
+                f"invalid AAQ FFN state for {self.target.name}: "
+                f"observations={self.observations}, count={count}, cache={sorted(self.cache)}"
+            )
+        value = _normalized_aaq(self.coupled, self.downstream_norm2, standard, count)
+        return ImportanceEntry(
+            np.ascontiguousarray(value.detach().cpu().numpy(), dtype=np.float32),
+            np.full(self.rows, count, dtype=np.int64),
+        )
+
+
+class _AttentionGateAaqBinding(_AaqBinding):
+    category = "attention_gate"
+
+    def __init__(
+        self,
+        collector: ActivationImatrixCollector,
+        target: ImatrixTarget,
+        query: nn.Module,
+        output: nn.Module,
+        head_dim: int,
+    ) -> None:
+        super().__init__(collector, target)
+        query_weight = query.weight
+        output_weight = output.weight
+        self.rows = int(query_weight.shape[0])
+        self.width = int(query_weight.shape[1])
+        self.gate_rows = self.rows // 2
+        heads = self.rows // (2 * head_dim)
+        self.gate_indices = (
+            torch.arange(heads, device=collector.device, dtype=torch.int64)[:, None]
+            * (2 * head_dim)
+            + head_dim
+            + torch.arange(head_dim, device=collector.device, dtype=torch.int64)[None, :]
+        ).reshape(-1)
+        self.coupled = torch.zeros(
+            (self.gate_rows, self.width), device=collector.device, dtype=torch.float32
+        )
+        self.downstream_norm2 = output_weight.detach().float().square().sum(0)
+        self.observations = 0
+        self.handles.extend(
+            (
+                query.register_forward_pre_hook(self._query_pre),
+                query.register_forward_hook(self._query_post),
+                output.register_forward_pre_hook(self._output_pre),
+            )
+        )
+
+    def _query_pre(self, _module, inputs) -> None:
+        self.cache["x"] = self.collector._matrix(inputs[0], self.width, self.target.name)
+
+    def _query_post(self, _module, _inputs, value) -> None:
+        projected = self.collector._matrix(value, self.rows, self.target.name)
+        self.cache["gate"] = projected.index_select(1, self.gate_indices)
+
+    def _output_pre(self, _module, inputs) -> None:
+        x = self.cache.pop("x")
+        gate = self.cache.pop("gate").float()
+        gated_attention = self.collector._matrix(
+            inputs[0], self.gate_rows, self.target.name
+        ).float()
+        if gate.shape != gated_attention.shape or gate.shape[0] != x.shape[0]:
+            raise RuntimeError(f"inconsistent AAQ attention observations for {self.target.name}")
+        sensitivity = gated_attention * (1.0 - torch.sigmoid(gate))
+        self.coupled.addmm_(sensitivity.square().T, x.float().square())
+        self.observations += int(x.shape[0])
+
+    def entry(self) -> ImportanceEntry | None:
+        standard, count = self._standard()
+        if count <= 0:
+            return None
+        if self.cache or self.observations != count:
+            raise RuntimeError(
+                f"invalid AAQ attention state for {self.target.name}: "
+                f"observations={self.observations}, count={count}, cache={sorted(self.cache)}"
+            )
+        gate = _normalized_aaq(self.coupled, self.downstream_norm2, standard, count)
+        value = standard.reshape(1, -1).expand(self.rows, -1).clone()
+        value.index_copy_(0, self.gate_indices, gate)
+        return ImportanceEntry(
+            np.ascontiguousarray(value.detach().cpu().numpy(), dtype=np.float32),
+            np.full(self.rows, count, dtype=np.int64),
+        )
+
+
+class _GatedNormAaqBinding(_AaqBinding):
+    category = "linear_attention_gate"
+
+    def __init__(
+        self,
+        collector: ActivationImatrixCollector,
+        target: ImatrixTarget,
+        gate: nn.Module,
+        norm: nn.Module,
+        output: nn.Module,
+        activation_kind: str,
+    ) -> None:
+        super().__init__(collector, target)
+        gate_weight = gate.weight
+        norm_weight = norm.weight
+        output_weight = output.weight
+        self.rows = int(gate_weight.shape[0])
+        self.width = int(gate_weight.shape[1])
+        self.head_dim = int(norm_weight.numel())
+        self.epsilon = float(
+            getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6))
+        )
+        self.norm_weight = norm_weight.detach().float().reshape(1, self.head_dim)
+        self.activation_kind = activation_kind
+        self.coupled = torch.zeros(
+            (self.rows, self.width), device=collector.device, dtype=torch.float32
+        )
+        self.downstream_norm2 = output_weight.detach().float().square().sum(0)
+        self.observations = 0
+        self.handles.extend(
+            (
+                gate.register_forward_pre_hook(self._gate_pre),
+                norm.register_forward_pre_hook(self._norm_pre),
+            )
+        )
+
+    def _gate_pre(self, _module, inputs) -> None:
+        self.cache["x"] = self.collector._matrix(inputs[0], self.width, self.target.name)
+
+    def _norm_pre(self, _module, inputs) -> None:
+        if len(inputs) < 2:
+            raise TypeError("AAQ gated norm requires hidden and gate inputs")
+        x = self.cache.pop("x")
+        hidden = inputs[0].detach().reshape(-1, self.head_dim).float()
+        gate = inputs[1].detach().reshape(-1, self.head_dim).float()
+        variance = hidden.square().mean(-1, keepdim=True)
+        normalized = hidden * torch.rsqrt(variance + self.epsilon)
+        normalized.mul_(self.norm_weight)
+        sensitivity = normalized * _activation_derivative(self.activation_kind, gate)
+        sensitivity = self.collector._matrix(
+            sensitivity.reshape(-1, self.rows), self.rows, self.target.name
+        )
+        if sensitivity.shape[0] != x.shape[0]:
+            raise RuntimeError(f"inconsistent AAQ gated-norm observations for {self.target.name}")
+        self.coupled.addmm_(sensitivity.square().T, x.float().square())
+        self.observations += int(x.shape[0])
+
+    def entry(self) -> ImportanceEntry | None:
+        standard, count = self._standard()
+        if count <= 0:
+            return None
+        if self.cache or self.observations != count:
+            raise RuntimeError(
+                f"invalid AAQ gated-norm state for {self.target.name}: "
+                f"observations={self.observations}, count={count}, cache={sorted(self.cache)}"
+            )
+        value = _normalized_aaq(self.coupled, self.downstream_norm2, standard, count)
+        return ImportanceEntry(
+            np.ascontiguousarray(value.detach().cpu().numpy(), dtype=np.float32),
+            np.full(self.rows, count, dtype=np.int64),
+        )
+
+
 class ActivationImatrixCollector:
     """Accumulate E[x^2] with independent counters for routed experts."""
 
@@ -44,12 +350,14 @@ class ActivationImatrixCollector:
         device: torch.device,
         *,
         accumulation_dtype: torch.dtype = torch.float64,
+        nonlinear: bool = False,
     ) -> None:
         if accumulation_dtype not in {torch.float32, torch.float64}:
             raise ValueError("imatrix accumulation dtype must be float32 or float64")
         self.targets = tuple(targets)
         self.device = device
         self.accumulation_dtype = accumulation_dtype
+        self.nonlinear = bool(nonlinear)
         self.sums = {
             target.name: torch.zeros(
                 (target.experts, target.width),
@@ -65,6 +373,10 @@ class ActivationImatrixCollector:
         self.handles: list[Any] = []
         self.restores: list[tuple[nn.Module, Any]] = []
         self.valid_mask: torch.Tensor | None = None
+        self._active_aaq: list[_AaqBinding] = []
+        self._aaq_entries: dict[str, ImportanceEntry] = {}
+        self._aaq_categories: dict[str, str] = {}
+        self._expert_aaq_sums: dict[str, torch.Tensor] = {}
 
     def set_valid_mask(self, value: torch.Tensor | None) -> None:
         self.valid_mask = None if value is None else value.detach().reshape(-1).to(torch.bool)
@@ -162,6 +474,13 @@ class ActivationImatrixCollector:
             ):
                 raise TypeError(f"unsupported routed-expert module: {module_name}")
             original = module.forward
+            activation_kind = _activation_kind(activation) if self.nonlinear else None
+            if activation_kind is not None:
+                self._expert_aaq_sums.setdefault(
+                    gate.name,
+                    torch.zeros_like(self.sums[gate.name], dtype=torch.float32),
+                )
+                self._aaq_categories[gate.name] = "routed_ffn_gate_up"
 
             def expert_forward(
                 _module,
@@ -171,6 +490,7 @@ class ActivationImatrixCollector:
                 *,
                 _gate=gate,
                 _down=down,
+                _activation_kind=activation_kind,
             ) -> torch.Tensor:
                 # Mirror the Transformers eager expert implementation, while
                 # collecting the actual Gate/Up and Down inputs in the same
@@ -195,7 +515,38 @@ class ActivationImatrixCollector:
                     gate_value, up_value = torch.nn.functional.linear(
                         current, _module.gate_up_proj[expert]
                     ).chunk(2, dim=-1)
-                    intermediate = _module.act_fn(gate_value) * up_value
+                    activated = _module.act_fn(gate_value)
+                    intermediate = activated * up_value
+                    if _activation_kind is not None and measured_current.numel():
+                        measured_gate = gate_value if valid is None else gate_value[valid]
+                        measured_up = up_value if valid is None else up_value[valid]
+                        measured_activated = activated if valid is None else activated[valid]
+                        measured_weight = top_k_weights[token_idx, top_k_pos]
+                        if valid is not None:
+                            measured_weight = measured_weight[valid]
+                        derivative = _activation_derivative(
+                            _activation_kind, measured_gate
+                        )
+                        downstream = (
+                            _module.down_proj[expert]
+                            .detach()
+                            .float()
+                            .square()
+                            .sum(0)
+                        )
+                        energy = (
+                            (
+                                (measured_up.float() * derivative).square()
+                                + measured_activated.float().square()
+                            )
+                            * downstream
+                        ).sum(-1)
+                        energy.mul_(measured_weight.detach().float().square())
+                        weighted = measured_current.detach().float().square()
+                        weighted.mul_(energy.reshape(-1, 1))
+                        self._expert_aaq_sums[_gate.name][expert].add_(
+                            weighted.sum(0)
+                        )
                     measured_intermediate = intermediate if valid is None else intermediate[valid]
                     if measured_intermediate.numel():
                         self.add_expert(_down, measured_intermediate, expert)
@@ -209,6 +560,115 @@ class ActivationImatrixCollector:
             self.restores.append((module, original))
             module.forward = types.MethodType(expert_forward, module)
 
+        if self.nonlinear:
+            self._install_nonlinear_bindings(modules, targets)
+
+    @staticmethod
+    def _child_name(parent: str, child: str) -> str:
+        return f"{parent}.{child}" if parent else child
+
+    def _install_nonlinear_bindings(
+        self,
+        modules: Mapping[str, nn.Module],
+        targets: Sequence[ImatrixTarget],
+    ) -> None:
+        linear_targets = {
+            target.module_name: target for target in targets if target.kind == "linear"
+        }
+        bound = {binding.target.name for binding in self._active_aaq}
+        for parent_name, parent in modules.items():
+            gate = getattr(parent, "gate_proj", None)
+            up = getattr(parent, "up_proj", None)
+            down = getattr(parent, "down_proj", None)
+            activation = getattr(parent, "act_fn", None)
+            target = linear_targets.get(self._child_name(parent_name, "gate_proj"))
+            activation_kind = _activation_kind(activation)
+            if (
+                target is not None
+                and target.name not in bound
+                and isinstance(gate, nn.Module)
+                and isinstance(up, nn.Module)
+                and isinstance(down, nn.Module)
+                and activation_kind is not None
+            ):
+                gate_weight = getattr(gate, "weight", None)
+                up_weight = getattr(up, "weight", None)
+                down_weight = getattr(down, "weight", None)
+                if (
+                    isinstance(gate_weight, torch.Tensor)
+                    and isinstance(up_weight, torch.Tensor)
+                    and isinstance(down_weight, torch.Tensor)
+                    and gate_weight.ndim == up_weight.ndim == down_weight.ndim == 2
+                    and gate_weight.shape == up_weight.shape
+                    and int(down_weight.shape[1]) == int(gate_weight.shape[0])
+                ):
+                    self._active_aaq.append(
+                        _DenseFfnAaqBinding(
+                            self, target, gate, up, down, activation_kind
+                        )
+                    )
+                    bound.add(target.name)
+
+            query = getattr(parent, "q_proj", None)
+            output = getattr(parent, "o_proj", None)
+            target = linear_targets.get(self._child_name(parent_name, "q_proj"))
+            head_dim = int(getattr(parent, "head_dim", 0))
+            if (
+                target is not None
+                and target.name not in bound
+                and isinstance(query, nn.Module)
+                and isinstance(output, nn.Module)
+                and head_dim > 0
+            ):
+                query_weight = getattr(query, "weight", None)
+                output_weight = getattr(output, "weight", None)
+                if (
+                    isinstance(query_weight, torch.Tensor)
+                    and isinstance(output_weight, torch.Tensor)
+                    and query_weight.ndim == output_weight.ndim == 2
+                    and int(query_weight.shape[0]) == 2 * int(output_weight.shape[1])
+                    and int(query_weight.shape[0]) % (2 * head_dim) == 0
+                ):
+                    self._active_aaq.append(
+                        _AttentionGateAaqBinding(
+                            self, target, query, output, head_dim
+                        )
+                    )
+                    bound.add(target.name)
+
+            z = getattr(parent, "in_proj_z", None)
+            norm = getattr(parent, "norm", None)
+            output = getattr(parent, "out_proj", None)
+            target = linear_targets.get(self._child_name(parent_name, "in_proj_z"))
+            activation = getattr(parent, "act", getattr(parent, "activation", None))
+            activation_kind = _activation_kind(activation)
+            if (
+                target is not None
+                and target.name not in bound
+                and isinstance(z, nn.Module)
+                and isinstance(norm, nn.Module)
+                and isinstance(output, nn.Module)
+                and activation_kind is not None
+            ):
+                z_weight = getattr(z, "weight", None)
+                norm_weight = getattr(norm, "weight", None)
+                output_weight = getattr(output, "weight", None)
+                if (
+                    isinstance(z_weight, torch.Tensor)
+                    and isinstance(norm_weight, torch.Tensor)
+                    and isinstance(output_weight, torch.Tensor)
+                    and z_weight.ndim == output_weight.ndim == 2
+                    and int(z_weight.shape[0]) == int(output_weight.shape[1])
+                    and int(norm_weight.numel()) > 0
+                    and int(z_weight.shape[0]) % int(norm_weight.numel()) == 0
+                ):
+                    self._active_aaq.append(
+                        _GatedNormAaqBinding(
+                            self, target, z, norm, output, activation_kind
+                        )
+                    )
+                    bound.add(target.name)
+
     def close(self) -> None:
         for handle in self.handles:
             handle.remove()
@@ -216,6 +676,14 @@ class ActivationImatrixCollector:
         for module, original in reversed(self.restores):
             module.forward = original
         self.restores.clear()
+        bindings, self._active_aaq = self._active_aaq, []
+        for binding in bindings:
+            binding.remove()
+        for binding in bindings:
+            entry = binding.entry()
+            if entry is not None:
+                self._aaq_entries[binding.target.name] = entry
+                self._aaq_categories[binding.target.name] = binding.category
 
     def entries(self) -> dict[str, ImportanceEntry]:
         result: dict[str, ImportanceEntry] = {}
@@ -228,7 +696,25 @@ class ActivationImatrixCollector:
             if not positive.any():
                 raise RuntimeError(f"imatrix target received no activations: {target.name}")
             result[target.name] = ImportanceEntry(np.ascontiguousarray(values), counts)
+        for name, sums in self._expert_aaq_sums.items():
+            ordinary = result[name]
+            values = ordinary.values.copy()
+            for expert, count in enumerate(ordinary.counts):
+                if count <= 0:
+                    continue
+                nonlinear = sums[expert].detach().cpu().numpy().astype(np.float64)
+                nonlinear /= float(count)
+                mean = float(nonlinear.mean())
+                if np.isfinite(mean) and mean > 1e-30:
+                    nonlinear *= float(ordinary.values[expert].mean()) / mean
+                    values[expert] = nonlinear.astype(np.float32)
+            result[name] = ImportanceEntry(np.ascontiguousarray(values), ordinary.counts)
+        result.update(self._aaq_entries)
         return result
+
+    @property
+    def aaq_categories(self) -> dict[str, str]:
+        return dict(self._aaq_categories)
 
 
 def _sha256(path: Path) -> str:
@@ -280,45 +766,71 @@ def _backend(model: Path, device: torch.device, attention: str):
     raise ValueError(f"generic imatrix does not yet support model type {model_type!r}")
 
 
-def _targets(backend: Any, model_type: str) -> tuple[dict[int, tuple[ImatrixTarget, ...]], tuple[ImatrixTarget, ...]]:
+def _targets(
+    backend: Any,
+    _model_type: str,
+) -> tuple[dict[int, tuple[ImatrixTarget, ...]], tuple[ImatrixTarget, ...]]:
     by_layer: dict[int, list[ImatrixTarget]] = {}
     index = backend.index
     for layer in range(backend.num_layers):
         prefix = f"model.language_model.layers.{layer}."
         values: list[ImatrixTarget] = []
-        for name in sorted(index.weight_map):
-            if not name.startswith(prefix):
-                continue
+        layer_names = tuple(
+            name for name in sorted(index.weight_map) if name.startswith(prefix)
+        )
+        for name in layer_names:
             shape = index.shape(name)
             suffix = name[len(prefix) :]
             if len(shape) == 2 and suffix.endswith(".weight"):
                 module_name = suffix.removesuffix(".weight")
                 values.append(ImatrixTarget(name, module_name, int(shape[1])))
-        if model_type in {"gemma4_text", "qwen3_5_moe"}:
-            expert_module = "experts" if model_type == "gemma4_text" else "mlp.experts"
-            gate_name = prefix + expert_module + ".gate_up_proj"
-            down_name = prefix + expert_module + ".down_proj"
-            if gate_name in index.weight_map and down_name in index.weight_map:
-                gate_shape = index.shape(gate_name)
-                down_shape = index.shape(down_name)
-                values.extend(
-                    (
-                        ImatrixTarget(
-                            gate_name,
-                            expert_module,
-                            int(gate_shape[2]),
-                            int(gate_shape[0]),
-                            "expert_gate_up",
-                        ),
-                        ImatrixTarget(
-                            down_name,
-                            expert_module,
-                            int(down_shape[2]),
-                            int(down_shape[0]),
-                            "expert_down",
-                        ),
-                    )
+        # Discover fused routed experts from tensor rank and module structure,
+        # rather than binding the generic collector to architecture names.
+        for gate_name in layer_names:
+            gate_shape = index.shape(gate_name)
+            gate_suffix = gate_name[len(prefix) :].removesuffix(".weight")
+            if len(gate_shape) != 3 or not gate_suffix.endswith(".gate_up_proj"):
+                continue
+            expert_module = gate_suffix.removesuffix(".gate_up_proj")
+            down_candidates = (
+                prefix + expert_module + ".down_proj",
+                prefix + expert_module + ".down_proj.weight",
+            )
+            down_name = next(
+                (candidate for candidate in down_candidates if candidate in index.weight_map),
+                None,
+            )
+            if down_name is None:
+                continue
+            down_shape = index.shape(down_name)
+            if (
+                len(down_shape) != 3
+                or int(gate_shape[0]) != int(down_shape[0])
+                or int(gate_shape[1]) != 2 * int(down_shape[2])
+                or int(gate_shape[2]) != int(down_shape[1])
+            ):
+                raise ValueError(
+                    f"incompatible routed-expert tensors: {gate_name} {gate_shape}, "
+                    f"{down_name} {down_shape}"
                 )
+            values.extend(
+                (
+                    ImatrixTarget(
+                        gate_name,
+                        expert_module,
+                        int(gate_shape[2]),
+                        int(gate_shape[0]),
+                        "expert_gate_up",
+                    ),
+                    ImatrixTarget(
+                        down_name,
+                        expert_module,
+                        int(down_shape[2]),
+                        int(down_shape[0]),
+                        "expert_down",
+                    ),
+                )
+            )
         by_layer[layer] = values
     all_targets = tuple(target for layer in range(backend.num_layers) for target in by_layer[layer])
     if not all_targets:
@@ -341,8 +853,9 @@ def collect_imatrix(
     work_dir: str | Path | None = None,
     keep_hidden: bool = False,
     accumulation_dtype: str = "float64",
+    objective: str = "aaq",
 ) -> ImportanceMatrix:
-    """Collect one frozen train-only BF16 activation imatrix layer by layer."""
+    """Collect one frozen train-only BF16 imatrix layer by layer."""
 
     root = Path(model_path).resolve()
     output_path = Path(output).resolve()
@@ -357,6 +870,8 @@ def collect_imatrix(
         raise RuntimeError("Metal imatrix requested but MPS is unavailable")
     if min(window_length, batch_size, train_tokens) <= 0:
         raise ValueError("imatrix window, batch, and train token counts must be positive")
+    if objective not in {"aaq", "linear"}:
+        raise ValueError("imatrix objective must be aaq or linear")
     dtype = {"float32": torch.float32, "float64": torch.float64}.get(accumulation_dtype)
     if dtype is None:
         raise ValueError("accumulation dtype must be float32 or float64")
@@ -391,7 +906,12 @@ def collect_imatrix(
         raise FileExistsError(f"imatrix hidden state already exists: {hidden_path}")
     backend, model_type = _backend(root, target_device, attention)
     targets_by_layer, targets = _targets(backend, model_type)
-    collector = ActivationImatrixCollector(targets, target_device, accumulation_dtype=dtype)
+    collector = ActivationImatrixCollector(
+        targets,
+        target_device,
+        accumulation_dtype=dtype,
+        nonlinear=objective == "aaq",
+    )
     store = HiddenStateStore(
         hidden_path,
         storage_tokens,
@@ -465,7 +985,13 @@ def collect_imatrix(
                 entries[base + "in_proj_qk.weight"] = entry
                 entries[base + "in_proj_v.weight"] = entry
         metadata = {
-            "objective": "mean_squared_linear_input_activation",
+            "objective": (
+                "activation_aware_nonlinear_energy"
+                if objective == "aaq"
+                else "mean_squared_linear_input_activation"
+            ),
+            "ordinary_objective": "mean_squared_linear_input_activation",
+            "aaq_entries": collector.aaq_categories,
             "split": "train",
             "model": _model_identity(root),
             "model_type": model_type,

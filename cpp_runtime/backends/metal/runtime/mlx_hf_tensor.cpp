@@ -84,21 +84,25 @@ array allocate_and_read(
 
 } // namespace
 
-MlxHfTensorStore::MlxHfTensorStore(std::filesystem::path root)
+MlxHfTensorStore::MlxHfTensorStore(
+    std::filesystem::path root,
+    std::string_view alias_architecture)
     : checkpoint_(std::make_shared<HfSafetensorStore>(std::move(root))) {
-    initialize_aliases();
+    initialize_aliases(alias_architecture);
 }
 
 MlxHfTensorStore::MlxHfTensorStore(
-    std::shared_ptr<HfSafetensorStore> checkpoint)
+    std::shared_ptr<HfSafetensorStore> checkpoint,
+    std::string_view alias_architecture)
     : checkpoint_(std::move(checkpoint)) {
     if (!checkpoint_) {
         throw std::invalid_argument("HF tensor checkpoint cannot be null");
     }
-    initialize_aliases();
+    initialize_aliases(alias_architecture);
 }
 
-void MlxHfTensorStore::initialize_aliases() {
+void MlxHfTensorStore::initialize_aliases(
+        std::string_view alias_architecture) {
     const auto config_path = checkpoint_->root() / "config.json";
     std::ifstream input(config_path, std::ios::binary);
     if (!input) return;
@@ -111,10 +115,10 @@ void MlxHfTensorStore::initialize_aliases() {
         names.push_back(name);
     }
     canonical_to_stored_ = mfq::make_legacy_tensor_aliases(
-        {}, config, names).canonical_to_stored;
+        alias_architecture, config, names).canonical_to_stored;
 }
 
-std::string MlxHfTensorStore::resolve(std::string_view canonical) const {
+std::string MlxHfTensorStore::stored_name(std::string_view canonical) const {
     const auto found = canonical_to_stored_.find(std::string(canonical));
     return found == canonical_to_stored_.end()
         ? std::string(canonical) : found->second;
@@ -130,7 +134,7 @@ MlxHfTensorStore::shared_checkpoint() const noexcept {
 }
 
 array MlxHfTensorStore::load_dense(const std::string& name) const {
-    const auto& record = checkpoint_->tensor(resolve(name));
+    const auto& record = checkpoint_->tensor(stored_name(name));
     return allocate_and_read(
         *checkpoint_,
         record,
@@ -139,9 +143,9 @@ array MlxHfTensorStore::load_dense(const std::string& name) const {
 }
 
 MlxMxWeight MlxHfTensorStore::load_mx(const std::string& name) const {
-    const auto stored_name = resolve(name);
-    const auto& values_record = checkpoint_->tensor(stored_name);
-    const auto& scales_record = checkpoint_->tensor(scale_name(stored_name));
+    const auto resolved_name = stored_name(name);
+    const auto& values_record = checkpoint_->tensor(resolved_name);
+    const auto& scales_record = checkpoint_->tensor(scale_name(resolved_name));
     if (values_record.shard != scales_record.shard ||
         scales_record.dtype != "F8_E8M0" ||
         values_record.shape.size() != 2 || scales_record.shape.size() != 2) {
@@ -180,7 +184,7 @@ MlxMxWeight MlxHfTensorStore::load_mx(const std::string& name) const {
 }
 
 MlxLinear MlxHfTensorStore::load_linear(const std::string& name) const {
-    const auto& record = checkpoint_->tensor(resolve(name));
+    const auto& record = checkpoint_->tensor(stored_name(name));
     if (record.dtype == "I8" || record.dtype == "F8_E4M3" ||
         record.dtype == "F8_E4M3FN") {
         return MlxLinear(load_mx(name));
@@ -189,7 +193,7 @@ MlxLinear MlxHfTensorStore::load_linear(const std::string& name) const {
 }
 
 MlxEmbedding MlxHfTensorStore::load_embedding(const std::string& name) const {
-    const auto& record = checkpoint_->tensor(resolve(name));
+    const auto& record = checkpoint_->tensor(stored_name(name));
     if (record.dtype == "I8" || record.dtype == "F8_E4M3" ||
         record.dtype == "F8_E4M3FN") {
         return MlxEmbedding(load_mx(name));

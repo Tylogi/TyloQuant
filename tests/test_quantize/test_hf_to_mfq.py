@@ -38,6 +38,7 @@ from mfq.tools.quantize_hf_to_mfq import (
     _minicpmo45_quantizable_matrix,
     _Mxfp4TensorSlice,
     _normalize_hf_expert_storage,
+    _plan_blob_nbytes,
     _RawSafeTensorSlice,
     _ScaledFp8TensorSlice,
     _SeparateExpertRowSource,
@@ -46,6 +47,7 @@ from mfq.tools.quantize_hf_to_mfq import (
     _transform_glm_kv_b,
     _validate_runtime_fused_pairs,
     _write_dense_axis0_blob,
+    _write_native_mxfp8_blob,
     convert,
 )
 from mfq.tools.quantize_hf_to_mfq import (
@@ -312,6 +314,29 @@ def test_standard_preset_quantizes_vision_and_predictor_only_with_opt_in() -> No
     assert by_name["mtp.fc.weight"].target_dtype == "BF16"
 
 
+def test_standard_preset_quantizes_stage_predictor_expert_banks_with_opt_in() -> None:
+    mapped = hf_to_mfq._apply_standard_preset(
+        [
+            TensorPlan(
+                name="predictor.stage.0.mlp.experts.gate.weight",
+                shard="model.safetensors",
+                shape=(16, 2048, 4096),
+                source_dtype="MXFP4",
+                target_dtype="NINTM",
+                expert_shape=(16, 2048, 4096),
+                expert_precisions=(ExpertPrecision("MXFP4"),) * 16,
+            )
+        ],
+        "S4-M",
+        {"num_hidden_layers": 43},
+        quantize_mtp=True,
+    )
+
+    assert mapped[0].target_dtype == "NINTM"
+    assert mapped[0].expert_shape == (16, 2048, 4096)
+    assert {value.family for value in mapped[0].expert_precisions or ()} == {"NINT4"}
+
+
 def test_normalize_hf_expert_storage_preserves_mixed_nintm_plan() -> None:
     precisions = (
         ExpertPrecision("NINT2", nint_spec=NintSpec(2, 16, 5)),
@@ -433,7 +458,9 @@ def test_scaled_fp8_tensor_slice_applies_modelopt_block_multipliers(tmp_path):
         torch.as_tensor(rows // 128)[:, None],
         (torch.arange(260) // 128)[None, :],
     ]
-    torch.testing.assert_close(actual, weight[rows].float() * expected_scale)
+    # CPU indexing is not implemented for float8 on every supported PyTorch
+    # build.  Convert before indexing so the reference remains portable.
+    torch.testing.assert_close(actual, weight.float()[rows] * expected_scale)
 
 
 def test_canonical_source_contract_resolves_and_decodes_mxfp8_e8m0(tmp_path):
@@ -463,6 +490,103 @@ def test_canonical_source_contract_resolves_and_decodes_mxfp8_e8m0(tmp_path):
         encodings[weight_name].scheme,
     )
     torch.testing.assert_close(source.read_rows(0, 2), torch.full((2, 128), 2.0))
+
+
+@pytest.mark.parametrize(
+    "weight_name,shape,scale_shape,expected_scheme",
+    [
+        ("layers.0.attn.wq_a.weight", (64, 96), (2, 3), "mxfp8_block32"),
+        (
+            "layers.0.engram.embed.weight",
+            (4, 64),
+            (4, 2),
+            "mxfp8_block1x32",
+        ),
+    ],
+)
+def test_deepseek_v41_decodes_native_dense_and_engram_mxfp8_blocks(
+    tmp_path,
+    weight_name,
+    shape,
+    scale_shape,
+    expected_scheme,
+):
+    path = tmp_path / "model.safetensors"
+    scale_name = weight_name.removesuffix(".weight") + ".scale"
+    encoded = np.full(shape, 0x38, dtype=np.uint8)
+    scales = np.full(scale_shape, 127, dtype=np.uint8)
+    _write_raw_safetensor(
+        path,
+        {
+            weight_name: ("F8_E4M3", encoded.shape, encoded.tobytes()),
+            scale_name: ("F8_E8M0", scales.shape, scales.tobytes()),
+        },
+    )
+    inventory = hf_to_mfq._hf_source_inventory(tmp_path)
+    config = {
+        "model_type": "deepseek_v41",
+        "quantization_config": {"weight_block_size": [32, 32]},
+        "text_config": {"model_type": "deepseek_v41_text", "num_hidden_layers": 1},
+    }
+
+    encodings, auxiliaries = _source_quantizations(inventory, config)
+
+    assert encodings[weight_name].scheme == expected_scheme
+    assert auxiliaries == {scale_name}
+    source = _ScaledFp8TensorSlice(
+        _RawSafeTensorSlice(path, weight_name),
+        _RawSafeTensorSlice(path, scale_name),
+        expected_scheme,
+    )
+    torch.testing.assert_close(source.read_rows(0, 2), torch.ones((2, shape[1])))
+
+
+def test_deepseek_v41_engram_mxfp8_is_preserved_source_exact(tmp_path):
+    weight_name = "layers.1.engram.embed.weight"
+    scale_name = "layers.1.engram.embed.scale"
+    shape = (4, 64)
+    scale_shape = (4, 2)
+    encoded = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape) % 0x7F
+    scales = np.arange(np.prod(scale_shape), dtype=np.uint8).reshape(scale_shape) + 123
+    path = tmp_path / "model.safetensors"
+    _write_raw_safetensor(
+        path,
+        {
+            weight_name: ("F8_E4M3", shape, encoded.tobytes()),
+            scale_name: ("F8_E8M0", scale_shape, scales.tobytes()),
+        },
+    )
+    item = TensorPlan(
+        name="model.block.1.associative_memory.embedding.weight",
+        shard=path.name,
+        shape=shape,
+        source_dtype="F8_E4M3",
+        target_dtype="MXFP8",
+        source_name=weight_name,
+        source_quantization="mxfp8_block1x32",
+        source_scale_name=scale_name,
+        source_scale_shard=path.name,
+    )
+    blob = tmp_path / "engram.mxfp8"
+    nbytes = _write_native_mxfp8_blob(
+        _RawSafeTensorSlice(path, weight_name),
+        _RawSafeTensorSlice(path, scale_name),
+        shape,
+        item.source_quantization,
+        blob,
+    )
+
+    assert nbytes == _plan_blob_nbytes(item, NintSpec())
+    restored = unpack_mx("MXFP8", blob.read_bytes())
+    np.testing.assert_array_equal(restored.values, encoded)
+    np.testing.assert_array_equal(restored.scales, scales)
+
+    mapped = hf_to_mfq._apply_standard_preset(
+        [item],
+        "S4-M",
+        {"num_hidden_layers": 4},
+    )
+    assert mapped[0].target_dtype == "MXFP8"
 
 
 def test_canonical_source_contract_decodes_and_exactly_copies_mxfp4(tmp_path):

@@ -231,6 +231,18 @@ def nint_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
     bits = int(g.get("bits", 4))
     packed = q_packed is not None
     if packed and bits != 4 and g.get("sub_scale") is not None:
+        if bits in {1, 7}:
+            weight = ext().nint_dequant_full_packed_compact_bits_cuda(
+                q_packed,
+                g["sub_scale"],
+                g["sub_min"],
+                g["neuron_scale"],
+                g["neuron_min"],
+                int(g["neuron_len"]),
+                int(g["gs"]),
+                bits,
+            )
+            return x @ weight.T
         if bits == 8 and M <= 8:
             qx, xscale, xsum = _workspace(g, x)
             return ext().nint_gemv_packed_u8_ws_cuda(
@@ -431,6 +443,50 @@ def nint_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
         return x @ wq.T - xs @ g["m_eff_h"].T
     from mfq.kernels.torch_backend import matmul as _dq_cublas
     return _dq_cublas(g, x)
+
+
+_nint_matmul_forward = nint_matmul
+
+
+def nint_backward_input(g: dict, output_gradient: torch.Tensor) -> torch.Tensor:
+    """Compute ``dX = dY @ W`` directly from packed NINT storage."""
+
+    gradient = output_gradient.reshape(-1, output_gradient.shape[-1]).contiguous()
+    return ext().nint_backward_input_cuda(
+        g["q_packed"],
+        g["sub_scale"],
+        g["sub_min"],
+        g["neuron_scale"],
+        g["neuron_min"],
+        gradient,
+        int(g["neuron_len"]),
+        int(g["gs"]),
+        int(g.get("bits", 4)),
+        bool(g.get("_q5_exec_layout", False)),
+    )
+
+
+class _NintMatmulAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, g: dict) -> torch.Tensor:
+        ctx.g = g
+        ctx.input_width = int(x.shape[-1])
+        ctx.input_dtype = x.dtype
+        return _nint_matmul_forward(g, x)
+
+    @staticmethod
+    def backward(ctx, output_gradient: torch.Tensor):
+        gradient = nint_backward_input(ctx.g, output_gradient)
+        gradient = gradient[:, : ctx.input_width].to(ctx.input_dtype)
+        return gradient, None
+
+
+def nint_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
+    """NINT forward with a direct packed input-gradient kernel."""
+
+    if not torch.is_grad_enabled() or not x.requires_grad:
+        return _nint_matmul_forward(g, x)
+    return _NintMatmulAutograd.apply(x, g)
 
 
 def nint_matmul_input_mul(g: dict, x: torch.Tensor, gate: torch.Tensor, activation: str) -> torch.Tensor:

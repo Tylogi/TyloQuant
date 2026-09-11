@@ -19,6 +19,7 @@ enum class MfqCudaBackbone {
     glm5_next,
     qwen4_exp,
     deepseek_v4,
+    deepseek_v41,
     unsupported,
 };
 
@@ -31,6 +32,7 @@ enum class MfqCudaPredictorAdapter {
     none,
     qwen35,
     flash_next,
+    deepseek_v41_dspark,
 };
 
 struct MfqCudaModelPlan {
@@ -69,6 +71,9 @@ inline constexpr MfqCudaBackbone mfq_cuda_backbone(
     if (implementation == "deepseek_v4") {
         return MfqCudaBackbone::deepseek_v4;
     }
+    if (implementation == "deepseek_v41") {
+        return MfqCudaBackbone::deepseek_v41;
+    }
     return MfqCudaBackbone::unsupported;
 }
 
@@ -97,6 +102,11 @@ inline MfqCudaModelPlan mfq_cuda_model_plan(
     if ((graph.backbone=="qwen4_exp" || graph.backbone=="glm5_next") && predictor!=nullptr &&
         predictor->implementation=="next_token_prediction" && predictor->tensor_root=="predictor") {
         result.predictor=MfqCudaPredictorAdapter::flash_next;
+    }
+    if (graph.backbone == "deepseek_v41" && predictor != nullptr &&
+        predictor->implementation == "deepseek_v41_dspark" &&
+        predictor->tensor_root == "predictor") {
+        result.predictor = MfqCudaPredictorAdapter::deepseek_v41_dspark;
     }
     return result;
 }

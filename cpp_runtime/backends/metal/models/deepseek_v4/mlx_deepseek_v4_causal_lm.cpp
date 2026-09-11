@@ -925,7 +925,7 @@ array MlxDeepseekV4Layer::forward(
     std::vector<array>* debug_stages,
     const array* incoming_pre,
     array* outgoing_pre,
-    MlxDeepseekV41SharedAttentionState* shared_attention) const {
+    MlxDeepseekV41HfSharedAttentionState* shared_attention) const {
     auto source = floating_contiguous(hidden);
     const int expected_hidden =
         checked_int(config_.hidden, "hidden size");
@@ -1249,7 +1249,9 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
             "DeepSeek-V4 HF max_context must be positive");
     }
     auto checkpoint = std::make_shared<HfSafetensorStore>(model_root);
-    MlxHfTensorStore model(std::move(checkpoint));
+    MlxHfTensorStore model(
+        std::move(checkpoint),
+        "deepseek_v4_raw_hf");
     std::vector<std::string> expert_prefixes;
     const bool split_dspark_cache =
         config.is_v41() && config.has_dspark();
@@ -1355,7 +1357,7 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
             split_dspark_cache ? dspark_expert_cache : expert_cache,
             dspark_cache_layer_base));
     }
-    std::optional<MlxDeepseekV41Engram> engram;
+    std::optional<MlxDeepseekV41HfEngram> engram;
     if (config.has_engram()) {
         const char* asset = std::getenv(
             "MFQ_DEEPSEEK_V41_ENGRAM_TOKEN_MAP");
@@ -1364,7 +1366,7 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
                 "DeepSeek-V4.1 Engram hash asset is missing; launch through "
                 "the TyloQuant server so its tokenizer asset is generated");
         }
-        engram.emplace(MlxDeepseekV41Engram::load_hf(
+        engram.emplace(MlxDeepseekV41HfEngram::load_hf(
             model,
             config,
             asset,
@@ -1416,7 +1418,7 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
         ssd_expert_cache,
     std::optional<MlxDeepseekV4Vision> vision,
     std::optional<MlxDeepseekV4DSpark> dspark,
-    std::optional<MlxDeepseekV41Engram> engram)
+    std::optional<MlxDeepseekV41HfEngram> engram)
     : config_(std::move(config)),
       embedding_(std::move(embedding)),
       layers_(std::move(layers)),
@@ -1762,7 +1764,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
         });
     auto hidden_values =
         mlx::core::contiguous(streams);
-    std::optional<MlxDeepseekV41EngramBatch> engram_batch;
+    std::optional<MlxDeepseekV41HfEngramBatch> engram_batch;
     if (engram_) {
         const bool prefetch_engram_rows =
             tokens > 1 && !expert_offload_ && !ssd_expert_cache_;
@@ -1772,7 +1774,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
             prefetch_engram_rows));
     }
     std::optional<array> carried_pre;
-    MlxDeepseekV41SharedAttentionState shared_attention;
+    MlxDeepseekV41HfSharedAttentionState shared_attention;
     if (config_.is_v41()) {
         carried_pre.emplace(mlx::core::concatenate(
             std::vector<array>{
@@ -2576,7 +2578,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
         int& target_position;
         int& target_batch;
         std::vector<std::int64_t>& target_tokens;
-        MlxDeepseekV41Engram* target_engram;
+        MlxDeepseekV41HfEngram* target_engram;
         std::optional<std::vector<MlxDeepseekV4LayerState>> saved_states;
         std::vector<std::int64_t> saved_tokens;
         int saved_position = 0;
@@ -2587,7 +2589,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             int& position,
             int& batch,
             std::vector<std::int64_t>& tokens,
-            MlxDeepseekV41Engram* engram)
+            MlxDeepseekV41HfEngram* engram)
             : target_states(states),
               target_position(position),
               target_batch(batch),

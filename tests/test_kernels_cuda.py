@@ -22,6 +22,7 @@ from mfq.kernels.cuda.nint_matmul import (  # noqa: E402
     nint5_q5_exec_matmul,
     nint5_q5_exec_repack,
     nint_argmax,
+    nint_backward_input,
     nint_matmul as fused_matmul,
     nint_matmul_input_mul,
     _workspace,
@@ -453,6 +454,39 @@ def test_nint_packed_bits_matmul_matches_dequant(spec, M):
     w_ref = torch.as_tensor(np.ascontiguousarray(nint_dequant(nt)), device=DEV, dtype=torch.float16)
     ref = x @ w_ref.T
     torch.testing.assert_close(y, ref, atol=2e-3, rtol=3e-3)
+
+
+@pytest.mark.parametrize("bits", range(1, 9))
+def test_nint_packed_backward_and_autograd_match_dequant(bits):
+    torch.manual_seed(1700 + bits)
+    np.random.seed(1700 + bits)
+    out, width, rows = 19, 72, 3
+    tensor = nint_quantize(
+        np.random.randn(out, width).astype(np.float32) * 0.05,
+        NintSpec(bits, 24, 7),
+        axis=0,
+    )
+    weight = to_gpu(tensor, layout="deploy")
+    dense = torch.as_tensor(
+        np.ascontiguousarray(nint_dequant(tensor)),
+        device=DEV,
+        dtype=torch.float16,
+    )
+    output_gradient = torch.randn(
+        rows, out, device=DEV, dtype=torch.float16
+    )
+    expected = output_gradient @ dense
+    torch.testing.assert_close(
+        nint_backward_input(weight, output_gradient),
+        expected,
+        rtol=3e-3,
+        atol=2e-3,
+    )
+    source = torch.randn(
+        rows, width, device=DEV, dtype=torch.float16, requires_grad=True
+    )
+    (fused_matmul(weight, source) * output_gradient).sum().backward()
+    torch.testing.assert_close(source.grad, expected, rtol=3e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize("M", [2, 4, 8])

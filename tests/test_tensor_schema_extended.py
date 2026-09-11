@@ -124,12 +124,12 @@ def test_deepseek_v4_graph_composes_vision_and_dspark() -> None:
         ),
         (
             "layers.14.engram.embed.scale",
-            "model.block.14.engram.embedding.weight_scale",
+            "model.block.14.associative_memory.embedding.weight_scale",
             TensorComponent.MODEL,
         ),
         (
             "layers.14.engram.q_weight",
-            "model.block.14.engram.query.weight",
+            "model.block.14.associative_memory.query.weight",
             TensorComponent.MODEL,
         ),
         (
@@ -167,9 +167,10 @@ def test_deepseek_v41_source_names_and_graph(
     assert graph is not None
     payload = graph.as_dict()
     assert payload["architecture"] == "deepseek_v41"
-    assert payload["graph"]["backbone"] == "deepseek_v4"
+    assert payload["graph"]["backbone"] == "deepseek_v41"
     components = {item["kind"]: item for item in payload["components"]}
     assert components["vision"]["implementation"] == "deepseek_v41_vision"
+    assert components["predictor"]["implementation"] == "deepseek_v41_dspark"
     assert payload["topology"] == {
         "text_layers": 40,
         "vision_layers": 32,

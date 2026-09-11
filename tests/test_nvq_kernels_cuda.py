@@ -37,6 +37,7 @@ from mfq.kernels.cuda.nvq_matmul import (  # noqa: E402
     nvq_gemv_batch_vec8,
     nvq_gemv_m1_vec8,
     nvq_matmul,
+    nvq_backward_input,
     nvq_matmul_input_mul,
     nvq_matmul_multi2,
     nvq_matmul_swiglu,
@@ -496,6 +497,76 @@ def test_nvq_cuda_direct_gemv_matches_dequant_matmul(format_id):
         expected = x @ weight.T
         relative = ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
         assert relative < 0.012, f"NVQ{format_id} M={m} relative error {relative}"
+
+
+@pytest.mark.parametrize(
+    ("case", "format_id"),
+    [
+        ("nvq1_l", 1),
+        ("nvq2", 2),
+        ("nvq3", 3),
+        ("nvq2_exec", 4),
+        ("nvq2j", 5),
+        ("nvq2j_exec", 6),
+        ("npq0_l", 7),
+        ("nvq1_s", 8),
+        ("npq0_s", 9),
+        ("nvq3j", 10),
+        ("nvq3j_analytic", 11),
+        ("nvq3j_512", 12),
+        ("nvq2j_1024", 13),
+        ("nvq2j_4096", 14),
+        ("nvq3j_1024", 15),
+    ],
+)
+def test_nvq_packed_backward_and_autograd_match_dequant(case, format_id):
+    if case == "npq0_l":
+        tensor, reference = _npq0_l_quantized()
+    elif case.startswith("nvq2j"):
+        spec = {
+            "nvq2j": NVQ2_E8,
+            "nvq2j_exec": NVQ2_E8,
+            "nvq2j_1024": NVQ2_E8_1024,
+            "nvq2j_4096": NVQ2_E8_4096,
+        }[case]
+        tensor, reference = _jsc_quantized(spec=spec)
+    elif case.startswith("nvq3j"):
+        spec = {
+            "nvq3j": NVQ3_D4,
+            "nvq3j_analytic": NVQ3_D4,
+            "nvq3j_512": NVQ3_D4_512,
+            "nvq3j_1024": NVQ3_D4_1024,
+        }[case]
+        tensor, reference = _jsc_quantized(
+            spec=spec, analytic_state=case == "nvq3j_analytic"
+        )
+    else:
+        tensor, reference = _quantized(
+            {"nvq1_l": 1, "nvq2": 2, "nvq3": 3,
+             "nvq2_exec": 2, "nvq1_s": 8, "npq0_s": 9}[case]
+        )
+    weight = (
+        to_gpu_nvq_exec(tensor)
+        if case in {"nvq2_exec", "nvq2j_exec"}
+        else to_gpu_nvq(tensor)
+    )
+    assert weight["format"] == format_id
+    dense = torch.as_tensor(reference, device="cuda", dtype=torch.float16)
+    output_gradient = torch.randn(
+        3, dense.shape[0], device="cuda", dtype=torch.float16
+    )
+    expected = output_gradient @ dense
+    torch.testing.assert_close(
+        nvq_backward_input(weight, output_gradient),
+        expected,
+        rtol=0.004,
+        atol=0.004,
+    )
+    source = torch.randn(
+        3, dense.shape[1], device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    (nvq_matmul(weight, source) * output_gradient).sum().backward()
+    torch.testing.assert_close(source.grad, expected, rtol=0.004, atol=0.004)
 
 
 def test_nvq_matmul_path_schedule_matches_measured_regions():

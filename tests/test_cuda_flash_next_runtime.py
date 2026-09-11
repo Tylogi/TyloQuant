@@ -913,6 +913,7 @@ def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,la
     np.testing.assert_allclose(array(raw["target_normalized"]),target[0],atol=2e-3,rtol=2e-3)
     np.testing.assert_allclose(array(raw["target_raw"]),target[1],atol=2e-3,rtol=2e-3)
     assert len(raw["layers"])==layers and len(raw["greedy"])==12 and raw["cycles"]>0
+    assert raw["drafted"]>=6 and raw["depth_cycles"][3]>=2
 
 
 @pytest.mark.parametrize("family",["qwen","glm"])

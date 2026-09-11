@@ -51,7 +51,7 @@ array float32(const array& value) {
 
 } // namespace
 
-struct MlxDeepseekV41Engram::Impl {
+struct MlxDeepseekV41HfEngram::Impl {
     struct Layer {
         std::size_t model_layer = 0;
         std::size_t table_index = 0;
@@ -93,7 +93,7 @@ struct MlxDeepseekV41Engram::Impl {
     std::vector<std::size_t> layer_lookup;
 };
 
-MlxDeepseekV41Engram MlxDeepseekV41Engram::load_hf(
+MlxDeepseekV41HfEngram MlxDeepseekV41HfEngram::load_hf(
     const MlxHfTensorStore& model,
     const DeepseekV4Config& config,
     const std::filesystem::path& hash_asset,
@@ -135,18 +135,18 @@ MlxDeepseekV41Engram MlxDeepseekV41Engram::load_hf(
             float32(model.load_dense(prefix + "key.weight")),
         });
     }
-    return MlxDeepseekV41Engram(std::make_shared<Impl>(
+    return MlxDeepseekV41HfEngram(std::make_shared<Impl>(
         config,
         std::move(hash),
         std::move(store),
         std::move(layers)));
 }
 
-MlxDeepseekV41Engram::MlxDeepseekV41Engram(
+MlxDeepseekV41HfEngram::MlxDeepseekV41HfEngram(
     std::shared_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 
-MlxDeepseekV41EngramBatch MlxDeepseekV41Engram::prepare(
+MlxDeepseekV41HfEngramBatch MlxDeepseekV41HfEngram::prepare(
     const array& token_ids,
     int start_position,
     bool prefetch_rows) {
@@ -161,7 +161,7 @@ MlxDeepseekV41EngramBatch MlxDeepseekV41Engram::prepare(
     std::vector<std::int32_t> host_ids(count);
     std::memcpy(host_ids.data(), ids.data<std::int32_t>(),
                 count * sizeof(std::int32_t));
-    MlxDeepseekV41EngramBatch result;
+    MlxDeepseekV41HfEngramBatch result;
     result.batch = ids.shape(0);
     result.tokens = ids.shape(1);
     result.start_position = start_position;
@@ -196,15 +196,15 @@ MlxDeepseekV41EngramBatch MlxDeepseekV41Engram::prepare(
     return result;
 }
 
-bool MlxDeepseekV41Engram::has_layer(std::size_t layer) const noexcept {
+bool MlxDeepseekV41HfEngram::has_layer(std::size_t layer) const noexcept {
     return layer < impl_->layer_lookup.size() &&
         impl_->layer_lookup[layer] != std::numeric_limits<std::size_t>::max();
 }
 
-array MlxDeepseekV41Engram::apply(
+array MlxDeepseekV41HfEngram::apply(
     std::size_t model_layer,
     const array& hidden,
-    const MlxDeepseekV41EngramBatch& batch) const {
+    const MlxDeepseekV41HfEngramBatch& batch) const {
     const auto& layer = impl_->layer(model_layer);
     const int connections = checked_int(impl_->config.hc_mult, "HC count");
     const int dimension = checked_int(impl_->config.hidden, "hidden size");
@@ -289,15 +289,15 @@ array MlxDeepseekV41Engram::apply(
         : mlx::core::astype(result, hidden.dtype());
 }
 
-void MlxDeepseekV41Engram::reset_hash() noexcept {
+void MlxDeepseekV41HfEngram::reset_hash() noexcept {
     impl_->hash.reset();
 }
 
-void MlxDeepseekV41Engram::truncate_hash(int position) {
+void MlxDeepseekV41HfEngram::truncate_hash(int position) {
     impl_->hash.truncate(position);
 }
 
-void MlxDeepseekV41Engram::restore_text_hash(
+void MlxDeepseekV41HfEngram::restore_text_hash(
     std::span<const std::int64_t> token_ids) {
     impl_->hash.reset();
     if (token_ids.empty()) return;
@@ -317,11 +317,11 @@ void MlxDeepseekV41Engram::restore_text_hash(
         0);
 }
 
-DeepseekV41EngramSsdStats MlxDeepseekV41Engram::stats() const {
+DeepseekV41EngramSsdStats MlxDeepseekV41HfEngram::stats() const {
     return impl_->store->stats();
 }
 
-void MlxDeepseekV41Engram::clear_rows() {
+void MlxDeepseekV41HfEngram::clear_rows() {
     impl_->store->clear();
 }
 

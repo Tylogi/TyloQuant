@@ -19,6 +19,8 @@
 #include <limits>
 #include <type_traits>
 
+#include "packed_backward.cuh"
+
 using namespace nvcuda;
 
 namespace {
@@ -178,6 +180,24 @@ __device__ __forceinline__ uint32_t load_packed_bits(
     return (word >> shift) & ((1u << bits) - 1u);
 }
 
+// One GS24 group contains three 7-bit sign masks.  Load their contiguous
+// 21-bit window once so the three vector decodes can reuse it.  Four byte
+// reads cover the worst seven-bit starting offset while retaining the exact
+// checked tail semantics of load_packed_bits().
+__device__ __forceinline__ uint32_t load_packed_sign_group3(
+    const uint8_t * data, int64_t bit, int64_t nbytes) {
+    const int64_t byte = bit >> 3;
+    const int shift = static_cast<int>(bit & 7);
+    uint32_t word = 0;
+#pragma unroll
+    for (int offset = 0; offset < 4; ++offset) {
+        if (byte + offset < nbytes) {
+            word |= static_cast<uint32_t>(data[byte + offset]) << (8 * offset);
+        }
+    }
+    return (word >> shift) & 0x1fffffu;
+}
+
 __device__ __forceinline__ uint32_t load_packed_4(
     const uint8_t * data, int64_t linear) {
     return (data[linear >> 1] >> ((linear & 1) * 4)) & 0x0fu;
@@ -206,6 +226,15 @@ __device__ __forceinline__ uint32_t load_group_exec96_bits(
     const uint8_t * data, int row, int group, int ng, int bit, int bits) {
     uint32_t words[3];
     load_group_exec96_words(data, row, group, ng, words);
+    const int word = bit >> 5;
+    const int shift = bit & 31;
+    uint32_t value = words[word] >> shift;
+    if (shift + bits > 32) value |= words[word + 1] << (32 - shift);
+    return value & ((1u << bits) - 1u);
+}
+
+__device__ __forceinline__ uint32_t extract_group_exec96_bits_ptr(
+    const uint32_t * words, int bit, int bits) {
     const int word = bit >> 5;
     const int shift = bit & 31;
     uint32_t value = words[word] >> shift;
@@ -892,6 +921,140 @@ __device__ __forceinline__ NvqVec8Values<FORMAT> load_nepq_vec8(
 }
 
 template <int FORMAT>
+__device__ __forceinline__ NvqVec8Values<FORMAT> load_nvq_group_vec8(
+    const uint8_t * indices,
+    int64_t indices_nbytes,
+    const uint8_t * aux,
+    int64_t aux_nbytes,
+    const int8_t * codebook,
+    const int8_t * bank,
+    int row,
+    int group,
+    int segment_local,
+    int ng,
+    int nvec,
+    int nsign,
+    int sign_mode,
+    uint32_t state,
+    uint32_t packed_signs,
+    uint64_t group_exec64,
+    const uint32_t * group_exec96,
+    int group_delta) {
+    const int segment = group * 3 + segment_local;
+    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+        if (segment >= nsign) return {make_int2(0, 0), 0, false};
+        const uint32_t metadata =
+            (group_exec64 >> (segment_local * 20)) & 0xfffffu;
+        const uint32_t index = metadata & 0xfffu;
+        const uint32_t mask8 = metadata >> 12;
+        return {apply_sign8(
+            reinterpret_cast<const int2 *>(bank)[index], mask8), 0, true};
+    } else if constexpr (FORMAT == kNvq3JscLGroupExec) {
+        const int vector4 = segment * 2;
+        if (vector4 >= nvec || segment >= nsign) {
+            return {make_int2(0, 0), 0, false};
+        }
+        const uint32_t index0 = extract_group_exec96_bits_ptr(
+            group_exec96, segment_local * 20, 10);
+        const uint32_t index1 = vector4 + 1 < nvec
+            ? extract_group_exec96_bits_ptr(
+                group_exec96, segment_local * 20 + 10, 10)
+            : 0;
+        const uint32_t mask8 = extract_group_exec96_bits_ptr(
+            group_exec96, 60 + segment_local * 8, 8);
+        return {apply_sign8(
+            make_int2(
+                reinterpret_cast<const int *>(bank)[index0],
+                reinterpret_cast<const int *>(bank)[index1]),
+            mask8), 0, true};
+    } else if constexpr (
+        FORMAT == kNvq3 || FORMAT == kNvq3Jsc ||
+        FORMAT == kNvq3Jsc2 || FORMAT == kNvq3Jsc512 ||
+        FORMAT == kNvq3JscL) {
+        const int vector4 = segment * 2;
+        if (vector4 >= nvec || segment >= nsign) {
+            return {make_int2(0, 0), 0, false};
+        }
+        const int64_t index_linear =
+            static_cast<int64_t>(row) * nvec + vector4;
+        constexpr int INDEX_BITS = format_index_bits(FORMAT);
+        const uint32_t index0 = INDEX_BITS == 8
+            ? indices[index_linear]
+            : load_packed_bits(
+                indices, index_linear * INDEX_BITS,
+                INDEX_BITS, indices_nbytes);
+        const uint32_t index1 = vector4 + 1 < nvec
+            ? (INDEX_BITS == 8
+                ? indices[index_linear + 1]
+                : load_packed_bits(
+                    indices, (index_linear + 1) * INDEX_BITS,
+                    INDEX_BITS, indices_nbytes))
+            : 0;
+        const uint32_t mask7 =
+            (packed_signs >> (segment_local * 7)) & 0x7fu;
+        const uint32_t mask8 = mask7 |
+            (static_cast<uint32_t>(parity7(mask7)) << 7);
+        return {apply_sign8(
+            make_int2(
+                reinterpret_cast<const int *>(bank)[index0],
+                reinterpret_cast<const int *>(bank)[index1]),
+            mask8), 0, true};
+    } else if constexpr (
+        FORMAT == kNvq2 || FORMAT == kNvq2Exec ||
+        FORMAT == kNvq2Jsc || FORMAT == kNvq2JscExec ||
+        FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL) {
+        if (segment >= nvec || segment >= nsign) {
+            return {make_int2(0, 0), 0, false};
+        }
+        const int64_t index_linear =
+            static_cast<int64_t>(row) * nvec + segment;
+        uint32_t index;
+        uint32_t mask8;
+        if constexpr (FORMAT == kNvq2Exec || FORMAT == kNvq2JscExec) {
+            const uint16_t metadata =
+                reinterpret_cast<const uint16_t *>(indices)[index_linear];
+            index = metadata & 0xffu;
+            mask8 = metadata >> 8;
+        } else {
+            constexpr int INDEX_BITS = format_index_bits(FORMAT);
+            index = INDEX_BITS == 8
+                ? indices[index_linear]
+                : load_packed_bits(
+                    indices, index_linear * INDEX_BITS,
+                    INDEX_BITS, indices_nbytes);
+            const uint32_t mask7 =
+                (packed_signs >> (segment_local * 7)) & 0x7fu;
+            const int last = parity7(mask7) ^
+                (sign_mode ? ((index >> 7) & 1u) : 0u);
+            mask8 = mask7 | (static_cast<uint32_t>(last) << 7);
+        }
+        const int2 values = reinterpret_cast<const int2 *>(bank)[index];
+        if constexpr (FORMAT == kNvq2Exec || FORMAT == kNvq2JscExec) {
+            return {apply_sign8_exec(values, mask8), 0, true};
+        }
+        return {apply_sign8(values, mask8), 0, true};
+    } else if constexpr (FORMAT == kNvq1S) {
+        if (segment >= nvec) return {make_int2(0, 0), 0, false};
+        const int64_t index_linear =
+            static_cast<int64_t>(row) * nvec + segment;
+        const uint32_t index = load_packed_bits(
+            indices, index_linear * 9, 9, indices_nbytes);
+        return {reinterpret_cast<const int2 *>(bank)[index], group_delta, true};
+    } else if constexpr (FORMAT == kNvq1L) {
+        if (segment >= nvec) return {make_int2(0, 0), 0, false};
+        const int64_t index_linear =
+            static_cast<int64_t>(row) * nvec + segment;
+        const uint32_t index = load_packed_bits(
+            indices, index_linear * 11, 11, indices_nbytes);
+        return {
+            reinterpret_cast<const int2 *>(codebook)[index], group_delta, true};
+    }
+    return load_nvq_vec8<FORMAT>(
+        indices, indices_nbytes, aux, aux_nbytes, codebook,
+        row, segment, group, ng, nvec, nsign, sign_mode, state);
+}
+
+template <int FORMAT>
 __device__ __forceinline__ float dot_nvq_vec8(
     const NvqVec8Values<FORMAT> & weight,
     const int8_t * activation) {
@@ -1318,11 +1481,7 @@ __global__ void __launch_bounds__(NWARPS * 32, 1) nvq3j2_gemv_m1_group_kernel(
 
 __device__ __forceinline__ uint32_t extract_group_exec96_bits(
     const uint32_t (&words)[3], int bit, int bits) {
-    const int word = bit >> 5;
-    const int shift = bit & 31;
-    uint32_t value = words[word] >> shift;
-    if (shift + bits > 32) value |= words[word + 1] << (32 - shift);
-    return value & ((1u << bits) - 1u);
+    return extract_group_exec96_bits_ptr(words, bit, bits);
 }
 
 __device__ __forceinline__ int aligned_group_d4_dot_words(
@@ -3523,7 +3682,7 @@ __global__ void __launch_bounds__(256) nepq_gemm_f16_gs24_kernel(
 }
 
 template <int FORMAT, int NWARPS, int ROWS_PER_BLOCK, bool SHARE_GROUP_STATE>
-__global__ void __launch_bounds__(NWARPS * 32) nvq_moe_mmvq_kernel(
+__device__ __forceinline__ void nvq_moe_mmvq_task(
     const uint8_t * indices,
     int64_t indices_nbytes,
     const uint8_t * aux,
@@ -3534,36 +3693,22 @@ __global__ void __launch_bounds__(NWARPS * 32) nvq_moe_mmvq_kernel(
     const int8_t * codebook,
     const int8_t * qx,
     const float * xscale,
-    const int32_t * ids,
-    const int32_t * expert_local,
     __half * output,
-    int pairs,
+    float * partial,
+    int pair,
     int routes,
-    int global_experts,
-    int pool_experts,
     int out_per_expert,
     int ng,
     int nvec,
     int nsign,
     int sub_bits,
     int sign_mode,
-    bool routed_input) {
-    const int pair = blockIdx.y;
-    const int row0 = blockIdx.x * ROWS_PER_BLOCK;
+    bool routed_input,
+    int source_row,
+    int local_expert,
+    int row0) {
     const int warp = threadIdx.y;
     const int lane = threadIdx.x;
-    if (pair >= pairs) return;
-    const int expert = ids[pair];
-    if (static_cast<unsigned int>(expert) >=
-        static_cast<unsigned int>(global_experts)) {
-        return;
-    }
-    const int local_expert = expert_local[expert];
-    if (static_cast<unsigned int>(local_expert) >=
-        static_cast<unsigned int>(pool_experts)) {
-        return;
-    }
-    const int source_row = routed_input ? pair : pair / routes;
 
     float acc[ROWS_PER_BLOCK];
 #pragma unroll
@@ -3642,18 +3787,19 @@ __global__ void __launch_bounds__(NWARPS * 32) nvq_moe_mmvq_kernel(
             acc[row_local] += __shfl_xor_sync(0xffffffff, acc[row_local], offset);
         }
     }
-    __shared__ float partial[ROWS_PER_BLOCK][NWARPS];
     if (lane == 0) {
 #pragma unroll
         for (int row_local = 0; row_local < ROWS_PER_BLOCK; ++row_local) {
-            partial[row_local][warp] = acc[row_local];
+            partial[row_local * NWARPS + warp] = acc[row_local];
         }
     }
     __syncthreads();
     if (warp == 0) {
 #pragma unroll
         for (int row_local = 0; row_local < ROWS_PER_BLOCK; ++row_local) {
-            float value = lane < NWARPS ? partial[row_local][lane] : 0.0f;
+            float value = lane < NWARPS
+                ? partial[row_local * NWARPS + lane]
+                : 0.0f;
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
                 value += __shfl_xor_sync(0xffffffff, value, offset);
@@ -3665,6 +3811,143 @@ __global__ void __launch_bounds__(NWARPS * 32) nvq_moe_mmvq_kernel(
             }
         }
     }
+}
+
+template <int FORMAT, int NWARPS, int ROWS_PER_BLOCK, bool SHARE_GROUP_STATE>
+__global__ void __launch_bounds__(NWARPS * 32) nvq_moe_mmvq_kernel(
+    const uint8_t * indices,
+    int64_t indices_nbytes,
+    const uint8_t * aux,
+    int64_t aux_nbytes,
+    const uint8_t * sub_scale,
+    int64_t sub_scale_nbytes,
+    const float * neuron_scale,
+    const int8_t * codebook,
+    const int8_t * qx,
+    const float * xscale,
+    const int32_t * ids,
+    const int32_t * expert_local,
+    __half * output,
+    int pairs,
+    int routes,
+    int global_experts,
+    int pool_experts,
+    int out_per_expert,
+    int ng,
+    int nvec,
+    int nsign,
+    int sub_bits,
+    int sign_mode,
+    bool routed_input) {
+    const int pair = blockIdx.y;
+    if (pair >= pairs) return;
+    const int expert = ids[pair];
+    if (static_cast<unsigned int>(expert) >=
+        static_cast<unsigned int>(global_experts)) {
+        return;
+    }
+    const int local_expert = expert_local[expert];
+    if (static_cast<unsigned int>(local_expert) >=
+        static_cast<unsigned int>(pool_experts)) {
+        return;
+    }
+    __shared__ float partial[ROWS_PER_BLOCK][NWARPS];
+    nvq_moe_mmvq_task<
+        FORMAT, NWARPS, ROWS_PER_BLOCK, SHARE_GROUP_STATE>(
+        indices, indices_nbytes, aux, aux_nbytes,
+        sub_scale, sub_scale_nbytes, neuron_scale, codebook,
+        qx, xscale, output, &partial[0][0], pair, routes,
+        out_per_expert, ng, nvec, nsign, sub_bits, sign_mode,
+        routed_input, routed_input ? pair : pair / routes,
+        local_expert, blockIdx.x * ROWS_PER_BLOCK);
+}
+
+template <int NWARPS, int ROWS_PER_BLOCK, bool SHARE_GROUP_STATE>
+__global__ void __launch_bounds__(NWARPS * 32)
+nvq_moe_mmvq_hetero_kernel(
+    const int64_t * weight_ptrs,
+    const int64_t * weight_sizes,
+    const int32_t * pool_params,
+    const int32_t * expert_pool,
+    const int32_t * expert_local,
+    const int8_t * qx,
+    const float * xscale,
+    const int32_t * ids,
+    __half * output,
+    int pairs,
+    int routes,
+    int global_experts,
+    int pool_count,
+    int out_per_expert,
+    bool routed_input) {
+    const int pair = blockIdx.y;
+    if (pair >= pairs) return;
+    const int expert = ids[pair];
+    if (static_cast<unsigned int>(expert) >=
+        static_cast<unsigned int>(global_experts)) {
+        return;
+    }
+    const int pool = expert_pool[expert];
+    const int local_expert = expert_local[expert];
+    if (static_cast<unsigned int>(pool) >=
+            static_cast<unsigned int>(pool_count) || local_expert < 0) {
+        return;
+    }
+    const int64_t * pointers =
+        weight_ptrs + static_cast<size_t>(pool) * 5;
+    const int64_t * sizes =
+        weight_sizes + static_cast<size_t>(pool) * 3;
+    const int32_t * params =
+        pool_params + static_cast<size_t>(pool) * 7;
+    if (local_expert >= params[0]) return;
+    const uint8_t * indices = reinterpret_cast<const uint8_t *>(
+        static_cast<uintptr_t>(pointers[0]));
+    const uint8_t * aux = reinterpret_cast<const uint8_t *>(
+        static_cast<uintptr_t>(pointers[1]));
+    const uint8_t * sub_scale = reinterpret_cast<const uint8_t *>(
+        static_cast<uintptr_t>(pointers[2]));
+    const float * neuron_scale = reinterpret_cast<const float *>(
+        static_cast<uintptr_t>(pointers[3]));
+    const int8_t * codebook = reinterpret_cast<const int8_t *>(
+        static_cast<uintptr_t>(pointers[4]));
+    const int ng = params[1];
+    const int nvec = params[2];
+    const int nsign = params[3];
+    const int sub_bits = params[4];
+    const int sign_mode = params[5];
+    const int format = params[6];
+    __shared__ float partial[ROWS_PER_BLOCK][NWARPS];
+
+#define NVQ_MOE_HETERO_MMVQ_CASE(FORMAT_VALUE)                                 \
+    case FORMAT_VALUE:                                                          \
+        nvq_moe_mmvq_task<                                                      \
+            FORMAT_VALUE, NWARPS, ROWS_PER_BLOCK, SHARE_GROUP_STATE>(           \
+            indices, sizes[0], aux, sizes[1], sub_scale, sizes[2],              \
+            neuron_scale, codebook, qx, xscale, output, &partial[0][0],         \
+            pair, routes, out_per_expert, ng, nvec, nsign, sub_bits,           \
+            sign_mode, routed_input, routed_input ? pair : pair / routes,       \
+            local_expert, blockIdx.x * ROWS_PER_BLOCK);                         \
+        break
+    switch (format) {
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq1L);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2Exec);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2Jsc);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2JscExec);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNpq0L);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq1S);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNpq0S);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3Jsc);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3Jsc2);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3Jsc512);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2JscL);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2JscXL);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3JscL);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq2JscXLGroupExec);
+        NVQ_MOE_HETERO_MMVQ_CASE(kNvq3JscLGroupExec);
+    }
+#undef NVQ_MOE_HETERO_MMVQ_CASE
 }
 
 template <int FORMAT, int PHYSICAL_WARPS, int LOGICAL_WARPS, int ROWS_PER_BLOCK>
@@ -5401,10 +5684,335 @@ mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_ws_cuda(
 }
 
 // Route-compacted online-dequant FP16 Tensor Core path for mixed NVQ pools.
-// One task covers up to 16 routed rows and a 64-row output tile.  The route
-// map is identical to the production grouped kernels; only the activation
-// arithmetic changes from Q8 to FP16 for controlled KLD comparisons.
-template <int FORMAT>
+// Each task reuses one 64/128-row weight tile across 16 to 128 routed rows.
+// Keep the format switch outside the inner K loop so one launch can serve
+// every NVQ cohort without a runtime branch per decoded value.
+constexpr int kNvqMoeF16PoolTileN = 64;
+constexpr int kNvqMoeF16HeteroTileN = 128;
+
+template <int GROUPS_PER_CHUNK>
+struct NvqMoeF16KLayout {
+    static constexpr int kTileK = kGroupSize * GROUPS_PER_CHUNK;
+    static_assert(kTileK % 16 == 0);
+    static constexpr int kStrideK = kTileK + 8;
+};
+
+template <int BM, int BN, int GROUPS_PER_CHUNK>
+struct __align__(16) NvqMoeF16SharedStorage {
+    static constexpr int kStrideK =
+        NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kStrideK;
+    static constexpr int kOperandBytes =
+        (BN + BM) * kStrideK * sizeof(__half);
+    static constexpr int kOutputBytes = BM == 128
+        ? BN * 16 * sizeof(float)
+        : (BN / 16) * BM * 16 * sizeof(float);
+    static constexpr int kBytes =
+        kOperandBytes > kOutputBytes ? kOperandBytes : kOutputBytes;
+    uint8_t bytes[kBytes];
+    int32_t pair_rows[BM];
+    int32_t source_rows[BM];
+};
+
+static_assert(sizeof(NvqMoeF16SharedStorage<64, 128, 4>) <= 48 * 1024);
+static_assert(sizeof(NvqMoeF16SharedStorage<128, 128, 2>) <= 48 * 1024);
+
+template <int FORMAT, int BM, int BN, int GROUPS_PER_CHUNK>
+__device__ __forceinline__ void nvq_moe_grouped_f16_task(
+    const uint8_t * indices,
+    int64_t indices_nbytes,
+    const uint8_t * aux,
+    int64_t aux_nbytes,
+    const uint8_t * sub_scale,
+    int64_t sub_scale_nbytes,
+    const float * neuron_scale,
+    const int8_t * codebook,
+    const __half * x,
+    const int32_t * ids_dst,
+    __half * output,
+    __half * weight_tile,
+    __half * activation_tile,
+    float * output_tile,
+    int32_t * pair_rows,
+    int32_t * source_rows,
+    int routes,
+    int out_per_expert,
+    int K,
+    int ng,
+    int nvec,
+    int nsign,
+    int sub_bits,
+    int sign_mode,
+    bool routed_input,
+    int local_expert,
+    int first,
+    int last,
+    int n0) {
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid = warp * 32 + lane;
+    using FragmentA = wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                                     __half, wmma::row_major>;
+    using FragmentB = wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                                     __half, wmma::col_major>;
+    using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+
+    static_assert(BM == 16 || BM == 32 || BM == 64 || BM == 128);
+    static_assert(BN == 64 || BN == 128);
+    static_assert(GROUPS_PER_CHUNK == 2 || GROUPS_PER_CHUNK == 4);
+    constexpr int kMFragments = BM / 16;
+    constexpr int kNFragments = BN / 16;
+    constexpr int kTileK =
+        NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kTileK;
+    constexpr int kStrideK =
+        NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kStrideK;
+    if (tid < BM) {
+        const int compact = first + tid;
+        const int pair_index = compact < last ? ids_dst[compact] : -1;
+        pair_rows[tid] = pair_index;
+        source_rows[tid] = pair_index < 0
+            ? -1 : (routed_input ? pair_index : pair_index / routes);
+    }
+    __syncthreads();
+    FragmentC accumulators[kMFragments];
+#pragma unroll
+    for (int m_fragment = 0; m_fragment < kMFragments; ++m_fragment) {
+        wmma::fill_fragment(accumulators[m_fragment], 0.0f);
+    }
+    const int chunks =
+        (ng + GROUPS_PER_CHUNK - 1) / GROUPS_PER_CHUNK;
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        const int group_base = chunk * GROUPS_PER_CHUNK;
+        const int k_base = group_base * kGroupSize;
+        constexpr int kWeightStates = BN * GROUPS_PER_CHUNK;
+#pragma unroll
+        for (int weight_index = tid;
+             weight_index < kWeightStates;
+            weight_index += 256) {
+            const int row_local =
+                weight_index / GROUPS_PER_CHUNK;
+            const int group_local = weight_index -
+                row_local * GROUPS_PER_CHUNK;
+            const int local_row = n0 + row_local;
+            const int row = local_expert * out_per_expert + local_row;
+            const int group = group_base + group_local;
+            const bool valid_weight =
+                local_row < out_per_expert && group < ng;
+            uint32_t state = 0;
+            float scale = 0.0f;
+            uint32_t packed_signs = 0;
+            uint64_t group_exec64 = 0;
+            uint32_t group_exec96[3] = {0, 0, 0};
+            int group_delta = 1;
+            const int8_t * bank = codebook;
+            if (valid_weight) {
+                const int64_t sub_linear =
+                    static_cast<int64_t>(row) * ng + group;
+                state = load_packed_bits(
+                    sub_scale, sub_linear * sub_bits,
+                    sub_bits, sub_scale_nbytes);
+                scale = format_scale<FORMAT>(
+                    neuron_scale[row], state, codebook);
+                if constexpr (is_e8_format(FORMAT) || is_d4_format(FORMAT)) {
+                    bank = active_codebook<FORMAT>(codebook, state);
+                }
+                if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+                    group_exec64 = load_group_exec64(
+                        indices, row, group, ng);
+                } else if constexpr (FORMAT == kNvq3JscLGroupExec) {
+                    load_group_exec96_words(
+                        indices, row, group, ng, group_exec96);
+                } else if constexpr (
+                    FORMAT == kNvq2 || FORMAT == kNvq2Jsc ||
+                    FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL ||
+                    FORMAT == kNvq3 || FORMAT == kNvq3Jsc ||
+                    FORMAT == kNvq3Jsc2 || FORMAT == kNvq3Jsc512 ||
+                    FORMAT == kNvq3JscL) {
+                    const int64_t sign_linear =
+                        static_cast<int64_t>(row) * nsign + group * 3;
+                    packed_signs = load_packed_sign_group3(
+                        aux, sign_linear * 7, aux_nbytes);
+                } else if constexpr (
+                    FORMAT == kNvq1S || FORMAT == kNvq1L) {
+                    group_delta = load_packed_bits(
+                        aux, sub_linear, 1, aux_nbytes) ? -1 : 1;
+                    if constexpr (FORMAT == kNvq1S) {
+                        bank = codebook +
+                            (group_delta < 0 ? kNvq1SBankBytes : 0);
+                    }
+                }
+            }
+#pragma unroll
+            for (int segment_local = 0;
+                 segment_local < kChunksPerGroup / 2;
+                 ++segment_local) {
+                int2 packed = make_int2(0, 0);
+                if (valid_weight) {
+                    const auto decoded = load_nvq_group_vec8<FORMAT>(
+                        indices, indices_nbytes, aux, aux_nbytes,
+                        codebook, bank, row, group, segment_local,
+                        ng, nvec, nsign, sign_mode, state,
+                        packed_signs, group_exec64, group_exec96,
+                        group_delta);
+                    packed = decoded.values;
+                    if constexpr (FORMAT == kNvq1S) {
+                        packed.x = nvq1_s_scale_delta4(
+                            packed.x, decoded.delta);
+                        packed.y = nvq1_s_scale_delta4(
+                            packed.y, decoded.delta);
+                    } else if constexpr (FORMAT == kNvq1L) {
+                        packed.x = nvq1_l_scale_delta4(
+                            packed.x, decoded.delta);
+                        packed.y = nvq1_l_scale_delta4(
+                            packed.y, decoded.delta);
+                    }
+                }
+#pragma unroll
+                for (int pair = 0; pair < 4; ++pair) {
+                    const int word = pair < 2 ? packed.x : packed.y;
+                    const int shift = (pair & 1) * 16;
+                    const int value0 = static_cast<int>(
+                        static_cast<int8_t>((word >> shift) & 0xff));
+                    const int value1 = static_cast<int>(
+                        static_cast<int8_t>(
+                            (word >> (shift + 8)) & 0xff));
+                    *reinterpret_cast<__half2 *>(
+                        weight_tile + row_local * kStrideK +
+                            group_local * kGroupSize +
+                            segment_local * 8 + pair * 2) =
+                        __halves2half2(
+                            __float2half(
+                                scale * static_cast<float>(value0)),
+                            __float2half(
+                                scale * static_cast<float>(value1)));
+                }
+            }
+        }
+
+        constexpr int kActivationVectorWidth = 8;
+        static_assert(kTileK % kActivationVectorWidth == 0);
+        constexpr int kActivationVectorsPerRow =
+            kTileK / kActivationVectorWidth;
+        constexpr int kActivationVectors =
+            BM * kActivationVectorsPerRow;
+        for (int index = tid; index < kActivationVectors; index += 256) {
+            const int m_local = index / kActivationVectorsPerRow;
+            const int vector_local =
+                index - m_local * kActivationVectorsPerRow;
+            const int k_local = vector_local * kActivationVectorWidth;
+            const int k = k_base + k_local;
+            const int source_row = source_rows[m_local];
+            __half * destination =
+                activation_tile + m_local * kStrideK + k_local;
+            if (source_row < 0 || k >= K) {
+                *reinterpret_cast<int4 *>(destination) =
+                    make_int4(0, 0, 0, 0);
+            } else if ((K & 7) == 0 && k + 7 < K) {
+                *reinterpret_cast<int4 *>(destination) =
+                    *reinterpret_cast<const int4 *>(
+                        x + static_cast<int64_t>(source_row) * K + k);
+            } else {
+#pragma unroll
+                for (int element = 0;
+                     element < kActivationVectorWidth;
+                     ++element) {
+                    destination[element] = k + element < K
+                        ? x[static_cast<int64_t>(source_row) * K +
+                            k + element]
+                        : __float2half(0.0f);
+                }
+            }
+        }
+        __syncthreads();
+
+        if (warp < kNFragments) {
+#pragma unroll
+            for (int k_local = 0;
+                 k_local < kTileK;
+                 k_local += 16) {
+                FragmentB weight_fragment;
+                wmma::load_matrix_sync(
+                    weight_fragment,
+                    weight_tile + warp * 16 * kStrideK + k_local,
+                    kStrideK);
+#pragma unroll
+                for (int m_fragment = 0;
+                     m_fragment < kMFragments;
+                     ++m_fragment) {
+                    FragmentA activation_fragment;
+                    wmma::load_matrix_sync(
+                        activation_fragment,
+                        activation_tile +
+                            m_fragment * 16 * kStrideK + k_local,
+                        kStrideK);
+                    wmma::mma_sync(
+                        accumulators[m_fragment], activation_fragment,
+                        weight_fragment, accumulators[m_fragment]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if constexpr (BM == 128) {
+        if (warp < kNFragments) {
+#pragma unroll
+            for (int m_fragment = 0;
+                 m_fragment < kMFragments;
+                 ++m_fragment) {
+                wmma::store_matrix_sync(
+                    output_tile + warp * 16 * 16,
+                    accumulators[m_fragment],
+                    16, wmma::mem_row_major);
+                __syncwarp();
+                for (int element = lane; element < 16 * 16; element += 32) {
+                    const int m_local = m_fragment * 16 + element / 16;
+                    const int n_local = element % 16;
+                    const int local_row = n0 + warp * 16 + n_local;
+                    const int pair_index = pair_rows[m_local];
+                    if (pair_index >= 0 && local_row < out_per_expert) {
+                        output[
+                            static_cast<int64_t>(pair_index) * out_per_expert +
+                            local_row] = __float2half(
+                                output_tile[warp * 16 * 16 + element]);
+                    }
+                }
+                __syncwarp();
+            }
+        }
+    } else {
+        if (warp < kNFragments) {
+#pragma unroll
+            for (int m_fragment = 0;
+                 m_fragment < kMFragments;
+                 ++m_fragment) {
+                wmma::store_matrix_sync(
+                    output_tile +
+                        (warp * BM + m_fragment * 16) * 16,
+                    accumulators[m_fragment],
+                    16, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+        if (warp < kNFragments) {
+            for (int element = lane; element < BM * 16; element += 32) {
+                const int m_local = element / 16;
+                const int n_local = element % 16;
+                const int local_row = n0 + warp * 16 + n_local;
+                const int pair_index = pair_rows[m_local];
+                if (pair_index >= 0 && local_row < out_per_expert) {
+                    output[
+                        static_cast<int64_t>(pair_index) * out_per_expert +
+                        local_row] = __float2half(
+                            output_tile[
+                                (warp * BM + m_local) * 16 + n_local]);
+                }
+            }
+        }
+    }
+    __syncthreads();
+}
+
+template <int FORMAT, int BM = 16>
 __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
     const uint8_t * indices,
     int64_t indices_nbytes,
@@ -5433,157 +6041,151 @@ __global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
     int sign_mode,
     int max_tiles,
     bool routed_input) {
-    constexpr int kTileM = 16;
-    constexpr int kTileN = 64;
-    constexpr int kGroupsPerChunk = 4;
-    constexpr int kTileK = kGroupSize * kGroupsPerChunk;
-    constexpr int kStrideK = kTileK + 8;
-    constexpr int kNFragments = kTileN / 16;
-    constexpr int kFineTilesPerTask = kTileM / 8;
-
-    const int lane = threadIdx.x;
-    const int warp = threadIdx.y;
-    const int tid = warp * 32 + lane;
-    const int ntiles_n = (out_per_expert + kTileN - 1) / kTileN;
-    const int64_t max_tasks = static_cast<int64_t>(max_tiles) * ntiles_n;
-    __shared__ __half weight_tile[kTileN][kStrideK];
-    __shared__ __half activation_tile[kTileM][kStrideK];
-    __shared__ float output_tile[kNFragments][16][16];
-
-    using FragmentA = wmma::fragment<wmma::matrix_a, 16, 16, 16,
-                                     __half, wmma::row_major>;
-    using FragmentB = wmma::fragment<wmma::matrix_b, 16, 16, 16,
-                                     __half, wmma::col_major>;
-    using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
-
+    constexpr int BN = kNvqMoeF16PoolTileN;
+    constexpr int GROUPS_PER_CHUNK = 4;
+    constexpr int kStrideK =
+        NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kStrideK;
+    __shared__ NvqMoeF16SharedStorage<
+        BM, BN, GROUPS_PER_CHUNK> shared;
+    auto * weight_tile = reinterpret_cast<__half *>(shared.bytes);
+    auto * activation_tile = weight_tile + BN * kStrideK;
+    auto * output_tile = reinterpret_cast<float *>(shared.bytes);
+    const int ntiles_n =
+        (out_per_expert + BN - 1) / BN;
+    const int64_t max_tasks =
+        static_cast<int64_t>(max_tiles) * ntiles_n;
     for (int64_t task = blockIdx.x; task < max_tasks; task += gridDim.x) {
         const int fine_tile = static_cast<int>(task / ntiles_n);
-        const int ntile = static_cast<int>(task -
-            static_cast<int64_t>(fine_tile) * ntiles_n);
+        const int ntile = static_cast<int>(
+            task - static_cast<int64_t>(fine_tile) * ntiles_n);
         if (fine_tile >= tile_bounds[global_experts]) continue;
         const int expert = tile_experts[fine_tile];
         const int local_fine_tile = fine_tile - tile_bounds[expert];
-        if (local_fine_tile % kFineTilesPerTask != 0) continue;
+        if (local_fine_tile % (BM / 8) != 0) continue;
         const int local_expert = expert_local[expert];
         if (static_cast<unsigned int>(local_expert) >=
             static_cast<unsigned int>(pool_experts)) continue;
         const int first = expert_bounds[expert] + local_fine_tile * 8;
-        const int last = min(first + kTileM, expert_bounds[expert + 1]);
-        const int n0 = ntile * kTileN;
+        const int last = min(
+            first + BM, expert_bounds[expert + 1]);
+        nvq_moe_grouped_f16_task<FORMAT, BM, BN, GROUPS_PER_CHUNK>(
+            indices, indices_nbytes, aux, aux_nbytes,
+            sub_scale, sub_scale_nbytes, neuron_scale, codebook,
+            x, ids_dst, output, weight_tile,
+            activation_tile, output_tile, shared.pair_rows,
+            shared.source_rows, routes,
+            out_per_expert, K, ng, nvec, nsign, sub_bits, sign_mode,
+            routed_input, local_expert, first, last,
+            ntile * BN);
+    }
+}
 
-        FragmentC accumulator;
-        wmma::fill_fragment(accumulator, 0.0f);
-        const int chunks = (ng + kGroupsPerChunk - 1) / kGroupsPerChunk;
-        for (int chunk = 0; chunk < chunks; ++chunk) {
-            const int group_base = chunk * kGroupsPerChunk;
-            const int k_base = group_base * kGroupSize;
-            const int row_local = tid / kGroupsPerChunk;
-            const int group_local = tid - row_local * kGroupsPerChunk;
-            const int local_row = n0 + row_local;
-            const int row = local_expert * out_per_expert + local_row;
-            const int group = group_base + group_local;
-            const bool valid_weight =
-                local_row < out_per_expert && group < ng;
-            uint32_t state = 0;
-            float scale = 0.0f;
-            if (valid_weight) {
-                const int64_t sub_linear =
-                    static_cast<int64_t>(row) * ng + group;
-                state = load_packed_bits(
-                    sub_scale, sub_linear * sub_bits,
-                    sub_bits, sub_scale_nbytes);
-                scale = format_scale<FORMAT>(
-                    neuron_scale[row], state, codebook);
-            }
-#pragma unroll
-            for (int quartet = 0; quartet < kChunksPerGroup; ++quartet) {
-                const int packed = valid_weight
-                    ? decode_chunk4<FORMAT>(
-                          indices, indices_nbytes, aux, aux_nbytes, codebook,
-                          row, group, quartet, nvec, nsign, ng,
-                          sign_mode, state)
-                    : 0;
-#pragma unroll
-                for (int pair = 0; pair < 2; ++pair) {
-                    const int shift = pair * 16;
-                    const int value0 = static_cast<int>(
-                        static_cast<int8_t>((packed >> shift) & 0xff));
-                    const int value1 = static_cast<int>(
-                        static_cast<int8_t>((packed >> (shift + 8)) & 0xff));
-                    *reinterpret_cast<__half2 *>(
-                        &weight_tile[row_local]
-                            [group_local * kGroupSize + quartet * 4 + pair * 2]) =
-                        __halves2half2(
-                            __float2half(scale * static_cast<float>(value0)),
-                            __float2half(scale * static_cast<float>(value1)));
-                }
-            }
-
-            constexpr int kActivationPairs = kTileM * (kTileK / 2);
-            for (int index = tid; index < kActivationPairs; index += 256) {
-                const int m_local = index / (kTileK / 2);
-                const int k_pair = index - m_local * (kTileK / 2);
-                const int compact = first + m_local;
-                const int k = k_base + k_pair * 2;
-                __half2 values = __float2half2_rn(0.0f);
-                if (compact < last) {
-                    const int pair_index = ids_dst[compact];
-                    const int source_row = routed_input
-                        ? pair_index : pair_index / routes;
-                    if (k + 1 < K) {
-                        values = *reinterpret_cast<const __half2 *>(
-                            x + static_cast<int64_t>(source_row) * K + k);
-                    } else if (k < K) {
-                        values = __halves2half2(
-                            x[static_cast<int64_t>(source_row) * K + k],
-                            __float2half(0.0f));
-                    }
-                }
-                *reinterpret_cast<__half2 *>(
-                    &activation_tile[m_local][k_pair * 2]) = values;
-            }
-            __syncthreads();
-
-            if (warp < kNFragments) {
-#pragma unroll
-                for (int k_local = 0; k_local < kTileK; k_local += 16) {
-                    FragmentA activation_fragment;
-                    FragmentB weight_fragment;
-                    wmma::load_matrix_sync(
-                        activation_fragment, &activation_tile[0][k_local],
-                        kStrideK);
-                    wmma::load_matrix_sync(
-                        weight_fragment, &weight_tile[warp * 16][k_local],
-                        kStrideK);
-                    wmma::mma_sync(
-                        accumulator, activation_fragment,
-                        weight_fragment, accumulator);
-                }
-            }
-            __syncthreads();
+template <int BM, int ROUTE_TILE_M, int GROUPS_PER_CHUNK>
+__global__ void __launch_bounds__(256, 1)
+nvq_moe_grouped_hetero_f16_kernel(
+    const int64_t * weight_ptrs,
+    const int64_t * weight_sizes,
+    const int32_t * pool_params,
+    const int32_t * expert_pool,
+    const int32_t * expert_local,
+    const __half * x,
+    const int32_t * ids_dst,
+    const int32_t * expert_bounds,
+    const int32_t * tile_bounds,
+    const int32_t * tile_experts,
+    __half * output,
+    int routes,
+    int global_experts,
+    int pool_count,
+    int out_per_expert,
+    int K,
+    int max_tiles,
+    bool routed_input) {
+    constexpr int BN = kNvqMoeF16HeteroTileN;
+    static_assert(BM % ROUTE_TILE_M == 0);
+    constexpr int kStrideK =
+        NvqMoeF16KLayout<GROUPS_PER_CHUNK>::kStrideK;
+    __shared__ NvqMoeF16SharedStorage<
+        BM, BN, GROUPS_PER_CHUNK> shared;
+    auto * weight_tile = reinterpret_cast<__half *>(shared.bytes);
+    auto * activation_tile = weight_tile + BN * kStrideK;
+    auto * output_tile = reinterpret_cast<float *>(shared.bytes);
+    const int ntiles_n =
+        (out_per_expert + BN - 1) / BN;
+    const int64_t max_tasks =
+        static_cast<int64_t>(max_tiles) * ntiles_n;
+    for (int64_t task = blockIdx.x; task < max_tasks; task += gridDim.x) {
+        const int fine_tile = static_cast<int>(task / ntiles_n);
+        const int ntile = static_cast<int>(
+            task - static_cast<int64_t>(fine_tile) * ntiles_n);
+        if (fine_tile >= tile_bounds[global_experts]) continue;
+        const int expert = tile_experts[fine_tile];
+        const int local_fine_tile = fine_tile - tile_bounds[expert];
+        if (local_fine_tile % (BM / ROUTE_TILE_M) != 0) continue;
+        const int pool = expert_pool[expert];
+        const int local_expert = expert_local[expert];
+        if (static_cast<unsigned int>(pool) >=
+            static_cast<unsigned int>(pool_count) || local_expert < 0) {
+            continue;
         }
+        const int64_t * pointers = weight_ptrs + static_cast<size_t>(pool) * 5;
+        const int64_t * sizes = weight_sizes + static_cast<size_t>(pool) * 3;
+        const int32_t * params = pool_params + static_cast<size_t>(pool) * 7;
+        const int pool_experts = params[0];
+        if (local_expert >= pool_experts) continue;
+        const int first =
+            expert_bounds[expert] + local_fine_tile * ROUTE_TILE_M;
+        const int last = min(
+            first + BM, expert_bounds[expert + 1]);
+        const uint8_t * indices = reinterpret_cast<const uint8_t *>(
+            static_cast<uintptr_t>(pointers[0]));
+        const uint8_t * aux = reinterpret_cast<const uint8_t *>(
+            static_cast<uintptr_t>(pointers[1]));
+        const uint8_t * sub_scale = reinterpret_cast<const uint8_t *>(
+            static_cast<uintptr_t>(pointers[2]));
+        const float * neuron_scale = reinterpret_cast<const float *>(
+            static_cast<uintptr_t>(pointers[3]));
+        const int8_t * codebook = reinterpret_cast<const int8_t *>(
+            static_cast<uintptr_t>(pointers[4]));
+        const int ng = params[1];
+        const int nvec = params[2];
+        const int nsign = params[3];
+        const int sub_bits = params[4];
+        const int sign_mode = params[5];
+        const int format = params[6];
 
-        if (warp < kNFragments) {
-            wmma::store_matrix_sync(
-                &output_tile[warp][0][0], accumulator,
-                16, wmma::mem_row_major);
+#define NVQ_MOE_HETERO_F16_CASE(FORMAT_VALUE)                                  \
+        case FORMAT_VALUE:                                                      \
+            nvq_moe_grouped_f16_task<                                           \
+                FORMAT_VALUE, BM, BN, GROUPS_PER_CHUNK>(                        \
+                indices, sizes[0], aux, sizes[1], sub_scale, sizes[2],          \
+                neuron_scale, codebook, x, ids_dst, output,                     \
+                weight_tile, activation_tile, output_tile,                     \
+                shared.pair_rows, shared.source_rows, routes,                   \
+                out_per_expert, K, ng, nvec,                                    \
+                nsign, sub_bits, sign_mode, routed_input, local_expert, first,  \
+                last, ntile * BN);                                              \
+            break
+        switch (format) {
+            NVQ_MOE_HETERO_F16_CASE(kNvq1L);
+            NVQ_MOE_HETERO_F16_CASE(kNvq2);
+            NVQ_MOE_HETERO_F16_CASE(kNvq3);
+            NVQ_MOE_HETERO_F16_CASE(kNvq2Exec);
+            NVQ_MOE_HETERO_F16_CASE(kNvq2Jsc);
+            NVQ_MOE_HETERO_F16_CASE(kNvq2JscExec);
+            NVQ_MOE_HETERO_F16_CASE(kNpq0L);
+            NVQ_MOE_HETERO_F16_CASE(kNvq1S);
+            NVQ_MOE_HETERO_F16_CASE(kNpq0S);
+            NVQ_MOE_HETERO_F16_CASE(kNvq3Jsc);
+            NVQ_MOE_HETERO_F16_CASE(kNvq3Jsc2);
+            NVQ_MOE_HETERO_F16_CASE(kNvq3Jsc512);
+            NVQ_MOE_HETERO_F16_CASE(kNvq2JscL);
+            NVQ_MOE_HETERO_F16_CASE(kNvq2JscXL);
+            NVQ_MOE_HETERO_F16_CASE(kNvq3JscL);
+            NVQ_MOE_HETERO_F16_CASE(kNvq2JscXLGroupExec);
+            NVQ_MOE_HETERO_F16_CASE(kNvq3JscLGroupExec);
         }
-        __syncthreads();
-        if (warp < kNFragments) {
-            for (int element = lane; element < 256; element += 32) {
-                const int m_local = element / 16;
-                const int n_local = element - m_local * 16;
-                const int compact = first + m_local;
-                const int local_row = n0 + warp * 16 + n_local;
-                if (compact < last && local_row < out_per_expert) {
-                    const int pair_index = ids_dst[compact];
-                    output[static_cast<int64_t>(pair_index) * out_per_expert +
-                           local_row] =
-                        __float2half(output_tile[warp][m_local][n_local]);
-                }
-            }
-        }
-        __syncthreads();
+#undef NVQ_MOE_HETERO_F16_CASE
     }
 }
 
@@ -5825,6 +6427,273 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
         NVQ_MOE_F16_LAUNCH();
     });
 #undef NVQ_MOE_F16_LAUNCH
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs,
+    mfq_tensor_backend::Tensor weight_sizes,
+    mfq_tensor_backend::Tensor pool_params,
+    mfq_tensor_backend::Tensor expert_pool,
+    mfq_tensor_backend::Tensor expert_local,
+    mfq_tensor_backend::Tensor x,
+    int64_t n_experts,
+    int64_t out_per_expert,
+    int64_t neuron_len,
+    int64_t route_tile_m,
+    mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor ids_dst,
+    mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts) {
+    MFQ_RUNTIME_CHECK(
+        n_experts > 0 && n_experts <= 4096,
+        "NVQ heterogeneous expert count must be in [1,4096]");
+    MFQ_RUNTIME_CHECK(
+        out_per_expert > 0 && out_per_expert <= INT_MAX &&
+            neuron_len > 0 && neuron_len <= INT_MAX,
+        "NVQ heterogeneous dimensions must fit int32");
+    MFQ_RUNTIME_CHECK(
+        route_tile_m == 8 || route_tile_m == 64 || route_tile_m == 128,
+        "NVQ heterogeneous route tile must be 8, 64, or 128");
+    MFQ_RUNTIME_CHECK(
+        weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
+            weight_ptrs.scalar_type() == mfq_tensor_backend::kInt64 &&
+            weight_ptrs.dim() == 2 && weight_ptrs.size(0) > 0 &&
+            weight_ptrs.size(1) == 5,
+        "NVQ heterogeneous weight pointers must be CUDA int64 [pools,5]");
+    const int pools = static_cast<int>(weight_ptrs.size(0));
+    MFQ_RUNTIME_CHECK(
+        weight_sizes.is_cuda() && weight_sizes.is_contiguous() &&
+            weight_sizes.scalar_type() == mfq_tensor_backend::kInt64 &&
+            weight_sizes.dim() == 2 && weight_sizes.size(0) == pools &&
+            weight_sizes.size(1) == 3,
+        "NVQ heterogeneous weight sizes must be CUDA int64 [pools,3]");
+    MFQ_RUNTIME_CHECK(
+        pool_params.is_cuda() && pool_params.is_contiguous() &&
+            pool_params.scalar_type() == mfq_tensor_backend::kInt32 &&
+            pool_params.dim() == 2 && pool_params.size(0) == pools &&
+            pool_params.size(1) == 7,
+        "NVQ heterogeneous pool parameters must be CUDA int32 [pools,7]");
+    MFQ_RUNTIME_CHECK(
+        expert_pool.is_cuda() && expert_pool.is_contiguous() &&
+            expert_pool.scalar_type() == mfq_tensor_backend::kInt32 &&
+            expert_pool.numel() == n_experts,
+        "NVQ heterogeneous expert-pool map must be CUDA int32 [experts]");
+    MFQ_RUNTIME_CHECK(
+        expert_local.is_cuda() && expert_local.is_contiguous() &&
+            expert_local.scalar_type() == mfq_tensor_backend::kInt32 &&
+            expert_local.numel() == n_experts,
+        "NVQ heterogeneous expert-local map must be CUDA int32 [experts]");
+    MFQ_RUNTIME_CHECK(
+        x.is_cuda() && x.is_contiguous() &&
+            x.scalar_type() == mfq_tensor_backend::kFloat16 &&
+            (x.dim() == 2 || x.dim() == 3) &&
+            x.size(-1) == neuron_len,
+        "NVQ heterogeneous FP16 input shape mismatch");
+    MFQ_RUNTIME_CHECK(
+        out.is_cuda() && out.is_contiguous() &&
+            out.scalar_type() == mfq_tensor_backend::kFloat16 &&
+            out.dim() == 3 && out.size(2) == out_per_expert,
+        "NVQ heterogeneous output must be CUDA FP16 [tokens,routes,out]");
+    const int tokens = static_cast<int>(out.size(0));
+    const int routes = static_cast<int>(out.size(1));
+    const int pairs = tokens * routes;
+    const bool routed_input = x.dim() == 3;
+    MFQ_RUNTIME_CHECK(
+        tokens > 8 && routes > 0 &&
+            ((!routed_input && x.size(0) == tokens) ||
+             (routed_input && x.size(0) == tokens && x.size(1) == routes)),
+        "NVQ heterogeneous input leading dimensions do not match output");
+    MFQ_RUNTIME_CHECK(
+        ids_dst.is_cuda() && ids_dst.is_contiguous() &&
+            ids_dst.scalar_type() == mfq_tensor_backend::kInt32 &&
+            ids_dst.numel() >= pairs,
+        "NVQ heterogeneous compact route map is missing");
+    MFQ_RUNTIME_CHECK(
+        expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
+            expert_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
+            expert_bounds.numel() >= n_experts + 1,
+        "NVQ heterogeneous expert bounds are missing");
+    MFQ_RUNTIME_CHECK(
+        tile_bounds.is_cuda() && tile_bounds.is_contiguous() &&
+            tile_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
+            tile_bounds.numel() >= n_experts + 1,
+        "NVQ heterogeneous tile bounds are missing");
+    MFQ_RUNTIME_CHECK(
+        tile_experts.is_cuda() && tile_experts.is_contiguous() &&
+            tile_experts.scalar_type() == mfq_tensor_backend::kInt32 &&
+            tile_experts.numel() >= pairs,
+        "NVQ heterogeneous tile expert map is missing");
+    for (const auto * tensor : {
+             &weight_sizes, &pool_params, &expert_pool, &expert_local,
+             &x, &out, &ids_dst, &expert_bounds, &tile_bounds,
+             &tile_experts}) {
+        MFQ_RUNTIME_CHECK(
+            tensor->device() == weight_ptrs.device(),
+            "NVQ heterogeneous tensors must share one CUDA device");
+    }
+
+    const int tile_m = static_cast<int>(route_tile_m);
+    const int fine_bm = tokens <= 128 ? 64 : (tokens <= 512 ? 32 : 64);
+    const int max_tiles =
+        (pairs + tile_m - 1) / tile_m + static_cast<int>(n_experts);
+    const int ntiles_n =
+        (static_cast<int>(out_per_expert) + kNvqMoeF16HeteroTileN - 1) /
+        kNvqMoeF16HeteroTileN;
+    const int block_cap = pairs >= 32768 ? 8192 : 4096;
+    const int blocks = static_cast<int>(std::max<int64_t>(
+        1, std::min<int64_t>(
+               static_cast<int64_t>(max_tiles) * ntiles_n, block_cap)));
+#define NVQ_MOE_HETERO_F16_LAUNCH(BM_VALUE, ROUTE_VALUE, GROUP_VALUE)           \
+    nvq_moe_grouped_hetero_f16_kernel<                                          \
+        BM_VALUE, ROUTE_VALUE, GROUP_VALUE><<<                                  \
+        blocks, dim3(32, 8), 0, mfq_current_cuda_stream()>>>(                   \
+        weight_ptrs.data_ptr<int64_t>(), weight_sizes.data_ptr<int64_t>(),      \
+        pool_params.data_ptr<int32_t>(), expert_pool.data_ptr<int32_t>(),       \
+        expert_local.data_ptr<int32_t>(),                                      \
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),              \
+        ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),         \
+        tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),      \
+        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes,          \
+        static_cast<int>(n_experts), pools,                                    \
+        static_cast<int>(out_per_expert), static_cast<int>(neuron_len),        \
+        max_tiles, routed_input)
+    if (tile_m == 128) {
+        NVQ_MOE_HETERO_F16_LAUNCH(128, 128, 2);
+    } else if (tile_m == 64) {
+        NVQ_MOE_HETERO_F16_LAUNCH(128, 64, 2);
+    } else if (fine_bm == 32) {
+        NVQ_MOE_HETERO_F16_LAUNCH(32, 8, 4);
+    } else {
+        NVQ_MOE_HETERO_F16_LAUNCH(64, 8, 4);
+    }
+#undef NVQ_MOE_HETERO_F16_LAUNCH
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs,
+    mfq_tensor_backend::Tensor weight_sizes,
+    mfq_tensor_backend::Tensor pool_params,
+    mfq_tensor_backend::Tensor expert_pool,
+    mfq_tensor_backend::Tensor expert_local,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor ids,
+    int64_t n_experts,
+    int64_t out_per_expert,
+    int64_t neuron_len,
+    bool input_quantized,
+    mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
+    MFQ_RUNTIME_CHECK(
+        n_experts > 0 && n_experts <= 4096,
+        "NVQ heterogeneous expert count must be in [1,4096]");
+    MFQ_RUNTIME_CHECK(
+        out_per_expert > 0 && out_per_expert <= INT_MAX &&
+            neuron_len > 0 && neuron_len <= INT_MAX,
+        "NVQ heterogeneous dimensions must fit int32");
+    MFQ_RUNTIME_CHECK(
+        weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
+            weight_ptrs.scalar_type() == mfq_tensor_backend::kInt64 &&
+            weight_ptrs.dim() == 2 && weight_ptrs.size(0) > 0 &&
+            weight_ptrs.size(1) == 5,
+        "NVQ heterogeneous weight pointers must be CUDA int64 [pools,5]");
+    const int pools = static_cast<int>(weight_ptrs.size(0));
+    MFQ_RUNTIME_CHECK(
+        weight_sizes.is_cuda() && weight_sizes.is_contiguous() &&
+            weight_sizes.scalar_type() == mfq_tensor_backend::kInt64 &&
+            weight_sizes.dim() == 2 && weight_sizes.size(0) == pools &&
+            weight_sizes.size(1) == 3,
+        "NVQ heterogeneous weight sizes must be CUDA int64 [pools,3]");
+    MFQ_RUNTIME_CHECK(
+        pool_params.is_cuda() && pool_params.is_contiguous() &&
+            pool_params.scalar_type() == mfq_tensor_backend::kInt32 &&
+            pool_params.dim() == 2 && pool_params.size(0) == pools &&
+            pool_params.size(1) == 7,
+        "NVQ heterogeneous pool parameters must be CUDA int32 [pools,7]");
+    MFQ_RUNTIME_CHECK(
+        expert_pool.is_cuda() && expert_pool.is_contiguous() &&
+            expert_pool.scalar_type() == mfq_tensor_backend::kInt32 &&
+            expert_pool.numel() == n_experts &&
+            expert_local.is_cuda() && expert_local.is_contiguous() &&
+            expert_local.scalar_type() == mfq_tensor_backend::kInt32 &&
+            expert_local.numel() == n_experts,
+        "NVQ heterogeneous expert maps must be CUDA int32 [experts]");
+    MFQ_RUNTIME_CHECK(
+        ids.is_cuda() && ids.is_contiguous() &&
+            ids.scalar_type() == mfq_tensor_backend::kInt32 && ids.dim() == 2,
+        "NVQ heterogeneous route IDs must be CUDA int32 [tokens,routes]");
+    const int tokens = static_cast<int>(ids.size(0));
+    const int routes = static_cast<int>(ids.size(1));
+    const int pairs = tokens * routes;
+    MFQ_RUNTIME_CHECK(
+        tokens > 0 && tokens <= 8 && routes > 0,
+        "NVQ heterogeneous MMVQ requires one to eight tokens");
+    MFQ_RUNTIME_CHECK(
+        x.is_cuda() && x.is_contiguous() &&
+            x.scalar_type() == mfq_tensor_backend::kFloat16 &&
+            (x.dim() == 2 || x.dim() == 3) &&
+            (input_quantized || x.size(-1) == neuron_len),
+        "NVQ heterogeneous routed input shape mismatch");
+    const bool routed_input = x.dim() == 3;
+    MFQ_RUNTIME_CHECK(
+        (!routed_input && x.size(0) == tokens) ||
+            (routed_input && x.size(0) == tokens && x.size(1) == routes),
+        "NVQ heterogeneous input leading dimensions do not match routes");
+    MFQ_RUNTIME_CHECK(
+        out.is_cuda() && out.is_contiguous() &&
+            out.scalar_type() == mfq_tensor_backend::kFloat16 &&
+            out.dim() == 3 && out.size(0) == tokens &&
+            out.size(1) == routes && out.size(2) == out_per_expert,
+        "NVQ heterogeneous output must be CUDA FP16 [tokens,routes,out]");
+    const int K = static_cast<int>(neuron_len);
+    const int ng = (K + kGroupSize - 1) / kGroupSize;
+    const int K_pad = ng * kGroupSize;
+    const int input_rows = routed_input ? pairs : tokens;
+    MFQ_RUNTIME_CHECK(
+        qx.is_cuda() && qx.is_contiguous() &&
+            qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.dim() == 2 &&
+            qx.size(0) >= input_rows && qx.size(1) >= K_pad,
+        "NVQ heterogeneous qx workspace mismatch");
+    MFQ_RUNTIME_CHECK(
+        xscale.is_cuda() && xscale.is_contiguous() &&
+            xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
+            xscale.dim() == 2 && xscale.size(0) >= input_rows &&
+            xscale.size(1) >= ng,
+        "NVQ heterogeneous xscale workspace mismatch");
+    for (const auto * tensor : {
+             &weight_sizes, &pool_params, &expert_pool, &expert_local,
+             &x, &ids, &out, &qx, &xscale}) {
+        MFQ_RUNTIME_CHECK(
+            tensor->device() == weight_ptrs.device(),
+            "NVQ heterogeneous tensors must share one CUDA device");
+    }
+
+    const cudaStream_t stream = mfq_current_cuda_stream();
+    if (!input_quantized) {
+        nvq_quantize_x_gs24_kernel<<<dim3(input_rows, ng), 32, 0, stream>>>(
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
+            qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), input_rows, K, ng);
+    }
+#define NVQ_MOE_HETERO_MMVQ_LAUNCH(NWARPS_VALUE)                               \
+    nvq_moe_mmvq_hetero_kernel<                                                \
+        NWARPS_VALUE, 2, false><<<                                             \
+        dim3((static_cast<int>(out_per_expert) + 1) / 2, pairs),               \
+        dim3(32, NWARPS_VALUE), 0, stream>>>(                                  \
+        weight_ptrs.data_ptr<int64_t>(), weight_sizes.data_ptr<int64_t>(),     \
+        pool_params.data_ptr<int32_t>(), expert_pool.data_ptr<int32_t>(),      \
+        expert_local.data_ptr<int32_t>(), qx.data_ptr<int8_t>(),               \
+        xscale.data_ptr<float>(), ids.data_ptr<int32_t>(),                     \
+        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), pairs, routes,   \
+        static_cast<int>(n_experts), pools, static_cast<int>(out_per_expert),  \
+        routed_input)
+    if (K >= 4096) NVQ_MOE_HETERO_MMVQ_LAUNCH(8);
+    else NVQ_MOE_HETERO_MMVQ_LAUNCH(4);
+#undef NVQ_MOE_HETERO_MMVQ_LAUNCH
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
@@ -6350,6 +7219,623 @@ mfq_tensor_backend::Tensor nvq_dequant_cuda(
     });
     MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ dequant kernel launch failed");
     return output;
+}
+
+namespace {
+
+template <typename T>
+__device__ __forceinline__ float nvq_backward_to_float(T value) {
+    return static_cast<float>(value);
+}
+
+template <>
+__device__ __forceinline__ float nvq_backward_to_float(__half value) {
+    return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float nvq_backward_to_float(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T nvq_backward_from_float(float value) {
+    return static_cast<T>(value);
+}
+
+template <>
+__device__ __forceinline__ __half nvq_backward_from_float(float value) {
+    return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 nvq_backward_from_float(float value) {
+    return __float2bfloat16_rn(value);
+}
+
+template <int FORMAT, typename T>
+__global__ void nvq_backward_input_kernel(
+        const uint8_t * indices,
+        int64_t indices_nbytes,
+        const uint8_t * aux,
+        int64_t aux_nbytes,
+        const uint8_t * sub_scale,
+        int64_t sub_scale_nbytes,
+        const float * neuron_scale,
+        const int8_t * codebook,
+        const T * output_gradient,
+        T * input_gradient,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int sub_bits,
+        int sign_mode) {
+    const int64_t total = static_cast<int64_t>(M) * K;
+    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         logical < total;
+         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(logical / K);
+        const int column = static_cast<int>(logical - static_cast<int64_t>(row) * K);
+        const int group = column / kGroupSize;
+        const int chunk = (column - group * kGroupSize) / 4;
+        const int component = column & 3;
+        float accumulator = 0.0f;
+        for (int output = 0; output < N; ++output) {
+            const int64_t state_index = static_cast<int64_t>(output) * ng + group;
+            const uint32_t state = load_packed_bits(
+                sub_scale, state_index * sub_bits, sub_bits, sub_scale_nbytes);
+            const int packed = decode_chunk4<FORMAT>(
+                indices, indices_nbytes, aux, aux_nbytes, codebook,
+                output, group, chunk, nvec, nsign, ng, sign_mode, state);
+            const int value = static_cast<int>(static_cast<int8_t>(
+                (packed >> (8 * component)) & 0xff));
+            const float weight =
+                format_scale<FORMAT>(neuron_scale[output], state, codebook) *
+                static_cast<float>(value);
+            accumulator = fmaf(
+                nvq_backward_to_float(
+                    output_gradient[static_cast<int64_t>(row) * N + output]),
+                weight,
+                accumulator);
+        }
+        input_gradient[logical] = nvq_backward_from_float<T>(accumulator);
+    }
+}
+
+template <int FORMAT, int Rows>
+__global__ void __launch_bounds__(32) nvq_backward_partial_kernel(
+        const uint8_t * indices,
+        int64_t indices_nbytes,
+        const uint8_t * aux,
+        int64_t aux_nbytes,
+        const uint8_t * sub_scale,
+        int64_t sub_scale_nbytes,
+        const float * neuron_scale,
+        const int8_t * codebook,
+        const __half * output_gradient,
+        float * partials,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int sub_bits,
+        int sign_mode,
+        int output_tile) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int chunk_linear = static_cast<int>(blockIdx.x) * 32 + lane;
+    const int k0 = chunk_linear * 4;
+    const bool valid = k0 < K;
+    const int group = k0 / kGroupSize;
+    const int chunk = (k0 - group * kGroupSize) / 4;
+    const int split = static_cast<int>(blockIdx.y);
+    const int output0 = split * output_tile;
+    const int output_end = min(output0 + output_tile, N);
+    float accumulators[Rows][4];
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+#pragma unroll
+        for (int component = 0; component < 4; ++component) {
+            accumulators[row][component] = 0.0f;
+        }
+    }
+    for (int output = output0; output < output_end; ++output) {
+        float anchor = lane == 0 ? neuron_scale[output] : 0.0f;
+        anchor = __shfl_sync(0xffffffffu, anchor, 0);
+        uint32_t state = 0;
+        int packed = 0;
+        float weight_scale = 0.0f;
+        if (valid) {
+            const int64_t state_index =
+                static_cast<int64_t>(output) * ng + group;
+            state = load_packed_bits(
+                sub_scale, state_index * sub_bits,
+                sub_bits, sub_scale_nbytes);
+            packed = decode_chunk4<FORMAT>(
+                indices, indices_nbytes, aux, aux_nbytes, codebook,
+                output, group, chunk, nvec, nsign, ng,
+                sign_mode, state);
+            weight_scale = format_scale<FORMAT>(anchor, state, codebook);
+        }
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float gradient = lane == 0 && row < M
+                ? __half2float(output_gradient[
+                    static_cast<int64_t>(row) * N + output])
+                : 0.0f;
+            gradient = __shfl_sync(0xffffffffu, gradient, 0);
+            const float factor = gradient * weight_scale;
+#pragma unroll
+            for (int component = 0; component < 4; ++component) {
+                const int value = static_cast<int>(static_cast<int8_t>(
+                    (packed >> (8 * component)) & 0xff));
+                accumulators[row][component] = fmaf(
+                    factor, static_cast<float>(value),
+                    accumulators[row][component]);
+            }
+        }
+    }
+    if (valid) {
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            if (row < M) {
+#pragma unroll
+                for (int component = 0; component < 4; ++component) {
+                    const int column = k0 + component;
+                    if (column < K) {
+                        partials[(static_cast<int64_t>(split) * M + row) *
+                            K + column] = accumulators[row][component];
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int FORMAT, int Rows>
+void launch_nvq_backward_small_m(
+        const mfq_tensor_backend::Tensor & indices,
+        const mfq_tensor_backend::Tensor & aux,
+        const mfq_tensor_backend::Tensor & sub_scale,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & codebook,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & partials,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int sub_bits,
+        int sign_mode,
+        int output_tile,
+        cudaStream_t stream) {
+    const dim3 grid(
+        static_cast<unsigned>((K + 127) / 128),
+        static_cast<unsigned>((N + output_tile - 1) / output_tile));
+    nvq_backward_partial_kernel<FORMAT, Rows><<<
+        grid, 32, 0, stream>>>(
+            indices.data_ptr<uint8_t>(), indices.numel(),
+            aux.data_ptr<uint8_t>(), aux.numel(),
+            sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
+            neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),
+            reinterpret_cast<const __half *>(
+                output_gradient.data_ptr<mfq_half>()),
+            partials.data_ptr<float>(), M, N, K, ng, nvec, nsign,
+            sub_bits, sign_mode, output_tile);
+}
+
+template <int FORMAT, typename T>
+__global__ void nepq_backward_input_kernel(
+        const uint8_t * indices,
+        int64_t indices_nbytes,
+        const uint8_t * aux,
+        int64_t aux_nbytes,
+        const uint8_t * state_stream,
+        int64_t state_nbytes,
+        const float * neuron_scale,
+        const int8_t * table_pool,
+        const uint8_t * bank_ids,
+        const T * output_gradient,
+        T * input_gradient,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int nsuper,
+        int table_stride,
+        int state_bits) {
+    const int64_t total = static_cast<int64_t>(M) * K;
+    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         logical < total;
+         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(logical / K);
+        const int column = static_cast<int>(logical - static_cast<int64_t>(row) * K);
+        const int group = column / kGroupSize;
+        const int chunk = (column - group * kGroupSize) / 4;
+        const int component = column & 3;
+        float accumulator = 0.0f;
+        for (int output = 0; output < N; ++output) {
+            const int64_t state_index = static_cast<int64_t>(output) * ng + group;
+            const uint32_t state = load_packed_bits(
+                state_stream, state_index * state_bits, state_bits, state_nbytes);
+            const int8_t * table = nepq_active_table(
+                table_pool, bank_ids, output, group, nsuper, table_stride);
+            const int packed = decode_nepq_chunk4<FORMAT>(
+                indices, indices_nbytes, aux, aux_nbytes, table,
+                output, group, chunk, nvec, nsign, ng, 0, state);
+            const int value = static_cast<int>(static_cast<int8_t>(
+                (packed >> (8 * component)) & 0xff));
+            const float weight =
+                format_scale<FORMAT>(neuron_scale[output], state, table) *
+                static_cast<float>(value);
+            accumulator = fmaf(
+                nvq_backward_to_float(
+                    output_gradient[static_cast<int64_t>(row) * N + output]),
+                weight,
+                accumulator);
+        }
+        input_gradient[logical] = nvq_backward_from_float<T>(accumulator);
+    }
+}
+
+template <int FORMAT, int Rows>
+__global__ void __launch_bounds__(32) nepq_backward_partial_kernel(
+        const uint8_t * indices,
+        int64_t indices_nbytes,
+        const uint8_t * aux,
+        int64_t aux_nbytes,
+        const uint8_t * state_stream,
+        int64_t state_nbytes,
+        const float * neuron_scale,
+        const int8_t * table_pool,
+        const uint8_t * bank_ids,
+        const __half * output_gradient,
+        float * partials,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int nsuper,
+        int table_stride,
+        int state_bits,
+        int output_tile) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int chunk_linear = static_cast<int>(blockIdx.x) * 32 + lane;
+    const int k0 = chunk_linear * 4;
+    const bool valid = k0 < K;
+    const int group = k0 / kGroupSize;
+    const int chunk = (k0 - group * kGroupSize) / 4;
+    const int split = static_cast<int>(blockIdx.y);
+    const int output0 = split * output_tile;
+    const int output_end = min(output0 + output_tile, N);
+    float accumulators[Rows][4];
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+#pragma unroll
+        for (int component = 0; component < 4; ++component) {
+            accumulators[row][component] = 0.0f;
+        }
+    }
+    for (int output = output0; output < output_end; ++output) {
+        float anchor = lane == 0 ? neuron_scale[output] : 0.0f;
+        anchor = __shfl_sync(0xffffffffu, anchor, 0);
+        uint32_t state = 0;
+        int packed = 0;
+        float weight_scale = 0.0f;
+        if (valid) {
+            const int64_t state_index =
+                static_cast<int64_t>(output) * ng + group;
+            state = load_packed_bits(
+                state_stream, state_index * state_bits,
+                state_bits, state_nbytes);
+            const int8_t * table = nepq_active_table(
+                table_pool, bank_ids, output, group,
+                nsuper, table_stride);
+            packed = decode_nepq_chunk4<FORMAT>(
+                indices, indices_nbytes, aux, aux_nbytes, table,
+                output, group, chunk, nvec, nsign, ng, 0, state);
+            weight_scale = format_scale<FORMAT>(anchor, state, table);
+        }
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float gradient = lane == 0 && row < M
+                ? __half2float(output_gradient[
+                    static_cast<int64_t>(row) * N + output])
+                : 0.0f;
+            gradient = __shfl_sync(0xffffffffu, gradient, 0);
+            const float factor = gradient * weight_scale;
+#pragma unroll
+            for (int component = 0; component < 4; ++component) {
+                const int value = static_cast<int>(static_cast<int8_t>(
+                    (packed >> (8 * component)) & 0xff));
+                accumulators[row][component] = fmaf(
+                    factor, static_cast<float>(value),
+                    accumulators[row][component]);
+            }
+        }
+    }
+    if (valid) {
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            if (row < M) {
+#pragma unroll
+                for (int component = 0; component < 4; ++component) {
+                    const int column = k0 + component;
+                    if (column < K) {
+                        partials[(static_cast<int64_t>(split) * M + row) *
+                            K + column] = accumulators[row][component];
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int FORMAT, int Rows>
+void launch_nepq_backward_small_m(
+        const mfq_tensor_backend::Tensor & indices,
+        const mfq_tensor_backend::Tensor & aux,
+        const mfq_tensor_backend::Tensor & state_stream,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & table_pool,
+        const mfq_tensor_backend::Tensor & bank_ids,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & partials,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int nsuper,
+        int table_stride,
+        int state_bits,
+        int output_tile,
+        cudaStream_t stream) {
+    const dim3 grid(
+        static_cast<unsigned>((K + 127) / 128),
+        static_cast<unsigned>((N + output_tile - 1) / output_tile));
+    nepq_backward_partial_kernel<FORMAT, Rows><<<grid, 32, 0, stream>>>(
+        indices.data_ptr<uint8_t>(), indices.numel(),
+        aux.data_ptr<uint8_t>(), aux.numel(),
+        state_stream.data_ptr<uint8_t>(), state_stream.numel(),
+        neuron_scale.data_ptr<float>(), table_pool.data_ptr<int8_t>(),
+        bank_ids.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half *>(
+            output_gradient.data_ptr<mfq_half>()),
+        partials.data_ptr<float>(), M, N, K, ng, nvec, nsign,
+        nsuper, table_stride, state_bits, output_tile);
+}
+
+template <typename T, typename Launch>
+void launch_backward_by_dtype(
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & result,
+        Launch && launch) {
+    if constexpr (std::is_same_v<T, __half>) {
+        launch(
+            reinterpret_cast<const T *>(output_gradient.data_ptr<mfq_half>()),
+            reinterpret_cast<T *>(result.data_ptr<mfq_half>()));
+    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        launch(
+            reinterpret_cast<const T *>(output_gradient.data_ptr<mfq_bfloat16>()),
+            reinterpret_cast<T *>(result.data_ptr<mfq_bfloat16>()));
+    } else {
+        launch(output_gradient.data_ptr<T>(), result.data_ptr<T>());
+    }
+}
+
+}  // namespace
+
+mfq_tensor_backend::Tensor nvq_backward_input_cuda(
+        mfq_tensor_backend::Tensor indices,
+        mfq_tensor_backend::Tensor aux,
+        mfq_tensor_backend::Tensor sub_scale,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor codebook,
+        mfq_tensor_backend::Tensor output_gradient,
+        int64_t neuron_len,
+        int64_t gs,
+        int64_t sub_bits,
+        int64_t format,
+        int64_t sign_mode) {
+    check_common(indices, aux, sub_scale, neuron_scale, codebook,
+                 neuron_len, gs, sub_bits, format, sign_mode);
+    MFQ_RUNTIME_CHECK(
+        output_gradient.is_cuda() && output_gradient.is_contiguous() &&
+        output_gradient.dim() == 2 &&
+        output_gradient.size(1) == neuron_scale.numel(),
+        "NVQ backward output gradient geometry mismatch");
+    MFQ_RUNTIME_CHECK(
+        indices.device() == output_gradient.device() &&
+        aux.device() == output_gradient.device() &&
+        sub_scale.device() == output_gradient.device() &&
+        neuron_scale.device() == output_gradient.device() &&
+        codebook.device() == output_gradient.device(),
+        "NVQ backward tensors must share one CUDA device");
+    const auto dtype = output_gradient.scalar_type();
+    MFQ_RUNTIME_CHECK(
+        dtype == mfq_tensor_backend::kFloat16 ||
+        dtype == mfq_tensor_backend::kFloat32 ||
+        dtype == mfq_tensor_backend::kBFloat16,
+        "NVQ backward output gradient must be fp16, bf16, or fp32");
+    const int M = static_cast<int>(output_gradient.size(0));
+    const int N = static_cast<int>(neuron_scale.numel());
+    const int K = static_cast<int>(neuron_len);
+    const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
+    const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
+        (is_d4_format(format) ? 4 : 8);
+    const int nsign = (K + 7) / 8;
+    auto result = mfq_tensor_backend::empty({M, K}, output_gradient.options());
+    constexpr int threads = 256;
+    const int64_t total = static_cast<int64_t>(M) * K;
+    if (total == 0) {
+        return result;
+    }
+    MfqCudaGuard guard(output_gradient.device());
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (total + threads - 1) / threads, 65535));
+    const cudaStream_t stream = mfq_current_cuda_stream();
+    if (dtype == mfq_tensor_backend::kFloat16 && M <= 8) {
+        const int output_tile = M <= 4 ? 16 : 32;
+        const int splits = (N + output_tile - 1) / output_tile;
+        auto partials = mfq_tensor_backend::empty(
+            {splits, M, K},
+            neuron_scale.options().dtype(mfq_tensor_backend::kFloat32));
+        launch_by_format(static_cast<int>(format), [&](auto tag) {
+            constexpr int F = decltype(tag)::value;
+            if (M == 1) {
+                launch_nvq_backward_small_m<F, 1>(
+                    indices, aux, sub_scale, neuron_scale, codebook,
+                    output_gradient, partials, M, N, K, ng, nvec, nsign,
+                    static_cast<int>(sub_bits), static_cast<int>(sign_mode),
+                    output_tile, stream);
+            } else if (M <= 2) {
+                launch_nvq_backward_small_m<F, 2>(
+                    indices, aux, sub_scale, neuron_scale, codebook,
+                    output_gradient, partials, M, N, K, ng, nvec, nsign,
+                    static_cast<int>(sub_bits), static_cast<int>(sign_mode),
+                    output_tile, stream);
+            } else if (M <= 4) {
+                launch_nvq_backward_small_m<F, 4>(
+                    indices, aux, sub_scale, neuron_scale, codebook,
+                    output_gradient, partials, M, N, K, ng, nvec, nsign,
+                    static_cast<int>(sub_bits), static_cast<int>(sign_mode),
+                    output_tile, stream);
+            } else {
+                launch_nvq_backward_small_m<F, 8>(
+                    indices, aux, sub_scale, neuron_scale, codebook,
+                    output_gradient, partials, M, N, K, ng, nvec, nsign,
+                    static_cast<int>(sub_bits), static_cast<int>(sign_mode),
+                    output_tile, stream);
+            }
+        });
+        mfq_packed_backward::launch_split_float_reduce_to_half(
+            partials.data_ptr<float>(),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
+            M, K, splits, stream);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return result;
+    }
+    auto weight = nvq_dequant_cuda(
+        indices, aux, sub_scale, neuron_scale, codebook,
+        neuron_len, gs, sub_bits, format, sign_mode);
+    mfq_packed_backward::launch_dense_half_weight(
+        output_gradient, weight, result, M, N, K, stream);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
+}
+
+mfq_tensor_backend::Tensor nepq_backward_input_cuda(
+        mfq_tensor_backend::Tensor indices,
+        mfq_tensor_backend::Tensor aux,
+        mfq_tensor_backend::Tensor state_stream,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor table_pool,
+        mfq_tensor_backend::Tensor bank_ids,
+        mfq_tensor_backend::Tensor output_gradient,
+        int64_t neuron_len,
+        int64_t state_bits,
+        int64_t format) {
+    check_nepq_common(
+        indices, aux, state_stream, neuron_scale, table_pool, bank_ids,
+        neuron_len, state_bits, format);
+    MFQ_RUNTIME_CHECK(
+        output_gradient.is_cuda() && output_gradient.is_contiguous() &&
+        output_gradient.dim() == 2 &&
+        output_gradient.size(1) == neuron_scale.numel(),
+        "NEPQ backward output gradient geometry mismatch");
+    MFQ_RUNTIME_CHECK(
+        indices.device() == output_gradient.device() &&
+        aux.device() == output_gradient.device() &&
+        state_stream.device() == output_gradient.device() &&
+        neuron_scale.device() == output_gradient.device() &&
+        table_pool.device() == output_gradient.device() &&
+        bank_ids.device() == output_gradient.device(),
+        "NEPQ backward tensors must share one CUDA device");
+    const auto dtype = output_gradient.scalar_type();
+    MFQ_RUNTIME_CHECK(
+        dtype == mfq_tensor_backend::kFloat16 ||
+        dtype == mfq_tensor_backend::kFloat32 ||
+        dtype == mfq_tensor_backend::kBFloat16,
+        "NEPQ backward output gradient must be fp16, bf16, or fp32");
+    const int M = static_cast<int>(output_gradient.size(0));
+    const int N = static_cast<int>(neuron_scale.numel());
+    const int K = static_cast<int>(neuron_len);
+    const int ng = (K + kGroupSize - 1) / kGroupSize;
+    const int nvec = K / 8;
+    const int nsign = (K + 7) / 8;
+    const int nsuper = (ng + kNepqGroupsPerSupergroup - 1) /
+        kNepqGroupsPerSupergroup;
+    const int table_stride = static_cast<int>(table_pool.size(1));
+    auto result = mfq_tensor_backend::empty({M, K}, output_gradient.options());
+    constexpr int threads = 256;
+    const int64_t total = static_cast<int64_t>(M) * K;
+    if (total == 0) {
+        return result;
+    }
+    MfqCudaGuard guard(output_gradient.device());
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (total + threads - 1) / threads, 65535));
+    const cudaStream_t stream = mfq_current_cuda_stream();
+    if (dtype == mfq_tensor_backend::kFloat16 && M <= 8) {
+        const int output_tile = M <= 4 ? 16 : 32;
+        const int splits = (N + output_tile - 1) / output_tile;
+        auto partials = mfq_tensor_backend::empty(
+            {splits, M, K},
+            neuron_scale.options().dtype(mfq_tensor_backend::kFloat32));
+        launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {
+            constexpr int F = decltype(tag)::value;
+            if (M == 1) {
+                launch_nepq_backward_small_m<F, 1>(
+                    indices, aux, state_stream, neuron_scale, table_pool,
+                    bank_ids, output_gradient, partials, M, N, K, ng,
+                    nvec, nsign, nsuper, table_stride,
+                    static_cast<int>(state_bits), output_tile, stream);
+            } else if (M <= 2) {
+                launch_nepq_backward_small_m<F, 2>(
+                    indices, aux, state_stream, neuron_scale, table_pool,
+                    bank_ids, output_gradient, partials, M, N, K, ng,
+                    nvec, nsign, nsuper, table_stride,
+                    static_cast<int>(state_bits), output_tile, stream);
+            } else if (M <= 4) {
+                launch_nepq_backward_small_m<F, 4>(
+                    indices, aux, state_stream, neuron_scale, table_pool,
+                    bank_ids, output_gradient, partials, M, N, K, ng,
+                    nvec, nsign, nsuper, table_stride,
+                    static_cast<int>(state_bits), output_tile, stream);
+            } else {
+                launch_nepq_backward_small_m<F, 8>(
+                    indices, aux, state_stream, neuron_scale, table_pool,
+                    bank_ids, output_gradient, partials, M, N, K, ng,
+                    nvec, nsign, nsuper, table_stride,
+                    static_cast<int>(state_bits), output_tile, stream);
+            }
+        });
+        mfq_packed_backward::launch_split_float_reduce_to_half(
+            partials.data_ptr<float>(),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
+            M, K, splits, stream);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return result;
+    }
+    auto weight = nepq_dequant_cuda(
+        indices, aux, state_stream, neuron_scale, table_pool, bank_ids,
+        neuron_len, state_bits, format);
+    mfq_packed_backward::launch_dense_half_weight(
+        output_gradient, weight, result, M, N, K, stream);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
 }
 
 mfq_tensor_backend::Tensor nvq_gemm_f16_cuda(

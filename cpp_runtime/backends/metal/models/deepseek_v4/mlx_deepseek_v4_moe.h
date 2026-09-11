@@ -4,7 +4,7 @@
 #include "mlx_grouped_linear.h"
 #include "mlx_hf_tensor.h"
 #include "mlx_moe.h"
-#include "mlx_ssd_expert_cache.h"
+#include "mlx_deepseek_v4_hf_ssd_expert_cache.h"
 #include "mlx_tensor.h"
 
 #include <array>

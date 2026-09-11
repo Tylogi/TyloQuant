@@ -12,6 +12,7 @@ import torch
 from mfq.formats import io
 from mfq.formats.assets import (
     ASSET_MANIFEST_KEY,
+    DEEPSEEK_V41_ENGRAM_ASSET,
     HF_CHAT_TEMPLATE_ASSET,
     HF_GENERATION_CONFIG_ASSET,
     HF_TOKENIZER_CONFIG_ASSET,
@@ -20,6 +21,7 @@ from mfq.formats.assets import (
     MODEL_CONFIG_ASSET,
     TOKENIZER_GGUF_ASSET,
     RuntimeAsset,
+    deepseek_v41_engram_asset,
     gguf_metadata_asset,
     hf_runtime_assets,
     minicpmo45_resampler_pos_embed_asset,
@@ -152,6 +154,52 @@ def test_minicpmo45_resampler_position_asset_matches_official_numpy_bf16() -> No
         height, width, embed_dim
     )
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_deepseek_v41_engram_asset_matches_hash_contract(tmp_path: Path) -> None:
+    tokenizers = pytest.importorskip("tokenizers")
+    tokenizer = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(
+            {"<pad>": 0, "The": 1, "the": 2, "DOG": 3},
+            unk_token="<pad>",
+        )
+    )
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer.save(str(tokenizer_path))
+    config = {
+        "engram_compressed_vocab_size": 3,
+        "engram_layer_ids": [1],
+        "engram_num_embeddings": [88],
+        "engram_max_ngram_size": 3,
+        "engram_n_heads": 2,
+        "engram_vocab_size": 17,
+        "engram_pad_token_id": 0,
+    }
+
+    asset = deepseek_v41_engram_asset(tokenizer_path, config)
+
+    assert asset.name == DEEPSEEK_V41_ENGRAM_ASSET
+    header = struct.unpack_from("<8sIIIIIi", asset.data)
+    assert header == (b"MFQENGR1", 4, 3, 1, 3, 2, 0)
+    offset = struct.calcsize("<8sIIIIIi")
+    layer_ids = np.frombuffer(asset.data, "<i4", 1, offset)
+    offset += layer_ids.nbytes
+    rows = np.frombuffer(asset.data, "<i8", 1, offset)
+    offset += rows.nbytes
+    primes = np.frombuffer(asset.data, "<i8", 4, offset).reshape(1, 2, 2)
+    offset += primes.nbytes
+    offsets = np.frombuffer(asset.data, "<i8", 4, offset).reshape(1, 4)
+    offset += offsets.nbytes
+    multipliers = np.frombuffer(asset.data, "<i8", 3, offset)
+    offset += multipliers.nbytes
+    token_map = np.frombuffer(asset.data, "<i4", 4, offset)
+    np.testing.assert_array_equal(layer_ids, [1])
+    np.testing.assert_array_equal(rows, [88])
+    np.testing.assert_array_equal(primes, [[[17, 19], [23, 29]]])
+    np.testing.assert_array_equal(offsets, [[0, 17, 36, 59]])
+    assert np.all(multipliers & 1)
+    assert token_map[1] == token_map[2]
+    assert token_map[3] != token_map[1]
 
 
 def test_pack_runtime_assets_adds_minicpmo45_position_asset(

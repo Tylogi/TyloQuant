@@ -66,5 +66,23 @@ static CudaRuntimeComponents load_cuda_runtime_components(
         }
         result.mtp_available = static_cast<bool>(result.mtp);
     }
+    if (result.plan.predictor ==
+            mfq::cuda::MfqCudaPredictorAdapter::deepseek_v41_dspark) {
+        MFQ_RUNTIME_CHECK(
+            model.c.is_deepseek_v41() &&
+                model.supports_deepseek_v41_speculation(),
+            "invalid DeepSeek-V4.1 DSpark backbone");
+        MfqFile predictor_file(mfq_path);
+        (void)load_config(predictor_file, config_path);
+        auto predictor =
+            mfq::cuda::deepseek_v41_runtime::CudaDeepseekV41Dspark::
+                load_if_present(predictor_file, model.c);
+        if (predictor) {
+            result.mtp = std::make_unique<
+                mfq::cuda::deepseek_v41_runtime::CudaDeepseekV41Dspark>(
+                    std::move(*predictor));
+        }
+        result.mtp_available = static_cast<bool>(result.mtp);
+    }
     return result;
 }

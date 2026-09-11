@@ -381,6 +381,68 @@ def nepq_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
     )
 
 
+_nepq_matmul_forward = nepq_matmul
+
+
+def nepq_backward_input(g: dict, output_gradient: torch.Tensor) -> torch.Tensor:
+    """Compute the NEPQ input gradient with a row-count-aware dispatch."""
+
+    gradient = output_gradient.reshape(-1, int(g["rows"])).contiguous().to(torch.float16)
+    if _has_residual(g) and gradient.shape[0] >= 16:
+        weight = nepq_dequantize(g).reshape(
+            int(g["rows"]), int(g["neuron_len"])
+        )
+        result = torch.mm(gradient, weight)
+    else:
+        result = ext().nepq_backward_input_cuda(
+            *_kernel_args(g),
+            gradient,
+            int(g["neuron_len"]),
+            int(g["sub_bits"]),
+            int(g["format"]),
+        )
+        if _has_residual(g):
+            result = ext().nepq_sparse_residual_backward_input_cuda(
+                g["residual_codebook"],
+                g["residual_first"],
+                g["residual_second"],
+                gradient,
+                int(g["residual_position_bits"]),
+                int(g["residual_block_vectors"]),
+                result,
+            )
+    block = int(g["rotation_block"])
+    if block:
+        result = ext().nepq_hadamard_adjoint_cuda(
+            result,
+            g["rotation_signs"],
+            block,
+        )
+    return result
+
+
+class _NepqMatmulAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, g: dict) -> torch.Tensor:
+        ctx.g = g
+        ctx.input_shape = tuple(x.shape)
+        ctx.input_dtype = x.dtype
+        return _nepq_matmul_forward(g, x)
+
+    @staticmethod
+    def backward(ctx, output_gradient: torch.Tensor):
+        gradient = nepq_backward_input(ctx.g, output_gradient)
+        return gradient.reshape(ctx.input_shape).to(ctx.input_dtype), None
+
+
+def nepq_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
+    """Compute all NEPQ projections with a direct packed input gradient."""
+
+    if not torch.is_grad_enabled() or not x.requires_grad:
+        return _nepq_matmul_forward(g, x)
+    return _NepqMatmulAutograd.apply(x, g)
+
+
 def nepq_grouped_matmul(
     g: dict,
     x: torch.Tensor,
@@ -499,6 +561,7 @@ def nepq_grouped_matmul_pool(
 
 
 __all__ = [
+    "nepq_backward_input",
     "nepq_dequantize",
     "nepq_gemm_f16",
     "nepq_grouped_matmul",

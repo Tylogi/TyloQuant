@@ -626,6 +626,603 @@ _VQ_MATMUL_SOURCE = r"""
     }
 """
 
+_VQ_BACKWARD_INPUT_SOURCE = r"""
+    uint column = thread_position_in_grid.x;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || first_row >= uint(M)) {
+        return;
+    }
+
+    float accumulators[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators[local_row] = 0.0f;
+    }
+    for (uint output = 0u; output < uint(OUT); ++output) {
+        float weight = mfq_vq_decode_weight(
+            indices_packed,
+            state_packed,
+            aux_packed,
+            anchors,
+            codebooks,
+            scale_lut,
+            state_to_codebank,
+            bank_ids,
+            parameters,
+            output,
+            column,
+            uint(GS),
+            uint(NG),
+            uint(VECTOR_SIZE),
+            uint(NVEC),
+            uint(INDEX_BITS),
+            uint(STATE_BITS),
+            uint(STATES),
+            uint(ENTRIES),
+            uint(CODE_BANKS),
+            uint(AUX_MODE),
+            uint(CODE_BANK_MODE),
+            uint(HAS_TABLE_BANKS),
+            uint(GROUPS_PER_SUPER),
+            uint(NSUPER),
+            uint(NSIGN));
+        if (HAS_RESIDUAL != 0) {
+            uint vector = column >> 3u;
+            uint component = column & 7u;
+            uint block = vector / uint(RESIDUAL_BLOCK_VECTORS);
+            uint position_in_block = vector - block * uint(RESIDUAL_BLOCK_VECTORS);
+            uint record_index = output * uint(RESIDUAL_BLOCKS) + block;
+            short records[2] = {
+                residual_first[record_index],
+                residual_second[record_index],
+            };
+            for (uint stream = 0u; stream < 2u; ++stream) {
+                int record = int(records[stream]);
+                if (record < 0) {
+                    continue;
+                }
+                uint position = uint(record) & ((1u << uint(POSITION_BITS)) - 1u);
+                uint dictionary_id = uint(record) >> uint(POSITION_BITS);
+                if (position == position_in_block && dictionary_id < 1024u) {
+                    weight += float(residual_codebook[dictionary_id * 8u + component]);
+                }
+            }
+        }
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = first_row + local_row;
+            if (row < uint(M)) {
+                accumulators[local_row] = fma(
+                    float(x[row * uint(OUT) + output]),
+                    weight,
+                    accumulators[local_row]);
+            }
+        }
+    }
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        uint row = first_row + local_row;
+        if (row < uint(M)) {
+            y[row * uint(K) + column] = T(accumulators[local_row]);
+        }
+    }
+"""
+
+_VQ_BACKWARD_PAIR_SOURCE = r"""
+    uint pair = thread_position_in_grid.x;
+    uint column = pair * 2u;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || first_row >= uint(M)) {
+        return;
+    }
+    uint group = column / uint(GS);
+    uint vector = column / uint(VECTOR_SIZE);
+    uint component0 = column - vector * uint(VECTOR_SIZE);
+    uint component1 = component0 + 1u;
+    float accumulators0[TILE_M];
+    float accumulators1[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators0[local_row] = 0.0f;
+        accumulators1[local_row] = 0.0f;
+    }
+    for (uint output = 0u; output < uint(OUT); ++output) {
+        uint state_index = output * uint(NG) + group;
+        uint state = mfq_read_bits(
+            state_packed,
+            state_index,
+            uint(STATE_BITS));
+        uint table_bank = 0u;
+        if (HAS_TABLE_BANKS != 0) {
+            table_bank = uint(bank_ids[
+                output * uint(NSUPER)
+                + group / uint(GROUPS_PER_SUPER)
+            ]);
+        }
+        uint index = mfq_read_bits(
+            indices_packed,
+            output * uint(NVEC) + vector,
+            uint(INDEX_BITS));
+        uint aux_value = 0u;
+        if (AUX_MODE == 1 || AUX_MODE == 2) {
+            aux_value = mfq_read_bits(
+                aux_packed,
+                output * uint(NSIGN) + column / 8u,
+                7u);
+        } else if (AUX_MODE == 3) {
+            aux_value = mfq_read_bits(aux_packed, state_index, 1u);
+        }
+        uint code_bank = 0u;
+        if (CODE_BANK_MODE == 1) {
+            code_bank = uint(state_to_codebank[state]);
+        } else if (CODE_BANK_MODE == 2) {
+            code_bank = aux_value;
+        }
+        uint code_base = (
+            (
+                (table_bank * uint(CODE_BANKS) + code_bank)
+                * uint(ENTRIES) + index
+            )
+            * uint(VECTOR_SIZE)
+        );
+        float code0 = float(codebooks[code_base + component0]);
+        float code1 = float(codebooks[code_base + component1]);
+        if (AUX_MODE == 1 || AUX_MODE == 2) {
+            uint sign0 = column & 7u;
+            uint sign1 = (column + 1u) & 7u;
+            uint negative0 = sign0 < 7u
+                ? ((aux_value >> sign0) & 1u)
+                : (popcount(aux_value) & 1u);
+            uint negative1 = sign1 < 7u
+                ? ((aux_value >> sign1) & 1u)
+                : (popcount(aux_value) & 1u);
+            if (AUX_MODE == 2) {
+                if (sign0 == 7u) {
+                    negative0 ^= (index >> 7u) & 1u;
+                }
+                if (sign1 == 7u) {
+                    negative1 ^= (index >> 7u) & 1u;
+                }
+            }
+            code0 = negative0 != 0u ? -code0 : code0;
+            code1 = negative1 != 0u ? -code1 : code1;
+        } else if (AUX_MODE == 3) {
+            float delta = aux_value != 0u ? -parameters[0] : parameters[0];
+            code0 += delta;
+            code1 += delta;
+        }
+        float weight_scale = anchors[output]
+            * scale_lut[table_bank * uint(STATES) + state];
+        float weight0 = weight_scale * code0;
+        float weight1 = weight_scale * code1;
+        if (HAS_RESIDUAL != 0) {
+            uint block = vector / uint(RESIDUAL_BLOCK_VECTORS);
+            uint position = vector - block * uint(RESIDUAL_BLOCK_VECTORS);
+            uint record_index = output * uint(RESIDUAL_BLOCKS) + block;
+            short records[2] = {
+                residual_first[record_index],
+                residual_second[record_index],
+            };
+            for (uint stream = 0u; stream < 2u; ++stream) {
+                int record = int(records[stream]);
+                if (record < 0) {
+                    continue;
+                }
+                uint record_position = uint(record)
+                    & ((1u << uint(POSITION_BITS)) - 1u);
+                uint dictionary_id = uint(record) >> uint(POSITION_BITS);
+                if (record_position == position && dictionary_id < 1024u) {
+                    weight0 += float(residual_codebook[
+                        dictionary_id * 8u + (column & 7u)
+                    ]);
+                    weight1 += float(residual_codebook[
+                        dictionary_id * 8u + ((column + 1u) & 7u)
+                    ]);
+                }
+            }
+        }
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = first_row + local_row;
+            if (row < uint(M)) {
+                float gradient = float(x[row * uint(OUT) + output]);
+                accumulators0[local_row] = fma(
+                    gradient,
+                    weight0,
+                    accumulators0[local_row]);
+                accumulators1[local_row] = fma(
+                    gradient,
+                    weight1,
+                    accumulators1[local_row]);
+            }
+        }
+    }
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        uint row = first_row + local_row;
+        if (row < uint(M)) {
+            y[row * uint(K) + column] = T(accumulators0[local_row]);
+            if (column + 1u < uint(K)) {
+                y[row * uint(K) + column + 1u] = T(accumulators1[local_row]);
+            }
+        }
+    }
+"""
+
+_VQ_BACKWARD_QUAD_SOURCE = r"""
+    uint quad = thread_position_in_grid.x;
+    uint column = quad * 4u;
+    uint first_row = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (column >= uint(K) || first_row >= uint(M)) {
+        return;
+    }
+    uint group = column / uint(GS);
+    uint vector = column / uint(VECTOR_SIZE);
+    uint component_base = column - vector * uint(VECTOR_SIZE);
+    float4 accumulators[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators[local_row] = float4(0.0f);
+    }
+    for (uint output = 0u; output < uint(OUT); ++output) {
+        uint state_index = output * uint(NG) + group;
+        uint state = mfq_read_bits(
+            state_packed,
+            state_index,
+            uint(STATE_BITS));
+        uint table_bank = 0u;
+        if (HAS_TABLE_BANKS != 0) {
+            table_bank = uint(bank_ids[
+                output * uint(NSUPER)
+                + group / uint(GROUPS_PER_SUPER)
+            ]);
+        }
+        uint index = mfq_read_bits(
+            indices_packed,
+            output * uint(NVEC) + vector,
+            uint(INDEX_BITS));
+        uint aux_value = 0u;
+        if (AUX_MODE == 1 || AUX_MODE == 2) {
+            aux_value = mfq_read_bits(
+                aux_packed,
+                output * uint(NSIGN) + column / 8u,
+                7u);
+        } else if (AUX_MODE == 3) {
+            aux_value = mfq_read_bits(aux_packed, state_index, 1u);
+        }
+        uint code_bank = 0u;
+        if (CODE_BANK_MODE == 1) {
+            code_bank = uint(state_to_codebank[state]);
+        } else if (CODE_BANK_MODE == 2) {
+            code_bank = aux_value;
+        }
+        uint code_base = (
+            (
+                (table_bank * uint(CODE_BANKS) + code_bank)
+                * uint(ENTRIES) + index
+            )
+            * uint(VECTOR_SIZE) + component_base
+        );
+        float weight_scale = anchors[output]
+            * scale_lut[table_bank * uint(STATES) + state];
+        float4 weights;
+        for (uint component = 0u; component < 4u; ++component) {
+            float code = float(codebooks[code_base + component]);
+            if (AUX_MODE == 1 || AUX_MODE == 2) {
+                uint sign_position = (column + component) & 7u;
+                uint negative = sign_position < 7u
+                    ? ((aux_value >> sign_position) & 1u)
+                    : (popcount(aux_value) & 1u);
+                if (AUX_MODE == 2 && sign_position == 7u) {
+                    negative ^= (index >> 7u) & 1u;
+                }
+                code = negative != 0u ? -code : code;
+            } else if (AUX_MODE == 3) {
+                code += aux_value != 0u ? -parameters[0] : parameters[0];
+            }
+            weights[component] = weight_scale * code;
+        }
+        if (HAS_RESIDUAL != 0) {
+            uint block = vector / uint(RESIDUAL_BLOCK_VECTORS);
+            uint position = vector - block * uint(RESIDUAL_BLOCK_VECTORS);
+            uint record_index = output * uint(RESIDUAL_BLOCKS) + block;
+            short records[2] = {
+                residual_first[record_index],
+                residual_second[record_index],
+            };
+            for (uint stream = 0u; stream < 2u; ++stream) {
+                int record = int(records[stream]);
+                if (record < 0) {
+                    continue;
+                }
+                uint record_position = uint(record)
+                    & ((1u << uint(POSITION_BITS)) - 1u);
+                uint dictionary_id = uint(record) >> uint(POSITION_BITS);
+                if (record_position == position && dictionary_id < 1024u) {
+                    for (uint component = 0u; component < 4u; ++component) {
+                        weights[component] += float(residual_codebook[
+                            dictionary_id * 8u
+                            + ((column + component) & 7u)
+                        ]);
+                    }
+                }
+            }
+        }
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = first_row + local_row;
+            if (row < uint(M)) {
+                float gradient = float(x[row * uint(OUT) + output]);
+                accumulators[local_row] = fma(
+                    float4(gradient),
+                    weights,
+                    accumulators[local_row]);
+            }
+        }
+    }
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        uint row = first_row + local_row;
+        if (row < uint(M)) {
+            for (uint component = 0u; component < 4u; ++component) {
+                if (column + component < uint(K)) {
+                    y[row * uint(K) + column + component] =
+                        T(accumulators[local_row][component]);
+                }
+            }
+        }
+    }
+"""
+
+_VQ_BACKWARD_MATRIX_SOURCE = r"""
+    constexpr uint BM = 8u;
+    constexpr uint BN = 64u;
+    constexpr uint BK = uint(GS) * uint(GPC);
+    constexpr uint BK_STORAGE = 128u;
+    constexpr uint BN_PAD = BN + 8u;
+    constexpr uint VECTORS_PER_GROUP =
+        (uint(GS) + uint(VECTOR_SIZE) - 1u) / uint(VECTOR_SIZE);
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint local_thread = thread_index_in_threadgroup;
+    uint row_base = threadgroup_position_in_grid.y * BM;
+    uint column_base = threadgroup_position_in_grid.x * BK;
+    threadgroup half gradient_tile[BM * BN_PAD];
+    threadgroup half weight_tile[BN * BK_STORAGE];
+    metal::simdgroup_matrix<float, 8, 8> c0;
+    metal::simdgroup_matrix<float, 8, 8> c1;
+    c0.thread_elements()[0] = 0.0f;
+    c0.thread_elements()[1] = 0.0f;
+    c1.thread_elements()[0] = 0.0f;
+    c1.thread_elements()[1] = 0.0f;
+    uint quadrant = lane / 4u;
+    uint fragment_row = (quadrant & 4u) + ((lane / 2u) & 3u);
+    uint fragment_col = (quadrant & 2u) * 2u + (lane & 1u) * 2u;
+    uint simd_col = simd_group * 16u;
+    uint chunks = (uint(OUT) + BN - 1u) / BN;
+    for (uint chunk = 0u; chunk < chunks; ++chunk) {
+        uint output_base = chunk * BN;
+        for (uint index = local_thread; index < BM * BN; index += 256u) {
+            uint local_row = index / BN;
+            uint local_output = index - local_row * BN;
+            uint row = row_base + local_row;
+            uint output = output_base + local_output;
+            gradient_tile[local_row * BN_PAD + local_output] =
+                row < uint(M) && output < uint(OUT)
+                ? half(x[row * uint(OUT) + output])
+                : half(0.0f);
+        }
+        for (
+            uint index = local_thread;
+            index < BN * BK_STORAGE;
+            index += 256u
+        ) {
+            weight_tile[index] = half(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint group_base = column_base / uint(GS);
+        for (
+            uint task = local_thread;
+            task < BN * uint(GPC);
+            task += 256u
+        ) {
+            uint local_output = task / uint(GPC);
+            uint local_group = task - local_output * uint(GPC);
+            uint output = output_base + local_output;
+            uint group = group_base + local_group;
+            bool valid = output < uint(OUT) && group < uint(NG);
+            uint state = 0u;
+            uint table_bank = 0u;
+            uint code_bank = 0u;
+            uint delta_value = 0u;
+            float weight_scale = 0.0f;
+            if (valid) {
+                uint state_index = output * uint(NG) + group;
+                state = mfq_read_bits(
+                    state_packed, state_index, uint(STATE_BITS));
+                if (HAS_TABLE_BANKS != 0) {
+                    table_bank = uint(bank_ids[
+                        output * uint(NSUPER)
+                        + group / uint(GROUPS_PER_SUPER)
+                    ]);
+                }
+                if (AUX_MODE == 3) {
+                    delta_value = mfq_read_bits(
+                        aux_packed, state_index, 1u);
+                }
+                if (CODE_BANK_MODE == 1) {
+                    code_bank = uint(state_to_codebank[state]);
+                } else if (CODE_BANK_MODE == 2) {
+                    code_bank = delta_value;
+                }
+                weight_scale = anchors[output]
+                    * scale_lut[table_bank * uint(STATES) + state];
+            }
+            for (
+                uint local_vector = 0u;
+                local_vector < VECTORS_PER_GROUP;
+                ++local_vector
+            ) {
+                uint local_column_base =
+                    local_group * uint(GS)
+                    + local_vector * uint(VECTOR_SIZE);
+                uint column = column_base + local_column_base;
+                uint vector = column / uint(VECTOR_SIZE);
+                uint index = valid && column < uint(K)
+                    ? mfq_read_bits(
+                        indices_packed,
+                        output * uint(NVEC) + vector,
+                        uint(INDEX_BITS))
+                    : 0u;
+                uint aux_value = 0u;
+                if (
+                    valid
+                    && column < uint(K)
+                    && (AUX_MODE == 1 || AUX_MODE == 2)
+                ) {
+                    aux_value = mfq_read_bits(
+                        aux_packed,
+                        output * uint(NSIGN) + column / 8u,
+                        7u);
+                }
+                for (
+                    uint component = 0u;
+                    component < uint(VECTOR_SIZE);
+                    ++component
+                ) {
+                    uint local_column = local_column_base + component;
+                    uint global_column = column + component;
+                    if (
+                        local_column >= BK
+                        || local_column >= (local_group + 1u) * uint(GS)
+                    ) {
+                        continue;
+                    }
+                    float value = 0.0f;
+                    if (valid && global_column < uint(K)) {
+                        uint code_offset = (
+                            (
+                                (
+                                    table_bank * uint(CODE_BANKS)
+                                    + code_bank
+                                )
+                                * uint(ENTRIES) + index
+                            )
+                            * uint(VECTOR_SIZE) + component
+                        );
+                        float code = float(codebooks[code_offset]);
+                        if (AUX_MODE == 1 || AUX_MODE == 2) {
+                            uint sign_position = global_column & 7u;
+                            uint negative = sign_position < 7u
+                                ? ((aux_value >> sign_position) & 1u)
+                                : (popcount(aux_value) & 1u);
+                            if (AUX_MODE == 2 && sign_position == 7u) {
+                                negative ^= (index >> 7u) & 1u;
+                            }
+                            code = negative != 0u ? -code : code;
+                        } else if (AUX_MODE == 3) {
+                            code += delta_value != 0u
+                                ? -parameters[0] : parameters[0];
+                        }
+                        value = weight_scale * code;
+                    }
+                    weight_tile[
+                        local_output * BK_STORAGE + local_column
+                    ] = half(value);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (HAS_RESIDUAL != 0) {
+            constexpr uint RESIDUAL_VECTORS = (BK + 7u) / 8u;
+            for (
+                uint task = local_thread;
+                task < BN * RESIDUAL_VECTORS;
+                task += 256u
+            ) {
+                uint local_output = task / RESIDUAL_VECTORS;
+                uint local_vector = task - local_output * RESIDUAL_VECTORS;
+                uint local_column = local_vector * 8u;
+                uint output = output_base + local_output;
+                uint column = column_base + local_column;
+                if (output >= uint(OUT) || column >= uint(K)) {
+                    continue;
+                }
+                uint vector = column >> 3u;
+                uint block = vector / uint(RESIDUAL_BLOCK_VECTORS);
+                uint position_in_block =
+                    vector - block * uint(RESIDUAL_BLOCK_VECTORS);
+                uint record_index = output * uint(RESIDUAL_BLOCKS) + block;
+                short records[2] = {
+                    residual_first[record_index],
+                    residual_second[record_index],
+                };
+                for (uint stream = 0u; stream < 2u; ++stream) {
+                    int record = int(records[stream]);
+                    if (record < 0) {
+                        continue;
+                    }
+                    uint position = uint(record)
+                        & ((1u << uint(POSITION_BITS)) - 1u);
+                    uint dictionary_id = uint(record) >> uint(POSITION_BITS);
+                    if (
+                        position == position_in_block
+                        && dictionary_id < 1024u
+                    ) {
+                        for (uint component = 0u; component < 8u; ++component) {
+                            if (local_column + component < BK) {
+                                uint offset =
+                                    local_output * BK_STORAGE
+                                    + local_column + component;
+                                weight_tile[offset] = half(
+                                    float(weight_tile[offset])
+                                    + float(residual_codebook[
+                                        dictionary_id * 8u + component
+                                    ]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0u; kk < BN; kk += 8u) {
+            metal::simdgroup_matrix<half, 8, 8> a;
+            metal::simdgroup_matrix<half, 8, 8> b0;
+            metal::simdgroup_matrix<half, 8, 8> b1;
+            a.thread_elements()[0] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col];
+            a.thread_elements()[1] = gradient_tile[
+                fragment_row * BN_PAD + kk + fragment_col + 1u];
+            b0.thread_elements()[0] = weight_tile[
+                (kk + fragment_row) * BK_STORAGE
+                + simd_col + fragment_col];
+            b0.thread_elements()[1] = weight_tile[
+                (kk + fragment_row) * BK_STORAGE
+                + simd_col + fragment_col + 1u];
+            b1.thread_elements()[0] = weight_tile[
+                (kk + fragment_row) * BK_STORAGE
+                + simd_col + 8u + fragment_col];
+            b1.thread_elements()[1] = weight_tile[
+                (kk + fragment_row) * BK_STORAGE
+                + simd_col + 8u + fragment_col + 1u];
+            simdgroup_multiply_accumulate(c0, a, b0, c0);
+            simdgroup_multiply_accumulate(c1, a, b1, c1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint row = row_base + fragment_row;
+    uint local_col0 = simd_col + fragment_col;
+    uint local_col1 = local_col0 + 8u;
+    uint col0 = column_base + local_col0;
+    uint col1 = column_base + local_col1;
+    if (row < uint(M)) {
+        if (local_col0 < BK && col0 < uint(K)) {
+            y[row * uint(K) + col0] = T(c0.thread_elements()[0]);
+        }
+        if (local_col0 + 1u < BK && col0 + 1u < uint(K)) {
+            y[row * uint(K) + col0 + 1u] = T(c0.thread_elements()[1]);
+        }
+        if (local_col1 < BK && col1 < uint(K)) {
+            y[row * uint(K) + col1] = T(c1.thread_elements()[0]);
+        }
+        if (local_col1 + 1u < BK && col1 + 1u < uint(K)) {
+            y[row * uint(K) + col1 + 1u] = T(c1.thread_elements()[1]);
+        }
+    }
+"""
+
 _VQ_DEQUANT_SOURCE = r"""
     uint linear = thread_position_in_grid.x;
     if (linear >= uint(OUT) * uint(K)) {
@@ -1088,6 +1685,46 @@ _HADAMARD_SOURCE = r"""
     }
 """
 
+_INVERSE_HADAMARD_SOURCE = r"""
+    uint row = thread_position_in_grid.x / 256u;
+    uint lane = thread_index_in_threadgroup;
+    if (row >= uint(M)) {
+        return;
+    }
+
+    threadgroup float values[BLOCK];
+    for (uint local_block = 0u; local_block < uint(K) / uint(BLOCK); ++local_block) {
+        uint column_base = local_block * uint(BLOCK);
+        for (uint index = lane; index < uint(BLOCK); index += 256u) {
+            uint column = column_base + index;
+            values[index] = float(x[row * uint(K) + column]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = 1u; stride < uint(BLOCK); stride <<= 1u) {
+            for (uint pair = lane; pair < uint(BLOCK) / 2u; pair += 256u) {
+                uint pair_block = pair / stride;
+                uint within = pair - pair_block * stride;
+                uint first = pair_block * (stride << 1u) + within;
+                uint second = first + stride;
+                float a = values[first];
+                float b = values[second];
+                values[first] = a + b;
+                values[second] = a - b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float inverse = rsqrt(float(BLOCK));
+        for (uint index = lane; index < uint(BLOCK); index += 256u) {
+            uint column = column_base + index;
+            y[row * uint(K) + column] = T(
+                values[index] * inverse * float(signs[column]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"""
+
 
 def _vq_kernel(name: str, source: str):
     return mx.fast.metal_kernel(
@@ -1119,6 +1756,94 @@ _VQ_GEMM_KERNEL = _vq_kernel("mfq_vq_gemm", _VQ_MATMUL_SOURCE)
 _VQ_GEMM_MATRIX_KERNEL = _vq_kernel(
     "mfq_vq_gemm_matrix",
     _VQ_GEMM_MATRIX_SOURCE,
+)
+_VQ_BACKWARD_INPUT_KERNEL = mx.fast.metal_kernel(
+    name="mfq_vq_packed_backward_input",
+    input_names=[
+        "indices_packed",
+        "state_packed",
+        "aux_packed",
+        "anchors",
+        "codebooks",
+        "scale_lut",
+        "state_to_codebank",
+        "bank_ids",
+        "parameters",
+        "residual_codebook",
+        "residual_first",
+        "residual_second",
+        "x",
+    ],
+    output_names=["y"],
+    header=_BITSTREAM_HEADER,
+    source=_VQ_BACKWARD_INPUT_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
+_VQ_BACKWARD_PAIR_KERNEL = mx.fast.metal_kernel(
+    name="mfq_vq_packed_backward_pair",
+    input_names=[
+        "indices_packed",
+        "state_packed",
+        "aux_packed",
+        "anchors",
+        "codebooks",
+        "scale_lut",
+        "state_to_codebank",
+        "bank_ids",
+        "parameters",
+        "residual_codebook",
+        "residual_first",
+        "residual_second",
+        "x",
+    ],
+    output_names=["y"],
+    header=_BITSTREAM_HEADER,
+    source=_VQ_BACKWARD_PAIR_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
+_VQ_BACKWARD_QUAD_KERNEL = mx.fast.metal_kernel(
+    name="mfq_vq_packed_backward_quad",
+    input_names=[
+        "indices_packed",
+        "state_packed",
+        "aux_packed",
+        "anchors",
+        "codebooks",
+        "scale_lut",
+        "state_to_codebank",
+        "bank_ids",
+        "parameters",
+        "residual_codebook",
+        "residual_first",
+        "residual_second",
+        "x",
+    ],
+    output_names=["y"],
+    header=_BITSTREAM_HEADER,
+    source=_VQ_BACKWARD_QUAD_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
+_VQ_BACKWARD_MATRIX_KERNEL = mx.fast.metal_kernel(
+    name="mfq_vq_packed_backward_matrix",
+    input_names=[
+        "indices_packed",
+        "state_packed",
+        "aux_packed",
+        "anchors",
+        "codebooks",
+        "scale_lut",
+        "state_to_codebank",
+        "bank_ids",
+        "parameters",
+        "residual_codebook",
+        "residual_first",
+        "residual_second",
+        "x",
+    ],
+    output_names=["y"],
+    header=_BITSTREAM_HEADER,
+    source=_VQ_BACKWARD_MATRIX_SOURCE,
+    compile_options={"math_mode": "fast"},
 )
 _VQ_DEQUANT_KERNEL = mx.fast.metal_kernel(
     name="mfq_vq_dequant",
@@ -1191,6 +1916,13 @@ _HADAMARD_KERNEL = mx.fast.metal_kernel(
     input_names=["x", "signs"],
     output_names=["y"],
     source=_HADAMARD_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
+_INVERSE_HADAMARD_KERNEL = mx.fast.metal_kernel(
+    name="mfq_inverse_signed_hadamard",
+    input_names=["x", "signs"],
+    output_names=["y"],
+    source=_INVERSE_HADAMARD_SOURCE,
     compile_options={"math_mode": "fast"},
 )
 
@@ -1271,6 +2003,80 @@ _NEPQ_RESIDUAL_DEQUANT_SOURCE = r"""
     y[logical] = T(value);
 """
 
+_NEPQ_RESIDUAL_BACKWARD_SOURCE = r"""
+    uint vector = thread_position_in_grid.x;
+    uint row_base = threadgroup_position_in_grid.y * uint(TILE_M);
+    if (vector >= uint(NVEC) || row_base >= uint(M)) {
+        return;
+    }
+    float accumulators[TILE_M][8];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        for (uint component = 0u; component < 8u; ++component) {
+            accumulators[local_row][component] = 0.0f;
+        }
+    }
+    uint begin = transpose_offsets[vector];
+    uint end = transpose_offsets[vector + 1u];
+    for (uint record = begin; record < end; ++record) {
+        uint output = transpose_rows[record];
+        uint dictionary_id = uint(transpose_dictionary[record]);
+        float gradients[TILE_M];
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = row_base + local_row;
+            gradients[local_row] = row < uint(M)
+                ? float(x[row * uint(OUT) + output])
+                : 0.0f;
+        }
+        for (uint component = 0u; component < 8u; ++component) {
+            float weight = float(residual_codebook[
+                dictionary_id * 8u + component
+            ]);
+            for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+                accumulators[local_row][component] = fma(
+                    gradients[local_row],
+                    weight,
+                    accumulators[local_row][component]);
+            }
+        }
+    }
+    uint column = vector * 8u;
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        uint row = row_base + local_row;
+        if (row < uint(M)) {
+            float values[8];
+            for (uint component = 0u; component < 8u; ++component) {
+                uint index = row * uint(K) + column + component;
+                values[component] = float(base[index])
+                    + accumulators[local_row][component];
+            }
+            if (FUSE_ROTATION != 0) {
+                for (uint stride = 1u; stride < 8u; stride <<= 1u) {
+                    for (uint pair = 0u; pair < 4u; ++pair) {
+                        uint pair_block = pair / stride;
+                        uint within = pair - pair_block * stride;
+                        uint first = pair_block * (stride << 1u) + within;
+                        uint second = first + stride;
+                        float first_value = values[first];
+                        float second_value = values[second];
+                        values[first] = first_value + second_value;
+                        values[second] = first_value - second_value;
+                    }
+                }
+            }
+            for (uint component = 0u; component < 8u; ++component) {
+                if (column + component < uint(K)) {
+                    float value = values[component];
+                    if (FUSE_ROTATION != 0) {
+                        value *= 0.3535533905932738f
+                            * float(rotation_signs[column + component]);
+                    }
+                    y[row * uint(K) + column + component] = T(value);
+                }
+            }
+        }
+    }
+"""
+
 _NEPQ_RESIDUAL_MATMUL_KERNEL = mx.fast.metal_kernel(
     name="mfq_nepq_sparse_residual_matmul",
     input_names=[
@@ -1298,6 +2104,21 @@ _NEPQ_RESIDUAL_DEQUANT_KERNEL = mx.fast.metal_kernel(
     compile_options={"math_mode": "fast"},
 )
 
+_NEPQ_RESIDUAL_BACKWARD_KERNEL = mx.fast.metal_kernel(
+    name="mfq_nepq_sparse_residual_backward",
+    input_names=[
+        "base",
+        "x",
+        "residual_codebook",
+        "transpose_offsets",
+        "transpose_rows",
+        "transpose_dictionary",
+        "rotation_signs",
+    ],
+    output_names=["y"],
+    source=_NEPQ_RESIDUAL_BACKWARD_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
 
 def _pack_bits(values: np.ndarray, bits: int) -> np.ndarray:
     source = np.ascontiguousarray(values).reshape(-1)
@@ -1350,6 +2171,55 @@ def _matrix_shape(tensor: VqTensor) -> tuple[int, int]:
     return out, int(tensor.neuron_len)
 
 
+def _transpose_sparse_residual_records(
+    first: np.ndarray,
+    second: np.ndarray,
+    *,
+    vectors: int,
+    block_vectors: int,
+    position_bits: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    blocks = int(first.shape[1])
+    vector_parts = []
+    row_parts = []
+    dictionary_parts = []
+    position_mask = (1 << position_bits) - 1
+    for records in (first, second):
+        flat = np.asarray(records, dtype=np.int32).reshape(-1)
+        locations = np.flatnonzero(flat >= 0)
+        if not locations.size:
+            continue
+        selected = flat[locations]
+        rows = locations // blocks
+        block_ids = locations - rows * blocks
+        vector_ids = block_ids * block_vectors + (selected & position_mask)
+        dictionary_ids = selected >> position_bits
+        valid = (vector_ids < vectors) & (dictionary_ids < 1024)
+        vector_parts.append(vector_ids[valid])
+        row_parts.append(rows[valid])
+        dictionary_parts.append(dictionary_ids[valid])
+    if not vector_parts:
+        return (
+            np.zeros(vectors + 1, dtype=np.uint32),
+            np.zeros(1, dtype=np.uint32),
+            np.zeros(1, dtype=np.uint16),
+        )
+    vector_ids = np.concatenate(vector_parts)
+    rows = np.concatenate(row_parts)
+    dictionary_ids = np.concatenate(dictionary_parts)
+    order = np.argsort(vector_ids, kind="stable")
+    vector_ids = vector_ids[order]
+    counts = np.bincount(vector_ids, minlength=vectors)
+    offsets = np.empty(vectors + 1, dtype=np.uint32)
+    offsets[0] = 0
+    np.cumsum(counts, dtype=np.uint32, out=offsets[1:])
+    return (
+        offsets,
+        np.ascontiguousarray(rows[order], dtype=np.uint32),
+        np.ascontiguousarray(dictionary_ids[order], dtype=np.uint16),
+    )
+
+
 @dataclass(frozen=True)
 class MetalVqWeight:
     """Canonical packed Metal layout shared by NVQ, NPQ, and NEPQ."""
@@ -1367,6 +2237,9 @@ class MetalVqWeight:
     residual_codebook: mx.array
     residual_first: mx.array
     residual_second: mx.array
+    residual_transpose_offsets: mx.array
+    residual_transpose_rows: mx.array
+    residual_transpose_dictionary: mx.array
     format_label: str
     out: int
     neuron_len: int
@@ -1409,6 +2282,9 @@ class MetalVqWeight:
         residual_codebook = np.zeros((1, 8), dtype=np.float16)
         residual_first = np.zeros((1, 1), dtype=np.int16)
         residual_second = np.full((1, 1), -1, dtype=np.int16)
+        residual_transpose_offsets = np.zeros(1, dtype=np.uint32)
+        residual_transpose_rows = np.zeros(1, dtype=np.uint32)
+        residual_transpose_dictionary = np.zeros(1, dtype=np.uint16)
         residual_position_bits = 0
         residual_block_vectors = 0
         residual_blocks_per_row = 0
@@ -1626,6 +2502,11 @@ class MetalVqWeight:
             residual_codebook=mx.array(residual_codebook),
             residual_first=mx.array(residual_first),
             residual_second=mx.array(residual_second),
+            residual_transpose_offsets=mx.array(residual_transpose_offsets),
+            residual_transpose_rows=mx.array(residual_transpose_rows),
+            residual_transpose_dictionary=mx.array(
+                residual_transpose_dictionary
+            ),
             format_label=label,
             out=out,
             neuron_len=neuron_len,
@@ -1741,6 +2622,43 @@ def signed_hadamard(
     )[0]
 
 
+def inverse_signed_hadamard(
+    x: mx.array | np.ndarray,
+    signs: mx.array | np.ndarray,
+    block: int,
+) -> mx.array:
+    """Apply the adjoint ``D @ H`` of :func:`signed_hadamard`."""
+
+    source = _floating(x)
+    if source.ndim != 2:
+        raise ValueError("inverse signed Hadamard input must be rank-2 [M,K]")
+    rows, width = (int(value) for value in source.shape)
+    block = int(block)
+    if block <= 0 or block & (block - 1) or width % block:
+        raise ValueError("Hadamard block must be a power of two dividing K")
+    if block > 8192:
+        raise ValueError("Hadamard block exceeds Metal threadgroup memory")
+    diagonal = signs if isinstance(signs, mx.array) else mx.array(signs)
+    if diagonal.ndim != 1 or int(diagonal.size) != width:
+        raise ValueError(f"Hadamard sign diagonal must have shape ({width},)")
+    diagonal = mx.contiguous(diagonal.astype(mx.int8))
+    if rows == 0:
+        return mx.zeros(source.shape, dtype=source.dtype)
+    return _INVERSE_HADAMARD_KERNEL(
+        inputs=[source, diagonal],
+        template=[
+            ("T", source.dtype),
+            ("M", rows),
+            ("K", width),
+            ("BLOCK", block),
+        ],
+        grid=(rows * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[source.shape],
+        output_dtypes=[source.dtype],
+    )[0]
+
+
 def _prepare_input(
     weight: MetalVqWeight,
     x: mx.array | np.ndarray,
@@ -1825,6 +2743,68 @@ def _add_sparse_residual_dequant(
         threadgroup=(min(256, total), 1, 1),
         output_shapes=[(weight.out, weight.neuron_len)],
         output_dtypes=[base.dtype],
+    )[0]
+
+
+def _ensure_sparse_residual_transpose(weight: MetalVqWeight) -> None:
+    if int(weight.residual_transpose_offsets.size) == weight.vectors + 1:
+        return
+    mx.eval(weight.residual_first, weight.residual_second)
+    offsets, rows, dictionary = _transpose_sparse_residual_records(
+        np.asarray(weight.residual_first),
+        np.asarray(weight.residual_second),
+        vectors=weight.vectors,
+        block_vectors=weight.residual_block_vectors,
+        position_bits=weight.residual_position_bits,
+    )
+    object.__setattr__(weight, "residual_transpose_offsets", mx.array(offsets))
+    object.__setattr__(weight, "residual_transpose_rows", mx.array(rows))
+    object.__setattr__(
+        weight,
+        "residual_transpose_dictionary",
+        mx.array(dictionary),
+    )
+
+
+def _add_sparse_residual_backward(
+    weight: MetalVqWeight,
+    gradient: mx.array,
+    base: mx.array,
+    *,
+    fuse_rotation: bool,
+) -> mx.array:
+    if not _has_sparse_residual(weight):
+        return base
+    _ensure_sparse_residual_transpose(weight)
+    rows = int(gradient.shape[0])
+    tile_rows = 1
+    return _NEPQ_RESIDUAL_BACKWARD_KERNEL(
+        inputs=[
+            base,
+            gradient,
+            weight.residual_codebook,
+            weight.residual_transpose_offsets,
+            weight.residual_transpose_rows,
+            weight.residual_transpose_dictionary,
+            weight.rotation_signs,
+        ],
+        template=[
+            ("T", gradient.dtype),
+            ("M", rows),
+            ("TILE_M", tile_rows),
+            ("OUT", weight.out),
+            ("K", weight.neuron_len),
+            ("NVEC", weight.vectors),
+            ("FUSE_ROTATION", int(fuse_rotation)),
+        ],
+        grid=(
+            ((weight.vectors + 31) // 32) * 32,
+            (rows + tile_rows - 1) // tile_rows,
+            1,
+        ),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(rows, weight.neuron_len)],
+        output_dtypes=[gradient.dtype],
     )[0]
 
 
@@ -1938,15 +2918,12 @@ def vq_gemm(weight: MetalVqWeight, x: mx.array | np.ndarray) -> mx.array:
     return _matmul(weight, x, path="gemm")
 
 
-def vq_matmul(
+def _vq_matmul_impl(
     weight: MetalVqWeight,
-    x: mx.array | np.ndarray,
+    source: mx.array,
     *,
     dequantize_threshold: int | None = 64,
 ) -> mx.array:
-    """Dispatch VQ matmul across packed and temporary-dense paths."""
-
-    source = x if isinstance(x, mx.array) else mx.array(x)
     if source.ndim < 1:
         raise ValueError("Metal VQ matmul input must have at least one dimension")
     rows = (
@@ -1963,8 +2940,189 @@ def vq_matmul(
     if rows == 1:
         return vq_gemv(weight, source)
     if rows <= 16:
-        return vq_mmq(weight, source)
-    return vq_gemm(weight, source)
+        return _matmul(weight, source, path="mmq")
+    return _matmul(weight, source, path="gemm")
+
+
+def vq_backward_input(
+    weight: MetalVqWeight,
+    output_gradient: mx.array | np.ndarray,
+) -> mx.array:
+    """Compute ``dX = dY @ W`` from packed NVQ/NPQ/NEPQ storage."""
+
+    gradient = _floating(output_gradient)
+    trailing = len(weight.output_shape)
+    if gradient.ndim < trailing or tuple(
+        int(value) for value in gradient.shape[-trailing:]
+    ) != weight.output_shape:
+        raise ValueError(
+            f"VQ output-gradient suffix must be {weight.output_shape}, got "
+            f"{tuple(int(value) for value in gradient.shape)}"
+        )
+    prefix = tuple(int(value) for value in gradient.shape[:-trailing])
+    rows = int(gradient.size) // weight.out
+    if rows == 0:
+        return mx.zeros((*prefix, weight.neuron_len), dtype=gradient.dtype)
+    gradient = mx.contiguous(gradient.reshape((rows, weight.out)))
+    use_dense = gradient.dtype == mx.float16 and rows > 8
+    use_matrix = (
+        gradient.dtype == mx.float16
+        and 5 <= rows <= 8
+        and weight.groupsize <= 128
+    )
+    use_pair = (
+        gradient.dtype == mx.float16
+        and rows == 2
+        and weight.groupsize % 2 == 0
+        and weight.vector_size % 2 == 0
+    )
+    use_quad = (
+        gradient.dtype == mx.float16
+        and rows <= 4
+        and weight.groupsize % 4 == 0
+        and weight.vector_size % 4 == 0
+    )
+    split_residual = (
+        _has_sparse_residual(weight)
+        and gradient.dtype == mx.float16
+        and rows <= 8
+    )
+    fuse_residual_rotation = split_residual and weight.rotation_block == 8
+    tile_rows = 8 if use_matrix else (
+        min(rows, 8) if gradient.dtype == mx.float16 else min(rows, 4)
+    )
+    groups_per_tile = max(1, 128 // weight.groupsize)
+    columns_per_tile = groups_per_tile * weight.groupsize
+    matrix_threads = 256
+    inputs = [
+        weight.indices_packed,
+        weight.state_packed,
+        weight.aux_packed,
+        weight.anchors,
+        weight.codebooks,
+        weight.scale_lut,
+        weight.state_to_codebank,
+        weight.bank_ids,
+        weight.parameters,
+        weight.residual_codebook,
+        weight.residual_first,
+        weight.residual_second,
+        gradient,
+    ]
+    template = [
+        ("T", gradient.dtype),
+        ("M", rows),
+        ("TILE_M", tile_rows),
+        ("OUT", weight.out),
+        ("K", weight.neuron_len),
+        ("GS", weight.groupsize),
+        ("GPC", groups_per_tile),
+        ("NG", weight.groups),
+        ("VECTOR_SIZE", weight.vector_size),
+        ("NVEC", weight.vectors),
+        ("INDEX_BITS", weight.index_bits),
+        ("STATE_BITS", weight.state_bits),
+        ("STATES", weight.states),
+        ("ENTRIES", weight.entries),
+        ("CODE_BANKS", weight.code_banks),
+        ("AUX_MODE", weight.aux_mode),
+        ("CODE_BANK_MODE", weight.code_bank_mode),
+        ("HAS_TABLE_BANKS", int(weight.table_banks > 1)),
+        ("GROUPS_PER_SUPER", weight.groups_per_super),
+        ("NSUPER", weight.supergroups),
+        ("NSIGN", math.ceil(weight.neuron_len / 8)),
+        ("HAS_RESIDUAL", int(_has_sparse_residual(weight) and not split_residual)),
+        ("RESIDUAL_BLOCKS", max(1, weight.residual_blocks_per_row)),
+        ("POSITION_BITS", max(1, weight.residual_position_bits)),
+        ("RESIDUAL_BLOCK_VECTORS", max(1, weight.residual_block_vectors)),
+    ]
+    kernel = (
+        _VQ_BACKWARD_MATRIX_KERNEL
+        if use_matrix
+        else (
+            _VQ_BACKWARD_QUAD_KERNEL
+            if use_quad
+            else (
+                _VQ_BACKWARD_PAIR_KERNEL
+                if use_pair
+                else _VQ_BACKWARD_INPUT_KERNEL
+            )
+        )
+    )
+    grid = (
+        (
+            ((weight.neuron_len + columns_per_tile - 1) // columns_per_tile)
+            * matrix_threads,
+            (rows + 7) // 8,
+            1,
+        )
+        if use_matrix
+        else (
+            (
+                ((weight.neuron_len + 127) // 128) * 32
+                if use_quad
+                else (
+                    ((weight.neuron_len + 63) // 64) * 32
+                    if use_pair
+                    else ((weight.neuron_len + 31) // 32) * 32
+                )
+            ),
+            (rows + tile_rows - 1) // tile_rows,
+            1,
+        )
+    )
+    result = (
+        gradient @ vq_dequantize(weight, dtype=gradient.dtype)
+        if use_dense
+        else kernel(
+            inputs=inputs,
+            template=template,
+            grid=grid,
+            threadgroup=(matrix_threads, 1, 1) if use_matrix else (32, 1, 1),
+            output_shapes=[(rows, weight.neuron_len)],
+            output_dtypes=[gradient.dtype],
+        )[0]
+    )
+    if split_residual:
+        result = _add_sparse_residual_backward(
+            weight,
+            gradient,
+            result,
+            fuse_rotation=fuse_residual_rotation,
+        )
+    if weight.rotation_block and not fuse_residual_rotation:
+        result = inverse_signed_hadamard(
+            result,
+            weight.rotation_signs,
+            weight.rotation_block,
+        )
+    return result.reshape((*prefix, weight.neuron_len))
+
+
+def vq_matmul(
+    weight: MetalVqWeight,
+    x: mx.array | np.ndarray,
+    *,
+    dequantize_threshold: int | None = 64,
+) -> mx.array:
+    """Dispatch VQ matmul with a direct packed custom VJP."""
+
+    source = x if isinstance(x, mx.array) else mx.array(x)
+
+    @mx.custom_function
+    def operation(value: mx.array) -> mx.array:
+        return _vq_matmul_impl(
+            weight,
+            value,
+            dequantize_threshold=dequantize_threshold,
+        )
+
+    @operation.vjp
+    def operation_vjp(primals, cotangent, output):
+        del primals, output
+        return vq_backward_input(weight, cotangent)
+
+    return operation(source)
 
 
 def vq_dequantize(
@@ -2196,7 +3354,9 @@ def vq_swiglu(
 __all__ = [
     "MetalVqWeight",
     "VqTensor",
+    "inverse_signed_hadamard",
     "signed_hadamard",
+    "vq_backward_input",
     "vq_dequantize",
     "vq_dequantize_matmul",
     "vq_embedding",

@@ -63,18 +63,6 @@ class ImportanceMatrix:
             raise ValueError(
                 f"imatrix width mismatch for {name}: {entry.width} != {neuron_len}"
             )
-        if entry.matrices == 1:
-            return name, entry.values[0]
-        if len(original_shape) != 3:
-            raise ValueError(
-                f"imatrix for non-expert tensor {name} has {entry.matrices} matrices"
-            )
-        experts, rows_per_expert, _ = original_shape
-        if entry.matrices != experts:
-            raise ValueError(
-                f"imatrix expert count mismatch for {name}: "
-                f"{entry.matrices} != {experts}"
-            )
         if isinstance(rows, slice):
             start = 0 if rows.start is None else int(rows.start)
             stop = int(storage_shape[0]) if rows.stop is None else int(rows.stop)
@@ -85,6 +73,24 @@ class ImportanceMatrix:
             int(row_ids.min()) < 0 or int(row_ids.max()) >= int(storage_shape[0])
         ):
             raise IndexError(f"imatrix row selection is outside {storage_shape[0]} rows")
+        if entry.matrices == 1:
+            return name, entry.values[0]
+        # Native AAQ entries may carry one input-importance vector per weight
+        # row.  Resolve those directly for both dense and flattened expert
+        # matrices; ordinary expert imatrices continue through the compact
+        # one-vector-per-expert path below.
+        if entry.matrices == int(storage_shape[0]):
+            return name, np.ascontiguousarray(entry.values[row_ids], dtype=np.float32)
+        if len(original_shape) != 3:
+            raise ValueError(
+                f"imatrix for non-expert tensor {name} has {entry.matrices} matrices"
+            )
+        experts, rows_per_expert, _ = original_shape
+        if entry.matrices != experts:
+            raise ValueError(
+                f"imatrix expert count mismatch for {name}: "
+                f"{entry.matrices} != {experts}"
+            )
         expert_ids = row_ids // int(rows_per_expert)
         return name, np.ascontiguousarray(entry.values[expert_ids], dtype=np.float32)
 

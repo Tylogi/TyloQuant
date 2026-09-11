@@ -763,14 +763,14 @@ static MfqRuntimeProfile architecture_runtime_profile(
         result.chat.top_p = 0.95;
         result.chat.presence_penalty = 0.0;
         result.chat.enable_mtp = false;
-        result.chat.mtp_max_draft_tokens = 4;
+        result.chat.mtp_max_draft_tokens = 5;
         result.source = "architecture-registry:deepseek_v41";
     } else if (identity_matches(identities, "deepseek_v4")) {
         result.chat.temperature = 1.0;
         result.chat.top_p = 0.8;
         result.chat.repetition_penalty = 1.05;
         result.chat.presence_penalty = 0.0;
-        result.chat.mtp_max_draft_tokens = 4;
+        result.chat.mtp_max_draft_tokens = 5;
         result.source = "architecture-registry:deepseek_v4";
     }
     return result;
@@ -783,18 +783,20 @@ struct MfqModelCapabilityRegistration {
     MfqModelCapabilityProfile profile;
 };
 
-static const std::array<MfqModelCapabilityRegistration, 11>
+static const std::array<MfqModelCapabilityRegistration, 12>
     kModelCapabilityRegistry{{
         {{{"minicpmo", nullptr, nullptr}},
          {"minicpmo", true, true, true, true, true, true, false}},
         {{{"minicpmtts", nullptr, nullptr}},
          {"minicpmo_tts", false, false, false, false, true, false, false}},
+        {{{"deepseek_v41", "deepseek_v41_text", nullptr}},
+         {"deepseek_v41", true, false, false, false, false, false, true}},
+        {{{"deepseek_v41_vision", nullptr, nullptr}},
+         {"deepseek_v41", true, true, false, false, false, false, true}},
         {{{"deepseek_v4", nullptr, nullptr}},
          {"deepseek_v4", true, false, false, false, false, false, true}},
         {{{"deepseek_v4_vision", nullptr, nullptr}},
          {"deepseek_v4", true, true, false, false, false, false, true}},
-        {{{"deepseek_v41", "deepseek_v41_text", "deepseek_v41_vision"}},
-         {"deepseek_v41", true, true, false, false, false, false, true}},
         {{{"glm_moe_dsa", nullptr, nullptr}}, {"glm_dsa"}},
         {{{"gemma4", "gemma4_text", nullptr}}, {"gemma4"}},
         {{{"qwen3_5", "qwen35", nullptr}},
@@ -2485,9 +2487,9 @@ static DeepseekV4ImageBlock deepseek_v41_image_block(
         int64_t height,
         int64_t width) {
     constexpr int64_t kImageStart = 0;
-    constexpr int64_t kImage = 2;
-    constexpr int64_t kImageNewLine = 3;
-    constexpr int64_t kImageEnd = 4;
+    constexpr int64_t kImage = 1;
+    constexpr int64_t kImageNewLine = 2;
+    constexpr int64_t kImageEnd = 3;
     if (height <= 0 || width <= 0) {
         throw ApiError(
             400, "invalid_request_error",
@@ -2496,41 +2498,42 @@ static DeepseekV4ImageBlock deepseek_v41_image_block(
     }
     DeepseekV4ImageBlock result;
     result.types.reserve(static_cast<size_t>(height * (width + 1) + 2));
-    result.permutation.reserve(static_cast<size_t>(height * width));
     result.types.push_back(kImageStart);
     for (int64_t row = 0; row < height; ++row) {
-        for (int64_t column = 0; column < width; ++column) {
-            result.types.push_back(kImage);
-            result.permutation.push_back(row * width + column);
-        }
+        result.types.insert(
+            result.types.end(), static_cast<size_t>(width), kImage);
         result.types.push_back(kImageNewLine);
     }
     result.types.push_back(kImageEnd);
     return result;
 }
 
-static MfqMultimodalInput parse_deepseek_v4_multimodal(
+static MfqMultimodalInput parse_deepseek_multimodal(
         const json & value,
         std::vector<int64_t> & prompt,
         const MfqTokenizer & tokenizer,
         int64_t vocab_size,
         TensorFileReader * file_reader,
-        bool v41 = false) {
+        bool v41) {
+    const std::string label = v41 ? "DeepSeek-V4.1" : "DeepSeek-V4";
     if (vocab_size <= 0) {
         throw ApiError(
             500, "server_error",
-            "DeepSeek-V4 multimodal runtime has no vocabulary size");
+            label + " multimodal runtime has no vocabulary size");
     }
     for (const char * name : {"pixel_values", "patch_mask", "vision_grid"}) {
         if (!value.contains(name)) {
             throw ApiError(
                 400, "invalid_request_error",
-                std::string("DeepSeek-V4 multimodal payload is missing ") + name,
+                label + " multimodal payload is missing " + name,
                 "mfq_multimodal");
         }
     }
     MfqMultimodalInput result;
-    result.processor = MfqMultimodalProcessor::deepseek_v4;
+    result.processor = v41
+        ? MfqMultimodalProcessor::deepseek_v41
+        : MfqMultimodalProcessor::deepseek_v4;
+    result.processor_name = v41 ? "deepseek_v41" : "deepseek_v4";
     auto pixels = decode_tensor<float>(
         value, "pixel_values", "float32", file_reader);
     result.pixel_values = std::move(pixels.first);
@@ -2555,7 +2558,7 @@ static MfqMultimodalInput parse_deepseek_v4_multimodal(
         result.pixel_shape[1] != result.patch_mask_shape[1]) {
         throw ApiError(
             400, "invalid_request_error",
-            "DeepSeek-V4 multimodal tensor geometry is invalid",
+            label + " multimodal tensor geometry is invalid",
             "mfq_multimodal");
     }
     if (!std::all_of(
@@ -2580,7 +2583,7 @@ static MfqMultimodalInput parse_deepseek_v4_multimodal(
             llm_w != (vit_w + 2) / 3) {
             throw ApiError(
                 400, "invalid_request_error",
-                "DeepSeek-V4 vision grid disagrees with patch geometry",
+                label + " vision grid disagrees with patch geometry",
                 "mfq_multimodal.vision_grid");
         }
         const int64_t active = vit_h * vit_w;
@@ -2590,7 +2593,7 @@ static MfqMultimodalInput parse_deepseek_v4_multimodal(
             if (actual > 1 || static_cast<bool>(actual) != (patch < active)) {
                 throw ApiError(
                     400, "invalid_request_error",
-                    "DeepSeek-V4 patch mask is not a contiguous active prefix",
+                    label + " patch mask is not a contiguous active prefix",
                     "mfq_multimodal.patch_mask");
             }
         }
@@ -2611,7 +2614,7 @@ static MfqMultimodalInput parse_deepseek_v4_multimodal(
         if (source >= images) {
             throw ApiError(
                 400, "invalid_request_error",
-                "DeepSeek-V4 image placeholders exceed processed images",
+                label + " image placeholders exceed processed images",
                 "messages");
         }
         const int64_t llm_h = result.vision_grid[4 * source + 2];
@@ -2621,7 +2624,7 @@ static MfqMultimodalInput parse_deepseek_v4_multimodal(
             : deepseek_v4_image_block(llm_h, llm_w, expanded.size());
         const int64_t begin = static_cast<int64_t>(expanded.size());
         for (const int64_t type : block.types) {
-            expanded.push_back(vocab_size + type);
+            expanded.push_back(v41 ? placeholder : vocab_size + type);
         }
         result.image_bounds.insert(
             result.image_bounds.end(),
@@ -2636,7 +2639,7 @@ static MfqMultimodalInput parse_deepseek_v4_multimodal(
     if (source != images) {
         throw ApiError(
             400, "invalid_request_error",
-            "DeepSeek-V4 image placeholders do not match processed images",
+            label + " image placeholders do not match processed images",
             "messages");
     }
     prompt = std::move(expanded);
@@ -2804,19 +2807,21 @@ static MfqMultimodalInput parse_mfq_vision(
         return parse_grid_vision_multimodal(value, file_reader.get());
     }
     if (version == 2) {
-        const auto processor = value.contains("processor") &&
-                value["processor"].is_string()
-            ? value["processor"].get<std::string>()
-            : std::string();
         if (!value.contains("processor") ||
-            !value["processor"].is_string() ||
-            (processor != "deepseek_v4" && processor != "deepseek_v41")) {
+            !value["processor"].is_string()) {
             throw ApiError(
                 400, "invalid_request_error",
-                "mfq_multimodal version 2 requires a DeepSeek-V4 processor",
+                "mfq_multimodal version 2 requires a DeepSeek processor",
                 "mfq_multimodal.processor");
         }
-        return parse_deepseek_v4_multimodal(
+        const auto processor = value["processor"].get<std::string>();
+        if (processor != "deepseek_v4" && processor != "deepseek_v41") {
+            throw ApiError(
+                400, "invalid_request_error",
+                "unsupported DeepSeek multimodal processor",
+                "mfq_multimodal.processor");
+        }
+        return parse_deepseek_multimodal(
             value,
             prompt,
             tokenizer,

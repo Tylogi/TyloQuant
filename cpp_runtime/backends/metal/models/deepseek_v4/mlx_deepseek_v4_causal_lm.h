@@ -115,7 +115,7 @@ public:
         std::vector<mlx::core::array>* debug_stages,
         const mlx::core::array* incoming_pre = nullptr,
         mlx::core::array* outgoing_pre = nullptr,
-        MlxDeepseekV41SharedAttentionState* shared_attention = nullptr) const;
+        MlxDeepseekV41HfSharedAttentionState* shared_attention = nullptr) const;
 
     std::optional<MlxDeepseekV4SsdPrefetchedLayer>
     prefetch_routed(std::size_t rows) const {
@@ -238,7 +238,7 @@ public:
             std::nullopt,
         std::optional<MlxDeepseekV4DSpark> dspark =
             std::nullopt,
-        std::optional<MlxDeepseekV41Engram> engram =
+        std::optional<MlxDeepseekV41HfEngram> engram =
             std::nullopt);
 
     // Accepts [tokens] or [batch,tokens]. Like the Python reference,
@@ -406,7 +406,7 @@ private:
         ssd_expert_cache_;
     std::optional<MlxDeepseekV4Vision> vision_;
     std::optional<MlxDeepseekV4DSpark> dspark_;
-    std::optional<MlxDeepseekV41Engram> engram_;
+    std::optional<MlxDeepseekV41HfEngram> engram_;
     MlxMtpGenerationStats last_mtp_stats_;
     int max_context_;
     mlx::core::Dtype activation_dtype_;

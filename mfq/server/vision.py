@@ -497,10 +497,70 @@ class MiniCPMO45VisionProcessor:
     def _decode_audio(cls, data: bytes) -> np.ndarray:
         try:
             import av
-        except ImportError as error:
-            raise VisionProcessingError(
-                "audio input requires the optional PyAV dependency"
-            ) from error
+        except ImportError:
+            # The standard library covers ordinary uncompressed WAV input,
+            # which keeps the native audio path useful without PyAV. Other
+            # containers still use PyAV for demuxing and resampling.
+            try:
+                import wave
+
+                with wave.open(io.BytesIO(data), "rb") as source:
+                    channels = source.getnchannels()
+                    sample_width = source.getsampwidth()
+                    sample_rate = source.getframerate()
+                    frame_count = source.getnframes()
+                    compression = source.getcomptype()
+                    if channels <= 0 or sample_rate <= 0 or frame_count <= 0:
+                        raise VisionProcessingError("audio WAV geometry is invalid")
+                    if compression != "NONE" or sample_width not in {1, 2, 3, 4}:
+                        raise VisionProcessingError(
+                            "audio WAV encoding requires the optional PyAV dependency"
+                        )
+                    target_count = int(round(
+                        frame_count * cls.audio_sample_rate / sample_rate
+                    ))
+                    if target_count > cls.maximum_audio_samples:
+                        raise VisionProcessingError("audio input exceeds the 30 minute limit")
+                    payload = source.readframes(frame_count)
+            except VisionProcessingError:
+                raise
+            except Exception as error:
+                raise VisionProcessingError(
+                    "audio input requires PyAV or an uncompressed PCM WAV"
+                ) from error
+
+            if sample_width == 1:
+                waveform = (
+                    np.frombuffer(payload, dtype=np.uint8).astype(np.float32) - 128.0
+                ) / 128.0
+            elif sample_width == 2:
+                waveform = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
+            elif sample_width == 3:
+                packed = np.frombuffer(payload, dtype=np.uint8).reshape(-1, 3)
+                values = (
+                    packed[:, 0].astype(np.int32)
+                    | (packed[:, 1].astype(np.int32) << 8)
+                    | (packed[:, 2].astype(np.int32) << 16)
+                )
+                values = (values ^ 0x800000) - 0x800000
+                waveform = values.astype(np.float32) / 8388608.0
+            else:
+                waveform = np.frombuffer(payload, dtype="<i4").astype(np.float32) / 2147483648.0
+            if waveform.size != frame_count * channels:
+                raise VisionProcessingError("audio WAV payload is truncated")
+            waveform = waveform.reshape(frame_count, channels).mean(axis=1)
+            if sample_rate != cls.audio_sample_rate:
+                source_positions = np.arange(frame_count, dtype=np.float64)
+                target_positions = np.arange(target_count, dtype=np.float64) * (
+                    sample_rate / cls.audio_sample_rate
+                )
+                waveform = np.interp(
+                    target_positions, source_positions, waveform
+                ).astype(np.float32)
+            waveform = np.ascontiguousarray(waveform, dtype=np.float32)
+            if not np.isfinite(waveform).all():
+                raise VisionProcessingError("audio input contains a non-finite sample")
+            return np.clip(waveform, -1.0, 1.0)
 
         chunks: list[np.ndarray] = []
         try:
@@ -737,7 +797,10 @@ class MiniCPMO45VisionProcessor:
             },
         }
         try:
-            os.fchmod(descriptor, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            elif os.name != "nt":
+                os.chmod(path, 0o600)
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(magic)
                 stream.write(token)
@@ -1713,6 +1776,7 @@ class DeepseekV4VisionProcessor:
 
     image_placeholder = "<｜deepseek_image｜>"
     processor_name = "deepseek_v4"
+    model_label = "DeepSeek-V4"
     patch_size = 14
     downsample_ratio = 3
     maximum_image_tokens = 384
@@ -1928,7 +1992,8 @@ class DeepseekV4VisionProcessor:
                     continue
                 if item_type != "image_url":
                     raise VisionProcessingError(
-                        f"DeepSeek-V4 Vision does not support {item_type or 'unknown'} input"
+                        f"{self.model_label} Vision does not support "
+                        f"{item_type or 'unknown'} input"
                     )
                 image_spec = item.get("image_url")
                 if not isinstance(image_spec, dict) or not isinstance(image_spec.get("url"), str):
@@ -1963,11 +2028,12 @@ class DeepseekV4VisionProcessor:
 
 
 class DeepseekV41VisionProcessor(DeepseekV4VisionProcessor):
-    """DeepSeek-V4.1 image preprocessing and compact row-major token layout."""
+    """Released DeepSeek-V4.1 patch and row-major image-span contract."""
 
     processor_name = "deepseek_v41"
+    model_label = "DeepSeek-V4.1"
     maximum_image_tokens = 1024
-    minimum_pixels = 295_936
+    minimum_pixels = 544 * 544
     maximum_width_height_ratio = None
 
     @classmethod
@@ -1976,8 +2042,12 @@ class DeepseekV41VisionProcessor(DeepseekV4VisionProcessor):
         best_height: int,
         best_width: int,
     ) -> tuple[int, int, int]:
-        n_llm_h = math.ceil((best_height // cls.patch_size) / cls.downsample_ratio)
-        n_llm_w = math.ceil((best_width // cls.patch_size) / cls.downsample_ratio)
+        n_llm_h = math.ceil(
+            (best_height // cls.patch_size) / cls.downsample_ratio
+        )
+        n_llm_w = math.ceil(
+            (best_width // cls.patch_size) / cls.downsample_ratio
+        )
         return n_llm_h, n_llm_w, n_llm_h * (n_llm_w + 1) + 2
 
     @classmethod

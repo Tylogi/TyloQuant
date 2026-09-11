@@ -541,7 +541,7 @@ void require_layer_state_close(
 void test_speculative_cache_transaction() {
     const auto config = test_config();
     for (const auto [layer, ratio, context] : {
-             std::array<int, 3>{1, 4, 8},
+             std::array<int, 3>{1, 4, 16},
              std::array<int, 3>{2, 128, 128},
          }) {
         auto expected_operation = attention(config, layer, ratio, context);
@@ -550,21 +550,40 @@ void test_speculative_cache_transaction() {
             config, ratio, 1, context);
         auto actual = MlxDeepseekV4LayerState::allocate(
             config, ratio, 1, context);
-        expected_operation(input_tokens({0.2f, 0.4f}), expected, 0).eval();
-        actual_operation(input_tokens({0.2f, 0.4f}), actual, 0).eval();
+        const std::vector<float> prefix = ratio == 4
+            ? std::vector<float>{
+                  0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f}
+            : std::vector<float>{0.2f, 0.4f};
+        const int start = static_cast<int>(prefix.size());
+        expected_operation(input_tokens(prefix), expected, 0).eval();
+        actual_operation(input_tokens(prefix), actual, 0).eval();
         materialize_state(expected);
         materialize_state(actual);
 
         actual.begin_speculative(1, 3);
-        materialize_state(actual.speculative_checkpoint());
+        const auto& checkpoint = actual.speculative_checkpoint();
+        require(
+            checkpoint.local_state().shape(1) == 3,
+            "speculative checkpoint copied the full local ring");
+        if (checkpoint.main()) {
+            require(
+                !checkpoint.main()->pool_prefix_backup(),
+                "speculative checkpoint copied the main pool prefix");
+        }
+        if (checkpoint.indexer()) {
+            require(
+                !checkpoint.indexer()->pool_prefix_backup(),
+                "speculative checkpoint copied the indexer pool prefix");
+        }
+        materialize_state(checkpoint);
         actual_operation(
-            input_tokens({0.6f, 0.8f, 1.0f}), actual, 2).eval();
+            input_tokens({0.7f, 0.8f, 0.9f}), actual, start).eval();
         materialize_state(actual);
         actual_operation.rollback_speculative(actual, 1);
         materialize_state(actual);
 
         expected_operation(
-            input_tokens({0.6f, 0.8f}), expected, 2).eval();
+            input_tokens({0.7f, 0.8f}), expected, start).eval();
         materialize_state(expected);
         require_layer_state_close(
             actual,
@@ -572,9 +591,9 @@ void test_speculative_cache_transaction() {
             "speculative compressed-cache rollback");
 
         auto expected_next = expected_operation(
-            input_tokens({1.2f}), expected, 4);
+            input_tokens({1.0f}), expected, start + 2);
         auto actual_next = actual_operation(
-            input_tokens({1.2f}), actual, 4);
+            input_tokens({1.0f}), actual, start + 2);
         require_close(
             evaluated_float(actual_next),
             evaluated_float(expected_next),

@@ -8,6 +8,7 @@ set(MFQ_METAL_INCLUDE_DIRS
     ${MFQ_METAL_ROOT}/ops
     ${MFQ_METAL_ROOT}/legacy/tpq
     ${MFQ_METAL_ROOT}/models/deepseek_v4
+    ${MFQ_METAL_ROOT}/models/deepseek_v41
     ${MFQ_METAL_ROOT}/models/flash_next
     ${MFQ_METAL_ROOT}/models/qwen35
     ${MFQ_METAL_ROOT}/models/minicpmo45
@@ -202,13 +203,17 @@ add_library(mfq-metal-runtime STATIC
     storage/deepseek_v41_engram_store.cpp
     storage/hf_safetensors_store.cpp
     storage/mfq_container.cpp
+    storage/nintm_expert_store.cpp
     storage/mlx_tensor_schema.cpp
     storage/compat/mlx_legacy_tensor_compat.cpp
+    runtime/mlx_axial_patch_vision.cpp
     runtime/mlx_grid_vision.cpp
     runtime/mlx_hf_tensor.cpp
     runtime/mlx_mtp.cpp
     runtime/mlx_multimodal.cpp
     runtime/mlx_sampling.cpp
+    runtime/mlx_deepseek_v4_hf_ssd_expert_arena.cpp
+    runtime/mlx_deepseek_v4_hf_ssd_expert_cache.cpp
     runtime/mlx_ssd_expert_arena.cpp
     runtime/mlx_ssd_expert_cache.cpp
     runtime/mlx_tensor.cpp
@@ -235,6 +240,13 @@ add_library(mfq-metal-runtime STATIC
     models/deepseek_v4/mlx_deepseek_v4_sparse.cpp
     models/deepseek_v4/mlx_deepseek_v4_vision.cpp
     models/deepseek_v4/mlx_deepseek_v41_engram.cpp
+    models/deepseek_v41/mlx_deepseek_v41_attention.cpp
+    models/deepseek_v41/mlx_deepseek_v41_causal_lm.cpp
+    models/deepseek_v41/mlx_deepseek_v41_dspark.cpp
+    models/deepseek_v41/mlx_deepseek_v41_engram.cpp
+    models/deepseek_v41/mlx_deepseek_v41_mhc.cpp
+    models/deepseek_v41/mlx_deepseek_v41_moe.cpp
+    models/deepseek_v41/mlx_deepseek_v41_vision.cpp
     models/flash_next/mlx_qwen4_causal_lm.cpp
     models/flash_next/qwen4_ops.cpp
     models/minicpmo45/mlx_minicpmo45.cpp

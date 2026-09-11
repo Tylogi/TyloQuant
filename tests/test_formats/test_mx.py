@@ -56,3 +56,26 @@ def test_mxfp8_tensor_rejects_e4m3_nan_code():
     values[2, 17] = 0x7F
     with pytest.raises(ValueError, match="E4M3 NaN code"):
         MxTensor("MXFP8", (4, 128), values, np.full((1, 1), 127, np.uint8))
+
+
+@pytest.mark.parametrize(
+    "shape,scale_shape",
+    [
+        ((64, 96), (2, 3)),
+        ((4, 64), (4, 2)),
+    ],
+)
+def test_mxfp8_roundtrips_native_block32_and_row1x32_geometries(
+    shape,
+    scale_shape,
+):
+    values = np.full(shape, 0x38, dtype=np.uint8)
+    scales = np.full(scale_shape, 127, dtype=np.uint8)
+    tensor = MxTensor("MXFP8", shape, values, scales)
+
+    from mfq.formats.mx import pack_mx, unpack_mx
+
+    restored = unpack_mx("MXFP8", pack_mx(tensor))
+    assert restored.shape == shape
+    np.testing.assert_array_equal(restored.values, values)
+    np.testing.assert_array_equal(restored.scales, scales)

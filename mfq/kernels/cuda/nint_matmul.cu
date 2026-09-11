@@ -31,6 +31,7 @@
 #include "reduce.cuh"
 #include "glu.cuh"
 #include "nint_small_m.h"
+#include "packed_backward.cuh"
 using namespace nvcuda;
 
 #define MFQ_CUBLAS_CHECK(expr) MFQ_RUNTIME_CHECK((expr) == CUBLAS_STATUS_SUCCESS, "cuBLAS call failed: ", #expr)
@@ -621,8 +622,8 @@ mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_bits_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t neuron_len, int64_t gs, int64_t bits)
 {
-    MFQ_RUNTIME_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
-                "packed-bits full dequant supports bits in {2,3,5,6,8}, got ", bits);
+    MFQ_RUNTIME_CHECK(bits >= 1 && bits <= 8 && bits != 4,
+                "generic packed-bits full dequant supports bits in {1,2,3,5,6,7,8}, got ", bits);
     MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
     MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
@@ -671,7 +672,9 @@ mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_bits_cuda(
         default: MFQ_RUNTIME_CHECK(false, "packed-bits full dequant unsupported gs ", gs);     \
     }
 
-    if (bits == 2) {
+    if (bits == 1) {
+        DQFULLBITS_GS_SWITCH(1);
+    } else if (bits == 2) {
         DQFULLBITS_GS_SWITCH(2);
     } else if (bits == 3) {
         DQFULLBITS_GS_SWITCH(3);
@@ -690,6 +693,8 @@ mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_bits_cuda(
         } else {
             DQFULLBITS_GS_SWITCH(6);
         }
+    } else if (bits == 7) {
+        DQFULLBITS_GS_SWITCH(7);
     } else {
         DQFULLBITS_GS_SWITCH(8);
     }
@@ -9535,4 +9540,747 @@ mfq_tensor_backend::Tensor nint8_zero_mmq_f32_packed_cuda(
         cudaGetLastError() == cudaSuccess,
         "NINT8-0 common FP32-output MMQ kernel launch failed");
     return out;
+}
+
+namespace {
+
+template <typename T>
+__device__ __forceinline__ float mfq_backward_to_float(T value) {
+    return static_cast<float>(value);
+}
+
+template <>
+__device__ __forceinline__ float mfq_backward_to_float(__half value) {
+    return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float mfq_backward_to_float(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T mfq_backward_from_float(float value) {
+    return static_cast<T>(value);
+}
+
+template <>
+__device__ __forceinline__ __half mfq_backward_from_float(float value) {
+    return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 mfq_backward_from_float(float value) {
+    return __float2bfloat16_rn(value);
+}
+
+__device__ __forceinline__ uint8_t mfq_nint_backward_code(
+        const uint8_t * group,
+        int element,
+        int bits,
+        bool q5_exec) {
+    if (q5_exec) {
+        return unpack_q5_gs28_exec_one(group, element);
+    }
+    const int bit = element * bits;
+    const int byte = bit >> 3;
+    const int shift = bit & 7;
+    uint32_t packed = group[byte];
+    if (shift + bits > 8) {
+        packed |= static_cast<uint32_t>(group[byte + 1]) << 8;
+    }
+    return static_cast<uint8_t>(
+        (packed >> shift) & ((1u << bits) - 1u));
+}
+
+template <typename T>
+__global__ void nint_backward_input_kernel(
+        const uint8_t * __restrict__ q_packed,
+        const uint8_t * __restrict__ sub_scale,
+        const uint8_t * __restrict__ sub_min,
+        const float * __restrict__ neuron_scale,
+        const float * __restrict__ neuron_min,
+        const T * __restrict__ output_gradient,
+        T * __restrict__ input_gradient,
+        int rows,
+        int outputs,
+        int width,
+        int groups,
+        int group_size,
+        int bits,
+        bool q5_exec) {
+    const int qbytes = q5_exec ? 20 : (group_size * bits + 7) / 8;
+    const int64_t total = static_cast<int64_t>(rows) * width;
+    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         logical < total;
+         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(logical / width);
+        const int column = static_cast<int>(logical - static_cast<int64_t>(row) * width);
+        const int group_index = column / group_size;
+        const int element = column - group_index * group_size;
+        float accumulator = 0.0f;
+        for (int output = 0; output < outputs; ++output) {
+            const int64_t metadata =
+                static_cast<int64_t>(output) * groups + group_index;
+            const uint8_t * packed_group = q_packed + metadata * qbytes;
+            const uint8_t code = mfq_nint_backward_code(
+                packed_group, element, bits, q5_exec);
+            const float scale = neuron_scale[output] *
+                static_cast<float>(q5_exec ? packed_group[18] : sub_scale[metadata]);
+            const float minimum = neuron_min[output] *
+                static_cast<float>(q5_exec ? packed_group[19] : sub_min[metadata]);
+            accumulator = fmaf(
+                mfq_backward_to_float(
+                    output_gradient[static_cast<int64_t>(row) * outputs + output]),
+                scale * static_cast<float>(code) - minimum,
+                accumulator);
+        }
+        input_gradient[logical] = mfq_backward_from_float<T>(accumulator);
+    }
+}
+
+template <int Bits, int Rows, bool Q5Exec>
+__global__ void __launch_bounds__(32) nint_backward_partial_kernel(
+        const uint8_t * __restrict__ q_packed,
+        const uint8_t * __restrict__ sub_scale,
+        const uint8_t * __restrict__ sub_min,
+        const float * __restrict__ neuron_scale,
+        const float * __restrict__ neuron_min,
+        const __half * __restrict__ output_gradient,
+        float * __restrict__ partials,
+        int rows,
+        int outputs,
+        int width,
+        int groups,
+        int group_size,
+        int output_tile) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int column = static_cast<int>(blockIdx.x) * 32 + lane;
+    const bool valid = column < width;
+    const int group_index = column / group_size;
+    const int element = column - group_index * group_size;
+    const int qbytes = Q5Exec ? 20 : (group_size * Bits + 7) / 8;
+    const int split = static_cast<int>(blockIdx.y);
+    const int output0 = split * output_tile;
+    const int output_end = min(output0 + output_tile, outputs);
+    float accumulators[Rows];
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+        accumulators[row] = 0.0f;
+    }
+    for (int output = output0; output < output_end; ++output) {
+        float output_scale = lane == 0 ? neuron_scale[output] : 0.0f;
+        float output_minimum = lane == 0 ? neuron_min[output] : 0.0f;
+        output_scale = __shfl_sync(0xffffffffu, output_scale, 0);
+        output_minimum = __shfl_sync(0xffffffffu, output_minimum, 0);
+        float weight = 0.0f;
+        if (valid) {
+            const int64_t metadata =
+                static_cast<int64_t>(output) * groups + group_index;
+            const uint8_t * packed_group = q_packed + metadata * qbytes;
+            const uint8_t code = Q5Exec
+                ? unpack_q5_gs28_exec_one(packed_group, element)
+                : unpack_qbits_one_dequant<Bits>(packed_group, element);
+            const float scale = output_scale * static_cast<float>(
+                Q5Exec ? packed_group[18] : sub_scale[metadata]);
+            const float minimum = output_minimum * static_cast<float>(
+                Q5Exec ? packed_group[19] : sub_min[metadata]);
+            weight = scale * static_cast<float>(code) - minimum;
+        }
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float gradient = lane == 0 && row < rows
+                ? __half2float(output_gradient[
+                    static_cast<int64_t>(row) * outputs + output])
+                : 0.0f;
+            gradient = __shfl_sync(0xffffffffu, gradient, 0);
+            accumulators[row] = fmaf(
+                gradient, weight, accumulators[row]);
+        }
+    }
+    if (valid) {
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            if (row < rows) {
+                partials[(static_cast<int64_t>(split) * rows + row) *
+                    width + column] = accumulators[row];
+            }
+        }
+    }
+}
+
+template <int Bits, int Rows, bool Q5Exec = false>
+void launch_nint_backward_partial(
+        const mfq_tensor_backend::Tensor & q_packed,
+        const mfq_tensor_backend::Tensor & sub_scale,
+        const mfq_tensor_backend::Tensor & sub_min,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & neuron_min,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & partials,
+        int rows,
+        int outputs,
+        int width,
+        int groups,
+        int group_size,
+        int output_tile,
+        cudaStream_t stream) {
+    const dim3 grid(
+        static_cast<unsigned>((width + 31) / 32),
+        static_cast<unsigned>((outputs + output_tile - 1) / output_tile));
+    nint_backward_partial_kernel<Bits, Rows, Q5Exec><<<
+        grid, 32, 0, stream>>>(
+            q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
+            sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
+            neuron_min.data_ptr<float>(),
+            reinterpret_cast<const __half *>(
+                output_gradient.data_ptr<mfq_half>()),
+            partials.data_ptr<float>(), rows, outputs, width, groups,
+            group_size, output_tile);
+}
+
+template <int Bits, bool Q5Exec = false>
+void launch_nint_backward_rows(
+        const mfq_tensor_backend::Tensor & q_packed,
+        const mfq_tensor_backend::Tensor & sub_scale,
+        const mfq_tensor_backend::Tensor & sub_min,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & neuron_min,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & partials,
+        int rows,
+        int outputs,
+        int width,
+        int groups,
+        int group_size,
+        int output_tile,
+        cudaStream_t stream) {
+#define MFQ_NINT_BACKWARD_ROWS(ROWS) \
+    launch_nint_backward_partial<Bits, ROWS, Q5Exec>( \
+        q_packed, sub_scale, sub_min, neuron_scale, neuron_min, \
+        output_gradient, partials, rows, outputs, width, groups, \
+        group_size, output_tile, stream)
+    if (rows == 1) {
+        MFQ_NINT_BACKWARD_ROWS(1);
+    } else if (rows <= 2) {
+        MFQ_NINT_BACKWARD_ROWS(2);
+    } else if (rows <= 4) {
+        MFQ_NINT_BACKWARD_ROWS(4);
+    } else {
+        MFQ_NINT_BACKWARD_ROWS(8);
+    }
+#undef MFQ_NINT_BACKWARD_ROWS
+}
+
+template <int Rows>
+__global__ void __launch_bounds__(32) nint8_backward_partial_kernel(
+        const uint8_t * __restrict__ q_packed,
+        const uint8_t * __restrict__ sub_scale,
+        const uint8_t * __restrict__ sub_min,
+        const float * __restrict__ neuron_scale,
+        const float * __restrict__ neuron_min,
+        const __half * __restrict__ output_gradient,
+        float * __restrict__ partials,
+        int rows,
+        int outputs,
+        int width,
+        int groups,
+        int group_size,
+        int output_tile) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int k0 = (static_cast<int>(blockIdx.x) * 32 + lane) * 4;
+    const bool valid = k0 < width;
+    const int split = static_cast<int>(blockIdx.y);
+    const int output0 = split * output_tile;
+    const int output_end = min(output0 + output_tile, outputs);
+    float accumulators[Rows][4];
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+#pragma unroll
+        for (int component = 0; component < 4; ++component) {
+            accumulators[row][component] = 0.0f;
+        }
+    }
+    const int row_stride = groups * group_size;
+    for (int output = output0; output < output_end; ++output) {
+        float output_scale = lane == 0 ? neuron_scale[output] : 0.0f;
+        float output_minimum = lane == 0 ? neuron_min[output] : 0.0f;
+        output_scale = __shfl_sync(0xffffffffu, output_scale, 0);
+        output_minimum = __shfl_sync(0xffffffffu, output_minimum, 0);
+        const uint32_t packed = valid
+            ? *reinterpret_cast<const uint32_t *>(
+                q_packed + static_cast<int64_t>(output) * row_stride + k0)
+            : 0u;
+        float weights[4];
+#pragma unroll
+        for (int component = 0; component < 4; ++component) {
+            const int column = k0 + component;
+            weights[component] = 0.0f;
+            if (column < width) {
+                const int group = column / group_size;
+                const int64_t metadata =
+                    static_cast<int64_t>(output) * groups + group;
+                const float scale = output_scale *
+                    static_cast<float>(sub_scale[metadata]);
+                const float minimum = output_minimum *
+                    static_cast<float>(sub_min[metadata]);
+                weights[component] = scale * static_cast<float>(
+                    (packed >> (8 * component)) & 0xffu) - minimum;
+            }
+        }
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float gradient = lane == 0 && row < rows
+                ? __half2float(output_gradient[
+                    static_cast<int64_t>(row) * outputs + output])
+                : 0.0f;
+            gradient = __shfl_sync(0xffffffffu, gradient, 0);
+#pragma unroll
+            for (int component = 0; component < 4; ++component) {
+                accumulators[row][component] = fmaf(
+                    gradient, weights[component],
+                    accumulators[row][component]);
+            }
+        }
+    }
+    if (valid) {
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            if (row < rows) {
+#pragma unroll
+                for (int component = 0; component < 4; ++component) {
+                    const int column = k0 + component;
+                    if (column < width) {
+                        partials[(static_cast<int64_t>(split) * rows + row) *
+                            width + column] = accumulators[row][component];
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int Rows>
+void launch_nint8_backward_partial(
+        const mfq_tensor_backend::Tensor & q_packed,
+        const mfq_tensor_backend::Tensor & sub_scale,
+        const mfq_tensor_backend::Tensor & sub_min,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & neuron_min,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & partials,
+        int rows,
+        int outputs,
+        int width,
+        int groups,
+        int group_size,
+        int output_tile,
+        cudaStream_t stream) {
+    const dim3 grid(
+        static_cast<unsigned>((width + 127) / 128),
+        static_cast<unsigned>((outputs + output_tile - 1) / output_tile));
+    nint8_backward_partial_kernel<Rows><<<grid, 32, 0, stream>>>(
+        q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
+        sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
+        neuron_min.data_ptr<float>(),
+        reinterpret_cast<const __half *>(
+            output_gradient.data_ptr<mfq_half>()),
+        partials.data_ptr<float>(), rows, outputs, width, groups,
+        group_size, output_tile);
+}
+
+void launch_nint8_backward_rows(
+        const mfq_tensor_backend::Tensor & q_packed,
+        const mfq_tensor_backend::Tensor & sub_scale,
+        const mfq_tensor_backend::Tensor & sub_min,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & neuron_min,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & partials,
+        int rows,
+        int outputs,
+        int width,
+        int groups,
+        int group_size,
+        int output_tile,
+        cudaStream_t stream) {
+#define MFQ_NINT8_BACKWARD_ROWS(ROWS) \
+    launch_nint8_backward_partial<ROWS>( \
+        q_packed, sub_scale, sub_min, neuron_scale, neuron_min, \
+        output_gradient, partials, rows, outputs, width, groups, \
+        group_size, output_tile, stream)
+    if (rows == 1) {
+        MFQ_NINT8_BACKWARD_ROWS(1);
+    } else if (rows <= 2) {
+        MFQ_NINT8_BACKWARD_ROWS(2);
+    } else if (rows <= 4) {
+        MFQ_NINT8_BACKWARD_ROWS(4);
+    } else {
+        MFQ_NINT8_BACKWARD_ROWS(8);
+    }
+#undef MFQ_NINT8_BACKWARD_ROWS
+}
+
+}  // namespace
+
+mfq_tensor_backend::Tensor nint_backward_input_cuda(
+        mfq_tensor_backend::Tensor q_packed,
+        mfq_tensor_backend::Tensor sub_scale,
+        mfq_tensor_backend::Tensor sub_min,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_min,
+        mfq_tensor_backend::Tensor output_gradient,
+        int64_t neuron_len,
+        int64_t group_size,
+        int64_t bits,
+        bool q5_exec) {
+    MFQ_RUNTIME_CHECK(
+        q_packed.is_cuda() && sub_scale.is_cuda() && sub_min.is_cuda() &&
+        neuron_scale.is_cuda() && neuron_min.is_cuda() && output_gradient.is_cuda(),
+        "NINT backward tensors must be CUDA tensors");
+    MFQ_RUNTIME_CHECK(
+        q_packed.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        sub_min.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
+        neuron_min.scalar_type() == mfq_tensor_backend::kFloat32,
+        "NINT backward packed tensor dtypes are invalid");
+    MFQ_RUNTIME_CHECK(
+        q_packed.is_contiguous() && sub_scale.is_contiguous() &&
+        sub_min.is_contiguous() && neuron_scale.is_contiguous() &&
+        neuron_min.is_contiguous() && output_gradient.is_contiguous(),
+        "NINT backward tensors must be contiguous");
+    MFQ_RUNTIME_CHECK(
+        output_gradient.dim() == 2 && sub_scale.dim() == 2 &&
+        sub_min.sizes() == sub_scale.sizes() && neuron_scale.dim() == 1 &&
+        neuron_min.sizes() == neuron_scale.sizes(),
+        "NINT backward tensor geometry is invalid");
+    MFQ_RUNTIME_CHECK(
+        bits >= 1 && bits <= 8 && group_size > 0 && neuron_len > 0 &&
+        output_gradient.size(1) == neuron_scale.numel() &&
+        sub_scale.size(0) == neuron_scale.numel() &&
+        sub_scale.size(1) == (neuron_len + group_size - 1) / group_size,
+        "NINT backward matrix geometry mismatch");
+    MFQ_RUNTIME_CHECK(
+        !q5_exec || (bits == 5 && group_size == 28),
+        "NINT Q5 backward execution layout requires NINT5 gs28");
+    MFQ_RUNTIME_CHECK(
+        q_packed.device() == output_gradient.device() &&
+        sub_scale.device() == output_gradient.device() &&
+        sub_min.device() == output_gradient.device() &&
+        neuron_scale.device() == output_gradient.device() &&
+        neuron_min.device() == output_gradient.device(),
+        "NINT backward tensors must share one CUDA device");
+    const auto dtype = output_gradient.scalar_type();
+    MFQ_RUNTIME_CHECK(
+        dtype == mfq_tensor_backend::kFloat16 ||
+        dtype == mfq_tensor_backend::kFloat32 ||
+        dtype == mfq_tensor_backend::kBFloat16,
+        "NINT backward output gradient must be fp16, bf16, or fp32");
+    const int rows = static_cast<int>(output_gradient.size(0));
+    const int outputs = static_cast<int>(output_gradient.size(1));
+    const int width = static_cast<int>(neuron_len);
+    const int groups = static_cast<int>(sub_scale.size(1));
+    const int qbytes = q5_exec ? 20 :
+        (static_cast<int>(group_size) * static_cast<int>(bits) + 7) / 8;
+    MFQ_RUNTIME_CHECK(
+        q_packed.numel() >= static_cast<int64_t>(outputs) * groups * qbytes,
+        "NINT backward packed stream is truncated");
+    auto result = mfq_tensor_backend::empty(
+        {rows, width}, output_gradient.options());
+    const int64_t total = static_cast<int64_t>(rows) * width;
+    if (total == 0) {
+        return result;
+    }
+    MfqCudaGuard guard(output_gradient.device());
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (total + threads - 1) / threads, 65535));
+    const cudaStream_t stream = mfq_current_cuda_stream();
+    const bool use_small_m_partial = rows <= 8 && (
+        q5_exec || bits <= 3 || bits == 5 || bits == 7 || bits == 8 ||
+        (bits == 4 && rows == 1) || (bits == 6 && rows <= 2));
+    if (dtype == mfq_tensor_backend::kFloat16 && use_small_m_partial) {
+        constexpr int output_tile = 32;
+        const int splits = (outputs + output_tile - 1) / output_tile;
+        auto partials = mfq_tensor_backend::empty(
+            {splits, rows, width}, neuron_scale.options());
+#define MFQ_NINT_BACKWARD_BITS(BITS) \
+        launch_nint_backward_rows<BITS>( \
+            q_packed, sub_scale, sub_min, neuron_scale, neuron_min, \
+            output_gradient, partials, rows, outputs, width, groups, \
+            static_cast<int>(group_size), output_tile, stream)
+        if (q5_exec) {
+            launch_nint_backward_rows<5, true>(
+                q_packed, sub_scale, sub_min, neuron_scale, neuron_min,
+                output_gradient, partials, rows, outputs, width, groups,
+                static_cast<int>(group_size), output_tile, stream);
+        } else if (bits == 8) {
+            if (rows <= 4) {
+                MFQ_NINT_BACKWARD_BITS(8);
+            } else {
+                launch_nint8_backward_rows(
+                    q_packed, sub_scale, sub_min, neuron_scale, neuron_min,
+                    output_gradient, partials, rows, outputs, width, groups,
+                    static_cast<int>(group_size), output_tile, stream);
+            }
+        } else {
+            switch (static_cast<int>(bits)) {
+                case 1: MFQ_NINT_BACKWARD_BITS(1); break;
+                case 2: MFQ_NINT_BACKWARD_BITS(2); break;
+                case 3: MFQ_NINT_BACKWARD_BITS(3); break;
+                case 4: MFQ_NINT_BACKWARD_BITS(4); break;
+                case 5: MFQ_NINT_BACKWARD_BITS(5); break;
+                case 6: MFQ_NINT_BACKWARD_BITS(6); break;
+                case 7: MFQ_NINT_BACKWARD_BITS(7); break;
+            }
+        }
+#undef MFQ_NINT_BACKWARD_BITS
+        mfq_packed_backward::launch_split_float_reduce_to_half(
+            partials.data_ptr<float>(),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
+            rows, width, splits, stream);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return result;
+    }
+    if (dtype == mfq_tensor_backend::kFloat16) {
+        auto weight = q5_exec
+            ? nint5_gs28_q5_dequant_cuda(
+                q_packed, neuron_scale, neuron_min, neuron_len)
+            : (bits == 4
+                ? nint_dequant_full_packed_compact_cuda(
+                    q_packed, sub_scale, sub_min, neuron_scale, neuron_min,
+                    neuron_len, group_size)
+                : nint_dequant_full_packed_compact_bits_cuda(
+                    q_packed, sub_scale, sub_min, neuron_scale, neuron_min,
+                    neuron_len, group_size, bits));
+        mfq_packed_backward::launch_dense_half_weight(
+            output_gradient, weight, result, rows, outputs, width, stream);
+    } else {
+        auto weight = q5_exec
+            ? nint5_gs28_q5_dequant_cuda(
+                q_packed, neuron_scale, neuron_min, neuron_len)
+            : (bits == 4
+                ? nint_dequant_full_packed_compact_cuda(
+                    q_packed, sub_scale, sub_min, neuron_scale, neuron_min,
+                    neuron_len, group_size)
+                : nint_dequant_full_packed_compact_bits_cuda(
+                    q_packed, sub_scale, sub_min, neuron_scale, neuron_min,
+                    neuron_len, group_size, bits));
+        mfq_packed_backward::launch_dense_half_weight(
+            output_gradient, weight, result, rows, outputs, width, stream);
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
+}
+
+namespace {
+
+template <typename T>
+__global__ void nint8_zero_backward_input_kernel(
+        const int8_t * __restrict__ q,
+        const __half * __restrict__ scales,
+        const T * __restrict__ output_gradient,
+        T * __restrict__ input_gradient,
+        int rows,
+        int outputs,
+        int width,
+        int groups) {
+    const int64_t total = static_cast<int64_t>(rows) * width;
+    for (int64_t logical = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         logical < total;
+         logical += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(logical / width);
+        const int column = static_cast<int>(logical - static_cast<int64_t>(row) * width);
+        const int group = column / 32;
+        float accumulator = 0.0f;
+        for (int output = 0; output < outputs; ++output) {
+            const float weight = static_cast<float>(
+                q[static_cast<int64_t>(output) * groups * 32 + column]) *
+                __half2float(scales[static_cast<int64_t>(output) * groups + group]);
+            accumulator = fmaf(
+                mfq_backward_to_float(
+                    output_gradient[static_cast<int64_t>(row) * outputs + output]),
+                weight,
+                accumulator);
+        }
+        input_gradient[logical] = mfq_backward_from_float<T>(accumulator);
+    }
+}
+
+template <int Rows>
+__global__ void __launch_bounds__(32) nint8_zero_backward_partial_kernel(
+        const int8_t * __restrict__ q,
+        const __half * __restrict__ scales,
+        const __half * __restrict__ output_gradient,
+        float * __restrict__ partials,
+        int rows,
+        int outputs,
+        int width,
+        int groups,
+        int output_tile) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int k0 = (static_cast<int>(blockIdx.x) * 32 + lane) * 4;
+    const bool valid = k0 < width;
+    const int group = k0 >> 5;
+    const int split = static_cast<int>(blockIdx.y);
+    const int output0 = split * output_tile;
+    const int output_end = min(output0 + output_tile, outputs);
+    float accumulators[Rows][4];
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+#pragma unroll
+        for (int component = 0; component < 4; ++component) {
+            accumulators[row][component] = 0.0f;
+        }
+    }
+    for (int output = output0; output < output_end; ++output) {
+        float scale = lane % 8 == 0 && valid
+            ? __half2float(scales[
+                static_cast<int64_t>(output) * groups + group])
+            : 0.0f;
+        scale = __shfl_sync(0xffffffffu, scale, 0, 8);
+        const int packed = valid
+            ? *reinterpret_cast<const int *>(
+                q + static_cast<int64_t>(output) * groups * 32 + k0)
+            : 0;
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float gradient = lane == 0 && row < rows
+                ? __half2float(output_gradient[
+                    static_cast<int64_t>(row) * outputs + output])
+                : 0.0f;
+            gradient = __shfl_sync(0xffffffffu, gradient, 0);
+            const float factor = gradient * scale;
+#pragma unroll
+            for (int component = 0; component < 4; ++component) {
+                const int value = static_cast<int>(static_cast<int8_t>(
+                    (packed >> (8 * component)) & 0xff));
+                accumulators[row][component] = fmaf(
+                    factor, static_cast<float>(value),
+                    accumulators[row][component]);
+            }
+        }
+    }
+    if (valid) {
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            if (row < rows) {
+#pragma unroll
+                for (int component = 0; component < 4; ++component) {
+                    const int column = k0 + component;
+                    if (column < width) {
+                        partials[(static_cast<int64_t>(split) * rows + row) *
+                            width + column] = accumulators[row][component];
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int Rows>
+void launch_nint8_zero_backward_small_m(
+        const mfq_tensor_backend::Tensor & q,
+        const mfq_tensor_backend::Tensor & scale,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & partials,
+        int rows,
+        int outputs,
+        int width,
+        int groups,
+        int output_tile,
+        cudaStream_t stream) {
+    const dim3 grid(
+        static_cast<unsigned>((width + 127) / 128),
+        static_cast<unsigned>((outputs + output_tile - 1) / output_tile));
+    nint8_zero_backward_partial_kernel<Rows><<<grid, 32, 0, stream>>>(
+        reinterpret_cast<const int8_t *>(q.data_ptr<uint8_t>()),
+        reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
+        reinterpret_cast<const __half *>(
+            output_gradient.data_ptr<mfq_half>()),
+        partials.data_ptr<float>(), rows, outputs, width, groups, output_tile);
+}
+
+}  // namespace
+
+mfq_tensor_backend::Tensor nint8_zero_backward_input_cuda(
+        mfq_tensor_backend::Tensor q,
+        mfq_tensor_backend::Tensor scale,
+        mfq_tensor_backend::Tensor output_gradient,
+        int64_t neuron_len) {
+    MFQ_RUNTIME_CHECK(
+        q.is_cuda() && q.scalar_type() == mfq_tensor_backend::kUInt8 &&
+        q.is_contiguous() && q.dim() == 3 && q.size(2) == 32,
+        "NINT8-0 backward q must be CUDA contiguous uint8 [N,G,32]");
+    MFQ_RUNTIME_CHECK(
+        scale.is_cuda() && scale.scalar_type() == mfq_tensor_backend::kFloat16 &&
+        scale.is_contiguous() && scale.sizes() == q.sizes().slice(0, 2),
+        "NINT8-0 backward scale geometry mismatch");
+    MFQ_RUNTIME_CHECK(
+        output_gradient.is_cuda() && output_gradient.is_contiguous() &&
+        output_gradient.dim() == 2 && output_gradient.size(1) == q.size(0),
+        "NINT8-0 backward output gradient geometry mismatch");
+    MFQ_RUNTIME_CHECK(
+        neuron_len > 0 && neuron_len <= q.size(1) * 32,
+        "NINT8-0 backward neuron length mismatch");
+    MFQ_RUNTIME_CHECK(
+        q.device() == output_gradient.device() &&
+        scale.device() == output_gradient.device(),
+        "NINT8-0 backward tensors must share one CUDA device");
+    const auto dtype = output_gradient.scalar_type();
+    MFQ_RUNTIME_CHECK(
+        dtype == mfq_tensor_backend::kFloat16 ||
+        dtype == mfq_tensor_backend::kFloat32 ||
+        dtype == mfq_tensor_backend::kBFloat16,
+        "NINT8-0 backward output gradient must be fp16, bf16, or fp32");
+    const int rows = static_cast<int>(output_gradient.size(0));
+    const int outputs = static_cast<int>(q.size(0));
+    const int width = static_cast<int>(neuron_len);
+    const int groups = static_cast<int>(q.size(1));
+    auto result = mfq_tensor_backend::empty({rows, width}, output_gradient.options());
+    const int64_t total = static_cast<int64_t>(rows) * width;
+    if (total == 0) {
+        return result;
+    }
+    MfqCudaGuard guard(output_gradient.device());
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (total + threads - 1) / threads, 65535));
+    const cudaStream_t stream = mfq_current_cuda_stream();
+    if (dtype == mfq_tensor_backend::kFloat16 && rows <= 8) {
+        constexpr int output_tile = 32;
+        const int splits = (outputs + output_tile - 1) / output_tile;
+        auto partials = mfq_tensor_backend::empty(
+            {splits, rows, width},
+            scale.options().dtype(mfq_tensor_backend::kFloat32));
+        if (rows == 1) {
+            launch_nint8_zero_backward_small_m<1>(
+                q, scale, output_gradient, partials,
+                rows, outputs, width, groups, output_tile, stream);
+        } else if (rows <= 2) {
+            launch_nint8_zero_backward_small_m<2>(
+                q, scale, output_gradient, partials,
+                rows, outputs, width, groups, output_tile, stream);
+        } else if (rows <= 4) {
+            launch_nint8_zero_backward_small_m<4>(
+                q, scale, output_gradient, partials,
+                rows, outputs, width, groups, output_tile, stream);
+        } else {
+            launch_nint8_zero_backward_small_m<8>(
+                q, scale, output_gradient, partials,
+                rows, outputs, width, groups, output_tile, stream);
+        }
+        mfq_packed_backward::launch_split_float_reduce_to_half(
+            partials.data_ptr<float>(),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
+            rows, width, splits, stream);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return result;
+    }
+    auto weight = nint8_zero_dequant_cuda(q, scale, neuron_len);
+    mfq_packed_backward::launch_dense_half_weight(
+        output_gradient, weight, result, rows, outputs, width, stream);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
 }

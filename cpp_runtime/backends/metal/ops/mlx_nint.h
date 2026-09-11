@@ -35,6 +35,13 @@ public:
     mlx::core::array embedding(
         const mlx::core::array& token_ids,
         mlx::core::Dtype dtype = mlx::core::float16) const;
+    // O-LoRA-style grouped projection:
+    // [..., M, G, K] x [G * O, K] -> [..., M, G, O].
+    // Returns nullopt when the packed layout or geometry should use the
+    // established exact fallback in MlxLinear.
+    std::optional<mlx::core::array> grouped_row_matmul(
+        const mlx::core::array& input,
+        int group_count) const;
 
     int bits() const noexcept {
         return bits_;

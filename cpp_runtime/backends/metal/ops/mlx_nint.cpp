@@ -2659,6 +2659,57 @@ nint4_gs24_mmq_kernel() {
     return kernel;
 }
 
+std::string nint4_gs24_grouped_mmq_source() {
+    std::string source(kNint4Gs24Mmq);
+    constexpr std::string_view ordinary =
+        "uint input_base = input_row * uint(K) + column;";
+    constexpr std::string_view grouped = R"METAL(
+                uint input_group =
+                    min(output_base, uint(OUT) - 1u)
+                    / uint(OUT_PER_GROUP);
+                uint input_base = (
+                    input_row * uint(PROJECTION_GROUPS) + input_group
+                ) * uint(K) + column;)METAL";
+    const auto position = source.find(ordinary);
+    if (position == std::string::npos ||
+        source.find(ordinary, position + ordinary.size()) !=
+            std::string::npos) {
+        throw std::runtime_error(
+            "NINT4/GS24 grouped small-M source is inconsistent");
+    }
+    source.replace(position, ordinary.size(), grouped);
+    return source;
+}
+
+mlx::core::fast::CustomKernelFunction
+make_nint4_gs24_grouped_mmq_kernel() {
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    return mlx::core::fast::metal_kernel(
+        "mfq_cpp_nint4_gs24_grouped_mmq_m1_6",
+        {
+            "q_packed",
+            "sub_scale",
+            "sub_min",
+            "neuron_scale",
+            "neuron_min",
+            "x",
+        },
+        {"y"},
+        nint4_gs24_grouped_mmq_source(),
+        kNintHeader,
+        true,
+        false,
+        options);
+}
+
+const mlx::core::fast::CustomKernelFunction&
+nint4_gs24_grouped_mmq_kernel() {
+    static const auto kernel =
+        make_nint4_gs24_grouped_mmq_kernel();
+    return kernel;
+}
+
 std::string nint4_gs24_gemv_source(
     bool add_residual) {
     std::string source(kNint4Gs24Gemv);
@@ -3376,6 +3427,71 @@ array MlxNintWeight::matmul_add(
     const array& input,
     const array& residual) const {
     return matmul_impl(input, &residual);
+}
+
+std::optional<array> MlxNintWeight::grouped_row_matmul(
+    const array& input,
+    int group_count) const {
+    if (group_count <= 0 || input.ndim() < 2 ||
+        input.shape(-2) != group_count ||
+        input.shape(-1) != input_size_ ||
+        output_size_ % group_count != 0) {
+        throw std::runtime_error(
+            "NINT grouped-row input geometry mismatch");
+    }
+    const int output_per_group = output_size_ / group_count;
+    const auto rows = input.size() /
+        (static_cast<std::size_t>(group_count) * input_size_);
+    // The O-LoRA output groups used by DSV4 are 16-neuron aligned. Keeping a
+    // threadgroup inside one projection group lets it share each decoded
+    // weight group across M rows without ever evaluating unused output rows.
+    if (rows == 0 || rows > 6 || bits_ != 4 || group_size_ != 24 ||
+        q5_execution_layout_ || output_per_group % 16 != 0) {
+        return std::nullopt;
+    }
+    auto source = input;
+    if (source.dtype() != mlx::core::float16) {
+        source = mlx::core::astype(source, mlx::core::float16);
+    }
+    source = mlx::core::contiguous(mlx::core::reshape(
+        source,
+        Shape{
+            static_cast<int>(rows) * group_count,
+            input_size_,
+        }));
+    auto outputs = nint4_gs24_grouped_mmq_kernel()(
+        {
+            q_packed_,
+            sub_scale_,
+            sub_min_,
+            neuron_scale_,
+            neuron_min_,
+            source,
+        },
+        {Shape{static_cast<int>(rows), output_size_}},
+        {mlx::core::float16},
+        {
+            ((output_size_ + 15) / 16) * 256,
+            1,
+            1,
+        },
+        {256, 1, 1},
+        {
+            {"T", mlx::core::float16},
+            {"NG", groups_},
+            {"K", input_size_},
+            {"OUT", output_size_},
+            {"M", static_cast<int>(rows)},
+            {"PROJECTION_GROUPS", group_count},
+            {"OUT_PER_GROUP", output_per_group},
+        },
+        std::nullopt,
+        false,
+        {});
+    Shape output_shape = input.shape();
+    output_shape.back() = output_per_group;
+    return mlx::core::reshape(
+        std::move(outputs.front()), std::move(output_shape));
 }
 
 std::optional<array> MlxNintWeight::greedy_argmax(

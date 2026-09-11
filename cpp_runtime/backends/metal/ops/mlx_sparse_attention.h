@@ -30,6 +30,22 @@ mlx::core::array mlx_sparse_selected_mla_attention(
     const mlx::core::array& sinks,
     std::optional<float> scale = std::nullopt);
 
+// Multi-query sparse MLA over an already chronological local window and a
+// capacity-backed compressed pool. This is the oMLX-style M>1 path: causal
+// local and pooled visibility are derived in the kernel, so adapters do not
+// need to concatenate the pool or materialize an indices/mask plan.
+mlx::core::array mlx_sparse_circular_mla_attention(
+    const mlx::core::array& query,
+    const mlx::core::array& local_kv,
+    const mlx::core::array& pooled_kv,
+    int pool_len,
+    const mlx::core::array& topk,
+    const mlx::core::array& sinks,
+    int query_offset,
+    int pool_ratio,
+    int local_window,
+    std::optional<float> scale = std::nullopt);
+
 // Single-token sparse-MLA specialization over a circular local cache plus an
 // optional compressed pool.  Keeping this in the common backend lets DSA and
 // sparse-MLA adapters share execution while retaining their own index policy.

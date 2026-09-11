@@ -1400,6 +1400,50 @@ void MlxDeepseekV4PoolState::restore_snapshot(
 }
 
 MlxDeepseekV4PoolState
+MlxDeepseekV4PoolState::speculative_snapshot() const {
+    MlxDeepseekV4PoolState result(
+        ratio_,
+        head_dim_,
+        overlap_,
+        batch_,
+        capacity_,
+        dtype_,
+        pool_,
+        state_kv_,
+        state_gate_,
+        prev_kv_,
+        prev_gate_);
+    result.pool_len_ = pool_len_;
+    result.remainder_ = remainder_;
+    return result;
+}
+
+void MlxDeepseekV4PoolState::restore_speculative_snapshot(
+    MlxDeepseekV4PoolState snapshot) {
+    if (ratio_ != snapshot.ratio_ ||
+        head_dim_ != snapshot.head_dim_ ||
+        overlap_ != snapshot.overlap_ ||
+        batch_ != snapshot.batch_ ||
+        capacity_ != snapshot.capacity_ ||
+        dtype_ != snapshot.dtype_ ||
+        snapshot.pool_prefix_backup_) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 speculative pool snapshot mismatch");
+    }
+    // dsv4_decode_pool_step produces new state arrays. Pool writes are
+    // append-only, so the old handle still contains every live prefix row;
+    // restoring the old logical length hides any rejected appended rows.
+    pool_ = std::move(snapshot.pool_);
+    state_kv_ = std::move(snapshot.state_kv_);
+    state_gate_ = std::move(snapshot.state_gate_);
+    prev_kv_ = std::move(snapshot.prev_kv_);
+    prev_gate_ = std::move(snapshot.prev_gate_);
+    pool_prefix_backup_.reset();
+    pool_len_ = snapshot.pool_len_;
+    remainder_ = snapshot.remainder_;
+}
+
+MlxDeepseekV4PoolState
 MlxDeepseekV4PoolState::allocate(
     int ratio,
     int head_dim,
@@ -1894,20 +1938,87 @@ void MlxDeepseekV4LayerState::restore_snapshot(
     position_ = snapshot.position_;
 }
 
+void MlxDeepseekV4LayerState::restore_speculative_snapshot(
+    MlxDeepseekV4LayerState snapshot,
+    int start_position,
+    int total_tokens) {
+    if (static_cast<bool>(main_) !=
+            static_cast<bool>(snapshot.main_) ||
+        static_cast<bool>(indexer_) !=
+            static_cast<bool>(snapshot.indexer_) ||
+        snapshot.position_ != start_position ||
+        snapshot.local_.ndim() != 3 ||
+        snapshot.local_.shape(0) != batch() ||
+        snapshot.local_.shape(1) != total_tokens ||
+        snapshot.local_.shape(2) != local_.shape(2)) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 speculative layer snapshot mismatch");
+    }
+    const int window = local_.shape(1);
+    auto slots = mlx::core::remainder(
+        mlx::core::arange(
+            start_position,
+            start_position + total_tokens,
+            1,
+            mlx::core::int32),
+        array(window, mlx::core::int32));
+    auto rows = mlx::core::broadcast_to(
+        mlx::core::reshape(slots, Shape{1, total_tokens}),
+        Shape{batch(), total_tokens});
+    local_ = dsv4_cache_write_inplace(
+        local_,
+        snapshot.local_,
+        rows);
+    if (main_) {
+        main_->restore_speculative_snapshot(
+            std::move(*snapshot.main_));
+    }
+    if (indexer_) {
+        indexer_->restore_speculative_snapshot(
+            std::move(*snapshot.indexer_));
+    }
+    position_ = start_position;
+}
+
 void MlxDeepseekV4LayerState::begin_speculative(
     int confirmed_tokens,
     int total_tokens) {
+    const int window = local_.shape(1);
     if (speculative_ || confirmed_tokens <= 0 ||
-        total_tokens <= confirmed_tokens) {
+        total_tokens <= confirmed_tokens ||
+        total_tokens > window) {
         throw std::invalid_argument(
             "invalid DeepSeek-V4 speculative cache transaction");
     }
+    auto slots = mlx::core::remainder(
+        mlx::core::arange(
+            position_,
+            position_ + total_tokens,
+            1,
+            mlx::core::int32),
+        array(window, mlx::core::int32));
+    MlxDeepseekV4LayerState checkpoint(
+        detached_copy(mlx::core::take(local_, slots, 1)),
+        main_
+            ? std::optional<MlxDeepseekV4PoolState>(
+                  main_->speculative_snapshot())
+            : std::nullopt,
+        indexer_
+            ? std::optional<MlxDeepseekV4PoolState>(
+                  indexer_->speculative_snapshot())
+            : std::nullopt);
+    checkpoint.position_ = position_;
     speculative_ = std::make_shared<MlxDeepseekV4LayerSpeculation>(
         MlxDeepseekV4LayerSpeculation{
-            snapshot(),
+            std::move(checkpoint),
             confirmed_tokens,
             total_tokens,
             position_,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
         });
 }
 
@@ -2579,7 +2690,7 @@ struct MlxDeepseekV4Attention::Impl {
         const array& index_weights,
         const array& positions,
         int query_offset,
-        MlxDeepseekV41SharedAttentionState& shared) const {
+        MlxDeepseekV41HfSharedAttentionState& shared) const {
         if (shared.index_keys == nullptr ||
             shared.compressed_kv == nullptr ||
             shared.index_keys->pool_len() !=
@@ -2813,7 +2924,7 @@ struct MlxDeepseekV4Attention::Impl {
         int pos0,
         const MlxDeepseekV4ImageVisibility* visibility,
         std::vector<array>* debug_stages,
-        MlxDeepseekV41SharedAttentionState* shared) const {
+        MlxDeepseekV41HfSharedAttentionState* shared) const {
         const int batch = source.shape(0);
         const int tokens = source.shape(1);
         const int heads = checked_int(
@@ -3647,7 +3758,7 @@ array MlxDeepseekV4Attention::operator()(
     int pos0,
     const MlxDeepseekV4ImageVisibility* visibility,
     std::vector<array>* debug_stages,
-    MlxDeepseekV41SharedAttentionState* shared) const {
+    MlxDeepseekV41HfSharedAttentionState* shared) const {
     auto source = floating_contiguous(input);
     const auto& config = impl_->config;
     const int hidden = checked_int(
@@ -4192,7 +4303,10 @@ void MlxDeepseekV4Attention::rollback_speculative(
     }
     const int keep = transaction->confirmed_tokens + accepted_tokens;
     const int start = transaction->start_position;
-    state.restore_snapshot(std::move(transaction->checkpoint));
+    state.restore_speculative_snapshot(
+        std::move(transaction->checkpoint),
+        start,
+        transaction->total_tokens);
     if (transaction->local_kv->ndim() != 3 ||
         transaction->local_kv->shape(0) != state.batch() ||
         transaction->local_kv->shape(1) < keep) {

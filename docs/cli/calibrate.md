@@ -39,8 +39,11 @@ Run `uv run mfq calibrate STAGE --help` for stage-specific options.
 ## Activation imatrix
 
 The imatrix stage consumes a local full-precision HF model and a prepared MFQ
-calibration corpus. CUDA uses FP64 accumulation by default; Metal uses BF16
-forward execution with FP32 accumulation.
+calibration corpus. It uses AAQ by default: ordinary projections use input
+second moments, while attention and FFN gates use their nonlinear activation
+energy and downstream sensitivity. CUDA uses FP64 accumulation for ordinary
+statistics by default; Metal uses BF16 forward execution with FP32
+accumulation. AAQ coupled statistics use FP32 on both backends.
 
 ### CUDA
 
@@ -60,6 +63,8 @@ uv run mfq calibrate imatrix \
 
 `--device` defaults to `cuda:0` for CUDA and `mps` for Metal.
 `--accumulation-dtype` overrides the backend default.
+Use `--objective linear` to produce a conventional llama.cpp-style input
+second-moment imatrix instead.
 
 ## Reuse during quantization
 

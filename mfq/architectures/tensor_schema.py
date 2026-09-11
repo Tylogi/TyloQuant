@@ -1391,6 +1391,154 @@ def _map_deepseek_vision(source_name: str) -> TensorNameMapping | None:
     )
 
 
+_DEEPSEEK_V41_BLOCK_SUFFIXES: dict[str, str] = {
+    "attn_norm.weight": "attention.norm.weight",
+    "ffn_norm.weight": "mlp.norm.weight",
+    "hc_attn_fn": "attention.mhc.pre.function",
+    "hc_attn_base": "attention.mhc.pre.base",
+    "hc_attn_scale": "attention.mhc.pre.scale",
+    "hc_ffn_fn": "mlp.mhc.pre.function",
+    "hc_ffn_base": "mlp.mhc.pre.base",
+    "hc_ffn_scale": "mlp.mhc.pre.scale",
+    "attn.wq_a.weight": "attention.query_a.weight",
+    "attn.wq_a.scale": "attention.query_a.weight_scale",
+    "attn.q_norm.weight": "attention.query_a_norm.weight",
+    "attn.wq_b.weight": "attention.query_b.weight",
+    "attn.wq_b.scale": "attention.query_b.weight_scale",
+    "attn.wkv.weight": "attention.key_value.weight",
+    "attn.wkv.scale": "attention.key_value.weight_scale",
+    "attn.kv_norm.weight": "attention.key_value_norm.weight",
+    "attn.attn_sink": "attention.sink",
+    "attn.wo_a.weight": "attention.output_a.weight",
+    "attn.wo_a.scale": "attention.output_a.weight_scale",
+    "attn.wo_b.weight": "attention.output_b.weight",
+    "attn.wo_b.scale": "attention.output_b.weight_scale",
+    "attn.compressor.wkv.weight": "attention.compressor.key_value.weight",
+    "attn.compressor.wgate.weight": "attention.compressor.gate.weight",
+    "attn.compressor.norm.weight": "attention.compressor.norm.weight",
+    "attn.indexer.wq_b.weight": "attention.indexer.query.weight",
+    "attn.indexer.wq_b.scale": "attention.indexer.query.weight_scale",
+    "attn.indexer.wk.weight": "attention.indexer.key.weight",
+    "attn.indexer.k_norm.weight": "attention.indexer.key_norm.weight",
+    "attn.indexer.weights_proj.weight": "attention.indexer.score.weight",
+    "engram.embed.weight": "associative_memory.embedding.weight",
+    "engram.embed.scale": "associative_memory.embedding.weight_scale",
+    "engram.q_weight": "associative_memory.query.weight",
+    "engram.k_weight": "associative_memory.key.weight",
+    "engram.wkv.weight": "associative_memory.projection.weight",
+    "engram.wkv.scale": "associative_memory.projection.weight_scale",
+    "ffn.gate.weight": "mlp.router.weight",
+    "ffn.gate.bias": "mlp.router.bias",
+    "ffn.gate.bias_vl": "mlp.router.vision_bias",
+}
+
+
+def _deepseek_v41_block_suffix(source_suffix: str) -> str | None:
+    direct = _DEEPSEEK_V41_BLOCK_SUFFIXES.get(source_suffix)
+    if direct is not None:
+        return direct
+    expert = _DEEPSEEK_EXPERT_RE.match(source_suffix)
+    if expert is not None:
+        projection = {"1": "gate", "2": "down", "3": "up"}[expert.group(2)]
+        leaf = "weight" if expert.group(3) == "weight" else "weight_scale"
+        return f"mlp.experts.{int(expert.group(1))}.{projection}.{leaf}"
+    shared = re.match(r"^ffn\.shared_experts\.w([123])\.(weight|scale)$", source_suffix)
+    if shared is not None:
+        projection = {"1": "gate", "2": "down", "3": "up"}[shared.group(1)]
+        leaf = "weight" if shared.group(2) == "weight" else "weight_scale"
+        return f"mlp.shared_expert.{projection}.{leaf}"
+    return None
+
+
+def _map_deepseek_v41_vision(source_name: str) -> TensorNameMapping | None:
+    root = {
+        "vision.patch_embed.proj.weight": "vision.patch_embedding.weight",
+        "vision.patch_embed.proj.bias": "vision.patch_embedding.bias",
+        "vision.norm.weight": "vision.output_norm.weight",
+        "aligner.w1.weight": "vision.aligner.input.weight",
+        "aligner.w1.bias": "vision.aligner.input.bias",
+        "aligner.w2.weight": "vision.aligner.output.weight",
+        "aligner.w2.bias": "vision.aligner.output.bias",
+        "image_start": "vision.special_token.start",
+        "image_newline": "vision.special_token.newline",
+        "image_end": "vision.special_token.end",
+    }.get(source_name)
+    if root is not None:
+        return TensorNameMapping(root, TensorComponent.VISION)
+    match = re.match(r"^vision\.blocks\.(\d+)\.(.+)$", source_name)
+    if match is None:
+        return None
+    suffix = {
+        "norm1.weight": "norm1.weight",
+        "norm2.weight": "norm2.weight",
+        "attn.wqkv.weight": "attention.qkv.weight",
+        "attn.wqkv.bias": "attention.qkv.bias",
+        "attn.wo.weight": "attention.output.weight",
+        "attn.wo.bias": "attention.output.bias",
+        "mlp.w1.weight": "mlp.gate_up.weight",
+        "mlp.w2.weight": "mlp.down.weight",
+    }.get(match.group(2))
+    if suffix is None:
+        return None
+    return TensorNameMapping(
+        vision_block(int(match.group(1)), suffix),
+        TensorComponent.VISION,
+    )
+
+
+def _deepseek_v41_source_mapper(
+    source_name: str,
+    _topology: GraphTopology,
+    _config: Mapping[str, object],
+) -> TensorNameMapping | None:
+    canonical = _already_canonical(source_name)
+    if canonical is not None:
+        return canonical
+    root = {
+        "embed.weight": "model.token_embedding.weight",
+        "norm.weight": "model.output_norm.weight",
+        "head.weight": "model.output.weight",
+    }.get(source_name)
+    if root is not None:
+        return TensorNameMapping(root, TensorComponent.MODEL)
+    vision = _map_deepseek_v41_vision(source_name)
+    if vision is not None:
+        return vision
+
+    layer = _DEEPSEEK_LAYER_RE.match(source_name)
+    if layer is not None:
+        suffix = _deepseek_v41_block_suffix(layer.group(2))
+        if suffix is None:
+            return None
+        return TensorNameMapping(
+            model_block(int(layer.group(1)), suffix),
+            TensorComponent.MODEL,
+        )
+
+    predictor = _DEEPSEEK_PREDICTOR_RE.match(source_name)
+    if predictor is None:
+        return None
+    stage = int(predictor.group(1))
+    source_suffix = predictor.group(2)
+    suffix = _deepseek_v41_block_suffix(source_suffix)
+    if suffix is None:
+        suffix = {
+            "main_norm.weight": "main_norm.weight",
+            "main_proj.weight": "main_projection.weight",
+            "main_proj.scale": "main_projection.weight_scale",
+            "norm.weight": "output_norm.weight",
+            "confidence_head.proj.weight": "confidence.projection.weight",
+            "markov_head.embed.weight": "markov.embedding.weight",
+            "markov_head.head.weight": "markov.output.weight",
+        }.get(source_suffix)
+    if suffix is None:
+        return None
+    return TensorNameMapping(
+        f"predictor.stage.{stage}.{suffix}",
+        TensorComponent.PREDICTOR,
+    )
+
+
 def _deepseek_v4_source_mapper(
     source_name: str,
     _topology: GraphTopology,
@@ -1646,6 +1794,30 @@ register_tensor_schema(
 
 register_tensor_schema(
     TensorSchemaRegistration(
+        architecture="deepseek_v41",
+        aliases=("deepseek_v41_text", "deepseek_v41_vision"),
+        source_mapper=_deepseek_v41_source_mapper,
+        component_specs=(
+            GraphComponentSpec(
+                TensorComponent.VISION,
+                "vision",
+                "deepseek_v41_vision",
+                input_contract="deepseek_v41_vision.v1",
+                position_policy="deepseek_v41_positions",
+                capabilities=("vision",),
+            ),
+            GraphComponentSpec(
+                TensorComponent.PREDICTOR,
+                "predictor",
+                "deepseek_v41_dspark",
+                capabilities=("speculative_prediction",),
+            ),
+        ),
+    )
+)
+
+register_tensor_schema(
+    TensorSchemaRegistration(
         architecture="deepseek_v4",
         aliases=("deepseek_v4_text", "deepseek_v4_vision"),
         source_mapper=_deepseek_v4_source_mapper,
@@ -1656,31 +1828,6 @@ register_tensor_schema(
                 "deepseek_v4_vision",
                 input_contract="deepseek_v4_vision.v1",
                 position_policy="deepseek_v4_positions",
-                capabilities=("vision",),
-            ),
-            GraphComponentSpec(
-                TensorComponent.PREDICTOR,
-                "predictor",
-                "dspark",
-                capabilities=("speculative_prediction",),
-            ),
-        ),
-    )
-)
-
-register_tensor_schema(
-    TensorSchemaRegistration(
-        architecture="deepseek_v41",
-        aliases=("deepseek_v41_text", "deepseek_v41_vision"),
-        source_mapper=_deepseek_v4_source_mapper,
-        backbone="deepseek_v4",
-        component_specs=(
-            GraphComponentSpec(
-                TensorComponent.VISION,
-                "vision",
-                "deepseek_v41_vision",
-                input_contract="deepseek_v41_vision.v1",
-                position_policy="deepseek_v41_positions",
                 capabilities=("vision",),
             ),
             GraphComponentSpec(
