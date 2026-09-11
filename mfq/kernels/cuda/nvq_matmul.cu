@@ -7716,6 +7716,161 @@ void launch_nvq_backward_mma_m8(
             M, N, K, ng, nvec, nsign, sub_bits, sign_mode);
 }
 
+template <int FORMAT>
+__global__ void __launch_bounds__(256) nepq_backward_mma_m8_kernel(
+        const uint8_t * indices,
+        int64_t indices_nbytes,
+        const uint8_t * aux,
+        int64_t aux_nbytes,
+        const uint8_t * state_stream,
+        int64_t state_nbytes,
+        const float * neuron_scale,
+        const int8_t * table_pool,
+        const uint8_t * bank_ids,
+        const __half * output_gradient,
+        __half * input_gradient,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int nsuper,
+        int table_stride,
+        int state_bits) {
+    constexpr int kWarps = 8;
+    __shared__ __align__(16) __half gradient_tile[kWarps][16 * 16];
+    __shared__ __align__(16) __half weight_tile[kWarps][16 * 16];
+    __shared__ __align__(16) float result_tile[kWarps][16 * 16];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int column0 = static_cast<int>(blockIdx.x) * 16;
+    for (int index = lane; index < 16 * 16; index += 32) {
+        gradient_tile[warp][index] = __float2half_rn(0.0f);
+    }
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
+    wmma::fill_fragment(accumulator, 0.0f);
+    for (int output_group = warp * 128;
+         output_group < N;
+         output_group += kWarps * 128) {
+        for (int output0 = output_group;
+             output0 < min(output_group + 128, N);
+             output0 += 16) {
+            for (int index = lane; index < M * 16; index += 32) {
+                const int row = index >> 4;
+                const int output = output0 + (index & 15);
+                gradient_tile[warp][index] = output < N
+                    ? output_gradient[static_cast<int64_t>(row) * N + output]
+                    : __float2half_rn(0.0f);
+            }
+            const int output = output0 + (lane & 15);
+            const int half = lane >> 4;
+            const int k0 = column0 + half * 8;
+            NvqVec8Values<FORMAT> decoded = {make_int2(0, 0), 0, false};
+            float weight_scale = 0.0f;
+            if (output < N && k0 < K) {
+                const int group = k0 / kGroupSize;
+                const uint32_t state = load_packed_bits(
+                    state_stream,
+                    (static_cast<int64_t>(output) * ng + group) * state_bits,
+                    state_bits,
+                    state_nbytes);
+                const int8_t * table = nepq_active_table(
+                    table_pool, bank_ids, output, group,
+                    nsuper, table_stride);
+                decoded = load_nepq_vec8<FORMAT>(
+                    indices, indices_nbytes, aux, aux_nbytes, table,
+                    output, k0 >> 3, group, ng, nvec, nsign, 0, state);
+                weight_scale = format_scale<FORMAT>(
+                    neuron_scale[output], state, table);
+            }
+#pragma unroll
+            for (int component = 0; component < 8; ++component) {
+                const int packed = component < 4
+                    ? decoded.values.x : decoded.values.y;
+                const int raw = static_cast<int>(static_cast<int8_t>(
+                    (packed >> (8 * (component & 3))) & 0xff));
+                int value = raw;
+                if constexpr (FORMAT == kNvq1L) {
+                    value = 8 * raw + decoded.delta;
+                } else if constexpr (FORMAT == kNvq1S) {
+                    value = 32 * raw + 5 * decoded.delta;
+                }
+                const int column = k0 + component;
+                weight_tile[warp][
+                    (lane & 15) * 16 + half * 8 + component] =
+                    decoded.valid && column < K
+                    ? __float2half_rn(weight_scale * static_cast<float>(value))
+                    : __float2half_rn(0.0f);
+            }
+            __syncwarp();
+            wmma::fragment<
+                wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>
+                    gradient_fragment;
+            wmma::fragment<
+                wmma::matrix_b, 16, 16, 16, __half, wmma::row_major>
+                    weight_fragment;
+            wmma::load_matrix_sync(
+                gradient_fragment, gradient_tile[warp], 16);
+            wmma::load_matrix_sync(
+                weight_fragment, weight_tile[warp], 16);
+            wmma::mma_sync(
+                accumulator, gradient_fragment, weight_fragment, accumulator);
+            __syncwarp();
+        }
+    }
+    wmma::store_matrix_sync(
+        result_tile[warp], accumulator, 16, wmma::mem_row_major);
+    __syncthreads();
+    const int index = static_cast<int>(threadIdx.x);
+    if (index < M * 16) {
+        const int row = index >> 4;
+        const int column = column0 + (index & 15);
+        if (column < K) {
+            float value = 0.0f;
+#pragma unroll
+            for (int source_warp = 0; source_warp < kWarps; ++source_warp) {
+                value += result_tile[source_warp][index];
+            }
+            input_gradient[static_cast<int64_t>(row) * K + column] =
+                __float2half_rn(value);
+        }
+    }
+}
+
+template <int FORMAT>
+void launch_nepq_backward_mma_m8(
+        const mfq_tensor_backend::Tensor & indices,
+        const mfq_tensor_backend::Tensor & aux,
+        const mfq_tensor_backend::Tensor & state_stream,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & table_pool,
+        const mfq_tensor_backend::Tensor & bank_ids,
+        const mfq_tensor_backend::Tensor & output_gradient,
+        mfq_tensor_backend::Tensor & result,
+        int M,
+        int N,
+        int K,
+        int ng,
+        int nvec,
+        int nsign,
+        int nsuper,
+        int table_stride,
+        int state_bits,
+        cudaStream_t stream) {
+    nepq_backward_mma_m8_kernel<FORMAT><<<
+        (K + 15) / 16, 256, 0, stream>>>(
+            indices.data_ptr<uint8_t>(), indices.numel(),
+            aux.data_ptr<uint8_t>(), aux.numel(),
+            state_stream.data_ptr<uint8_t>(), state_stream.numel(),
+            neuron_scale.data_ptr<float>(), table_pool.data_ptr<int8_t>(),
+            bank_ids.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half *>(
+                output_gradient.data_ptr<mfq_half>()),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
+            M, N, K, ng, nvec, nsign, nsuper, table_stride, state_bits);
+}
+
 template <int FORMAT, typename T>
 __global__ void nepq_backward_input_kernel(
         const uint8_t * indices,
@@ -8106,6 +8261,21 @@ mfq_tensor_backend::Tensor nepq_backward_input_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 65535));
     const cudaStream_t stream = mfq_current_cuda_stream();
+    // Fuse dynamic table selection, vector decode, and WMMA when K tiles
+    // provide enough parallel work; retain split reduction for output-wide MLPs.
+    if (dtype == mfq_tensor_backend::kFloat16 && M >= 5 && M <= 8 &&
+            static_cast<int64_t>(K) >= 2 * static_cast<int64_t>(N)) {
+        launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {
+            constexpr int F = decltype(tag)::value;
+            launch_nepq_backward_mma_m8<F>(
+                indices, aux, state_stream, neuron_scale, table_pool,
+                bank_ids, output_gradient, result, M, N, K, ng,
+                nvec, nsign, nsuper, table_stride,
+                static_cast<int>(state_bits), stream);
+        });
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return result;
+    }
     if (dtype == mfq_tensor_backend::kFloat16 && M <= 8) {
         const int output_tile = M <= 4 ? 16 : 32;
         const int splits = (N + output_tile - 1) / output_tile;

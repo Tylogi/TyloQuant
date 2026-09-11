@@ -154,7 +154,7 @@ def test_nepq_cuda_online_f16_matches_stored_weight(spec, m):
 
 
 @pytest.mark.parametrize("spec", [NEPQ0_S, NEPQ0_L, NEPQ1_S, NEPQ1_L])
-@pytest.mark.parametrize("m", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("m", [1, 2, 4, 5, 7, 8, 16])
 def test_nepq_packed_backward_and_autograd_match_dequant(spec, m):
     tensor = _dynamic_tensor(spec)
     gpu = to_gpu_nepq(tensor)
