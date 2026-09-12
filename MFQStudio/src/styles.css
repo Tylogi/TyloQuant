@@ -154,6 +154,7 @@ html, body, #root { min-width: 320px; min-height: 100%; margin: 0; }
 body { overflow: hidden; }
 button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
+button:not(:disabled):active { opacity: 0.8; }
 button:disabled { cursor: not-allowed; opacity: 0.45; }
 button, input, textarea, select {
   transition: border-color 130ms ease, background-color 130ms ease, color 130ms ease,
@@ -735,6 +736,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   background: transparent;
 }
 .overview-panel-title > button:hover { color: var(--ink); background: var(--surface-hover); }
+.overview-panel-title > button.copied { color: var(--success); }
 .overview-panel-title > span { margin-left: auto; color: var(--muted); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .overview-endpoint-panel > code {
   overflow: hidden;
