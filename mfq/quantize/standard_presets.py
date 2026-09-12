@@ -110,6 +110,9 @@ class TensorDescriptor:
 
 
 _LAYER_PATTERN = re.compile(r"(?:^|\.)(?:layers|blocks|block|blk)\.(\d+)(?:\.|$)")
+_BLOCK_FF_GATE_PATTERN = re.compile(
+    r"(?:model|vision|predictor)\.block\.\d+\.mlp\.gate\.weight"
+)
 _VISION_COMPONENTS = frozenset(
     {
         "visual",
@@ -301,9 +304,16 @@ def describe_tensor(
     is_expert_bank = len(shape) == 3 and role is TensorRole.ROUTED_EXPERT
     quantizable = (is_matrix or is_expert_bank) and source_dtype not in {"I32", "I64"}
     quantizable &= any(value.endswith(".weight") for value in names)
+    # `.mlp.gate.weight` marks a MoE router in raw checkpoints; the canonical
+    # schema maps those routers to `mlp.router.weight` and names the dense FFN
+    # gate `model.block.<N>.mlp.gate.weight`, so block-scoped gates stay
+    # quantizable and keep their fused gate/up precision pair.
+    router_gate_names = [
+        value for value in names if _BLOCK_FF_GATE_PATTERN.fullmatch(value) is None
+    ]
     quantizable &= not any(
         marker in value
-        for value in names
+        for value in router_gate_names
         for marker in (
             "_norm.weight",
             "layernorm.weight",
