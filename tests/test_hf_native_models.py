@@ -19,6 +19,7 @@ from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.server.catalog import ModelCatalog, native_hf_model_type_supported
 from mfq.server.hf_tokenizer import (
+    DEEPSEEK_V4_CHAT_TEMPLATE,
     DEEPSEEK_V41_CHAT_TEMPLATE,
     ensure_hf_tokenizer_gguf,
     ensure_mfq_tokenizer_gguf,
@@ -246,6 +247,28 @@ def test_minicpmo_native_runtime_materializes_exact_resampler_asset(
     asset = Path(environment["MFQ_MINICPMO45_RESAMPLER_POSITION_ASSET"])
     assert asset.is_file()
     assert asset.read_bytes()[:20] == b"MFQRSPB1" + struct.pack("<III", 70, 70, 4096)
+
+
+def test_deepseek_v4_gets_released_chat_template_fallback(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "DeepSeek-V4-Vision-Test"
+    _hf_fixture(model)
+    (model / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", "vocab_size": 6}),
+        encoding="utf-8",
+    )
+    tokenizer_config = json.loads((model / "tokenizer_config.json").read_text())
+    tokenizer_config["chat_template"] = None
+    (model / "tokenizer_config.json").write_text(
+        json.dumps(tokenizer_config), encoding="utf-8"
+    )
+
+    tokenizer = ensure_hf_tokenizer_gguf(model, tmp_path / "tokenizers")
+    reader = GGUFReader(tokenizer, "r")
+    assert reader.get_field("tokenizer.chat_template").contents() == (
+        DEEPSEEK_V4_CHAT_TEMPLATE
+    )
 
 
 def test_deepseek_v41_gets_chat_template_and_engram_token_map(

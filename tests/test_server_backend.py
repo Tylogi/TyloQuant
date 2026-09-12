@@ -67,6 +67,30 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
                     "decode_tps": 1500.0,
                     "generation_ms": 14.0,
                     "generation_tps": 214.0,
+                    "mtp_available": 1.0,
+                    "mtp_used": 1.0,
+                    "mtp_cycles": 5.0,
+                    "mtp_drafted_tokens": 10.0,
+                    "mtp_accepted_tokens": 4.0,
+                    "mtp_acceptance_rate": 0.4,
+                    "mtp_selected_depth": 2.0,
+                    "mtp_depth_0_cycles": 3.0,
+                    "mtp_depth_1_cycles": 0.0,
+                    "mtp_depth_2_cycles": 0.0,
+                    "mtp_depth_3_cycles": 0.0,
+                    "mtp_depth_4_cycles": 0.0,
+                    "mtp_depth_5_cycles": 2.0,
+                    "mtp_position_1_acceptance_rate": 1.0,
+                    "mtp_position_2_acceptance_rate": 1.0,
+                    "mtp_position_3_acceptance_rate": 0.0,
+                    "mtp_position_4_acceptance_rate": 0.0,
+                    "mtp_position_5_acceptance_rate": 0.0,
+                    "mtp_depth_0_cycle_ms": 45.7,
+                    "mtp_depth_1_cycle_ms": 0.0,
+                    "mtp_depth_2_cycle_ms": 0.0,
+                    "mtp_depth_3_cycle_ms": 0.0,
+                    "mtp_depth_4_cycle_ms": 0.0,
+                    "mtp_depth_5_cycle_ms": 257.6,
                     "sampling": {
                         "max_tokens": 12,
                         "temperature": 0.25,
@@ -143,6 +167,10 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
         assert deltas[3].performance is not None
         assert deltas[3].performance.multimodal_ms == 3.0
         assert deltas[3].performance.model_prefill_ms == 7.0
+        assert deltas[3].performance.mtp_selected_depth == 2
+        assert deltas[3].performance.mtp_depth_5_cycles == 2
+        assert deltas[3].performance.mtp_position_2_acceptance_rate == 1.0
+        assert deltas[3].performance.mtp_depth_5_cycle_ms == 257.6
 
     asyncio.run(run())
     assert captured["authorization"] == f"Bearer {backend_key}"

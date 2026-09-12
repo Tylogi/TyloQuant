@@ -3683,6 +3683,78 @@
             "title": "Mtp Cycles",
             "type": "integer"
           },
+          "mtp_depth_0_cycle_ms": {
+            "default": 0.0,
+            "minimum": 0.0,
+            "title": "Mtp Depth 0 Cycle Ms",
+            "type": "number"
+          },
+          "mtp_depth_0_cycles": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Mtp Depth 0 Cycles",
+            "type": "integer"
+          },
+          "mtp_depth_1_cycle_ms": {
+            "default": 0.0,
+            "minimum": 0.0,
+            "title": "Mtp Depth 1 Cycle Ms",
+            "type": "number"
+          },
+          "mtp_depth_1_cycles": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Mtp Depth 1 Cycles",
+            "type": "integer"
+          },
+          "mtp_depth_2_cycle_ms": {
+            "default": 0.0,
+            "minimum": 0.0,
+            "title": "Mtp Depth 2 Cycle Ms",
+            "type": "number"
+          },
+          "mtp_depth_2_cycles": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Mtp Depth 2 Cycles",
+            "type": "integer"
+          },
+          "mtp_depth_3_cycle_ms": {
+            "default": 0.0,
+            "minimum": 0.0,
+            "title": "Mtp Depth 3 Cycle Ms",
+            "type": "number"
+          },
+          "mtp_depth_3_cycles": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Mtp Depth 3 Cycles",
+            "type": "integer"
+          },
+          "mtp_depth_4_cycle_ms": {
+            "default": 0.0,
+            "minimum": 0.0,
+            "title": "Mtp Depth 4 Cycle Ms",
+            "type": "number"
+          },
+          "mtp_depth_4_cycles": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Mtp Depth 4 Cycles",
+            "type": "integer"
+          },
+          "mtp_depth_5_cycle_ms": {
+            "default": 0.0,
+            "minimum": 0.0,
+            "title": "Mtp Depth 5 Cycle Ms",
+            "type": "number"
+          },
+          "mtp_depth_5_cycles": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Mtp Depth 5 Cycles",
+            "type": "integer"
+          },
           "mtp_drafted_tokens": {
             "default": 0,
             "minimum": 0,
@@ -3695,11 +3767,53 @@
             "title": "Mtp Head Ms",
             "type": "number"
           },
+          "mtp_position_1_acceptance_rate": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Mtp Position 1 Acceptance Rate",
+            "type": "number"
+          },
+          "mtp_position_2_acceptance_rate": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Mtp Position 2 Acceptance Rate",
+            "type": "number"
+          },
+          "mtp_position_3_acceptance_rate": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Mtp Position 3 Acceptance Rate",
+            "type": "number"
+          },
+          "mtp_position_4_acceptance_rate": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Mtp Position 4 Acceptance Rate",
+            "type": "number"
+          },
+          "mtp_position_5_acceptance_rate": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Mtp Position 5 Acceptance Rate",
+            "type": "number"
+          },
           "mtp_rollback_ms": {
             "default": 0.0,
             "minimum": 0.0,
             "title": "Mtp Rollback Ms",
             "type": "number"
+          },
+          "mtp_selected_depth": {
+            "default": 0,
+            "maximum": 5,
+            "minimum": 0,
+            "title": "Mtp Selected Depth",
+            "type": "integer"
           },
           "mtp_target_ms": {
             "default": 0.0,

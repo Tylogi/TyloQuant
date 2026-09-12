@@ -1,4 +1,4 @@
-"""Source contracts for the raw-HF DeepSeek-V4.1 Metal fast paths."""
+"""Source contracts for the raw-HF DeepSeek-V4 family Metal fast paths."""
 
 from pathlib import Path
 
@@ -12,6 +12,17 @@ CAUSAL_LM_HEADER = (DSV4 / "mlx_deepseek_v4_causal_lm.h").read_text(
 )
 SPARSE = (DSV4 / "mlx_deepseek_v4_sparse.cpp").read_text(encoding="utf-8")
 DSPARK = (DSV4 / "mlx_deepseek_v4_dspark.cpp").read_text(encoding="utf-8")
+MOE = (
+    ROOT / "cpp_runtime" / "backends" / "metal" / "ops" / "mlx_moe.cpp"
+).read_text(encoding="utf-8")
+METAL_SERVER = (
+    ROOT
+    / "cpp_runtime"
+    / "backends"
+    / "metal"
+    / "apps"
+    / "mfq_decode_mlx.cpp"
+).read_text(encoding="utf-8")
 
 
 def test_raw_hf_v41_prefill_uses_the_direct_circular_sparse_kernel() -> None:
@@ -62,3 +73,25 @@ def test_v41_mtp_depth_is_acceptance_deterministic() -> None:
 def test_v41_new_sessions_reuse_cache_storage() -> None:
     assert "reuse_v41_storage" in CAUSAL_LM
     assert "state.reset_v41()" in CAUSAL_LM
+
+
+def test_m3_ultra_nax_prefill_covers_both_flash_expert_geometries() -> None:
+    assert "const bool dsv4f_geometry = experts == 256" in MOE
+    assert "input_width == 4096" in MOE
+    assert "output_width == 2048 || output_width == 4096" in MOE
+    assert "const bool dsv41_geometry = experts == 384" in MOE
+    assert "dsv4f_geometry || dsv41_geometry" in MOE
+    assert "apple_m3_ultra() && optimized_geometry" in MOE
+
+
+def test_m3_ultra_v4_flash_prefill_uses_balanced_4096_chunks() -> None:
+    assert '"MFQ_METAL_DSV4_PREFILL_AUTOTUNE"' in METAL_SERVER
+    assert "const bool dsv4_flash_geometry =" in METAL_SERVER
+    assert "config.n_experts == 256" in METAL_SERVER
+    assert "config.moe_inter == 2048" in METAL_SERVER
+    assert (
+        "effective_arguments.prefill_chunk_size = config.is_v41()"
+        in METAL_SERVER
+    )
+    assert "? 5440" in METAL_SERVER
+    assert ": 4096;" in METAL_SERVER

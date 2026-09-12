@@ -218,23 +218,28 @@ bool mxfp4_nax_prefill_enabled(
     int input_width,
     int output_width) noexcept {
     constexpr int kDefaultMinRoutes = 1024;
-    // Raw-HF DeepSeek-V4.1-Flash uses 384 native MXFP4 experts with
-    // 5120->2304 Gate/Up and 2304->5120 Down projections.  On M3 Ultra,
-    // MLX's batched gather-QMM is materially faster for these large routed
-    // matrices than the compatibility block-list kernel.  Keep the default
-    // deliberately geometry-specific so unrelated MXFP4 models retain their
-    // established numerical and performance policy.
+    // Raw-HF DeepSeek-V4-Flash and V4.1-Flash use native MXFP4 routed
+    // experts. On M3 Ultra, MLX's batched gather-QMM is materially faster for
+    // these large routed matrices than the compatibility block-list kernel.
+    // Keep the default deliberately geometry-specific so unrelated MXFP4
+    // models retain their established numerical and performance policy.
+    const bool dsv4f_geometry = experts == 256 && (
+        (input_width == 4096 &&
+         (output_width == 2048 || output_width == 4096)) ||
+        (input_width == 2048 && output_width == 4096));
     const bool dsv41_geometry = experts == 384 && (
         (input_width == 5120 &&
          (output_width == 2304 || output_width == 4608)) ||
         (input_width == 2304 && output_width == 5120));
+    const bool optimized_geometry =
+        dsv4f_geometry || dsv41_geometry;
     const bool automatic = route_count >= kDefaultMinRoutes &&
         (apple_m5_family() ||
-         (apple_m3_ultra() && dsv41_geometry));
+         (apple_m3_ultra() && optimized_geometry));
     const char* value = std::getenv(
         "MFQ_METAL_NINTM_PREFILL_NAX");
     if (value == nullptr) {
-        return apple_m3_ultra() && dsv41_geometry &&
+        return apple_m3_ultra() && optimized_geometry &&
             route_count >= kDefaultMinRoutes;
     }
     const auto setting = std::string_view(value);

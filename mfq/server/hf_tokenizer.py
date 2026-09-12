@@ -26,6 +26,9 @@ class HfTokenizerError(RuntimeError):
     pass
 
 
+DEEPSEEK_V4_CHAT_TEMPLATE = r"""{{ bos_token }}{% for message in messages %}{% if message['role'] == 'system' %}{{ message['content'] }}{% elif message['role'] == 'user' %}{{ '<｜User｜>' + message['content'] }}{% elif message['role'] == 'assistant' %}{{ '<｜Assistant｜>' + message['content'] + eos_token }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<｜Assistant｜>' }}{% if enable_thinking %}{{ '<think>' }}{% else %}{{ '</think>' }}{% endif %}{% endif %}"""
+
+
 DEEPSEEK_V41_CHAT_TEMPLATE = r"""{{ bos_token }}{%- set thinking = enable_thinking | default(true) -%}{%- set effort = reasoning_effort | default('high') -%}{%- if thinking -%}<｜System｜>Reasoning Effort: {%- if effort == 'low' -%}25{%- elif effort == 'xhigh' -%}75{%- elif effort == 'max' -%}100{%- elif effort is number -%}{{ effort }}{%- else -%}50{%- endif -%} (range 1-100, the higher the value, the more thorough the reasoning)\n\n{%- endif -%}{%- for message in messages -%}{%- if message.role == 'system' -%}{%- if not loop.first or not thinking -%}<｜System｜>{%- endif -%}{{ message.content or '' }}{%- elif message.role == 'user' -%}<｜User｜>{%- if message.content is string -%}{{ message.content }}{%- else -%}{%- for block in message.content -%}{%- if block.type == 'text' -%}{{ block.text }}{%- elif block.type in ['image', 'image_url'] -%}<｜deepseek_image｜>{%- endif -%}{%- endfor -%}{%- endif -%}{%- elif message.role == 'tool' -%}<｜User｜><tool_result>{{ message.content or '' }}</tool_result>{%- elif message.role == 'assistant' -%}{%- if message.reasoning_content is defined and message.reasoning_content -%}{{ message.reasoning_content }}</think>{%- endif -%}{{ message.content or '' }}{%- if message.tool_calls is defined and message.tool_calls -%}\n\n<｜DSML｜ calls>\n{%- for call in message.tool_calls -%}<｜DSML｜ invoke name=\"{{ call.function.name }}\">\n<｜DSML｜ parameter name=\"arguments\" string=\"false\">{{ call.function.arguments | tojson }}</｜DSML｜ parameter>\n</｜DSML｜ invoke>{%- endfor -%}\n</｜DSML｜ calls>{%- endif -%}{{ eos_token }}{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<｜Assistant｜>{%- if thinking -%}<think>{%- else -%}</think>{%- endif -%}{%- endif -%}"""
 
 
@@ -88,7 +91,7 @@ def _special_id(
 
 def _fingerprint_payloads(payloads: tuple[tuple[str, bytes], ...]) -> str:
     digest = hashlib.sha256()
-    digest.update(b"mfq-hf-tokenizer-gguf-v3\0")
+    digest.update(b"mfq-hf-tokenizer-gguf-v4\0")
     for name, payload in payloads:
         digest.update(name.encode("utf-8"))
         digest.update(payload)
@@ -146,12 +149,12 @@ def _write_tokenizer_gguf(
     model_type = config.get("model_type")
     if not isinstance(model_type, str) or not model_type:
         raise HfTokenizerError("HF config.json has no model_type")
-    if (
-        model_type.startswith("deepseek_v41")
-        and not isinstance(tokenizer_config.get("chat_template"), (str, list))
-    ):
+    if not isinstance(tokenizer_config.get("chat_template"), (str, list)):
         tokenizer_config = dict(tokenizer_config)
-        tokenizer_config["chat_template"] = DEEPSEEK_V41_CHAT_TEMPLATE
+        if model_type.startswith("deepseek_v41"):
+            tokenizer_config["chat_template"] = DEEPSEEK_V41_CHAT_TEMPLATE
+        elif model_type.startswith("deepseek_v4"):
+            tokenizer_config["chat_template"] = DEEPSEEK_V4_CHAT_TEMPLATE
 
     model = tokenizer.get("model")
     if not isinstance(model, dict) or model.get("type") != "BPE":
@@ -584,6 +587,7 @@ def native_hf_asset_environment(
 
 __all__ = [
     "HfTokenizerError",
+    "DEEPSEEK_V4_CHAT_TEMPLATE",
     "DEEPSEEK_V41_CHAT_TEMPLATE",
     "ensure_hf_tokenizer_gguf",
     "ensure_mfq_tokenizer_gguf",
