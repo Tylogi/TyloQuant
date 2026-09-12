@@ -1,4 +1,5 @@
 #include "mlx_deepseek_v4_sparse.h"
+#include "mlx_deepseek_v41_deepselect.h"
 
 #include "mlx_detached_copy.h"
 
@@ -966,7 +967,7 @@ void test_topk() {
             65536.0f + static_cast<float>(index) * 1.0e-8f;
     }
     auto v41_selected = evaluated_int(
-        mfq::metal::dsv41_deepselect_topk512(
+        mfq::metal::deepseek_v41_deepselect_topk512(
             float_array(v41_values, Shape{1, 1, v41_keys})));
     std::sort(v41_selected.begin(), v41_selected.end());
     auto reference = std::vector<int>(v41_keys);
@@ -988,7 +989,7 @@ void test_topk() {
 
     const auto valid_counts = int_array({700}, Shape{1, 1});
     auto prefix_selected = evaluated_int(
-        mfq::metal::dsv41_deepselect_topk512(
+        mfq::metal::deepseek_v41_deepselect_topk512(
             float_array(v41_values, Shape{1, 1, v41_keys}),
             valid_counts));
     std::sort(prefix_selected.begin(), prefix_selected.end());
@@ -1010,7 +1011,7 @@ void test_topk() {
         "V4.1 DeepSelect visible-prefix mismatch");
 
     const auto short_prefix = evaluated_int(
-        mfq::metal::dsv41_deepselect_topk512(
+        mfq::metal::deepseek_v41_deepselect_topk512(
             float_array(v41_values, Shape{1, 1, v41_keys}),
             int_array({7}, Shape{1, 1})));
     for (int index = 0; index < 512; ++index) {
@@ -1034,7 +1035,7 @@ void test_topk() {
         }
     }
     const auto batched_selected = evaluated_int(
-        mfq::metal::dsv41_deepselect_topk512(
+        mfq::metal::deepseek_v41_deepselect_topk512(
             float_array(
                 batched_values,
                 Shape{2, 3, batched_keys}),
@@ -1063,7 +1064,7 @@ void test_topk() {
     }
 
     auto tied_v41 = evaluated_int(
-        mfq::metal::dsv41_deepselect_topk512(
+        mfq::metal::deepseek_v41_deepselect_topk512(
             float_array(
                 std::vector<float>(batched_keys, 1.0f),
                 Shape{1, 1, batched_keys})));
@@ -1152,7 +1153,7 @@ void benchmark_v41_deepselect_topk() {
                 Shape{1, benchmark.rows, 512},
                 mlx::core::int32);
             if (deepselect) {
-                relative = mfq::metal::dsv41_deepselect_topk512(
+                relative = mfq::metal::deepseek_v41_deepselect_topk512(
                     scores,
                     valid_counts);
             } else {

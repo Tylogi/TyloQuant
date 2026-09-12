@@ -1,7 +1,8 @@
 #include "mlx_deepseek_v41_attention.h"
 
-#include "mlx_deepseek_v4_attention.h"
-#include "mlx_deepseek_v4_sparse.h"
+#include "mlx_deepseek_v41_deepselect.h"
+#include "mlx_deepseek_family_attention.h"
+#include "mlx_deepseek_sparse.h"
 #include "mlx_detached_copy.h"
 #include "mlx_sparse_attention.h"
 #include "mlx_transformer.h"
@@ -222,11 +223,11 @@ array topk_from_scores(
         const bool use_deepselect =
             requested == 512 &&
             count == 512 &&
-            dsv41_deepselect_topk_preferred(
+            deepseek_v41_deepselect_preferred(
                 width,
                 scores.shape(0) * scores.shape(1));
         return use_deepselect
-            ? dsv41_deepselect_topk512(scores, valid_counts)
+            ? deepseek_v41_deepselect_topk512(scores, valid_counts)
             : slice_axis(
                   mlx::core::argpartition(scores, width - count, -1),
                   -1,
@@ -1132,7 +1133,7 @@ array MlxDeepseekV41Attention::forward(
                         candidates);
                 } else {
                     std::optional<array> valid_counts;
-                    if (dsv41_deepselect_topk_preferred(
+                    if (deepseek_v41_deepselect_preferred(
                             pool_length,
                             batch * tokens)) {
                         valid_counts = mlx::core::broadcast_to(

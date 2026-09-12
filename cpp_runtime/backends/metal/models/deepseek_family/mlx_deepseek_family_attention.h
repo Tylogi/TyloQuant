@@ -1,0 +1,399 @@
+#pragma once
+
+#include "deepseek_family_model.h"
+#include "mlx_deepseek_sparse.h"
+#include "mlx_hf_tensor.h"
+#include "mlx_tensor.h"
+
+#include <cstdint>
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <utility>
+#include <vector>
+
+#include <mlx/mlx.h>
+
+namespace mfq::metal {
+
+// Build adjacent-pair RoPE tables with the same Yarn frequency correction as
+// the DeepSeek-V4 reference runtime.
+std::pair<mlx::core::array, mlx::core::array>
+deepseek_v4_yarn_tables(
+    int dimension,
+    int length,
+    float theta,
+    const DeepseekV4RopeScaling& scaling = {});
+
+mlx::core::array deepseek_v4_rope_adjacent(
+    const mlx::core::array& value,
+    const mlx::core::array& cosine,
+    const mlx::core::array& sine,
+    bool inverse = false);
+
+mlx::core::array deepseek_v4_unweighted_rms(
+    const mlx::core::array& value,
+    float eps);
+
+// Preserve the released QAT graph's dynamic MXFP8 simulation on non-RoPE
+// KV channels.  Shared by the main decoder and DSpark attention.
+mlx::core::array deepseek_v4_kv_fp8_sim_prefix(
+    const mlx::core::array& input,
+    int rotary_dimension);
+
+// V4.1 quantizes the complete post-RoPE window KV vector in groups of 32.
+mlx::core::array deepseek_v41_kv_fp8_sim(
+    const mlx::core::array& input);
+
+// M3 Ultra fast path for the released D=512 V4.1 window-KV preparation.
+mlx::core::array deepseek_v41_fused_kv_prepare(
+    const mlx::core::array& input,
+    const mlx::core::array& weight,
+    float eps,
+    int rotary_dimension,
+    const mlx::core::array& cosine,
+    const mlx::core::array& sine);
+
+class MlxDeepseekV4PoolState {
+public:
+    static MlxDeepseekV4PoolState allocate(
+        int ratio,
+        int head_dim,
+        bool overlap,
+        int batch,
+        int max_context,
+        mlx::core::Dtype dtype = mlx::core::float16);
+
+    static MlxDeepseekV4PoolState allocate_v41(
+        int ratio,
+        int head_dim,
+        int batch,
+        int max_context,
+        mlx::core::Dtype cache_dtype = mlx::core::bfloat16);
+
+    // V4.1 keeps the ratio-2 pooling accumulators in FP32, exposes the
+    // unrotated latent to the Indexer, and only then writes the transformed
+    // value to its persistent cache.
+    mlx::core::array compress_v41(
+        const mlx::core::array& kv,
+        const std::optional<mlx::core::array>& gate,
+        const mlx::core::array& norm,
+        int start_position,
+        mlx::core::Dtype output_dtype,
+        float eps);
+    void append_v41(const mlx::core::array& values);
+
+    void update(
+        const mlx::core::array& kv_token,
+        const mlx::core::array& gate_token,
+        const mlx::core::array& ape,
+        const mlx::core::array& norm,
+        int length,
+        const mlx::core::array& compressed_cosine,
+        const mlx::core::array& compressed_sine,
+        int quant_mode,
+        float eps);
+
+    // Build complete compressor windows in parallel during prefill, then
+    // retain only the bounded tail state required by subsequent decode.
+    // The starting position must be ratio-aligned; callers can fall back to
+    // update() for an already-partial window.
+    void prefill(
+        const mlx::core::array& kv,
+        const mlx::core::array& gate,
+        const mlx::core::array& ape,
+        const mlx::core::array& norm,
+        int start_position,
+        const mlx::core::array& compressed_cosine,
+        const mlx::core::array& compressed_sine,
+        int quant_mode,
+        float eps);
+
+    int ratio() const noexcept {
+        return ratio_;
+    }
+    int head_dim() const noexcept {
+        return head_dim_;
+    }
+    bool overlap() const noexcept {
+        return overlap_;
+    }
+    int batch() const noexcept {
+        return batch_;
+    }
+    int capacity() const noexcept {
+        return capacity_;
+    }
+    int pool_len() const noexcept {
+        return pool_len_;
+    }
+    int remainder() const noexcept {
+        return remainder_;
+    }
+
+    const mlx::core::array& pool() const noexcept {
+        return pool_;
+    }
+    const mlx::core::array& state_kv() const noexcept {
+        return state_kv_;
+    }
+    const mlx::core::array& state_gate() const noexcept {
+        return state_gate_;
+    }
+    const std::optional<mlx::core::array>&
+    prev_kv() const noexcept {
+        return prev_kv_;
+    }
+    const std::optional<mlx::core::array>&
+    prev_gate() const noexcept {
+        return prev_gate_;
+    }
+    const std::optional<mlx::core::array>&
+    pool_prefix_backup() const noexcept {
+        return pool_prefix_backup_;
+    }
+
+    // Take a compact rollback snapshot. The fixed-capacity pool is updated
+    // in place, so preserve only its live prefix rather than copying every
+    // unused context row.
+    MlxDeepseekV4PoolState snapshot() const;
+    void restore_snapshot(MlxDeepseekV4PoolState snapshot);
+
+    // Speculative verification only appends pool rows. Keep the immutable
+    // pre-transaction state arrays and metadata, but do not copy the live
+    // pool prefix: rejected rows are hidden by restoring pool_len and are
+    // overwritten by the next contiguous update.
+    MlxDeepseekV4PoolState speculative_snapshot() const;
+    void restore_speculative_snapshot(
+        MlxDeepseekV4PoolState snapshot);
+
+    // V4.1's ratio-1/2 caches are append-only and every live row is guarded
+    // by pool_len/remainder. Reset their logical extent without reallocating
+    // and zeroing the context-sized backing arrays between text sessions.
+    void reset_v41();
+
+private:
+    MlxDeepseekV4PoolState(
+        int ratio,
+        int head_dim,
+        bool overlap,
+        int batch,
+        int capacity,
+        mlx::core::Dtype dtype,
+        mlx::core::array pool,
+        mlx::core::array state_kv,
+        mlx::core::array state_gate,
+        std::optional<mlx::core::array> prev_kv,
+        std::optional<mlx::core::array> prev_gate);
+
+    int ratio_;
+    int head_dim_;
+    bool overlap_;
+    int batch_;
+    int capacity_;
+    mlx::core::Dtype dtype_;
+    mlx::core::array pool_;
+    mlx::core::array state_kv_;
+    mlx::core::array state_gate_;
+    std::optional<mlx::core::array> prev_kv_;
+    std::optional<mlx::core::array> prev_gate_;
+    std::optional<mlx::core::array> pool_prefix_backup_;
+    int pool_len_ = 0;
+    int remainder_ = 0;
+};
+
+struct MlxDeepseekV4LayerSpeculation;
+
+class MlxDeepseekV4LayerState {
+public:
+    static MlxDeepseekV4LayerState allocate(
+        const DeepseekV4Config& config,
+        int ratio,
+        int batch,
+        int max_context,
+        mlx::core::Dtype dtype = mlx::core::float16,
+        std::optional<std::size_t> layer = std::nullopt);
+
+    int batch() const noexcept {
+        return local_.shape(0);
+    }
+    int position() const noexcept {
+        return position_;
+    }
+    const mlx::core::array& local_state() const noexcept {
+        return local_;
+    }
+    mlx::core::array local_positions() const;
+    const std::optional<MlxDeepseekV4PoolState>&
+    main() const noexcept {
+        return main_;
+    }
+    const std::optional<MlxDeepseekV4PoolState>&
+    indexer() const noexcept {
+        return indexer_;
+    }
+
+    MlxDeepseekV4LayerState snapshot() const;
+    void restore_snapshot(MlxDeepseekV4LayerState snapshot);
+    void reset_v41();
+
+    // Open a target-cache transaction before a speculative verify. The
+    // attention adapter records its already-normalized input while the
+    // target graph runs; rollback then rebuilds only attention cache state,
+    // never the complete decoder/MoE graph.
+    void begin_speculative(int confirmed_tokens, int total_tokens);
+    const MlxDeepseekV4LayerState& speculative_checkpoint() const;
+    bool has_speculative() const noexcept;
+
+private:
+    friend class MlxDeepseekV4Attention;
+
+    MlxDeepseekV4LayerState(
+        mlx::core::array local,
+        std::optional<MlxDeepseekV4PoolState> main,
+        std::optional<MlxDeepseekV4PoolState> indexer);
+
+    void restore_speculative_snapshot(
+        MlxDeepseekV4LayerState snapshot,
+        int start_position,
+        int total_tokens);
+
+    mlx::core::array local_;
+    std::optional<MlxDeepseekV4PoolState> main_;
+    std::optional<MlxDeepseekV4PoolState> indexer_;
+    std::shared_ptr<MlxDeepseekV4LayerSpeculation> speculative_;
+    int position_ = 0;
+};
+
+// Injectable construction keeps the attention graph testable independently of
+// container I/O while using the same native MlxLinear objects as production.
+struct MlxDeepseekV4AttentionComponents {
+    MlxLinear q_a;
+    MlxLinear kv;
+    MlxLinear q_b;
+    MlxLinear wo_a;
+    MlxLinear wo_b;
+    mlx::core::array q_norm;
+    mlx::core::array kv_norm;
+    mlx::core::array sinks;
+
+    std::optional<MlxLinear> main_kv;
+    std::optional<MlxLinear> main_gate;
+    std::optional<mlx::core::array> main_ape;
+    std::optional<mlx::core::array> main_norm;
+
+    std::optional<MlxLinear> index_q_b;
+    std::optional<MlxLinear> index_kv;
+    std::optional<MlxLinear> index_gate;
+    std::optional<MlxLinear> index_weights;
+    std::optional<mlx::core::array> index_ape;
+    std::optional<mlx::core::array> index_norm;
+
+    // V4.1 derives one shared Indexer key from the compressor latent. These
+    // tensors only exist on KV-source layers.
+    std::optional<MlxLinear> index_key;
+    std::optional<mlx::core::array> index_key_norm;
+};
+
+struct MlxDeepseekV4ImageVisibility {
+    mlx::core::array left;
+    mlx::core::array right;
+    int max_image_tokens = 0;
+};
+
+// V4.1 source layers publish one compressed KV cache, one Indexer-key cache,
+// and one selected-position tensor for the following consumers. Persistent
+// arrays remain owned by the source layer state; this object only carries
+// non-owning references plus per-forward selection tensors.
+struct MlxDeepseekV41HfSharedAttentionState {
+    const MlxDeepseekV4PoolState* compressed_kv = nullptr;
+    const MlxDeepseekV4PoolState* index_keys = nullptr;
+    std::optional<mlx::core::array> topk;
+    std::optional<mlx::core::array> candidates;
+};
+
+// Match the released get_image_visible() contract.  Alignment pads before
+// IMAGE_START are not visual; visibility begins at IMAGE_START and includes
+// IMAGE_END.  Sentinel IDs are vocab_size + {0..4}.
+MlxDeepseekV4ImageVisibility deepseek_v4_image_visibility(
+    const std::vector<std::int64_t>& token_ids,
+    std::int64_t vocab_size,
+    int max_image_tokens);
+
+class MlxDeepseekV4Attention {
+public:
+    static MlxDeepseekV4Attention load(
+        const MfqContainer& model,
+        const DeepseekV4Config& config,
+        int layer,
+        int ratio,
+        int max_context);
+
+    static MlxDeepseekV4Attention load(
+        const MfqContainer& model,
+        const DeepseekV4Config& config,
+        int layer,
+        int ratio,
+        int max_context,
+        std::pair<mlx::core::array, mlx::core::array>
+            rope_base,
+        std::pair<mlx::core::array, mlx::core::array>
+            rope_compressed);
+
+    static MlxDeepseekV4Attention load(
+        const MlxHfTensorStore& model,
+        const DeepseekV4Config& config,
+        int layer,
+        int ratio,
+        int max_context,
+        std::pair<mlx::core::array, mlx::core::array>
+            rope_base,
+        std::pair<mlx::core::array, mlx::core::array>
+            rope_compressed);
+
+    MlxDeepseekV4Attention(
+        DeepseekV4Config config,
+        int layer,
+        int ratio,
+        int max_context,
+        MlxDeepseekV4AttentionComponents components,
+        std::pair<mlx::core::array, mlx::core::array>
+            rope_base,
+        std::pair<mlx::core::array, mlx::core::array>
+            rope_compressed);
+
+    mlx::core::array operator()(
+        const mlx::core::array& input,
+        MlxDeepseekV4LayerState& state,
+        int pos0) const;
+
+    mlx::core::array operator()(
+        const mlx::core::array& input,
+        MlxDeepseekV4LayerState& state,
+        int pos0,
+        const MlxDeepseekV4ImageVisibility* visibility) const;
+
+    mlx::core::array operator()(
+        const mlx::core::array& input,
+        MlxDeepseekV4LayerState& state,
+        int pos0,
+        const MlxDeepseekV4ImageVisibility* visibility,
+        std::vector<mlx::core::array>* debug_stages,
+        MlxDeepseekV41HfSharedAttentionState* shared = nullptr) const;
+
+    void commit_speculative(
+        MlxDeepseekV4LayerState& state) const noexcept;
+    void rollback_speculative(
+        MlxDeepseekV4LayerState& state,
+        int accepted_tokens) const;
+
+    int ratio() const noexcept;
+    int layer() const noexcept;
+    int max_context() const noexcept;
+
+private:
+    struct Impl;
+    std::shared_ptr<Impl> impl_;
+};
+
+} // namespace mfq::metal

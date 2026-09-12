@@ -9,7 +9,12 @@ METAL_QWEN = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "models/qwen35" / "mlx_qwen35_causal_lm.cpp"
 ).read_text(encoding="utf-8")
 METAL_DSV4 = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
+    ROOT
+    / "cpp_runtime"
+    / "backends"
+    / "metal"
+    / "models/deepseek_family"
+    / "mlx_deepseek_family_causal_lm.cpp"
 ).read_text(encoding="utf-8")
 METAL_DSV41 = (
     ROOT

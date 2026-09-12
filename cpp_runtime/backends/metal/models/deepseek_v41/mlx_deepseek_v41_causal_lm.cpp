@@ -1,6 +1,6 @@
 #include "mlx_deepseek_v41_causal_lm.h"
 
-#include "mlx_deepseek_v4_attention.h"
+#include "mlx_deepseek_family_attention.h"
 #include "mlx_eval_timing.h"
 #include "mlx_legacy_tensor_compat.h"
 #include "nintm_expert_store.h"

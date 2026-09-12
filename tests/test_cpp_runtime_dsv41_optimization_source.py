@@ -4,17 +4,27 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DSV4 = ROOT / "cpp_runtime" / "backends" / "metal" / "models" / "deepseek_v4"
-ATTENTION = (DSV4 / "mlx_deepseek_v4_attention.cpp").read_text(encoding="utf-8")
-CAUSAL_LM = (DSV4 / "mlx_deepseek_v4_causal_lm.cpp").read_text(encoding="utf-8")
-CAUSAL_LM_HEADER = (DSV4 / "mlx_deepseek_v4_causal_lm.h").read_text(
+METAL = ROOT / "cpp_runtime" / "backends" / "metal"
+FAMILY = METAL / "models" / "deepseek_family"
+V41 = METAL / "models" / "deepseek_v41"
+OPS = METAL / "ops"
+ATTENTION = (FAMILY / "mlx_deepseek_family_attention.cpp").read_text(
     encoding="utf-8"
 )
-SPARSE = (DSV4 / "mlx_deepseek_v4_sparse.cpp").read_text(encoding="utf-8")
-DSPARK = (DSV4 / "mlx_deepseek_v4_dspark.cpp").read_text(encoding="utf-8")
-MOE = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "ops" / "mlx_moe.cpp"
-).read_text(encoding="utf-8")
+CAUSAL_LM = (FAMILY / "mlx_deepseek_family_causal_lm.cpp").read_text(
+    encoding="utf-8"
+)
+CAUSAL_LM_HEADER = (FAMILY / "mlx_deepseek_family_causal_lm.h").read_text(
+    encoding="utf-8"
+)
+SPARSE = (OPS / "mlx_deepseek_sparse.cpp").read_text(encoding="utf-8")
+DSPARK = (FAMILY / "mlx_deepseek_family_dspark.cpp").read_text(
+    encoding="utf-8"
+)
+MOE = (OPS / "mlx_moe.cpp").read_text(encoding="utf-8")
+V41_HF_POLICY = (V41 / "mlx_deepseek_v41_hf_policy.h").read_text(
+    encoding="utf-8"
+)
 METAL_SERVER = (
     ROOT
     / "cpp_runtime"
@@ -26,7 +36,8 @@ METAL_SERVER = (
 
 
 def test_raw_hf_v41_prefill_uses_the_direct_circular_sparse_kernel() -> None:
-    assert '"MFQ_METAL_DSV41_CIRCULAR_PREFILL"' in ATTENTION
+    assert '"MFQ_METAL_DSV41_CIRCULAR_PREFILL"' in V41_HF_POLICY
+    assert "deepseek_v41_hf_circular_prefill_enabled()" in ATTENTION
     assert "tokens > 1 &&" in ATTENTION
     assert "visibility == nullptr &&" in ATTENTION
     assert "pool_len > 0 &&" in ATTENTION

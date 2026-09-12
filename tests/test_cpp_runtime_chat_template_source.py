@@ -24,7 +24,12 @@ METAL_DECODE = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp"
 ).read_text(encoding="utf-8")
 METAL_DSV4 = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
+    ROOT
+    / "cpp_runtime"
+    / "backends"
+    / "metal"
+    / "models/deepseek_family"
+    / "mlx_deepseek_family_causal_lm.cpp"
 ).read_text(encoding="utf-8")
 STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
     encoding="utf-8"

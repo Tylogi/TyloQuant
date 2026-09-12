@@ -1,7 +1,7 @@
 #pragma once
 
 #include "deepseek_v41_model.h"
-#include "mlx_deepseek_v4_hc.h"
+#include "mlx_deepseek_hc.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
 

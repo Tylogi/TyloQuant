@@ -1,6 +1,7 @@
-#include "mlx_deepseek_v4_causal_lm.h"
+#include "mlx_deepseek_family_causal_lm.h"
 #include "mlx_eval_timing.h"
 #include "mlx_mtp.h"
+#include "mlx_deepseek_v41_hf_policy.h"
 
 #include "nlohmann/json.hpp"
 
@@ -33,56 +34,6 @@ using mlx::core::array;
 constexpr int kConnections = 4;
 constexpr int kHcProjectionWidth =
     2 * kConnections + kConnections * kConnections;
-constexpr std::size_t kDefaultEngramCacheMiB = 256;
-
-struct V41ExpertCacheBudgets {
-    std::size_t backbone = 0;
-    std::size_t dspark = 0;
-};
-
-V41ExpertCacheBudgets split_v41_expert_cache(
-    const DeepseekV4Config& config,
-    std::size_t total,
-    bool prefill_overlap) {
-    const auto hidden = static_cast<std::size_t>(config.hidden);
-    const auto intermediate = static_cast<std::size_t>(config.moe_inter);
-    if (hidden == 0 || intermediate == 0 ||
-        hidden > std::numeric_limits<std::size_t>::max() / intermediate) {
-        throw std::invalid_argument(
-            "invalid DeepSeek-V4.1 expert-cache geometry");
-    }
-    const auto elements = hidden * intermediate;
-    // Three MXFP4 matrices: 4-bit values plus one E8M0 scale per 32 values.
-    if (elements > std::numeric_limits<std::size_t>::max() / 51u) {
-        throw std::invalid_argument(
-            "DeepSeek-V4.1 expert-cache slot size overflows");
-    }
-    const auto slot_bytes = elements * 51u / 32u;
-    const auto backbone_slots = std::size_t{6} +
-        (prefill_overlap
-             ? 2u * static_cast<std::size_t>(config.n_experts)
-             : 0u);
-    const auto dspark_slots = std::min(
-        static_cast<std::size_t>(config.dspark_n_experts),
-        std::max<std::size_t>(
-            6,
-            4u * static_cast<std::size_t>(config.dspark_top_k)));
-    if (slot_bytes == 0 ||
-        backbone_slots > std::numeric_limits<std::size_t>::max() / slot_bytes ||
-        dspark_slots > std::numeric_limits<std::size_t>::max() / slot_bytes) {
-        throw std::invalid_argument(
-            "DeepSeek-V4.1 expert-cache minimum overflows");
-    }
-    const auto backbone_minimum = backbone_slots * slot_bytes;
-    const auto dspark_minimum = dspark_slots * slot_bytes;
-    if (total < backbone_minimum ||
-        total - backbone_minimum < dspark_minimum) {
-        throw std::invalid_argument(
-            "DeepSeek-V4.1 SSD expert cache is too small for separate "
-            "backbone and DSpark arenas");
-    }
-    return {total - dspark_minimum, dspark_minimum};
-}
 
 bool ssd_route_transactions_enabled() noexcept {
     const char* value = std::getenv(
@@ -102,66 +53,6 @@ bool force_ssd_route_transactions() noexcept {
     const char* value = std::getenv(
         "MFQ_SSD_DEVICE_ROUTE_FORCE_TRANSACTION");
     return value != nullptr && std::string_view(value) != "0";
-}
-
-bool v41_fused_hyper_connections_enabled() noexcept {
-    // Opt in explicitly: the fused BF16 reduction is numerically close but
-    // can change greedy token tie-breaks after many layers.
-    const char* value = std::getenv("MFQ_METAL_DSV41_FUSED_HC");
-    return value != nullptr && std::string_view(value) != "0";
-}
-
-bool v41_exact_hc_post_enabled() noexcept {
-    // HC post preserves the generic BF16 graph exactly. Keep the wider HC
-    // pre fusion opt-in because its reduction can change greedy tie-breaks,
-    // while using the exact post-only kernel by default for V4.1 decode.
-    const char* value = std::getenv("MFQ_METAL_DSV41_EXACT_HC_POST");
-    return value == nullptr ||
-        (std::string_view(value) != "0" &&
-         std::string_view(value) != "false" &&
-         std::string_view(value) != "off");
-}
-
-bool v41_exact_hc_collapse_norm_enabled() noexcept {
-    const char* value = std::getenv(
-        "MFQ_METAL_DSV41_EXACT_HC_COLLAPSE_NORM");
-    return value == nullptr ||
-        (std::string_view(value) != "0" &&
-         std::string_view(value) != "false" &&
-         std::string_view(value) != "off");
-}
-
-bool v41_exact_hc_metadata_enabled() noexcept {
-    const char* value = std::getenv(
-        "MFQ_METAL_DSV41_EXACT_HC_METADATA");
-    return value == nullptr ||
-        (std::string_view(value) != "0" &&
-         std::string_view(value) != "false" &&
-         std::string_view(value) != "off");
-}
-
-int v41_resident_prefill_layer_group() noexcept {
-    const char* value = std::getenv(
-        "MFQ_METAL_DSV41_PREFILL_LAYER_GROUP");
-    return value == nullptr
-        ? 1
-        : std::clamp(std::atoi(value), 1, 43);
-}
-
-std::size_t engram_cache_bytes() {
-    const char* value = std::getenv(
-        "MFQ_DEEPSEEK_V41_ENGRAM_CACHE_MIB");
-    if (value == nullptr || *value == '\0') {
-        return kDefaultEngramCacheMiB * 1024u * 1024u;
-    }
-    char* end = nullptr;
-    const auto mib = std::strtoull(value, &end, 10);
-    if (end == value || *end != '\0' || mib == 0 ||
-        mib > std::numeric_limits<std::size_t>::max() / (1024u * 1024u)) {
-        throw std::invalid_argument(
-            "MFQ_DEEPSEEK_V41_ENGRAM_CACHE_MIB must be a positive integer");
-    }
-    return static_cast<std::size_t>(mib) * 1024u * 1024u;
 }
 
 int checked_int(
@@ -764,7 +655,8 @@ MlxDeepseekV4Layer::hc_pre_norm(
         });
     const bool fused_hyper_connections =
         config_.fast_hyper_connections() ||
-        (config_.is_v41() && v41_fused_hyper_connections_enabled());
+        (config_.is_v41() &&
+         deepseek_v41_hf_fused_hyper_connections_enabled());
     if (fused_hyper_connections &&
         residual.dtype() == mlx::core::bfloat16) {
         auto flat_float = mlx::core::astype(
@@ -822,7 +714,7 @@ MlxDeepseekV4Layer::hc_pre_norm(
             config_.rms_eps));
     auto mixes = raw_mixes * inverse;
     if (config_.is_v41() &&
-        v41_exact_hc_metadata_enabled() &&
+        deepseek_v41_hf_exact_hc_metadata_enabled() &&
         residual.dtype() == mlx::core::bfloat16 &&
         batch * tokens == 1) {
         auto metadata = deepseek_v41_hc_metadata_exact(
@@ -862,8 +754,8 @@ array MlxDeepseekV4Layer::hc_post(
     const bool fused_hyper_connections =
         config_.fast_hyper_connections() ||
         (config_.is_v41() &&
-         (v41_fused_hyper_connections_enabled() ||
-          v41_exact_hc_post_enabled()));
+         (deepseek_v41_hf_fused_hyper_connections_enabled() ||
+          deepseek_v41_hf_exact_hc_post_enabled()));
     if (fused_hyper_connections &&
         (residual.dtype() == mlx::core::float16 ||
          residual.dtype() == mlx::core::bfloat16)) {
@@ -968,7 +860,7 @@ array MlxDeepseekV4Layer::forward(
         components_.attention_norm,
         attention_norm_);
     auto branch = config_.is_v41()
-        ? (v41_exact_hc_collapse_norm_enabled() &&
+        ? (deepseek_v41_hf_exact_hc_collapse_norm_enabled() &&
                    source.dtype() == mlx::core::bfloat16 &&
                    source.shape(0) * source.shape(1) == 1
                ? deepseek_v41_hc_collapse_norm(
@@ -1026,7 +918,7 @@ array MlxDeepseekV4Layer::forward(
             "DeepSeek-V4.1 attention HC pre coefficients are unavailable");
     }
     branch = config_.is_v41()
-        ? (v41_exact_hc_collapse_norm_enabled() &&
+        ? (deepseek_v41_hf_exact_hc_collapse_norm_enabled() &&
                    result.dtype() == mlx::core::bfloat16 &&
                    result.shape(0) * result.shape(1) == 1
                ? deepseek_v41_hc_collapse_norm(
@@ -1058,8 +950,8 @@ array MlxDeepseekV4Layer::forward(
               *ffn_hc.packed_metadata)
         : ((config_.fast_hyper_connections() ||
             (config_.is_v41() &&
-             (v41_fused_hyper_connections_enabled() ||
-              v41_exact_hc_post_enabled()))) &&
+             (deepseek_v41_hf_fused_hyper_connections_enabled() ||
+              deepseek_v41_hf_exact_hc_post_enabled()))) &&
                    (residual.dtype() == mlx::core::float16 ||
                     residual.dtype() == mlx::core::bfloat16)
                ? deepseek_v4_hc_post_sum(
@@ -1277,7 +1169,7 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
         auto backbone_cache_bytes = expert_cache_bytes;
         std::size_t dspark_cache_bytes = 0;
         if (split_dspark_cache) {
-            const auto budgets = split_v41_expert_cache(
+            const auto budgets = deepseek_v41_hf_split_expert_cache(
                 config,
                 expert_cache_bytes,
                 prefill_overlap);
@@ -1370,7 +1262,7 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
             model,
             config,
             asset,
-            engram_cache_bytes(),
+            deepseek_v41_hf_engram_cache_bytes(),
             io_workers));
     }
     std::optional<MlxLinear> hc_head_fn;
@@ -1838,7 +1730,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
     const int materialize_layer_group =
         materialize_each_layer && config_.is_v41() &&
                 !expert_offload_ && !ssd_expert_cache_
-        ? v41_resident_prefill_layer_group()
+        ? deepseek_v41_hf_resident_prefill_layer_group()
         : 1;
     std::size_t materialize_group_begin = 0;
     std::array<
@@ -2328,7 +2220,8 @@ MlxDeepseekV4CausalLm::engram_ssd_stats() const {
 
 bool MlxDeepseekV4CausalLm::fused_hyper_connections_active() const noexcept {
     return config_.fast_hyper_connections() ||
-        (config_.is_v41() && v41_fused_hyper_connections_enabled());
+        (config_.is_v41() &&
+         deepseek_v41_hf_fused_hyper_connections_enabled());
 }
 
 void MlxDeepseekV4CausalLm::prewarm_ssd_expert_arena() {

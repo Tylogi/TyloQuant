@@ -1,4 +1,4 @@
-#include "mlx_deepseek_v4_hc.h"
+#include "mlx_deepseek_hc.h"
 
 #include <algorithm>
 #include <cmath>

@@ -1,5 +1,7 @@
-#include "mlx_deepseek_v4_attention.h"
+#include "mlx_deepseek_family_attention.h"
 #include "mlx_eval_timing.h"
+#include "mlx_deepseek_v41_deepselect.h"
+#include "mlx_deepseek_v41_hf_policy.h"
 
 #include "mlx_detached_copy.h"
 #include "mlx_grouped_linear.h"
@@ -18,10 +20,6 @@
 #include <utility>
 #include <vector>
 
-#if defined(__APPLE__)
-#include <sys/sysctl.h>
-#endif
-
 namespace mfq::metal {
 namespace {
 
@@ -30,36 +28,6 @@ using mlx::core::Dtype;
 using mlx::core::MathMode;
 using mlx::core::Shape;
 using mlx::core::array;
-
-bool v41_fast_indexer_enabled() noexcept {
-    // The tiled kernel keeps indexer scores in FP32 while avoiding the
-    // [B, T, H, K, D] broadcast used by the reference expression.  Keep an
-    // explicit reference-path escape hatch for numerical investigations.
-    const char* value = std::getenv(
-        "MFQ_METAL_DSV41_FAST_INDEXER");
-    if (value == nullptr) {
-        return true;
-    }
-    const auto setting = std::string_view(value);
-    return setting != "0"
-        && setting != "false"
-        && setting != "off";
-}
-
-bool v41_circular_prefill_enabled() noexcept {
-    // The direct long-prefill kernel consumes chronological local rows plus
-    // the capacity-backed CSA pool. It avoids rebuilding a unified cache and
-    // a dense index/mask plan on every V4.1 layer. Keep a parity escape hatch.
-    const char* value = std::getenv(
-        "MFQ_METAL_DSV41_CIRCULAR_PREFILL");
-    if (value == nullptr) {
-        return true;
-    }
-    const auto setting = std::string_view(value);
-    return setting != "0"
-        && setting != "false"
-        && setting != "off";
-}
 
 bool block32_inverse_rope_qmv_enabled() noexcept {
     const char* value = std::getenv(
@@ -71,36 +39,6 @@ bool block32_inverse_rope_qmv_enabled() noexcept {
     return setting != "0"
         && setting != "false"
         && setting != "off";
-}
-
-bool apple_m3_ultra() noexcept {
-#if defined(__APPLE__)
-    static const bool is_m3_ultra = [] {
-        char name[64]{};
-        std::size_t size = sizeof(name);
-        return ::sysctlbyname(
-                "machdep.cpu.brand_string",
-                name,
-                &size,
-                nullptr,
-                0) == 0 &&
-            std::string_view(name).rfind("Apple M3 Ultra", 0) == 0;
-    }();
-    return is_m3_ultra;
-#else
-    return false;
-#endif
-}
-
-bool v41_fused_kv_prepare_enabled() noexcept {
-    if (const char* value = std::getenv(
-            "MFQ_METAL_DSV41_FUSED_KV_PREP")) {
-        const auto setting = std::string_view(value);
-        return setting != "0"
-            && setting != "false"
-            && setting != "off";
-    }
-    return apple_m3_ultra();
 }
 
 constexpr const char* kHadamardSource = R"METAL(
@@ -940,7 +878,7 @@ array v41_weighted_rms_rope_activation_quant(
     // This schedule is intentionally specific to the released V4.1 window
     // KV shape. Synthetic configurations and other devices keep the portable
     // MLX composition unless explicitly forced through the feature switch.
-    if (!v41_fused_kv_prepare_enabled() ||
+    if (!deepseek_v41_hf_fused_kv_prepare_enabled() ||
         input.ndim() != 3 ||
         input.shape(-1) != 512 ||
         input.dtype() != output_dtype ||
@@ -3014,7 +2952,7 @@ struct MlxDeepseekV4Attention::Impl {
         }
 
         auto query = index_query(q_rank, positions);
-        const bool fast_indexer = v41_fast_indexer_enabled();
+        const bool fast_indexer = deepseek_v41_hf_fast_indexer_enabled();
         auto scores = fast_indexer
             ? (tokens == 1
                    ? dsv4_indexer_scores_decode(
@@ -3102,7 +3040,7 @@ struct MlxDeepseekV4Attention::Impl {
             const bool use_deepselect =
                 config.index_topk == 512 &&
                 count == 512 &&
-                dsv41_deepselect_topk_preferred(
+                deepseek_v41_deepselect_preferred(
                     pool_len,
                     batch * tokens);
             if (use_deepselect) {
@@ -3111,7 +3049,7 @@ struct MlxDeepseekV4Attention::Impl {
                         visible_counts,
                         Shape{1, tokens}),
                     Shape{batch, tokens});
-                return dsv41_deepselect_topk512(
+                return deepseek_v41_deepselect_topk512(
                     scores,
                     per_row_visible);
             }
@@ -3526,7 +3464,7 @@ struct MlxDeepseekV4Attention::Impl {
                 pool_len > 0 &&
                 selected.shape(2) > 0 &&
                 config.fast_attention() &&
-                v41_circular_prefill_enabled();
+                deepseek_v41_hf_circular_prefill_enabled();
             if (use_circular_prefill) {
                 direct_prefill = attention_dsv4_sparse_prefill(
                     mlx::core::transpose(q, {0, 2, 1, 3}),

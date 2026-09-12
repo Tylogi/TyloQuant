@@ -7,6 +7,7 @@ set(MFQ_METAL_INCLUDE_DIRS
     ${MFQ_METAL_ROOT}/runtime
     ${MFQ_METAL_ROOT}/ops
     ${MFQ_METAL_ROOT}/legacy/tpq
+    ${MFQ_METAL_ROOT}/models/deepseek_family
     ${MFQ_METAL_ROOT}/models/deepseek_v4
     ${MFQ_METAL_ROOT}/models/deepseek_v41
     ${MFQ_METAL_ROOT}/models/flash_next
@@ -231,19 +232,21 @@ add_library(mfq-metal-runtime STATIC
     ops/mlx_vq.cpp
     # Isolated compatibility reader/operator for old TPQ artifacts only.
     legacy/tpq/mlx_tpq.cpp
-    models/deepseek_v4/deepseek_v4_model.cpp
-    models/deepseek_v4/mlx_deepseek_v4_attention.cpp
-    models/deepseek_v4/mlx_deepseek_v4_causal_lm.cpp
-    models/deepseek_v4/mlx_deepseek_v4_dspark.cpp
-    models/deepseek_v4/mlx_deepseek_v4_hc.cpp
-    models/deepseek_v4/mlx_deepseek_v4_moe.cpp
-    models/deepseek_v4/mlx_deepseek_v4_sparse.cpp
-    models/deepseek_v4/mlx_deepseek_v4_vision.cpp
-    models/deepseek_v4/mlx_deepseek_v41_engram.cpp
+    ops/mlx_deepseek_hc.cpp
+    ops/mlx_deepseek_sparse.cpp
+    models/deepseek_family/deepseek_family_model.cpp
+    models/deepseek_family/mlx_deepseek_family_attention.cpp
+    models/deepseek_family/mlx_deepseek_family_causal_lm.cpp
+    models/deepseek_family/mlx_deepseek_family_dspark.cpp
+    models/deepseek_family/mlx_deepseek_family_moe.cpp
+    models/deepseek_family/mlx_deepseek_family_vision.cpp
     models/deepseek_v41/mlx_deepseek_v41_attention.cpp
     models/deepseek_v41/mlx_deepseek_v41_causal_lm.cpp
+    models/deepseek_v41/mlx_deepseek_v41_deepselect.cpp
     models/deepseek_v41/mlx_deepseek_v41_dspark.cpp
     models/deepseek_v41/mlx_deepseek_v41_engram.cpp
+    models/deepseek_v41/mlx_deepseek_v41_hf_causal_lm.cpp
+    models/deepseek_v41/mlx_deepseek_v41_hf_engram.cpp
     models/deepseek_v41/mlx_deepseek_v41_mhc.cpp
     models/deepseek_v41/mlx_deepseek_v41_moe.cpp
     models/deepseek_v41/mlx_deepseek_v41_vision.cpp

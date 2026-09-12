@@ -1,6 +1,7 @@
 #include "mfq_container.h"
-#include "mlx_deepseek_v4_causal_lm.h"
+#include "mlx_deepseek_family_causal_lm.h"
 #include "mlx_deepseek_v41_causal_lm.h"
+#include "mlx_deepseek_v41_hf_causal_lm.h"
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_minicpmo45.h"
 #include "mlx_moe.h"
@@ -1878,13 +1879,23 @@ int serve_loaded_runtime(
         });
 }
 
-int run_native_hf_server(const Arguments& arguments) {
+template <class LoadHf>
+int run_native_hf_server_impl(
+    const Arguments& arguments,
+    bool expect_v41,
+    LoadHf load_hf) {
     if (arguments.tokenizer_gguf.empty()) {
         throw std::runtime_error(
             "HF model directories currently require --tokenizer-gguf PATH");
     }
-    const auto config = mfq::metal::DeepseekV4Config::from_json(
+    const auto config = mfq::metal::DeepseekFamilyConfig::from_json(
         read_text(arguments.mfq / "config.json"));
+    if (config.is_v41() != expect_v41) {
+        throw std::runtime_error(
+            expect_v41
+                ? "DeepSeek-V4.1 raw-HF facade received a V4 checkpoint"
+                : "DeepSeek-V4 raw-HF facade received a V4.1 checkpoint");
+    }
     const int context = static_cast<int>(
         std::min<std::int64_t>(
             arguments.context_size,
@@ -1951,7 +1962,9 @@ int run_native_hf_server(const Arguments& arguments) {
     mlx::core::set_default_stream(runtime_stream);
     const auto started = std::chrono::steady_clock::now();
     std::cout
-        << "Loading native-format DeepSeek-V4 HF weights on Apple UMA: "
+        << "Loading native-format "
+        << (expect_v41 ? "DeepSeek-V4.1" : "DeepSeek-V4")
+        << " HF weights on Apple UMA: "
         << (expert_cache_bytes == 0
                 ? "fully resident"
                 : "SSD expert streaming")
@@ -1961,7 +1974,7 @@ int run_native_hf_server(const Arguments& arguments) {
                       static_cast<double>(resident_wired_limit) /
                       static_cast<double>(std::uint64_t{1} << 30)) + ")")
         << std::endl;
-    auto runtime = mfq::metal::MlxDeepseekV4CausalLm::load_hf(
+    auto runtime = load_hf(
         arguments.mfq,
         context,
         expert_cache_bytes,
@@ -1974,7 +1987,8 @@ int run_native_hf_server(const Arguments& arguments) {
     constexpr double gib = static_cast<double>(std::uint64_t{1} << 30);
     std::cout
         << "Loaded " << runtime.layer_count()
-        << " DeepSeek-V4 layers in " << load_seconds << " s"
+        << (expect_v41 ? " DeepSeek-V4.1 layers in " : " DeepSeek-V4 layers in ")
+        << load_seconds << " s"
         << " expert_backing="
         << (expert_cache_bytes == 0
                 ? "hf-native-resident"
@@ -1986,14 +2000,14 @@ int run_native_hf_server(const Arguments& arguments) {
         << std::endl;
     const auto model_root = arguments.mfq;
     const auto load_runtime =
-        [model_root, expert_cache_bytes, prefill_overlap](
+        [model_root, expert_cache_bytes, prefill_overlap, load_hf](
             std::int64_t requested_context) {
             if (requested_context < 1 ||
                 requested_context > std::numeric_limits<int>::max()) {
                 throw std::invalid_argument(
                     "Metal runtime context is out of range");
             }
-            return mfq::metal::MlxDeepseekV4CausalLm::load_hf(
+            return load_hf(
                 model_root,
                 static_cast<int>(requested_context),
                 expert_cache_bytes,
@@ -2013,6 +2027,31 @@ int run_native_hf_server(const Arguments& arguments) {
         config.max_position_embeddings,
         config.vocab,
         runtime_stream);
+}
+
+int run_native_hf_v4_server(const Arguments& arguments) {
+    return run_native_hf_server_impl(
+        arguments,
+        false,
+        [](const std::filesystem::path& model_root,
+           int max_context,
+           std::size_t expert_cache_bytes,
+           std::size_t io_workers,
+           bool prefill_overlap) {
+            return mfq::metal::MlxDeepseekFamilyCausalLm::load_hf(
+                model_root,
+                max_context,
+                expert_cache_bytes,
+                io_workers,
+                prefill_overlap);
+        });
+}
+
+int run_native_hf_v41_server(const Arguments& arguments) {
+    return run_native_hf_server_impl(
+        arguments,
+        true,
+        &mfq::metal::load_deepseek_v41_hf);
 }
 
 int run_native_server(
@@ -2329,8 +2368,11 @@ int main(int argc, char** argv) {
                 const auto config_path = arguments.mfq / "config.json";
                 const auto config = nlohmann::json::parse(read_text(config_path));
                 const auto model_type = config.value("model_type", std::string{});
+                if (model_type.rfind("deepseek_v41", 0) == 0) {
+                    return run_native_hf_v41_server(arguments);
+                }
                 if (model_type.rfind("deepseek_v4", 0) == 0) {
-                    return run_native_hf_server(arguments);
+                    return run_native_hf_v4_server(arguments);
                 }
 #else
                 throw std::runtime_error(

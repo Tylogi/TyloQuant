@@ -1,4 +1,4 @@
-#include "mlx_deepseek_v4_vision.h"
+#include "mlx_deepseek_family_vision.h"
 
 #include "mlx_multimodal.h"
 

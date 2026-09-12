@@ -22,6 +22,21 @@ state machines, cache lifecycle, sampling, dispatch, metrics, multimodal
 pipelines, and MTP orchestration must never live in a model-architecture
 directory.
 
+The Metal DeepSeek implementation follows the same boundary:
+
+- `models/deepseek_v4/` exposes the V4 compatibility surface only;
+- `models/deepseek_v41/` owns V4.1 configuration, DeepSelect policy, Engram,
+  DSpark, vision, and architecture-specific runtime code;
+- `models/deepseek_family/` contains the format-preserving execution core
+  shared by the two raw-HF checkpoint variants; and
+- `backends/metal/ops/` owns reusable sparse-attention, DeepSelect, MoE, and
+  hyper-connection primitives.
+
+The family core deliberately retains the established execution graph so a
+source-layout refactor cannot silently change model output or tuned device
+performance. New architecture-specific behavior must enter through the V4 or
+V4.1 owner rather than being added to the family core by model-name checks.
+
 `CMakeLists.txt` is the single entry point. Existing executable target names
 (`mfq-decode`, `mfq-decode-metal`, and `mfq-perplexity`) and the established
 Metal build output directory remain unchanged. Integrated upstream-derived

@@ -1,4 +1,4 @@
-#include "mlx_deepseek_v4_moe.h"
+#include "mlx_deepseek_family_moe.h"
 
 #include "mlx_eval_timing.h"
 #include "mlx_moe_ops.h"

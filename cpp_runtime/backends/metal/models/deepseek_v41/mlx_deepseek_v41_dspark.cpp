@@ -1,8 +1,8 @@
 #include "mlx_deepseek_v41_dspark.h"
 
 #include "mlx_deepseek_v41_attention.h"
-#include "mlx_deepseek_v4_attention.h"
-#include "mlx_deepseek_v4_sparse.h"
+#include "mlx_deepseek_family_attention.h"
+#include "mlx_deepseek_sparse.h"
 #include "mlx_sampling.h"
 #include "mlx_transformer.h"
 

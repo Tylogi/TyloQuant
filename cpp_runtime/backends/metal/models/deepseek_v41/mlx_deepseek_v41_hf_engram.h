@@ -1,7 +1,7 @@
 #pragma once
 
 #include "deepseek_v41_engram_store.h"
-#include "deepseek_v4_model.h"
+#include "deepseek_family_model.h"
 #include "mlx_hf_tensor.h"
 
 #include <cstddef>

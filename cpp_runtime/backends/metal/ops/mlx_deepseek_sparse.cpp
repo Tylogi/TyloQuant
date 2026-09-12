@@ -1,4 +1,4 @@
-#include "mlx_deepseek_v4_sparse.h"
+#include "mlx_deepseek_sparse.h"
 #include "mlx_sparse_attention.h"
 #include "mfq_nintm_prefill_embedded.h"
 
@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <limits>
@@ -18,10 +17,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#if defined(__APPLE__)
-#include <sys/sysctl.h>
-#endif
 
 namespace mfq::metal {
 namespace {
@@ -192,7 +187,7 @@ constexpr int kIndexerDimension = 128;
 constexpr int kAttentionHeads = 64;
 constexpr int kAttentionDimension = 512;
 
-#include "mlx_deepseek_v4_sparse_kernels.inc"
+#include "mlx_deepseek_sparse_kernels.inc"
 
 Kernel make_kernel(
     const char* name,
@@ -302,13 +297,13 @@ const Kernel& topk_kernel() {
     return kernel;
 }
 
-const Kernel& v41_deepselect_topk_kernel() {
+const Kernel& deepselect_topk_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_dsv41_deepselect_topk512",
+        "mfq_cpp_deepselect_topk512",
         {"x", "valid_keys", "topk_params"},
         {"out"},
-        kV41DeepSelectTopkSource,
-        kV41DeepSelectTopkHeader);
+        kDeepSelectTopkSource,
+        kDeepSelectTopkHeader);
     return kernel;
 }
 
@@ -456,53 +451,6 @@ TemplateArgs decode_compressor_templates(
 }
 
 } // namespace
-
-bool dsv41_deepselect_topk_preferred(int width, int rows) noexcept {
-    // These crossovers include the downstream gather, validation, and sort,
-    // not just selection.  They were measured on an M3 Ultra.  In particular,
-    // keep single-token decode and short prefill on MLX argpartition.
-    const bool favorable_shape =
-        (width >= 16384 && rows >= 64) ||
-        (width >= 8192 && rows >= 128);
-    if (!favorable_shape) {
-        return false;
-    }
-    if (const auto* requested = std::getenv(
-            "MFQ_METAL_DSV41_DEEPSELECT")) {
-        return std::strcmp(requested, "0") != 0 &&
-            std::strcmp(requested, "false") != 0 &&
-            std::strcmp(requested, "off") != 0;
-    }
-#if defined(__APPLE__)
-    static const bool is_m3_ultra = [] {
-        std::size_t size = 0;
-        if (::sysctlbyname(
-                "machdep.cpu.brand_string",
-                nullptr,
-                &size,
-                nullptr,
-                0) != 0 || size <= 1) {
-            return false;
-        }
-        std::string name(size, '\0');
-        if (::sysctlbyname(
-                "machdep.cpu.brand_string",
-                name.data(),
-                &size,
-                nullptr,
-                0) != 0) {
-            return false;
-        }
-        if (!name.empty() && name.back() == '\0') {
-            name.pop_back();
-        }
-        return name == "Apple M3 Ultra";
-    }();
-    return is_m3_ultra;
-#else
-    return false;
-#endif
-}
 
 array dsv4_cache_write_inplace(
     const array& cache,
@@ -1185,7 +1133,7 @@ array dsv4_topk512(
     return std::move(outputs.front());
 }
 
-array dsv41_deepselect_topk512(
+array mlx_deepselect_topk512(
     const array& scores,
     const std::optional<array>& valid_keys) {
     auto source = typed_contiguous(
@@ -1218,7 +1166,7 @@ array dsv41_deepselect_topk512(
         {rows, 1024},
         "DeepSelect top-k grid");
     const array topk_params({keys}, mlx::core::int32);
-    auto outputs = v41_deepselect_topk_kernel()(
+    auto outputs = deepselect_topk_kernel()(
         {source, counts, topk_params},
         {Shape{batch, queries, 512}},
         {mlx::core::int32},

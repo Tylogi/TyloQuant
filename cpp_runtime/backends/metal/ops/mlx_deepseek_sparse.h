@@ -1,0 +1,205 @@
+#pragma once
+
+#include <optional>
+#include <utility>
+
+#include <mlx/mlx.h>
+
+namespace mfq::metal {
+
+// A bounded decode-compressor delta.  emitted is [B,1,D] and is valid only
+// when the corresponding int32 emit_rows entry is non-negative.
+struct MlxDsv4PoolStep {
+    mlx::core::array emitted;
+    mlx::core::array emit_rows;
+    mlx::core::array state_kv;
+    mlx::core::array state_gate;
+    std::optional<mlx::core::array> prev_kv;
+    std::optional<mlx::core::array> prev_gate;
+};
+
+// Compatibility result for a capacity-backed compressed cache.
+struct MlxDsv4PoolUpdate {
+    mlx::core::array pool;
+    mlx::core::array state_kv;
+    mlx::core::array state_gate;
+    std::optional<mlx::core::array> prev_kv;
+    std::optional<mlx::core::array> prev_gate;
+};
+
+// Destructively update rows of a fixed-capacity [B,C,D] cache. The returned
+// array aliases the original Metal allocation; callers must replace the old
+// cache handle and must not retain snapshots of it. This mirrors llama.cpp's
+// persistent KV writes instead of copying all C rows for every token.
+mlx::core::array dsv4_cache_write_inplace(
+    const mlx::core::array& cache,
+    const mlx::core::array& values,
+    const mlx::core::array& rows);
+
+// Simulate DeepSeek-V4's power-of-two-scaled E2M1 cache groups.
+mlx::core::array dsv4_fp4_sim(
+    const mlx::core::array& input);
+
+// Compress raw windows to 512-D or 128-D cache rows.
+mlx::core::array dsv4_compress(
+    const mlx::core::array& kv,
+    const mlx::core::array& gate,
+    const mlx::core::array& ape,
+    const mlx::core::array& norm,
+    const std::optional<mlx::core::array>& prev_kv,
+    const std::optional<mlx::core::array>& prev_gate,
+    const mlx::core::array& positions,
+    const mlx::core::array& cos,
+    const mlx::core::array& sin,
+    int ratio,
+    bool overlap,
+    int quant_mode = 0,
+    float eps = 1e-6f);
+
+// Update bounded compressor state without copying the long-context pool.
+MlxDsv4PoolStep dsv4_decode_pool_step(
+    const mlx::core::array& kv_token,
+    const mlx::core::array& gate_token,
+    const mlx::core::array& ape,
+    const mlx::core::array& norm,
+    const mlx::core::array& state_kv,
+    const mlx::core::array& state_gate,
+    const std::optional<mlx::core::array>& prev_kv,
+    const std::optional<mlx::core::array>& prev_gate,
+    const mlx::core::array& seq_len,
+    const mlx::core::array& cos,
+    const mlx::core::array& sin,
+    int ratio,
+    bool overlap,
+    int quant_mode = 0,
+    float eps = 1e-6f);
+
+// Apply a bounded compressor delta to a capacity-backed pool with native MLX
+// indexed update semantics.
+MlxDsv4PoolUpdate dsv4_decode_pool_update(
+    const mlx::core::array& kv_token,
+    const mlx::core::array& gate_token,
+    const mlx::core::array& ape,
+    const mlx::core::array& norm,
+    const mlx::core::array& state_kv,
+    const mlx::core::array& state_gate,
+    const std::optional<mlx::core::array>& prev_kv,
+    const std::optional<mlx::core::array>& prev_gate,
+    const mlx::core::array& pool,
+    const mlx::core::array& seq_len,
+    const mlx::core::array& cos,
+    const mlx::core::array& sin,
+    int ratio,
+    bool overlap,
+    int quant_mode = 0,
+    float eps = 1e-6f);
+
+// Compute the pooled-token indexer score. The V4F 64-head path returns FP16;
+// the V4.1 32-head path retains FP32 scores for candidate/top-k selection.
+mlx::core::array dsv4_indexer_scores(
+    const mlx::core::array& q,
+    const mlx::core::array& k,
+    const mlx::core::array& weights,
+    int query_offset,
+    int ratio);
+
+// Decode-specialized streaming indexer score path. When score_count is set,
+// only that key prefix is dispatched while the returned scratch keeps the
+// full K capacity; pass the same prefix as valid_keys to dsv4_topk512.
+mlx::core::array dsv4_indexer_scores_decode(
+    const mlx::core::array& q,
+    const mlx::core::array& k,
+    const mlx::core::array& weights,
+    int query_offset,
+    int ratio,
+    int score_count = -1);
+
+// Fixed-width half-precision top-512 selection. valid_keys limits selection
+// to an initialized prefix of a fixed-capacity decode scratch.
+mlx::core::array dsv4_topk512(
+    const mlx::core::array& scores,
+    bool deterministic = true,
+    int valid_keys = -1);
+
+// Family-neutral exact FP32 top-512 operator. Model-specific policy decides
+// when its DeepSelect moving-threshold implementation is profitable.
+mlx::core::array mlx_deepselect_topk512(
+    const mlx::core::array& scores,
+    const std::optional<mlx::core::array>& valid_keys = std::nullopt);
+
+// Build circular-local plus pooled sparse-attention plans.  The pair contains
+// int32 cache indices followed by a float16 additive mask.
+std::pair<mlx::core::array, mlx::core::array>
+dsv4_build_prefill_plan(
+    const mlx::core::array& topk,
+    int query_offset,
+    int local_history,
+    int pool_len,
+    int ratio,
+    int window);
+
+// Vision-aware variant. left/right are [B,M] visible distances inside an
+// image sentinel span; ordinary text rows contain zero.  The local plan may
+// expand by max_image_tokens while pooled/indexer causality stays unchanged.
+std::pair<mlx::core::array, mlx::core::array>
+dsv4_build_prefill_plan_visible(
+    const mlx::core::array& topk,
+    const mlx::core::array& left,
+    const mlx::core::array& right,
+    int query_offset,
+    int local_history,
+    int pool_len,
+    int ratio,
+    int window,
+    int max_image_tokens);
+
+std::pair<mlx::core::array, mlx::core::array>
+dsv4_build_decode_plan(
+    const mlx::core::array& topk,
+    const mlx::core::array& seq_len,
+    int pool_len,
+    int ratio,
+    int window);
+
+// Selected-row DSV4 attention.  Dispatches decode, short-query, or prefill-MMA
+// Metal kernels from the query count.  meta is intentionally accepted for API
+// parity with the CUDA/Python operator and has no numerical role.
+mlx::core::array attention_dsv4_sparse(
+    const mlx::core::array& q,
+    const mlx::core::array& kv,
+    const mlx::core::array& indices,
+    const mlx::core::array& mask,
+    const mlx::core::array& sinks,
+    const std::optional<mlx::core::array>& meta = std::nullopt,
+    std::optional<float> scale = std::nullopt);
+
+// Multi-token V4.1 specialization. Causal local/pool visibility is derived
+// inside the Metal kernel, avoiding a concatenated cache and plan tensors.
+mlx::core::array attention_dsv4_sparse_prefill(
+    const mlx::core::array& q,
+    const mlx::core::array& chronological_local_kv,
+    const mlx::core::array& pooled_kv,
+    int pool_len,
+    const mlx::core::array& topk,
+    const mlx::core::array& sinks,
+    int query_offset,
+    int ratio,
+    int window,
+    std::optional<float> scale = std::nullopt);
+
+// Single-token specialization which addresses the circular local cache and
+// compressed pool directly.  This avoids materializing a concatenated cache
+// and a separate indices/mask plan on every layer of every decode step.
+mlx::core::array attention_dsv4_sparse_decode(
+    const mlx::core::array& q,
+    const mlx::core::array& local_kv,
+    const std::optional<mlx::core::array>& pooled_kv,
+    int pool_len,
+    const mlx::core::array& topk,
+    const mlx::core::array& sinks,
+    int seq_len,
+    int ratio,
+    int window,
+    std::optional<float> scale = std::nullopt);
+
+} // namespace mfq::metal

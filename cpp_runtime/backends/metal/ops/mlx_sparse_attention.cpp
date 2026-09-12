@@ -31,7 +31,7 @@ using TemplateArgs = std::vector<
 // Transitional source bundle: cache/index preparation remains owned by the
 // DSV4 adapter, while every sparse-attention execution kernel is dispatched
 // from this model-neutral operator layer.
-#include "../models/deepseek_v4/mlx_deepseek_v4_sparse_kernels.inc"
+#include "mlx_deepseek_sparse_kernels.inc"
 
 Kernel make_sparse_kernel(
     const char* name,
