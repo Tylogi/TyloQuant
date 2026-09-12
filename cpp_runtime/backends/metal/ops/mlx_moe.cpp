@@ -111,6 +111,31 @@ bool apple_m5_family() noexcept {
     return is_m5;
 }
 
+bool apple_m3_ultra() noexcept {
+    static const bool is_m3_ultra = [] {
+        std::size_t size = 0;
+        if (::sysctlbyname(
+                "machdep.cpu.brand_string",
+                nullptr,
+                &size,
+                nullptr,
+                0) != 0 || size <= 1) {
+            return false;
+        }
+        std::string name(size, '\0');
+        if (::sysctlbyname(
+                "machdep.cpu.brand_string",
+                name.data(),
+                &size,
+                nullptr,
+                0) != 0) {
+            return false;
+        }
+        return name.rfind("Apple M3 Ultra", 0) == 0;
+    }();
+    return is_m3_ultra;
+}
+
 bool nint_grouped_nax_enabled() noexcept {
     const char* value = std::getenv("MFQ_METAL_NINT_PREFILL_NAX");
     if (value != nullptr) {
@@ -187,12 +212,30 @@ int grouped_mmq_tile_columns(
     return block_rows == 64 && output_width >= 1024 ? 96 : 64;
 }
 
-bool mxfp4_nax_prefill_enabled(int route_count) noexcept {
+bool mxfp4_nax_prefill_enabled(
+    int route_count,
+    int experts,
+    int input_width,
+    int output_width) noexcept {
     constexpr int kDefaultMinRoutes = 1024;
+    // Raw-HF DeepSeek-V4.1-Flash uses 384 native MXFP4 experts with
+    // 5120->2304 Gate/Up and 2304->5120 Down projections.  On M3 Ultra,
+    // MLX's batched gather-QMM is materially faster for these large routed
+    // matrices than the compatibility block-list kernel.  Keep the default
+    // deliberately geometry-specific so unrelated MXFP4 models retain their
+    // established numerical and performance policy.
+    const bool dsv41_geometry = experts == 384 && (
+        (input_width == 5120 &&
+         (output_width == 2304 || output_width == 4608)) ||
+        (input_width == 2304 && output_width == 5120));
+    const bool automatic = route_count >= kDefaultMinRoutes &&
+        (apple_m5_family() ||
+         (apple_m3_ultra() && dsv41_geometry));
     const char* value = std::getenv(
         "MFQ_METAL_NINTM_PREFILL_NAX");
     if (value == nullptr) {
-        return false;
+        return apple_m3_ultra() && dsv41_geometry &&
+            route_count >= kDefaultMinRoutes;
     }
     const auto setting = std::string_view(value);
     if (
@@ -202,9 +245,7 @@ bool mxfp4_nax_prefill_enabled(int route_count) noexcept {
     ) {
         return true;
     }
-    return setting == "auto"
-        && apple_m5_family()
-        && route_count >= kDefaultMinRoutes;
+    return setting == "auto" && automatic;
 }
 
 bool mxfp4_nax_smallm_preferred(
@@ -8797,14 +8838,17 @@ array MlxNintMoeWeight::routed_matmul_sorted(
         shared_input = false;
     }
 
-    // On M5, prefill-sized MXFP4 gather-QMM is substantially faster through
-    // MLX's NAX path than through the pre-NAX block-list kernel.  The SSD
-    // arena already stores native MXFP4 bytes and E8M0 scales, so this is a
-    // zero-conversion view over the same unified-memory banks.  Keep it
-    // available as an explicit experiment while its different reduction tree
-    // is validated against the established full-model numerical contract.
+    // Prefill-sized pure-MXFP4 projections can use MLX's batched gather-QMM
+    // without repacking: the resident arena already stores native MXFP4 bytes
+    // and E8M0 scales. This is the measured default for V4.1 geometry on M3
+    // Ultra and remains explicitly selectable for other devices/models.
     if (
-        (mxfp4_nax_prefill_enabled(route_count) || force_mxfp4_nax)
+        (mxfp4_nax_prefill_enabled(
+             route_count,
+             impl_->experts,
+             impl_->neuron_len,
+             impl_->out_per_expert) ||
+         force_mxfp4_nax)
         && impl_->mxfp4_slot_ids.has_value()
         && impl_->projections == 1
         && impl_->rotations.empty()
