@@ -256,7 +256,9 @@ bool mxfp4_nax_prefill_enabled(
 bool mxfp4_nax_smallm_preferred(
     const array& expert_ids,
     int tokens,
-    int experts) noexcept {
+    int experts,
+    int input_width,
+    int output_width) noexcept {
     const char* value = std::getenv(
         "MFQ_METAL_NINTM_SMALLM_NAX");
     const auto setting = value == nullptr
@@ -266,11 +268,19 @@ bool mxfp4_nax_smallm_preferred(
         setting == "1"
         || setting == "true"
         || setting == "on";
+    // A six-row verifier on M3 Ultra is 30%+ faster through gather-QMM for
+    // the native DSV4F expert shapes. Keep V4.1 and unrelated 256-expert
+    // models on their established small-M kernels.
+    const bool dsv4f_m3_ultra =
+        apple_m3_ultra() && experts == 256 && (
+            (input_width == 4096 &&
+             (output_width == 2048 || output_width == 4096)) ||
+            (input_width == 2048 && output_width == 4096));
     if (
         tokens < 4
         || tokens > 6
         || (!force && setting != "auto" && setting != "adaptive")
-        || (!force && !apple_m5_family())
+        || (!force && !apple_m5_family() && !dsv4f_m3_ultra)
         || expert_ids.dtype() != mlx::core::int32
         || !expert_ids.flags().row_contiguous
         || !expert_ids.is_available()
@@ -8590,7 +8600,9 @@ bool MlxNintMoeWeight::prefers_mxfp4_smallm_nax(
         && mxfp4_nax_smallm_preferred(
             expert_ids,
             expert_ids.shape(0),
-            impl_->experts);
+            impl_->experts,
+            impl_->neuron_len,
+            impl_->out_per_expert);
 }
 
 int MlxNintMoeWeight::recommended_grouped_mmq_block_rows(

@@ -186,8 +186,12 @@ constexpr double kDepthExitMargin = 1.15;
 // measured both alternatives; require only three consecutive losing choices.
 constexpr int kDepthExitStreak = 3;
 // The first maximum-depth pass includes graph compilation and is discarded by
-// update_time(). The second pass is the first representative realized sample.
-constexpr int kDepthRealizedWindow = 1;
+// update_time().  Do not permanently hand the remainder of a request to plain
+// decode after one otherwise profitable chain happens to reject early: native
+// generation has no later MTP re-entry probe.  Four realized cycles are still
+// short enough to abandon genuinely losing speculation quickly while
+// smoothing the normal cycle-to-cycle acceptance variance.
+constexpr int kDepthRealizedWindow = 4;
 constexpr double kDepthRealizedMargin = 1.03;
 
 } // namespace
@@ -340,6 +344,9 @@ void MlxMtpDepthController::observe(
         // instead of spending the rest of a short response exploring depths.
         resolve_realized_window();
         current_depth_ = best_depth();
+        if (current_depth_ == 0 && speculation_losing()) {
+            exit_streak_ = kDepthExitStreak;
+        }
         milliseconds_since_probe_ = 0.0;
         return;
     }

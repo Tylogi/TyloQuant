@@ -83,6 +83,25 @@ int main() {
             }
         }
         {
+            mfq::metal::MlxMtpDepthController controller(5);
+            controller.observe(5, 5, 1000.0);
+            controller.observe(5, 5, 150.0);
+            controller.observe(0, 0, 45.0);
+            controller.observe(0, 0, 45.0);
+            controller.observe(0, 0, 45.0);
+            controller.observe(5, 0, 155.0);
+            if (controller.should_exit()) {
+                throw std::runtime_error(
+                    "adaptive MTP exited after one transient rejection");
+            }
+            controller.observe(5, 5, 150.0);
+            controller.observe(5, 5, 150.0);
+            if (controller.should_exit()) {
+                throw std::runtime_error(
+                    "adaptive MTP rejected a profitable realized window");
+            }
+        }
+        {
             mfq::metal::MlxMtpDepthController controller(
                 5,
                 mfq::metal::MlxMtpDepthPolicy::AcceptanceOnly);
