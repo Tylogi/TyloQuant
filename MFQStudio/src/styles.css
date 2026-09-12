@@ -364,7 +364,7 @@ select:focus-visible, summary:focus-visible {
   align-items: baseline;
   justify-content: space-between;
   gap: 18px;
-  margin: 25px 1px 11px;
+  margin-block: 25px 11px;
 }
 .section-label strong {
   color: var(--muted);
@@ -409,7 +409,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 12px;
-  margin: 0;
+  margin-block: 0;
 }
 .metric-grid > .metric-tile {
   display: grid;
@@ -663,7 +663,6 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   grid-template-columns: 54px minmax(0, 1fr) auto;
   align-items: center;
   gap: 18px;
-  margin: 0;
   padding: 20px;
 }
 .runtime-hero-copy { display: grid; min-width: 0; gap: 5px; }
