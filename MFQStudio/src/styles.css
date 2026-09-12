@@ -18,8 +18,8 @@
   --ink: #202122;
   --ink-strong: #111213;
   --ink-soft: #454748;
-  --muted: #737678;
-  --muted-light: #999c9e;
+  --muted: #5f6264;
+  --muted-light: #6c6f71;
   --line: rgb(32 34 35 / 12%);
   --line-strong: rgb(32 34 35 / 18%);
   --line-soft: rgb(32 34 35 / 8%);
@@ -63,7 +63,7 @@
   --ink-strong: #ffffff;
   --ink-soft: #ced0d0;
   --muted: #999d9e;
-  --muted-light: #6f7475;
+  --muted-light: #8d9293;
   --line: rgb(240 243 243 / 12%);
   --line-strong: rgb(240 243 243 / 18%);
   --line-soft: rgb(240 243 243 / 7%);
@@ -108,7 +108,7 @@
     --ink-strong: #ffffff;
     --ink-soft: #ced0d0;
     --muted: #999d9e;
-    --muted-light: #6f7475;
+    --muted-light: #8d9293;
     --line: rgb(240 243 243 / 12%);
     --line-strong: rgb(240 243 243 / 18%);
     --line-soft: rgb(240 243 243 / 7%);
@@ -251,7 +251,7 @@ select:focus-visible, summary:focus-visible {
   text-align: left;
 }
 .sectioned-nav button:hover { color: var(--ink); background: var(--sidebar-hover); }
-.sectioned-nav button.active { color: var(--on-accent); background: var(--accent); }
+.sectioned-nav button.active { color: var(--on-accent); background: var(--accent); font-weight: 700; }
 .sectioned-nav button.active .ui-icon { color: currentColor; }
 .sectioned-nav button > span {
   min-width: 22px;
@@ -260,7 +260,7 @@ select:focus-visible, summary:focus-visible {
   padding: 1px 6px;
   color: inherit;
   background: rgb(127 127 127 / 17%);
-  font-size: 9.5px;
+  font-size: 10px;
   text-align: center;
 }
 
@@ -402,7 +402,7 @@ select:focus-visible, summary:focus-visible {
 }
 .panel-heading-actions button:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface-hover); }
 
-button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); }
+button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
 button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent); background: var(--accent-hover); }
 
 .metric-grid {
@@ -695,7 +695,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   box-shadow: none;
 }
 .runtime-hero-actions button:hover { border-color: var(--line-strong); background: var(--surface-hover); }
-.runtime-hero-actions button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); }
+.runtime-hero-actions button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
 .runtime-hero-actions button.primary:hover { border-color: var(--accent-hover); background: var(--accent-hover); }
 
 .overview-memory-panel { padding: 19px; }
@@ -902,7 +902,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 .server-temperature-control strong { width: 42px; color: var(--ink-soft); font: 610 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
 .server-page-footer { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 18px; }
 .server-page-footer > span { color: var(--muted-light); font-size: 11px; }
-.server-page-footer > button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); }
+.server-page-footer > button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
 
 /* ---------- Settings page ---------- */
 
@@ -942,7 +942,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 }
 .settings-page button:hover,
 .settings-page .portable-actions label:hover { border-color: var(--line-strong); background: var(--surface-hover); }
-.settings-page button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); }
+.settings-page button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
 .settings-page textarea,
 .settings-page input:not([type="checkbox"]):not([type="range"]),
 .settings-page select {
@@ -1024,7 +1024,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 .cluster-panel { margin-top: 10px; }
 .mcp-form { display: grid; grid-template-columns: minmax(110px, .3fr) auto minmax(240px, 1fr) auto; gap: 7px; margin-top: 12px; }
 .mcp-form input, .mcp-form select { min-width: 0; border: 1px solid var(--panel-line); border-radius: 7px; padding: 7px 9px; color: var(--ink-soft); background: var(--panel-control); font-size: 11px; }
-.mcp-form button { min-width: 64px; border: 1px solid var(--accent); border-radius: 7px; padding: 7px 11px; color: var(--on-accent); background: var(--accent); font-size: 10.5px; font-weight: 620; }
+.mcp-form button { min-width: 64px; border: 1px solid var(--accent); border-radius: 7px; padding: 7px 11px; color: var(--on-accent); background: var(--accent); font-size: 10.5px; font-weight: 700; }
 .mcp-form button:hover { border-color: var(--accent-hover); background: var(--accent-hover); }
 .mcp-server-list { display: grid; gap: 4px; margin-top: 10px; }
 .mcp-server { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px; border-top: 1px solid var(--panel-line); padding: 8px 0; }
@@ -1088,7 +1088,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   color: var(--on-accent);
   background: var(--accent);
   font-size: 11px;
-  font-weight: 650;
+  font-weight: 700;
   box-shadow: var(--shadow-sm);
 }
 .job-run:hover { border-color: var(--accent-hover); background: var(--accent-hover); transform: translateY(-1px); }
@@ -1171,7 +1171,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   color: var(--on-accent);
   background: var(--accent);
   font-size: 13px;
-  font-weight: 620;
+  font-weight: 700;
   box-shadow: none;
 }
 .open-model-primary:hover { border-color: var(--accent-hover); background: var(--accent-hover); }
@@ -1283,7 +1283,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 .voice-component-banner strong { font-size: 11px; }
 .voice-component-banner span { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .voice-component-banner progress { width: 100%; height: 4px; grid-column: 1 / -1; accent-color: var(--accent); }
-.voice-component-banner button { grid-column: 2; grid-row: 1; border: 1px solid var(--accent-border); border-radius: 7px; padding: 6px 9px; color: var(--on-accent); background: var(--accent); font-size: 10.5px; font-weight: 650; }
+.voice-component-banner button { grid-column: 2; grid-row: 1; border: 1px solid var(--accent-border); border-radius: 7px; padding: 6px 9px; color: var(--on-accent); background: var(--accent); font-size: 10.5px; font-weight: 700; }
 .voice-component-banner button:disabled { cursor: progress; opacity: 0.65; }
 .composer { overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: none; }
 .composer:focus-within { border-color: var(--line-strong); box-shadow: 0 0 0 3px var(--accent-soft); }
@@ -1296,7 +1296,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 .composer-toolbar .voice-button { position: relative; width: 28px; padding: 0; border-radius: 50%; }
 .voice-button span { position: absolute; inset: 8px; border-radius: 50%; background: var(--accent); transform: scale(calc(0.82 + var(--voice-level) * 0.38)); box-shadow: 0 0 calc(4px + var(--voice-level) * 9px) var(--accent-soft); }
 .composer-hint { margin-left: auto; color: var(--muted-light); font-size: 10.5px; }
-.composer-toolbar .send-button { width: 32px; border-color: var(--accent); border-radius: 50%; padding: 0; color: var(--on-accent); background: var(--accent); }
+.composer-toolbar .send-button { width: 32px; border-color: var(--accent); border-radius: 50%; padding: 0; color: var(--on-accent); background: var(--accent); font-weight: 700; }
 .composer-toolbar .send-button:hover { border-color: var(--accent-hover); background: var(--accent-hover); }
 .composer-toolbar .send-button.stop { border-color: var(--danger); color: #fff; background: var(--danger); }
 .attachment-tray { display: flex; gap: 7px; overflow-x: auto; padding: 9px 9px 0; }
