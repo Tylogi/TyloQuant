@@ -517,12 +517,17 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   width: 54px;
   height: 54px;
   place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--panel-line);
+  border-radius: 14px;
+  background: var(--panel-control);
   color: var(--ink-strong);
-  font-size: 28px;
+  font-size: 26px;
   font-weight: 650;
   letter-spacing: -0.03em;
   line-height: 1;
 }
+.model-monogram img { width: 32px; height: 32px; }
 .model-monogram.loading { color: var(--warning); }
 .model-monogram.ready { color: var(--success); }
 .model-monogram.failed { color: var(--danger); }
@@ -904,7 +909,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 .settings-page { display: grid; }
 .settings-page > .section-label:first-child { margin-top: 2px; }
 .settings-page-inherited { min-width: 0; border: 0; margin: 0; padding: 0; }
-.settings-page-inherited:disabled { opacity: 0.52; }
+.settings-page-inherited:disabled { opacity: 0.65; }
 .settings-page-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .settings-page-section { display: grid; min-width: 0; align-content: start; }
 .settings-page-panel { min-width: 0; }

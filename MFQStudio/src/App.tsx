@@ -952,7 +952,11 @@ function ModelMonogram({
   state: ModelMonogramState;
 }) {
   const initial = Array.from(name.trim())[0]?.toLocaleUpperCase() || "E";
-  return <span aria-hidden="true" className={`model-monogram ${state}`}>{initial}</span>;
+  return (
+    <span aria-hidden="true" className={`model-monogram ${state}`}>
+      {state === "idle" ? <img src="/mfq-mark.svg" alt="" /> : initial}
+    </span>
+  );
 }
 
 function MetricTile({
@@ -3852,7 +3856,7 @@ export default function App() {
           <nav className="sectioned-nav" aria-label={tr("推理", "Inference")}>
             <section>
               <div className="sidebar-group-label">{tr("推理", "Inference")}</div>
-              <button className={view === "dashboard" && dashboardPage === "overview" ? "active" : ""} onClick={() => openStudioPage("dashboard", "overview")} type="button"><Icon name="gauge" />{tr("概览", "Overview")}<span>{formatNumber(runtime?.active_requests || 0)}</span></button>
+              <button className={view === "dashboard" && dashboardPage === "overview" ? "active" : ""} onClick={() => openStudioPage("dashboard", "overview")} type="button"><Icon name="gauge" />{tr("概览", "Overview")}{Number(runtime?.active_requests || 0) > 0 && <span>{formatNumber(runtime?.active_requests || 0)}</span>}</button>
               <button className={view === "dashboard" && dashboardPage === "models" ? "active" : ""} onClick={() => openStudioPage("dashboard", "models")} type="button"><Icon name="folder" />{tr("模型", "Models")}</button>
               <button className={view === "dashboard" && dashboardPage === "connections" ? "active" : ""} onClick={openServerPage} type="button"><Icon name="server-rack" />{tr("服务器", "Server")}</button>
               <button className={view === "dashboard" && dashboardPage === "cache" ? "active" : ""} onClick={() => openStudioPage("dashboard", "cache")} type="button"><Icon name="memory" />{tr("资源", "Resources")}</button>
