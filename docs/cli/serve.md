@@ -223,6 +223,9 @@ uv run mfq serve \
   to `5440` for a fully resident raw-HF DeepSeek V4.1 checkpoint on M3 Ultra;
   set `MFQ_METAL_DSV41_PREFILL_AUTOTUNE=0` to retain `2048` exactly, or pass
   any other chunk size as an explicit override.
+- M3 Ultra also fuses the released V4.1 window-KV RMSNorm, partial RoPE, and
+  activation fake-quant operations. Set `MFQ_METAL_DSV41_FUSED_KV_PREP=0`
+  only when comparing against the portable MLX composition.
 - `--runtime-startup-timeout` covers native worker startup and model loading.
 
 ## Command options

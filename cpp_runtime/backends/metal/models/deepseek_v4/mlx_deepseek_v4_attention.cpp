@@ -18,6 +18,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
 namespace mfq::metal {
 namespace {
 
@@ -67,6 +71,36 @@ bool block32_inverse_rope_qmv_enabled() noexcept {
     return setting != "0"
         && setting != "false"
         && setting != "off";
+}
+
+bool apple_m3_ultra() noexcept {
+#if defined(__APPLE__)
+    static const bool is_m3_ultra = [] {
+        char name[64]{};
+        std::size_t size = sizeof(name);
+        return ::sysctlbyname(
+                "machdep.cpu.brand_string",
+                name,
+                &size,
+                nullptr,
+                0) == 0 &&
+            std::string_view(name).rfind("Apple M3 Ultra", 0) == 0;
+    }();
+    return is_m3_ultra;
+#else
+    return false;
+#endif
+}
+
+bool v41_fused_kv_prepare_enabled() noexcept {
+    if (const char* value = std::getenv(
+            "MFQ_METAL_DSV41_FUSED_KV_PREP")) {
+        const auto setting = std::string_view(value);
+        return setting != "0"
+            && setting != "false"
+            && setting != "off";
+    }
+    return apple_m3_ultra();
 }
 
 constexpr const char* kHadamardSource = R"METAL(
@@ -356,6 +390,88 @@ constexpr const char* kV41ActivationQuantSource = R"METAL(
     y[index] = T(quantized * scale);
 )METAL";
 
+// Exact DSV4.1 window-KV geometry: one 256-thread group owns a D=512 row.
+// Each SIMD group quantizes one 32-value block in each half of the row after
+// sharing the row-wide RMS reduction. This collapses RMSNorm, RoPE, and the
+// E4M3/E8M0 fake-quant boundary into a single read/write pass.
+constexpr const char* kV41WeightedRmsRopeQuantSource = R"METAL(
+    uint row = threadgroup_position_in_grid.x;
+    uint local_thread = thread_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    if (row >= uint(ROWS)) {
+        return;
+    }
+
+    constexpr uint HALF = 256u;
+    constexpr uint PREFIX = uint(DIM - ROTARY);
+    uint row_base = row * uint(DIM);
+    uint first_column = local_thread;
+    uint second_column = local_thread + HALF;
+    float first_input = float(x[row_base + first_column]);
+    float second_input = float(x[row_base + second_column]);
+
+    threadgroup float reductions[8];
+    float subtotal = simd_sum(
+        first_input * first_input + second_input * second_input);
+    if (lane == 0u) {
+        reductions[simd_group] = subtotal;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (local_thread == 0u) {
+        float total = 0.0f;
+        for (uint group = 0u; group < 8u; ++group) {
+            total += reductions[group];
+        }
+        reductions[0] = rsqrt(total / float(DIM) + params[0]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inverse_rms = reductions[0];
+
+    T first_value = T(
+        first_input * inverse_rms * float(weights[first_column]));
+    T second_value = T(
+        second_input * inverse_rms * float(weights[second_column]));
+    if (second_column >= PREFIX) {
+        uint rotary_column = second_column - PREFIX;
+        uint pair = rotary_column >> 1u;
+        uint pair_column = PREFIX + (pair << 1u);
+        float pair_first = float(T(
+            float(x[row_base + pair_column]) *
+            inverse_rms * float(weights[pair_column])));
+        float pair_second = float(T(
+            float(x[row_base + pair_column + 1u]) *
+            inverse_rms * float(weights[pair_column + 1u])));
+        uint token = row % uint(TOKENS);
+        float cosine =
+            float(cos_values[token * uint(PAIRS) + pair]);
+        float sine =
+            float(sin_values[token * uint(PAIRS) + pair]);
+        float rotated = (rotary_column & 1u) == 0u
+            ? pair_first * cosine - pair_second * sine
+            : pair_first * sine + pair_second * cosine;
+        second_value = T(rotated);
+    }
+
+    float first_float = float(first_value);
+    float first_maximum = simd_max(abs(first_float));
+    float first_scale = pow2_ceil(
+        max(first_maximum, 1.0e-4f) / 448.0f);
+    float first_normalized = first_float / first_scale;
+    y[row_base + first_column] = T(
+        fp8_e4m3(clamp(first_normalized, -448.0f, 448.0f)) *
+        first_scale);
+
+    float second_float = float(second_value);
+    float second_maximum = simd_max(abs(second_float));
+    float second_scale = pow2_ceil(
+        max(second_maximum, 1.0e-4f) / 448.0f);
+    float second_normalized = second_float / second_scale;
+    y[row_base + second_column] = T(
+        fp8_e4m3(clamp(second_normalized, -448.0f, 448.0f)) *
+        second_scale);
+)METAL";
+
 const mlx::core::fast::CustomKernelFunction&
 hadamard_kernel() {
     static const auto kernel = [] {
@@ -438,6 +554,24 @@ v41_activation_quant_kernel() {
             {"x"},
             {"y"},
             kV41ActivationQuantSource,
+            kV41ActivationQuantHeader,
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+v41_weighted_rms_rope_quant_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_dsv41_weighted_rms_rope_quant",
+            {"x", "cos_values", "sin_values", "weights", "params"},
+            {"y"},
+            kV41WeightedRmsRopeQuantSource,
             kV41ActivationQuantHeader,
             true,
             false,
@@ -781,6 +915,87 @@ array weighted_rms(
         : mlx::core::astype(result, output_dtype);
 }
 
+array v41_weighted_rms_rope_activation_quant(
+    const array& input,
+    const array& weight,
+    Dtype output_dtype,
+    float eps,
+    int rotary,
+    const array& cosine,
+    const array& sine,
+    const array& params) {
+    const auto reference = [&] {
+        auto result = weighted_rms(
+            input,
+            weight,
+            output_dtype,
+            eps);
+        result = replace_last_rope(
+            result,
+            rotary,
+            cosine,
+            sine);
+        return v41_activation_quant(result, 32, 0);
+    };
+    // This schedule is intentionally specific to the released V4.1 window
+    // KV shape. Synthetic configurations and other devices keep the portable
+    // MLX composition unless explicitly forced through the feature switch.
+    if (!v41_fused_kv_prepare_enabled() ||
+        input.ndim() != 3 ||
+        input.shape(-1) != 512 ||
+        input.dtype() != output_dtype ||
+        rotary != 64) {
+        return reference();
+    }
+    auto source = floating_contiguous(input);
+    if (weight.dtype() != mlx::core::float32 ||
+        weight.ndim() != 1 || weight.size() != 512u ||
+        params.dtype() != mlx::core::float32 ||
+        params.size() != 1 ||
+        !std::isfinite(eps) || eps <= 0.0f ||
+        cosine.shape() != sine.shape() ||
+        cosine.shape(-1) != 32) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4.1 fused KV preparation input");
+    }
+    const int tokens = source.shape(1);
+    const int rows = checked_int(
+        source.size() / 512u,
+        "DeepSeek-V4.1 fused KV row count");
+    const int grid = checked_product(
+        {rows, 256},
+        "DeepSeek-V4.1 fused KV grid");
+    if (tokens <= 0 ||
+        cosine.size() != static_cast<std::size_t>(tokens) * 32u) {
+        throw std::invalid_argument(
+            "DeepSeek-V4.1 fused KV RoPE table mismatch");
+    }
+    auto outputs = v41_weighted_rms_rope_quant_kernel()(
+        {
+            source,
+            typed_contiguous(cosine, mlx::core::float32),
+            typed_contiguous(sine, mlx::core::float32),
+            weight,
+            params,
+        },
+        {source.shape()},
+        {source.dtype()},
+        {grid, 1, 1},
+        {256, 1, 1},
+        {
+            {"T", source.dtype()},
+            {"ROWS", rows},
+            {"DIM", 512},
+            {"ROTARY", 64},
+            {"PAIRS", 32},
+            {"TOKENS", tokens},
+        },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
 array stable_softmax(
     const array& input,
     int axis) {
@@ -1120,6 +1335,24 @@ array deepseek_v4_kv_fp8_sim_prefix(
 array deepseek_v41_kv_fp8_sim(
     const array& input) {
     return v41_activation_quant(input, 32, 0);
+}
+
+array deepseek_v41_fused_kv_prepare(
+    const array& input,
+    const array& weight,
+    float eps,
+    int rotary_dimension,
+    const array& cosine,
+    const array& sine) {
+    return v41_weighted_rms_rope_activation_quant(
+        input,
+        weight,
+        input.dtype(),
+        eps,
+        rotary_dimension,
+        cosine,
+        sine,
+        array({eps}, mlx::core::float32));
 }
 
 MlxDeepseekV4ImageVisibility deepseek_v4_image_visibility(
@@ -3069,17 +3302,15 @@ struct MlxDeepseekV4Attention::Impl {
             mlx::core::expand_dims(
                 mlx::core::expand_dims(sine, 0),
                 2));
-        kv = weighted_rms(
+        kv = v41_weighted_rms_rope_activation_quant(
             kv,
             components.kv_norm,
             source.dtype(),
-            static_cast<float>(config.rms_eps));
-        kv = replace_last_rope(
-            kv,
+            static_cast<float>(config.rms_eps),
             rotary,
             mlx::core::expand_dims(cosine, 0),
-            mlx::core::expand_dims(sine, 0));
-        kv = v41_activation_quant(kv, 32, 0);
+            mlx::core::expand_dims(sine, 0),
+            rms_params);
         if (detail::component_profile_active()) {
             detail::profile_eval(
                 profile_component("q_kv_prepare"),
