@@ -266,7 +266,8 @@ void print_help() {
         << "  --host ADDRESS         server bind address (default 127.0.0.1)\n"
         << "  --port PORT            server port (default 8080)\n"
         << "  --ctx-size TOKENS      runtime/API context limit (default 32768)\n"
-        << "  --prefill-chunk-size N maximum prompt chunk (default 2048)\n"
+        << "  --prefill-chunk-size N maximum prompt chunk (portable default 2048;\n"
+        << "                          resident DSV4.1 on M3 Ultra uses 5440)\n"
         << "  --moe-gpu-cache-gb N   unified-memory hot-expert cache\n"
         << "                          MFQ default: full residency; HF default: auto\n"
         << "  --model-name NAME      API model name (default MFQ filename)\n"
@@ -297,6 +298,40 @@ std::size_t physical_memory_bytes() {
         throw std::runtime_error("cannot determine physical memory size");
     }
     return static_cast<std::size_t>(bytes);
+}
+
+bool apple_m3_ultra() noexcept {
+    static const bool detected = [] {
+        std::size_t size = 0;
+        if (sysctlbyname(
+                "machdep.cpu.brand_string",
+                nullptr,
+                &size,
+                nullptr,
+                0) != 0 || size <= 1) {
+            return false;
+        }
+        std::string name(size, '\0');
+        if (sysctlbyname(
+                "machdep.cpu.brand_string",
+                name.data(),
+                &size,
+                nullptr,
+                0) != 0) {
+            return false;
+        }
+        return name.rfind("Apple M3 Ultra", 0) == 0;
+    }();
+    return detected;
+}
+
+bool dsv41_prefill_autotune_enabled() noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_DSV41_PREFILL_AUTOTUNE");
+    return value == nullptr || (
+        std::string_view(value) != "0"
+        && std::string_view(value) != "false"
+        && std::string_view(value) != "off");
 }
 
 std::size_t server_cache_limit_bytes() {
@@ -1856,6 +1891,25 @@ int run_native_hf_server(const Arguments& arguments) {
             expert_cache_bytes,
             kDeepseekV41AutomaticExpertCacheLimitBytes);
     }
+    Arguments effective_arguments = arguments;
+    if (
+        config.is_v41()
+        && config.top_k == 6
+        && expert_cache_bytes == 0
+        && apple_m3_ultra()
+        && arguments.prefill_chunk_size == 2048
+        && dsv41_prefill_autotune_enabled()
+    ) {
+        // V4.1 routes six experts per token. A 5440-token chunk produces
+        // 32640 routed rows, just below MLX 0.32's 32768-row sorted MXFP4
+        // NAX boundary, without entering its slower large-row fallback. The
+        // managed server forwards 2048 as its portable default, so that exact
+        // value is the auto sentinel; any other CLI value remains explicit.
+        effective_arguments.prefill_chunk_size = 5440;
+        std::cout
+            << "M3 Ultra DSV4.1 prefill autotune: chunk_size=5440"
+            << std::endl;
+    }
     std::size_t resident_wired_limit = 0;
     if (expert_cache_bytes == 0) {
         resident_wired_limit = resident_hf_wired_limit_bytes(arguments.mfq);
@@ -1924,7 +1978,7 @@ int run_native_hf_server(const Arguments& arguments) {
                 prefill_overlap);
         };
     return serve_loaded_runtime(
-        arguments,
+        effective_arguments,
         nullptr,
         std::move(runtime),
         load_runtime,
