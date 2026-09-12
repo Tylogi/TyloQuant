@@ -850,9 +850,11 @@ std::int32_t run_mlx_mtp_generation(
 
     const bool compact_stochastic =
         !request.sampling.greedy() && request.sampling.top_k > 0 &&
-        request.sampling.top_k <= 64;
+        request.sampling.top_k <= 128;
     MlxSamplingParams draft_sampling = request.sampling;
-    if (compact_stochastic) {
+    if (compact_stochastic &&
+        request.draft_sampling_policy ==
+            MlxMtpDraftSamplingPolicy::Sharpened) {
         // The proposal may be sharper than the target distribution because
         // exact p/q verification preserves the target sampler.
         draft_sampling.temperature = 0.6;
@@ -1298,9 +1300,9 @@ array verify_stochastic_mtp_top_k_chain_device(
     const array& random,
     int drafts,
     int top_k) {
-    if (top_k <= 0 || top_k > 64) {
+    if (top_k <= 0 || top_k > 128) {
         throw std::invalid_argument(
-            "MTP compact stochastic verification requires top_k in [1,64]");
+            "MTP compact stochastic verification requires top_k in [1,128]");
     }
     if (drafts <= 0 || drafts > 5) {
         throw std::invalid_argument(

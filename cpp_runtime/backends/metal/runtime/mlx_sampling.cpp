@@ -487,6 +487,12 @@ constexpr const char* kHierarchicalTopKFinalSource = R"METAL(
             }
         }
         output[0] = chosen;
+        for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
+            indices_out[rank] = tile_indices[rank];
+            probabilities_out[rank] = rank < keep
+                ? probabilities[rank] / keep_sum
+                : 0.0f;
+        }
     }
 )METAL";
 
@@ -662,10 +668,19 @@ hierarchical_top_k_merge_kernel() {
 
 const mlx::core::fast::CustomKernelFunction&
 hierarchical_top_k_final_kernel() {
-    static const auto kernel = make_kernel(
-        "mfq_cpp_sample_top_k_128_final",
-        {"scores", "indices", "random", "params"},
-        kHierarchicalTopKFinalSource);
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_sample_top_k_128_final",
+            {"scores", "indices", "random", "params"},
+            {"output", "indices_out", "probabilities_out"},
+            kHierarchicalTopKFinalSource,
+            "",
+            true,
+            false,
+            options);
+    }();
     return kernel;
 }
 
@@ -892,7 +907,7 @@ array run_sorted(
     return mlx::core::reshape(outputs.front(), view.prefix);
 }
 
-array run_hierarchical_top_k(
+MlxTopKDistribution run_hierarchical_top_k_single(
     const LogitsView& view,
     const array& random,
     double temperature,
@@ -948,10 +963,18 @@ array run_hierarchical_top_k(
             static_cast<float>(top_p),
         },
         mlx::core::float32);
-    auto output = hierarchical_top_k_final_kernel()(
+    auto outputs = hierarchical_top_k_final_kernel()(
         {scores, indices, random, params},
-        {Shape{1}},
-        {mlx::core::int32},
+        {
+            Shape{1},
+            Shape{1, top_k},
+            Shape{1, top_k},
+        },
+        {
+            mlx::core::int32,
+            mlx::core::int32,
+            mlx::core::float32,
+        },
         {kThreads, 1, 1},
         {kThreads, 1, 1},
         {
@@ -960,8 +983,60 @@ array run_hierarchical_top_k(
         },
         std::nullopt,
         false,
-        {}).front();
-    return mlx::core::reshape(std::move(output), view.prefix);
+        {});
+    return {
+        std::move(outputs.at(0)),
+        std::move(outputs.at(1)),
+        std::move(outputs.at(2)),
+    };
+}
+
+MlxTopKDistribution run_hierarchical_top_k_distribution(
+    const LogitsView& view,
+    const array& random,
+    double temperature,
+    int top_k,
+    double top_p) {
+    std::vector<array> sampled;
+    std::vector<array> indices;
+    std::vector<array> probabilities;
+    sampled.reserve(static_cast<std::size_t>(view.rows));
+    indices.reserve(static_cast<std::size_t>(view.rows));
+    probabilities.reserve(static_cast<std::size_t>(view.rows));
+    for (int row = 0; row < view.rows; ++row) {
+        LogitsView single{
+            mlx::core::contiguous(mlx::core::slice(
+                view.values,
+                Shape{row, 0},
+                Shape{row + 1, view.vocab})),
+            Shape{1},
+            1,
+            view.vocab,
+        };
+        auto result = run_hierarchical_top_k_single(
+            single,
+            mlx::core::slice(random, Shape{row}, Shape{row + 1}),
+            temperature,
+            top_k,
+            top_p);
+        sampled.push_back(std::move(result.sampled));
+        indices.push_back(std::move(result.indices));
+        probabilities.push_back(std::move(result.probabilities));
+    }
+    auto sample_shape = view.prefix;
+    auto distribution_shape = view.prefix;
+    distribution_shape.push_back(top_k);
+    return {
+        mlx::core::reshape(
+            mlx::core::concatenate(std::move(sampled), 0),
+            std::move(sample_shape)),
+        mlx::core::reshape(
+            mlx::core::concatenate(std::move(indices), 0),
+            distribution_shape),
+        mlx::core::reshape(
+            mlx::core::concatenate(std::move(probabilities), 0),
+            std::move(distribution_shape)),
+    };
 }
 
 } // namespace
@@ -1069,12 +1144,12 @@ array sample_top_k_top_p(
     auto uniforms = normalize_random(random, view.rows);
     if (view.rows == 1 && view.vocab > kTopKBlock &&
         top_k <= kHierarchicalTopK) {
-        return run_hierarchical_top_k(
+        return run_hierarchical_top_k_distribution(
             view,
             uniforms,
             temperature,
             top_k,
-            top_p);
+            top_p).sampled;
     }
     if (top_k > kDirectTopK) {
         return run_sorted(
@@ -1107,11 +1182,19 @@ MlxTopKDistribution sample_top_k_distribution(
         throw std::invalid_argument("top_p must be in (0,1]");
     }
     auto view = normalize_logits(logits);
-    if (top_k < 1 || top_k > std::min(view.vocab, kDirectTopK)) {
+    if (top_k < 1 || top_k > std::min(view.vocab, kHierarchicalTopK)) {
         throw std::invalid_argument(
-            "compact top_k must be in [1,min(vocab,64)]");
+            "compact top_k must be in [1,min(vocab,128)]");
     }
     auto uniforms = normalize_random(random, view.rows);
+    if (top_k > kDirectTopK) {
+        return run_hierarchical_top_k_distribution(
+            view,
+            uniforms,
+            temperature,
+            top_k,
+            top_p);
+    }
     return run_direct_top_k_distribution(
         view,
         uniforms,

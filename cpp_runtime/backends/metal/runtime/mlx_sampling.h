@@ -68,9 +68,11 @@ mlx::core::array sample_top_k_top_p(
     double top_p = 1.0);
 
 // Return the sampled token and the compact, filtered top-k distribution in a
-// single GPU pass.  The final dimension of indices/probabilities is top_k;
-// entries removed by top-p have zero probability.  This is used by
-// speculative verification to avoid materializing a full vocabulary on CPU.
+// GPU-resident pass. The final dimension of indices/probabilities is top_k;
+// entries removed by top-p have zero probability. Values up to 64 use the
+// direct kernel and values up to 128 use exact hierarchical selection. This
+// is used by speculative verification to avoid materializing a full
+// vocabulary on CPU.
 MlxTopKDistribution sample_top_k_distribution(
     const mlx::core::array& logits,
     const mlx::core::array& random,

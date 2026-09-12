@@ -863,6 +863,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
                 callback,
                 0,
                 MlxMtpDepthPolicy::AcceptanceOnly,
+                MlxMtpDraftSamplingPolicy::MatchTarget,
             },
             callbacks,
             last_mtp_stats_);

@@ -1092,13 +1092,10 @@ MlxDeepseekV4DSpark::draft_impl(
     const int available_width = std::min(
         block_size(),
         impl_->maximum_context - state.position_);
-    // V4.1 was released with variable-width DSpark proposals, so shrinking
-    // the physical block avoids evaluating unused attention, MoE and LM-head
-    // rows after the adaptive controller lowers its requested depth.  Keep
-    // the legacy V4 checkpoint's fixed non-causal block geometry unchanged.
-    const int physical_width = impl_->config.is_v41()
-        ? std::min(requested, available_width)
-        : available_width;
+    // Match oMLX's DSpark proposal_forward: the physical block follows the
+    // controller width. This avoids evaluating unused attention, MoE and
+    // LM-head rows when acceptance lowers the next request to depth 1..4.
+    const int physical_width = std::min(requested, available_width);
     const int vocab = checked_int(impl_->config.vocab, "vocabulary size");
     const int hidden_size = checked_int(impl_->config.hidden, "hidden size");
     if (anchors.ndim() != 2 || anchors.shape(0) != state.batch() ||

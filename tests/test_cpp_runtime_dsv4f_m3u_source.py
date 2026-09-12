@@ -7,6 +7,9 @@ ROOT = Path(__file__).resolve().parents[1]
 METAL = ROOT / "cpp_runtime" / "backends" / "metal"
 MOE = (METAL / "ops" / "mlx_moe.cpp").read_text(encoding="utf-8")
 MTP = (METAL / "runtime" / "mlx_mtp.cpp").read_text(encoding="utf-8")
+DSPARK = (
+    METAL / "models" / "deepseek_family" / "mlx_deepseek_family_dspark.cpp"
+).read_text(encoding="utf-8")
 CAUSAL = (
     METAL / "models" / "deepseek_family" / "mlx_deepseek_family_causal_lm.cpp"
 ).read_text(encoding="utf-8")
@@ -25,8 +28,16 @@ def test_m3_ultra_dsv4f_mtp_uses_native_mxfp4_smallm_nax() -> None:
 
 def test_dsv4f_mtp_matches_omlx_persistent_acceptance_depth() -> None:
     assert "MlxMtpDepthPolicy::AcceptanceOnly" in CAUSAL
+    assert "MlxMtpDraftSamplingPolicy::MatchTarget" in CAUSAL
     assert "accepted_drafts + 1" in MTP
     assert (
         "if (policy_ == MlxMtpDepthPolicy::AcceptanceOnly) {\n"
         "        return false;"
     ) in MTP
+
+
+def test_dsv4f_dspark_only_evaluates_the_selected_width() -> None:
+    assert (
+        "const int physical_width = std::min(requested, available_width);"
+        in DSPARK
+    )

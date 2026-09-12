@@ -59,9 +59,10 @@ def test_chunked_prefill_skips_discarded_vocabulary_projections() -> None:
 
 
 def test_v41_dspark_only_evaluates_the_requested_draft_width() -> None:
-    assert "const int physical_width = impl_->config.is_v41()" in DSPARK
-    assert "? std::min(requested, available_width)" in DSPARK
-    assert ": available_width;" in DSPARK
+    assert (
+        "const int physical_width = std::min(requested, available_width);"
+        in DSPARK
+    )
 
 
 def test_dspark_serving_skips_unused_diagnostic_graphs() -> None:

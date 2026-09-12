@@ -286,6 +286,54 @@ int main() {
             }
         }
         {
+            constexpr int top_k = 100;
+            std::vector<std::int32_t> proposal_indices(2 * top_k);
+            std::vector<std::int32_t> target_indices(3 * top_k);
+            std::vector<float> proposal_probabilities(2 * top_k, 0.0f);
+            std::vector<float> target_probabilities(3 * top_k, 0.0f);
+            for (int row = 0; row < 2; ++row) {
+                for (int rank = 0; rank < top_k; ++rank) {
+                    proposal_indices[static_cast<std::size_t>(
+                        row * top_k + rank)] = rank;
+                }
+                proposal_probabilities[static_cast<std::size_t>(
+                    row * top_k)] = 1.0f;
+            }
+            for (int row = 0; row < 3; ++row) {
+                for (int rank = 0; rank < top_k; ++rank) {
+                    target_indices[static_cast<std::size_t>(
+                        row * top_k + rank)] = rank;
+                }
+                target_probabilities[static_cast<std::size_t>(
+                    row * top_k)] = 1.0f;
+            }
+            auto result = verify_stochastic_mtp_top_k_chain_device(
+                mlx::core::array(
+                    proposal_indices.begin(),
+                    mlx::core::Shape{2, top_k}),
+                mlx::core::array(
+                    proposal_probabilities.begin(),
+                    mlx::core::Shape{2, top_k}),
+                mlx::core::array(
+                    target_indices.begin(),
+                    mlx::core::Shape{3, top_k}),
+                mlx::core::array(
+                    target_probabilities.begin(),
+                    mlx::core::Shape{3, top_k}),
+                mlx::core::array({0, 0}, mlx::core::int32),
+                mlx::core::array(
+                    {0.5f, 0.5f, 0.5f}, mlx::core::float32),
+                2,
+                top_k);
+            result.eval();
+            const auto* values = result.data<std::int32_t>();
+            if (values[0] != 2 || values[1] != 0 ||
+                values[2] != 0 || values[3] != 0) {
+                throw std::runtime_error(
+                    "device stochastic MTP top-k=100 chain mismatch");
+            }
+        }
+        {
             int target_position = 0;
             int resolved_cycles = 0;
             std::vector<std::int64_t> emitted;

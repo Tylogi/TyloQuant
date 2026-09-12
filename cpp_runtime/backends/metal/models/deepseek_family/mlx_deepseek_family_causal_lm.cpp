@@ -3001,6 +3001,9 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 // families retain the throughput controller's plain-decode
                 // escape hatch.
                 MlxMtpDepthPolicy::AcceptanceOnly,
+                // oMLX samples DSpark's Markov-adjusted proposal rows with
+                // the request sampler; keep p/q overlap aligned for prose.
+                MlxMtpDraftSamplingPolicy::MatchTarget,
             },
             mtp_callbacks,
             last_mtp_stats_);

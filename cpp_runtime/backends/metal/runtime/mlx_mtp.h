@@ -27,6 +27,14 @@ enum class MlxMtpDepthPolicy {
     AcceptanceOnly,
 };
 
+// Generic one-layer predictors benefit from a sharper proposal distribution,
+// while DeepSeek DSpark is trained as a block predictor and oMLX samples its
+// Markov-adjusted rows with the request sampler itself.
+enum class MlxMtpDraftSamplingPolicy {
+    Sharpened,
+    MatchTarget,
+};
+
 struct MlxMtpVerification {
     std::size_t accepted_drafts = 0;
     std::int32_t next_token = -1;
@@ -147,6 +155,8 @@ struct MlxMtpEngineRequest {
     std::uint64_t sampler_draws_consumed = 0;
     MlxMtpDepthPolicy depth_policy =
         MlxMtpDepthPolicy::AdaptiveThroughput;
+    MlxMtpDraftSamplingPolicy draft_sampling_policy =
+        MlxMtpDraftSamplingPolicy::Sharpened;
 };
 
 // Avoid allocating a vocabulary-sized count vector on the common no-penalty

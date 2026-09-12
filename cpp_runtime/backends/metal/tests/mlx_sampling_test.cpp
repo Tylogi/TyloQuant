@@ -508,6 +508,74 @@ void test_compact_top_k_distribution() {
         nucleus.size() == 2 &&
             nucleus[0] == 1.0f && nucleus[1] == 0.0f,
         "compact top-p mask mismatch");
+
+    constexpr int rows = 2;
+    constexpr int vocab = 4097;
+    constexpr int top_k = 100;
+    constexpr float temperature = 0.85f;
+    constexpr float top_p = 0.82f;
+    const std::vector<float> uniforms{0.17f, 0.73f};
+    std::vector<float> large_logits(
+        static_cast<std::size_t>(rows * vocab));
+    for (int row = 0; row < rows; ++row) {
+        for (int token = 0; token < vocab; ++token) {
+            large_logits[static_cast<std::size_t>(row * vocab + token)] =
+                std::sin(
+                    static_cast<float>(token) * 0.013671875f +
+                    static_cast<float>(row) * 0.37f) *
+                    4.0f +
+                static_cast<float>(token % 29) * 0.00390625f;
+        }
+    }
+    auto hierarchical = mfq::metal::sample_top_k_distribution(
+        floats(large_logits, Shape{rows, vocab}),
+        floats(uniforms, Shape{rows}),
+        temperature,
+        top_k,
+        top_p);
+    std::vector<std::int32_t> expected;
+    for (int row = 0; row < rows; ++row) {
+        expected.push_back(cpu_sample(
+            large_logits.data() + row * vocab,
+            vocab,
+            uniforms[static_cast<std::size_t>(row)],
+            temperature,
+            top_k,
+            top_p));
+    }
+    require_ids(
+        hierarchical.sampled,
+        expected,
+        "compact hierarchical top-k sampled token");
+    require(
+        hierarchical.indices.shape() == Shape({rows, top_k}) &&
+            hierarchical.probabilities.shape() == Shape({rows, top_k}),
+        "compact hierarchical top-k distribution shape mismatch");
+    const auto large_indices = evaluated_ids(hierarchical.indices);
+    const auto large_probabilities = evaluated_floats(
+        hierarchical.probabilities);
+    for (int row = 0; row < rows; ++row) {
+        float probability_sum = 0.0f;
+        float previous = std::numeric_limits<float>::infinity();
+        for (int rank = 0; rank < top_k; ++rank) {
+            const auto offset = static_cast<std::size_t>(
+                row * top_k + rank);
+            const int token = large_indices[offset];
+            require(
+                token >= 0 && token < vocab,
+                "compact hierarchical top-k index is out of range");
+            const float value = large_logits[static_cast<std::size_t>(
+                row * vocab + token)];
+            require(
+                value <= previous,
+                "compact hierarchical top-k indices are not sorted");
+            previous = value;
+            probability_sum += large_probabilities[offset];
+        }
+        require(
+            std::abs(probability_sum - 1.0f) < 1e-5f,
+            "compact hierarchical top-k probabilities do not sum to one");
+    }
 }
 
 void benchmark_direct_top_k() {
@@ -592,6 +660,7 @@ void benchmark_direct_top_k() {
         << " checksum="
         << checksum
         << '\n';
+
 }
 
 void test_seeded_sampler() {
