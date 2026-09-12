@@ -111,9 +111,14 @@ int main() {
                     "acceptance-only MTP did not follow accepted depth");
             }
             controller.observe(3, 0, 1.0);
-            if (controller.depth() != 1 || !controller.should_exit()) {
+            if (controller.depth() != 1 || controller.should_exit()) {
                 throw std::runtime_error(
-                    "acceptance-only MTP missed deterministic handoff");
+                    "acceptance-only MTP did not persist after rejection");
+            }
+            controller.observe(1, 0, 10000.0);
+            if (controller.depth() != 1 || controller.should_exit()) {
+                throw std::runtime_error(
+                    "acceptance-only MTP used timing or plain fallback");
             }
             mfq::metal::MlxMtpDepthController profitable(
                 5,

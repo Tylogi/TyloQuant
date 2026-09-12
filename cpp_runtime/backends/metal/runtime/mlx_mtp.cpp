@@ -287,25 +287,12 @@ void MlxMtpDepthController::observe(
     milliseconds_since_explore_ += cycle_ms;
 
     if (policy_ == MlxMtpDepthPolicy::AcceptanceOnly) {
-        // DeepSeek-V4.1's quantized backbone can round differently at each
-        // verifier width. Keep scheduling independent of timing so identical
-        // requests traverse identical numerical shapes even under load.
-        acceptance_only_drafted_ +=
-            static_cast<std::uint64_t>(used_depth);
-        acceptance_only_accepted_ +=
-            static_cast<std::uint64_t>(accepted_drafts);
+        // Match oMLX's DeepSeek DSpark controller exactly: a rejection keeps
+        // one lookahead beyond the accepted prefix, while a fully accepted
+        // block grows by one up to the configured maximum. Timing never
+        // changes the chosen verification shape and MTP never hands the
+        // remainder of the request to plain decode.
         current_depth_ = std::min(maximum_depth_, accepted_drafts + 1);
-        // A deterministic acceptance gate retains the same numerical path
-        // for identical inputs while avoiding a request-long loss on prose
-        // and code. Two cycles give DSpark a useful sample; 60% or less has
-        // not paid for V4.1's target verifier in full-model measurements.
-        const auto minimum_drafts = static_cast<std::uint64_t>(
-            maximum_depth_ + 1);
-        acceptance_only_exit_ =
-            cycles_ >= 2 &&
-            acceptance_only_drafted_ >= minimum_drafts &&
-            acceptance_only_accepted_ * 5 <=
-                acceptance_only_drafted_ * 3;
         return;
     }
 
@@ -389,7 +376,7 @@ void MlxMtpDepthController::observe(
 
 bool MlxMtpDepthController::should_exit() const noexcept {
     if (policy_ == MlxMtpDepthPolicy::AcceptanceOnly) {
-        return acceptance_only_exit_;
+        return false;
     }
     return realized_speculation_losing_ ||
         exit_streak_ >= kDepthExitStreak;

@@ -2996,9 +2996,11 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 std::span<const std::int64_t>(eos),
                 callback,
                 0,
-                config_.is_v41()
-                    ? MlxMtpDepthPolicy::AcceptanceOnly
-                    : MlxMtpDepthPolicy::AdaptiveThroughput,
+                // Keep every DeepSeek-V4 DSpark request on MTP and adapt its
+                // verifier width from acceptance, matching oMLX. Other model
+                // families retain the throughput controller's plain-decode
+                // escape hatch.
+                MlxMtpDepthPolicy::AcceptanceOnly,
             },
             mtp_callbacks,
             last_mtp_stats_);

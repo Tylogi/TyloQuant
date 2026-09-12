@@ -19,9 +19,9 @@ namespace mfq::metal {
 inline constexpr int kMlxMtpEngineMaximumDraftDepth = 5;
 
 // Quantized target models can round differently for different verification
-// row counts.  AdaptiveThroughput is the general policy; AcceptanceOnly keeps
-// the row-count sequence a pure function of accepted tokens so machine load
-// cannot change greedy text.
+// row counts. AdaptiveThroughput is the general policy; AcceptanceOnly mirrors
+// oMLX's DeepSeek DSpark controller: the next width is accepted + 1 and the
+// request remains on the MTP path for its entire lifetime.
 enum class MlxMtpDepthPolicy {
     AdaptiveThroughput,
     AcceptanceOnly,
@@ -212,9 +212,6 @@ private:
     std::uint64_t realized_window_tokens_ = 0;
     double realized_window_ms_ = 0.0;
     bool realized_speculation_losing_ = false;
-    bool acceptance_only_exit_ = false;
-    std::uint64_t acceptance_only_drafted_ = 0;
-    std::uint64_t acceptance_only_accepted_ = 0;
     double milliseconds_since_probe_ = 0.0;
     double milliseconds_since_explore_ = 0.0;
     std::vector<double> acceptance_;
