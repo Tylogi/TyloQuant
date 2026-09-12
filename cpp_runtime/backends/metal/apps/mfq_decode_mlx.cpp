@@ -334,6 +334,15 @@ bool dsv41_prefill_autotune_enabled() noexcept {
         && std::string_view(value) != "off");
 }
 
+bool dsv4_prefill_autotune_enabled() noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_DSV4_PREFILL_AUTOTUNE");
+    return value == nullptr || (
+        std::string_view(value) != "0"
+        && std::string_view(value) != "false"
+        && std::string_view(value) != "off");
+}
+
 std::size_t server_cache_limit_bytes() {
     // MLX otherwise defaults its reusable-buffer cache to the much larger
     // process memory limit. Distinct Prefill shapes can then retain tens of
@@ -1892,22 +1901,36 @@ int run_native_hf_server(const Arguments& arguments) {
             kDeepseekV41AutomaticExpertCacheLimitBytes);
     }
     Arguments effective_arguments = arguments;
+    const bool dsv4_flash_geometry =
+        !config.is_v41()
+        && config.hidden == 4096
+        && config.n_experts == 256
+        && config.moe_inter == 2048;
     if (
-        config.is_v41()
+        (config.is_v41() || dsv4_flash_geometry)
         && config.top_k == 6
         && expert_cache_bytes == 0
         && apple_m3_ultra()
         && arguments.prefill_chunk_size == 2048
-        && dsv41_prefill_autotune_enabled()
+        && (config.is_v41()
+                ? dsv41_prefill_autotune_enabled()
+                : dsv4_prefill_autotune_enabled())
     ) {
-        // V4.1 routes six experts per token. A 5440-token chunk produces
-        // 32640 routed rows, just below MLX 0.32's 32768-row sorted MXFP4
-        // NAX boundary, without entering its slower large-row fallback. The
-        // managed server forwards 2048 as its portable default, so that exact
-        // value is the auto sentinel; any other CLI value remains explicit.
-        effective_arguments.prefill_chunk_size = 5440;
+        // Both models route six experts per token. V4.1 peaks at 5440 tokens,
+        // producing 32640 routed rows just below MLX's 32768-row boundary.
+        // V4 Flash instead uses balanced 4096-token chunks: its smaller expert
+        // geometry regresses on an 8K prompt when the first chunk approaches
+        // that boundary. The managed server forwards 2048 as its portable
+        // default, so that exact value is the auto sentinel; any other CLI
+        // value remains explicit.
+        effective_arguments.prefill_chunk_size = config.is_v41()
+            ? 5440
+            : 4096;
         std::cout
-            << "M3 Ultra DSV4.1 prefill autotune: chunk_size=5440"
+            << "M3 Ultra "
+            << (config.is_v41() ? "DSV4.1" : "DSV4 Flash")
+            << " prefill autotune: chunk_size="
+            << effective_arguments.prefill_chunk_size
             << std::endl;
     }
     std::size_t resident_wired_limit = 0;
