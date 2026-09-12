@@ -2865,14 +2865,32 @@ struct MlxDeepseekV4Attention::Impl {
                     mlx::core::float32));
         }
 
-        auto selected = slice_axis(
-            mlx::core::argpartition(
-                scores,
+        array selected = [&]() -> array {
+            const bool use_deepselect =
+                config.index_topk == 512 &&
+                count == 512 &&
+                dsv41_deepselect_topk_preferred(
+                    pool_len,
+                    batch * tokens);
+            if (use_deepselect) {
+                auto per_row_visible = mlx::core::broadcast_to(
+                    mlx::core::reshape(
+                        visible_counts,
+                        Shape{1, tokens}),
+                    Shape{batch, tokens});
+                return dsv41_deepselect_topk512(
+                    scores,
+                    per_row_visible);
+            }
+            return slice_axis(
+                mlx::core::argpartition(
+                    scores,
+                    pool_len - count,
+                    -1),
+                -1,
                 pool_len - count,
-                -1),
-            -1,
-            pool_len - count,
-            pool_len);
+                pool_len);
+        }();
         selected = mlx::core::sort(
             mlx::core::astype(selected, mlx::core::int32),
             -1);

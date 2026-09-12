@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <limits>
@@ -17,6 +18,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 namespace mfq::metal {
 namespace {
@@ -297,6 +302,16 @@ const Kernel& topk_kernel() {
     return kernel;
 }
 
+const Kernel& v41_deepselect_topk_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_dsv41_deepselect_topk512",
+        {"x", "valid_keys", "topk_params"},
+        {"out"},
+        kV41DeepSelectTopkSource,
+        kV41DeepSelectTopkHeader);
+    return kernel;
+}
+
 const Kernel& prefill_plan_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_dsv4_prefill_plan",
@@ -441,6 +456,53 @@ TemplateArgs decode_compressor_templates(
 }
 
 } // namespace
+
+bool dsv41_deepselect_topk_preferred(int width, int rows) noexcept {
+    // These crossovers include the downstream gather, validation, and sort,
+    // not just selection.  They were measured on an M3 Ultra.  In particular,
+    // keep single-token decode and short prefill on MLX argpartition.
+    const bool favorable_shape =
+        (width >= 16384 && rows >= 64) ||
+        (width >= 8192 && rows >= 128);
+    if (!favorable_shape) {
+        return false;
+    }
+    if (const auto* requested = std::getenv(
+            "MFQ_METAL_DSV41_DEEPSELECT")) {
+        return std::strcmp(requested, "0") != 0 &&
+            std::strcmp(requested, "false") != 0 &&
+            std::strcmp(requested, "off") != 0;
+    }
+#if defined(__APPLE__)
+    static const bool is_m3_ultra = [] {
+        std::size_t size = 0;
+        if (::sysctlbyname(
+                "machdep.cpu.brand_string",
+                nullptr,
+                &size,
+                nullptr,
+                0) != 0 || size <= 1) {
+            return false;
+        }
+        std::string name(size, '\0');
+        if (::sysctlbyname(
+                "machdep.cpu.brand_string",
+                name.data(),
+                &size,
+                nullptr,
+                0) != 0) {
+            return false;
+        }
+        if (!name.empty() && name.back() == '\0') {
+            name.pop_back();
+        }
+        return name == "Apple M3 Ultra";
+    }();
+    return is_m3_ultra;
+#else
+    return false;
+#endif
+}
 
 array dsv4_cache_write_inplace(
     const array& cache,
@@ -1117,6 +1179,52 @@ array dsv4_topk512(
                 static_cast<int>(deterministic),
             },
         },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
+array dsv41_deepselect_topk512(
+    const array& scores,
+    const std::optional<array>& valid_keys) {
+    auto source = typed_contiguous(
+        scores,
+        mlx::core::float32);
+    if (source.ndim() != 3 ||
+        source.shape(0) <= 0 ||
+        source.shape(1) <= 0 ||
+        source.shape(2) < 512) {
+        throw std::invalid_argument(
+            "DSV4.1 DeepSelect top-k expects f32 [B,M,K>=512]");
+    }
+    const int batch = source.shape(0);
+    const int queries = source.shape(1);
+    const int keys = source.shape(2);
+    array counts = valid_keys.has_value()
+        ? typed_contiguous(*valid_keys, mlx::core::int32)
+        : mlx::core::full(
+              Shape{batch, queries},
+              keys,
+              mlx::core::int32);
+    if (counts.shape() != Shape{batch, queries}) {
+        throw std::invalid_argument(
+            "DSV4.1 DeepSelect valid-key counts must be [B,M]");
+    }
+    const int rows = checked_product(
+        {batch, queries},
+        "DeepSelect top-k row count");
+    const int grid = checked_product(
+        {rows, 1024},
+        "DeepSelect top-k grid");
+    const array topk_params({keys}, mlx::core::int32);
+    auto outputs = v41_deepselect_topk_kernel()(
+        {source, counts, topk_params},
+        {Shape{batch, queries, 512}},
+        {mlx::core::int32},
+        {grid, 1, 1},
+        {1024, 1, 1},
+        {},
         std::nullopt,
         false,
         {});

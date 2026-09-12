@@ -37,5 +37,14 @@ Authors, Björn Hoehrmann, and Florian Loitsch.
 License: MIT (`LICENSES/nlohmann-json-MIT.txt`)
 Source: https://github.com/nlohmann/json
 
+DeepSelect
+----------
+The DeepSeek-V4.1 Metal FP32 top-512 kernel is an independent Metal
+adaptation of DeepSelect's moving-threshold candidate-selection algorithm.
+
+Copyright (c) 2025 DeepSeek
+License: MIT (`LICENSES/DeepSelect-MIT.txt`)
+Source: https://github.com/deepseek-ai/DeepSelect
+
 The MIT license notices above must accompany source and binary distributions
 that contain these components or substantial portions of them.
