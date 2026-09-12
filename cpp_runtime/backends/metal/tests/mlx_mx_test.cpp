@@ -932,6 +932,72 @@ void test_grouped_row_mxfp8_prefill() {
     }
 }
 
+void test_grouped_row_block32_mxfp8_batched_qmm() {
+    using namespace mlx::core;
+    constexpr int groups = 2;
+    constexpr int outputs_per_group = 32;
+    constexpr int inputs = 128;
+    constexpr int tokens = 17;
+    const auto weight = make_patterned_block32_mxfp8_weight(
+        groups * outputs_per_group,
+        inputs,
+        41);
+    std::vector<float> values(
+        static_cast<std::size_t>(tokens) * groups * inputs);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        values[index] = static_cast<float>(
+            static_cast<int>((index * 13 + 7) % 47) - 23) / 96.0f;
+    }
+    auto packed = reshape(
+        view(weight.packed_values(), uint32),
+        Shape{groups * outputs_per_group, inputs / 4});
+    auto expanded_scales = repeat(weight.block_scales(), 32, 0);
+    for (const auto dtype : {float16, float32}) {
+        auto input = astype(
+            array(values.begin(), Shape{1, tokens, groups, inputs}),
+            dtype);
+        auto actual = contiguous(
+            weight.grouped_row_matmul(input, groups));
+        std::vector<array> pieces;
+        pieces.reserve(groups);
+        for (int group = 0; group < groups; ++group) {
+            pieces.push_back(quantized_matmul(
+                take(input, group, input.ndim() - 2),
+                slice(
+                    packed,
+                    Shape{group * outputs_per_group, 0},
+                    Shape{
+                        (group + 1) * outputs_per_group,
+                        inputs / 4,
+                    }),
+                slice(
+                    expanded_scales,
+                    Shape{group * outputs_per_group, 0},
+                    Shape{
+                        (group + 1) * outputs_per_group,
+                        inputs / 32,
+                    }),
+                std::nullopt,
+                true,
+                32,
+                8,
+                "mxfp8"));
+        }
+        auto reference = contiguous(
+            stack(pieces, input.ndim() - 2));
+        eval(actual, reference);
+        require(
+            actual.shape() == reference.shape(),
+            "block32 MXFP8 batched grouped-row shape mismatch");
+        require(
+            std::memcmp(
+                actual.data<std::uint8_t>(),
+                reference.data<std::uint8_t>(),
+                actual.nbytes()) == 0,
+            "block32 MXFP8 batched grouped-row differs from serial QMM");
+    }
+}
+
 void test_grouped_row_mxfp8_verify() {
     using namespace mlx::core;
     constexpr int groups = 2;
@@ -1092,6 +1158,7 @@ int main() {
         test_grouped_block32_mxfp8_inverse_rope_matches_native_qmv();
         benchmark_v41_block32_mxfp8_inverse_rope();
         test_grouped_row_mxfp8_prefill();
+        test_grouped_row_block32_mxfp8_batched_qmm();
         test_grouped_row_mxfp8_verify();
         test_grouped_mxfp8_small_m_matches_decode();
         std::cout << "MFQ MXFP4/MXFP8 Metal GEMV/MMQ/GEMM/grouped/embedding passed\n";

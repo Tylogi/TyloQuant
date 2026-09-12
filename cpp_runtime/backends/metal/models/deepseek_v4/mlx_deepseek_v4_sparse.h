@@ -121,6 +121,20 @@ mlx::core::array dsv4_topk512(
     bool deterministic = true,
     int valid_keys = -1);
 
+// Exact FP32 top-512 used by the V4.1 indexer.  This is a Metal adaptation of
+// DeepSelect's moving-threshold candidate filtering: full scores are read
+// once, while repeated radix selection stays in a bounded threadgroup arena.
+// valid_keys optionally supplies the visible prefix length for each [B,M]
+// row, avoiding masked-tail work during causal prefill.
+mlx::core::array dsv41_deepselect_topk512(
+    const mlx::core::array& scores,
+    const std::optional<mlx::core::array>& valid_keys = std::nullopt);
+
+// Whether the measured device/shape crossover favors DeepSelect over MLX's
+// generic argpartition.  An explicit MFQ_METAL_DSV41_DEEPSELECT setting
+// overrides device detection; the shape crossover remains enforced.
+bool dsv41_deepselect_topk_preferred(int width, int rows) noexcept;
+
 // Build circular-local plus pooled sparse-attention plans.  The pair contains
 // int32 cache indices followed by a float16 additive mask.
 std::pair<mlx::core::array, mlx::core::array>

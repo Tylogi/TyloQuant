@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -748,6 +749,65 @@ void test_yarn_rope_and_rms() {
         "scaled Yarn table shape mismatch");
 }
 
+void test_v41_fused_kv_prepare_parity() {
+    constexpr int tokens = 3;
+    constexpr int dimension = 512;
+    constexpr int rotary = 64;
+    std::vector<float> values(tokens * dimension);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        values[index] =
+            std::sin(static_cast<float>(index) * 0.071f) *
+            (0.25f + static_cast<float>(index % 37u) * 0.19f);
+    }
+    const auto tables = mfq::metal::deepseek_v4_yarn_tables(
+        rotary,
+        tokens,
+        10'000.0f);
+    std::vector<float> weight_values(dimension);
+    for (int column = 0; column < dimension; ++column) {
+        weight_values[column] =
+            0.75f + static_cast<float>(column % 29) * 0.013f;
+    }
+    const auto weights = float_array(
+        weight_values,
+        Shape{dimension});
+
+    for (const auto dtype :
+         {mlx::core::float16, mlx::core::bfloat16}) {
+        auto input = mlx::core::astype(
+            float_array(values, Shape{1, tokens, dimension}),
+            dtype);
+        setenv(
+            "MFQ_METAL_DSV41_FUSED_KV_PREP",
+            "0",
+            1);
+        auto reference_kv = mfq::metal::deepseek_v41_fused_kv_prepare(
+            input,
+            weights,
+            1.0e-6f,
+            rotary,
+            tables.first,
+            tables.second);
+        setenv(
+            "MFQ_METAL_DSV41_FUSED_KV_PREP",
+            "1",
+            1);
+        auto fused_kv = mfq::metal::deepseek_v41_fused_kv_prepare(
+            input,
+            weights,
+            1.0e-6f,
+            rotary,
+            tables.first,
+            tables.second);
+        require_close(
+            evaluated_float(fused_kv),
+            evaluated_float(reference_kv),
+            0.0f,
+            "V4.1 fused KV preparation parity");
+    }
+    unsetenv("MFQ_METAL_DSV41_FUSED_KV_PREP");
+}
+
 void test_pool_and_ratio_schedule() {
     const auto config = test_config();
     auto zero = MlxDeepseekV4LayerState::allocate(
@@ -1368,6 +1428,7 @@ int main() {
     try {
         test_image_visibility_starts_at_image_start();
         test_yarn_rope_and_rms();
+        test_v41_fused_kv_prepare_parity();
         test_pool_and_ratio_schedule();
         test_v41_pool_logical_reset();
         test_local_attention_cpu_reference();

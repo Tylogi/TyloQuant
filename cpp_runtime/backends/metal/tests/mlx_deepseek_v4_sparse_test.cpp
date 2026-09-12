@@ -3,8 +3,10 @@
 #include "mlx_detached_copy.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -954,6 +956,263 @@ void test_topk() {
             short_result[index] == expected,
             "short top-k padding mismatch");
     }
+
+    constexpr int v41_keys = 8192;
+    std::vector<float> v41_values(v41_keys);
+    for (int index = 0; index < v41_keys; ++index) {
+        const std::uint32_t mixed =
+            std::uint32_t(index) * 747796405u + 2891336453u;
+        v41_values[index] = static_cast<float>(mixed & 0xffffu) /
+            65536.0f + static_cast<float>(index) * 1.0e-8f;
+    }
+    auto v41_selected = evaluated_int(
+        mfq::metal::dsv41_deepselect_topk512(
+            float_array(v41_values, Shape{1, 1, v41_keys})));
+    std::sort(v41_selected.begin(), v41_selected.end());
+    auto reference = std::vector<int>(v41_keys);
+    for (int index = 0; index < v41_keys; ++index) {
+        reference[index] = index;
+    }
+    std::partial_sort(
+        reference.begin(),
+        reference.begin() + 512,
+        reference.end(),
+        [&](int left, int right) {
+            return v41_values[left] > v41_values[right];
+        });
+    reference.resize(512);
+    std::sort(reference.begin(), reference.end());
+    require(
+        v41_selected == reference,
+        "V4.1 DeepSelect top-k membership mismatch");
+
+    const auto valid_counts = int_array({700}, Shape{1, 1});
+    auto prefix_selected = evaluated_int(
+        mfq::metal::dsv41_deepselect_topk512(
+            float_array(v41_values, Shape{1, 1, v41_keys}),
+            valid_counts));
+    std::sort(prefix_selected.begin(), prefix_selected.end());
+    reference.resize(700);
+    for (int index = 0; index < 700; ++index) {
+        reference[index] = index;
+    }
+    std::partial_sort(
+        reference.begin(),
+        reference.begin() + 512,
+        reference.end(),
+        [&](int left, int right) {
+            return v41_values[left] > v41_values[right];
+        });
+    reference.resize(512);
+    std::sort(reference.begin(), reference.end());
+    require(
+        prefix_selected == reference,
+        "V4.1 DeepSelect visible-prefix mismatch");
+
+    const auto short_prefix = evaluated_int(
+        mfq::metal::dsv41_deepselect_topk512(
+            float_array(v41_values, Shape{1, 1, v41_keys}),
+            int_array({7}, Shape{1, 1})));
+    for (int index = 0; index < 512; ++index) {
+        require(
+            short_prefix[index] == (index < 7 ? index : 7),
+            "V4.1 DeepSelect short-prefix sentinel mismatch");
+    }
+
+    constexpr int batched_rows = 6;
+    constexpr int batched_keys = 16384;
+    const std::vector<std::int32_t> batched_valid{
+        0, 7, 511, 512, 513, batched_keys,
+    };
+    std::vector<float> batched_values(
+        static_cast<std::size_t>(batched_rows) * batched_keys);
+    for (int row = 0; row < batched_rows; ++row) {
+        for (int key = 0; key < batched_keys; ++key) {
+            batched_values[static_cast<std::size_t>(row) * batched_keys + key] =
+                static_cast<float>(key) - 8192.0f +
+                static_cast<float>(row) / 16.0f;
+        }
+    }
+    const auto batched_selected = evaluated_int(
+        mfq::metal::dsv41_deepselect_topk512(
+            float_array(
+                batched_values,
+                Shape{2, 3, batched_keys}),
+            int_array(batched_valid, Shape{2, 3})));
+    for (int row = 0; row < batched_rows; ++row) {
+        std::vector<int> selected(
+            batched_selected.begin() + row * 512,
+            batched_selected.begin() + (row + 1) * 512);
+        std::sort(selected.begin(), selected.end());
+        if (batched_valid[row] <= 512) {
+            for (int index = 0; index < 512; ++index) {
+                require(
+                    selected[index] ==
+                        (index < batched_valid[row]
+                             ? index
+                             : batched_valid[row]),
+                    "V4.1 DeepSelect batched short row mismatch");
+            }
+        } else {
+            for (int index = 0; index < 512; ++index) {
+                require(
+                    selected[index] == batched_valid[row] - 512 + index,
+                    "V4.1 DeepSelect batched long row mismatch");
+            }
+        }
+    }
+
+    auto tied_v41 = evaluated_int(
+        mfq::metal::dsv41_deepselect_topk512(
+            float_array(
+                std::vector<float>(batched_keys, 1.0f),
+                Shape{1, 1, batched_keys})));
+    std::sort(tied_v41.begin(), tied_v41.end());
+    require(
+        std::adjacent_find(tied_v41.begin(), tied_v41.end()) ==
+            tied_v41.end(),
+        "V4.1 DeepSelect returned duplicate tied indices");
+    require(
+        tied_v41.front() >= 0 && tied_v41.back() < batched_keys,
+        "V4.1 DeepSelect tied index escaped the score row");
+}
+
+void benchmark_v41_deepselect_topk() {
+    struct Case {
+        int rows;
+        int keys;
+        bool causal_prefix;
+        int repetitions;
+    };
+    const std::vector<Case> cases{
+        {1, 1024, false, 80},
+        {1, 4096, false, 80},
+        {1, 16384, false, 60},
+        {1, 65536, false, 40},
+        {1, 131072, false, 30},
+        {32, 4096, true, 20},
+        {64, 8192, true, 10},
+        {128, 8192, true, 6},
+        {32, 16384, true, 12},
+        {64, 16384, true, 8},
+        {96, 16384, true, 6},
+        {128, 16384, true, 5},
+        {256, 2048, false, 5},
+        {512, 2048, false, 3},
+        {2031, 2048, false, 1},
+        {512, 4096, false, 3},
+        {2031, 4096, false, 1},
+        {512, 8192, false, 3},
+        {2031, 8192, false, 1},
+        {64, 16384, false, 8},
+        {128, 16384, false, 5},
+        {512, 16384, false, 2},
+        {2031, 16384, false, 1},
+    };
+    const auto median = [](std::vector<double> values) {
+        std::sort(values.begin(), values.end());
+        return values[values.size() / 2];
+    };
+    std::cout
+        << "dsv41_topk_pipeline_benchmark rows keys prefix "
+           "argpartition_us deepselect_us speedup\n";
+    for (const auto& benchmark : cases) {
+        std::vector<float> values(
+            static_cast<std::size_t>(benchmark.rows) * benchmark.keys);
+        std::vector<std::int32_t> valid(
+            static_cast<std::size_t>(benchmark.rows),
+            benchmark.keys);
+        for (int row = 0; row < benchmark.rows; ++row) {
+            if (benchmark.causal_prefix) {
+                valid[row] = 513 + static_cast<int>(
+                    static_cast<std::int64_t>(row + 1) *
+                    (benchmark.keys - 513) / benchmark.rows);
+            }
+            for (int key = 0; key < benchmark.keys; ++key) {
+                std::uint32_t mixed =
+                    std::uint32_t(row * benchmark.keys + key) *
+                        747796405u +
+                    2891336453u;
+                mixed ^= mixed >> 16u;
+                values[static_cast<std::size_t>(row) * benchmark.keys + key] =
+                    key < valid[row]
+                    ? static_cast<float>(mixed & 0x00ffffffu) /
+                          16777216.0f
+                    : -std::numeric_limits<float>::infinity();
+            }
+        }
+        const auto scores = float_array(
+            values,
+            Shape{1, benchmark.rows, benchmark.keys});
+        const auto valid_counts = int_array(
+            valid,
+            Shape{1, benchmark.rows});
+        const auto operation = [&](bool deepselect) {
+            array relative = mlx::core::zeros(
+                Shape{1, benchmark.rows, 512},
+                mlx::core::int32);
+            if (deepselect) {
+                relative = mfq::metal::dsv41_deepselect_topk512(
+                    scores,
+                    valid_counts);
+            } else {
+                auto partition = mlx::core::argpartition(
+                    scores,
+                    benchmark.keys - 512,
+                    -1);
+                relative = mlx::core::slice(
+                    partition,
+                    Shape{0, 0, benchmark.keys - 512},
+                    Shape{1, benchmark.rows, benchmark.keys});
+            }
+            auto selected_values = mlx::core::take_along_axis(
+                scores,
+                relative,
+                -1);
+            auto selected = mlx::core::where(
+                mlx::core::greater(
+                    selected_values,
+                    array(-std::numeric_limits<float>::infinity())),
+                relative,
+                array(benchmark.keys, mlx::core::int32));
+            return mlx::core::sort(selected, -1);
+        };
+        for (int warmup = 0; warmup < 5; ++warmup) {
+            operation(false).eval();
+            operation(true).eval();
+        }
+        const auto measure = [&](bool deepselect) {
+            const auto started = std::chrono::steady_clock::now();
+            for (int repetition = 0;
+                 repetition < benchmark.repetitions;
+                 ++repetition) {
+                operation(deepselect).eval();
+            }
+            return std::chrono::duration<double, std::micro>(
+                       std::chrono::steady_clock::now() - started).count() /
+                benchmark.repetitions;
+        };
+        std::vector<double> baseline_samples;
+        std::vector<double> deepselect_samples;
+        for (int round = 0; round < 7; ++round) {
+            if ((round & 1) == 0) {
+                baseline_samples.push_back(measure(false));
+                deepselect_samples.push_back(measure(true));
+            } else {
+                deepselect_samples.push_back(measure(true));
+                baseline_samples.push_back(measure(false));
+            }
+        }
+        const double baseline = median(baseline_samples);
+        const double deepselect = median(deepselect_samples);
+        std::cout
+            << benchmark.rows << ' '
+            << benchmark.keys << ' '
+            << int(benchmark.causal_prefix) << ' '
+            << baseline << ' '
+            << deepselect << ' '
+            << baseline / deepselect << '\n';
+    }
 }
 
 void test_sparse_plans() {
@@ -1613,6 +1872,9 @@ int main() {
         test_direct_decode_attention_path();
         test_short_prefill_plan_matches_circular_decode();
         test_invalid_inputs();
+        if (std::getenv("MFQ_DSV41_TOPK_BENCH") != nullptr) {
+            benchmark_v41_deepselect_topk();
+        }
         std::cout
             << "MFQ C++ DeepSeek-V4 sparse Metal tests passed\n";
         return 0;

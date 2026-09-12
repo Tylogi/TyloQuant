@@ -1336,43 +1336,98 @@ array MlxMxWeight::grouped_row_matmul(
             mlx::core::float16);
     }
     const int output_per_group = output_size_ / group_count;
-    if (mxfp8_scale_block_size_ == 32) {
-        // DeepSeek-V4.1 stores independent 32x32 MXFP8 blocks. The fused
-        // grouped kernels below assume the legacy 128x128 sidecar layout,
-        // so use MLX's native MXFP8 matmul once per O-LoRA group here.
-        auto packed = mlx::core::reshape(
-            mlx::core::view(values_, mlx::core::uint32),
-            Shape{output_size_, input_size_ / 4});
-        std::vector<array> pieces;
-        pieces.reserve(static_cast<std::size_t>(group_count));
-        for (int group = 0; group < group_count; ++group) {
-            auto group_input = mlx::core::take(
-                source,
-                group,
-                source.ndim() - 2);
-            auto group_weight = mlx::core::slice(
-                packed,
-                Shape{group * output_per_group, 0},
-                Shape{(group + 1) * output_per_group, input_size_ / 4});
-            auto group_scales = mlx::core::slice(
-                *expanded_mxfp8_scales_,
-                Shape{group * output_per_group, 0},
-                Shape{(group + 1) * output_per_group, input_size_ / 32});
-            pieces.push_back(mlx::core::quantized_matmul(
-                std::move(group_input),
-                std::move(group_weight),
-                std::move(group_scales),
-                std::nullopt,
-                true,
-                32,
-                8,
-                "mxfp8"));
-        }
-        return mlx::core::stack(pieces, input.ndim() - 2);
-    }
     std::size_t rows = 1;
     for (std::size_t axis = 0; axis + 2 < source.ndim(); ++axis) {
         rows *= static_cast<std::size_t>(source.shape(axis));
+    }
+    if (mxfp8_scale_block_size_ == 32) {
+        const char* grouped_layout = std::getenv(
+            "MFQ_METAL_MXFP8_GROUPED_PREFILL_LAYOUT");
+        if (grouped_layout != nullptr &&
+            std::string_view(grouped_layout) == "serial") {
+            auto packed = mlx::core::reshape(
+                mlx::core::view(values_, mlx::core::uint32),
+                Shape{output_size_, input_size_ / 4});
+            std::vector<array> pieces;
+            pieces.reserve(static_cast<std::size_t>(group_count));
+            for (int group = 0; group < group_count; ++group) {
+                pieces.push_back(mlx::core::quantized_matmul(
+                    mlx::core::take(
+                        source,
+                        group,
+                        source.ndim() - 2),
+                    mlx::core::slice(
+                        packed,
+                        Shape{group * output_per_group, 0},
+                        Shape{
+                            (group + 1) * output_per_group,
+                            input_size_ / 4,
+                        }),
+                    mlx::core::slice(
+                        *expanded_mxfp8_scales_,
+                        Shape{group * output_per_group, 0},
+                        Shape{
+                            (group + 1) * output_per_group,
+                            input_size_ / 32,
+                        }),
+                    std::nullopt,
+                    true,
+                    32,
+                    8,
+                    "mxfp8"));
+            }
+            return mlx::core::stack(
+                pieces,
+                input.ndim() - 2);
+        }
+        // DeepSeek-V4.1 stores independent 32x32 MXFP8 blocks. Present its
+        // O-LoRA groups as one batched native QMM so MLX can schedule the
+        // complete projection in a single graph node instead of launching
+        // and stacking one quantized matmul per group.
+        auto packed = mlx::core::reshape(
+            mlx::core::view(values_, mlx::core::uint32),
+            Shape{
+                group_count,
+                output_per_group,
+                input_size_ / 4,
+            });
+        auto scales = mlx::core::reshape(
+            *expanded_mxfp8_scales_,
+            Shape{
+                group_count,
+                output_per_group,
+                input_size_ / 32,
+            });
+        auto grouped_source = mlx::core::contiguous(
+            mlx::core::transpose(
+                mlx::core::reshape(
+                    source,
+                    Shape{
+                        checked_dimension(rows, "grouped MXFP8 row count"),
+                        group_count,
+                        input_size_,
+                    }),
+                {1, 0, 2}));
+        auto grouped_output = mlx::core::quantized_matmul(
+            std::move(grouped_source),
+            std::move(packed),
+            std::move(scales),
+            std::nullopt,
+            true,
+            32,
+            8,
+            "mxfp8");
+        auto row_major = mlx::core::transpose(
+            std::move(grouped_output),
+            {1, 0, 2});
+        Shape output_shape(
+            input.shape().begin(),
+            input.shape().end() - 2);
+        output_shape.push_back(group_count);
+        output_shape.push_back(output_per_group);
+        return mlx::core::reshape(
+            std::move(row_major),
+            std::move(output_shape));
     }
     const auto* layout = std::getenv(
         "MFQ_METAL_MXFP8_GROUPED_SMALL_M_LAYOUT");

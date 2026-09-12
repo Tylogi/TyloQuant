@@ -204,14 +204,35 @@ array topk_from_scores(
     const array& scores,
     int requested,
     int pool_length,
-    const std::optional<array>& source_indices = std::nullopt) {
+    const std::optional<array>& source_indices = std::nullopt,
+    const std::optional<array>& valid_counts = std::nullopt) {
     const int width = scores.shape(-1);
     const int count = std::min(requested, width);
     if (count <= 0) {
         return empty_topk(scores.shape(0), scores.shape(1));
     }
-    auto partition = mlx::core::argpartition(scores, width - count, -1);
-    auto relative = slice_axis(partition, -1, width - count, width);
+    array relative = [&]() -> array {
+        if (count == width) {
+            return mlx::core::broadcast_to(
+                mlx::core::reshape(
+                    positions(0, width),
+                    Shape{1, 1, width}),
+                scores.shape());
+        }
+        const bool use_deepselect =
+            requested == 512 &&
+            count == 512 &&
+            dsv41_deepselect_topk_preferred(
+                width,
+                scores.shape(0) * scores.shape(1));
+        return use_deepselect
+            ? dsv41_deepselect_topk512(scores, valid_counts)
+            : slice_axis(
+                  mlx::core::argpartition(scores, width - count, -1),
+                  -1,
+                  width - count,
+                  width);
+    }();
     auto values = mlx::core::take_along_axis(scores, relative, -1);
     auto selected = source_indices
         ? mlx::core::take_along_axis(*source_indices, relative, -1)
@@ -287,8 +308,18 @@ array candidate_blocks_from_scores(
         array(std::numeric_limits<float>::infinity(), block_scores.dtype()),
         block_scores);
     const int count = std::min(requested_blocks, blocks);
-    auto partition = mlx::core::argpartition(block_scores, blocks - count, -1);
-    auto selected = slice_axis(partition, -1, blocks - count, blocks);
+    auto selected = count == blocks
+        ? mlx::core::broadcast_to(
+              block_ids,
+              Shape{batch, tokens, blocks})
+        : slice_axis(
+              mlx::core::argpartition(
+                  block_scores,
+                  blocks - count,
+                  -1),
+              -1,
+              blocks - count,
+              blocks);
     auto values = mlx::core::take_along_axis(block_scores, selected, -1);
     return mlx::core::where(
         mlx::core::greater(
@@ -1100,10 +1131,25 @@ array MlxDeepseekV41Attention::forward(
                         pool_length,
                         candidates);
                 } else {
+                    std::optional<array> valid_counts;
+                    if (dsv41_deepselect_topk_preferred(
+                            pool_length,
+                            batch * tokens)) {
+                        valid_counts = mlx::core::broadcast_to(
+                            mlx::core::reshape(
+                                mlx::core::floor_divide(
+                                    positions(pos0, pos0 + tokens) +
+                                        array(1, mlx::core::int32),
+                                    array(ratio_, mlx::core::int32)),
+                                Shape{1, tokens}),
+                            Shape{batch, tokens});
+                    }
                     topk = topk_from_scores(
                         scores,
                         checked_int(config_.index_topk, "index top-k"),
-                        pool_length);
+                        pool_length,
+                        std::nullopt,
+                        valid_counts);
                 }
             }
             shared.topk = topk;

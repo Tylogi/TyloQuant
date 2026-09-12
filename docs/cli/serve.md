@@ -219,7 +219,13 @@ uv run mfq serve \
 
 - `--context-size 0` leaves context sizing to the native runtime.
 - `--prefill-chunk-size` is forwarded to the Metal worker; the CUDA worker does
-  not receive this option.
+  not receive this option. The portable `2048` value is automatically tuned
+  to `5440` for a fully resident raw-HF DeepSeek V4.1 checkpoint on M3 Ultra;
+  set `MFQ_METAL_DSV41_PREFILL_AUTOTUNE=0` to retain `2048` exactly, or pass
+  any other chunk size as an explicit override.
+- M3 Ultra also fuses the released V4.1 window-KV RMSNorm, partial RoPE, and
+  activation fake-quant operations. Set `MFQ_METAL_DSV41_FUSED_KV_PREP=0`
+  only when comparing against the portable MLX composition.
 - `--runtime-startup-timeout` covers native worker startup and model loading.
 
 ## Command options
@@ -231,7 +237,7 @@ uv run mfq serve \
 | `--host HOST` | Public API bind address. | `127.0.0.1` |
 | `--port PORT` | Public API port, from 1 to 65535. | `8090` |
 | `--context-size N` | Native context size; `0` keeps the runtime default. | `0` |
-| `--prefill-chunk-size N` | Metal prefill chunk size. | `2048` |
+| `--prefill-chunk-size N` | Metal prefill chunk size; exact resident M3 Ultra DSV4.1 geometry auto-tunes the portable value. | `2048` |
 | `--runtime-startup-timeout SECONDS` | Time allowed for native startup. | `1800` |
 | `--db PATH` | SQLite server database. | `./mfq-server.sqlite3` |
 | `--web-root PATH` | Prebuilt Web UI directory. | Auto-detect |

@@ -1070,6 +1070,307 @@ constexpr const char* kTopkSource = R"MFQ_METAL(
     }
 )MFQ_METAL";
 
+// DeepSelect-inspired exact top-512 for the FP32 DeepSeek-V4.1 indexer.
+//
+// The CUDA DeepSelect implementation keeps a moving threshold and only
+// re-selects a compact candidate set.  Metal has no portable equivalent of
+// CUDA thread-block clusters, so each score row is owned by one threadgroup:
+// blocks are visited through a coprime permutation, scores above the current
+// threshold are compacted, and an exact radix selection raises the threshold
+// whenever the bounded candidate arena fills.  Every score is read once from
+// device memory; all repeated selection work stays in threadgroup memory.
+constexpr const char* kV41DeepSelectTopkHeader = R"MFQ_METAL(
+    #define MFQ_DSV41_TOPK 512u
+    #define MFQ_DSV41_THREADS 1024u
+    #define MFQ_DSV41_SIMD_GROUPS 32u
+    #define MFQ_DSV41_CANDIDATES 3840u
+
+    METAL_FUNC uint mfq_dsv41_ordered_float(float value) {
+        value = isnan(value) ? -INFINITY : value;
+        uint bits = as_type<uint>(value);
+        return (bits & 0x80000000u) != 0u
+            ? ~bits
+            : (bits ^ 0x80000000u);
+    }
+
+    METAL_FUNC uint mfq_dsv41_gcd(uint left, uint right) {
+        while (right != 0u) {
+            uint remainder = left % right;
+            left = right;
+            right = remainder;
+        }
+        return left;
+    }
+
+    METAL_FUNC void mfq_dsv41_compact_topk(
+        threadgroup uint* candidate_keys,
+        threadgroup uint* candidate_indices,
+        threadgroup atomic_uint* histogram,
+        threadgroup uint* greater_partials,
+        threadgroup uint* tie_partials,
+        threadgroup uint* state,
+        uint tid,
+        uint simd_group,
+        uint lane) {
+        const uint candidate_count = state[0];
+        if (tid == 0u) {
+            state[2] = 0u;
+            state[3] = MFQ_DSV41_TOPK;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Resolve the exact FP32 threshold one byte at a time.  The arena is
+        // at most 3.75K entries, so these scans hit threadgroup memory rather
+        // than rereading the full score row.
+        for (uint pass = 0u; pass < 4u; ++pass) {
+            if (tid < 256u) {
+                atomic_store_explicit(
+                    &histogram[tid], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint shift = 24u - pass * 8u;
+            const uint prefix = state[2];
+            for (uint slot = tid;
+                 slot < candidate_count;
+                 slot += MFQ_DSV41_THREADS) {
+                const uint key = candidate_keys[slot];
+                const bool prefix_match = pass == 0u
+                    ? true
+                    : (key >> (shift + 8u)) == prefix;
+                if (prefix_match) {
+                    atomic_fetch_add_explicit(
+                        &histogram[(key >> shift) & 0xffu],
+                        1u,
+                        memory_order_relaxed);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+                uint rank = state[3];
+                uint selected = 0u;
+                for (int bucket = 255; bucket >= 0; --bucket) {
+                    const uint count = atomic_load_explicit(
+                        &histogram[uint(bucket)],
+                        memory_order_relaxed);
+                    if (rank <= count) {
+                        selected = uint(bucket);
+                        break;
+                    }
+                    rank -= count;
+                }
+                state[2] = (state[2] << 8u) | selected;
+                state[3] = rank;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const uint threshold = state[2];
+        const uint ties_needed = state[3];
+        uint local_keys[4];
+        uint local_indices[4];
+        bool local_greater_flags[4];
+        bool local_tie_flags[4];
+        uint local_greater = 0u;
+        uint local_ties = 0u;
+        for (uint item = 0u; item < 4u; ++item) {
+            const uint slot = tid + item * MFQ_DSV41_THREADS;
+            const bool active = slot < candidate_count;
+            const uint key = active ? candidate_keys[slot] : 0u;
+            local_keys[item] = key;
+            local_indices[item] = active ? candidate_indices[slot] : 0u;
+            local_greater_flags[item] = active && key > threshold;
+            local_tie_flags[item] = active && key == threshold;
+            local_greater += uint(local_greater_flags[item]);
+            local_ties += uint(local_tie_flags[item]);
+        }
+
+        const uint prefix_greater =
+            metal::simd_prefix_exclusive_sum(local_greater);
+        const uint prefix_ties =
+            metal::simd_prefix_exclusive_sum(local_ties);
+        if (lane == 31u) {
+            greater_partials[simd_group] =
+                prefix_greater + local_greater;
+            tie_partials[simd_group] = prefix_ties + local_ties;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0u) {
+            const uint group_greater = lane < MFQ_DSV41_SIMD_GROUPS
+                ? greater_partials[lane]
+                : 0u;
+            const uint group_ties = lane < MFQ_DSV41_SIMD_GROUPS
+                ? tie_partials[lane]
+                : 0u;
+            const uint group_greater_prefix =
+                metal::simd_prefix_exclusive_sum(group_greater);
+            const uint group_tie_prefix =
+                metal::simd_prefix_exclusive_sum(group_ties);
+            if (lane < MFQ_DSV41_SIMD_GROUPS) {
+                greater_partials[lane] = group_greater_prefix;
+                tie_partials[lane] = group_tie_prefix;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint greater_position =
+            greater_partials[simd_group] + prefix_greater;
+        uint tie_position = tie_partials[simd_group] + prefix_ties;
+        const uint greater_count = MFQ_DSV41_TOPK - ties_needed;
+        for (uint item = 0u; item < 4u; ++item) {
+            if (local_greater_flags[item]) {
+                candidate_keys[greater_position] = local_keys[item];
+                candidate_indices[greater_position] = local_indices[item];
+                ++greater_position;
+            } else if (
+                local_tie_flags[item] && tie_position < ties_needed) {
+                const uint output_position = greater_count + tie_position;
+                candidate_keys[output_position] = local_keys[item];
+                candidate_indices[output_position] = local_indices[item];
+                ++tie_position;
+            } else if (local_tie_flags[item]) {
+                ++tie_position;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            state[0] = MFQ_DSV41_TOPK;
+            state[1] = threshold;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+)MFQ_METAL";
+
+constexpr const char* kV41DeepSelectTopkSource = R"MFQ_METAL(
+    const uint row = threadgroup_position_in_grid.x;
+    const uint tid = thread_index_in_threadgroup;
+    const uint simd_group = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint width = uint(topk_params[0]);
+    const uint input_base = row * width;
+    const uint output_base = row * MFQ_DSV41_TOPK;
+    const uint active = min(
+        uint(max(valid_keys[row], 0)),
+        width);
+    if (active <= MFQ_DSV41_TOPK) {
+        for (uint index = tid;
+             index < MFQ_DSV41_TOPK;
+             index += MFQ_DSV41_THREADS) {
+            out[output_base + index] =
+                index < active ? int(index) : int(active);
+        }
+        return;
+    }
+
+    threadgroup uint candidate_keys[MFQ_DSV41_CANDIDATES];
+    threadgroup uint candidate_indices[MFQ_DSV41_CANDIDATES];
+    threadgroup atomic_uint histogram[256];
+    threadgroup uint group_counts[MFQ_DSV41_SIMD_GROUPS];
+    threadgroup uint greater_partials[MFQ_DSV41_SIMD_GROUPS];
+    threadgroup uint tie_partials[MFQ_DSV41_SIMD_GROUPS];
+    // candidate count, ordered threshold, radix prefix/rank, append base and
+    // total, block stride/start.
+    threadgroup uint state[8];
+    if (tid == 0u) {
+        state[0] = 0u;
+        state[1] = 0u;
+        const uint blocks =
+            (active + MFQ_DSV41_THREADS - 1u) / MFQ_DSV41_THREADS;
+        uint stride = blocks == 1u
+            ? 1u
+            : 1u + (0x9e3779b9u % (blocks - 1u));
+        while (mfq_dsv41_gcd(stride, blocks) != 1u) {
+            ++stride;
+            if (stride >= blocks) {
+                stride = 1u;
+            }
+        }
+        state[6] = stride;
+        state[7] = (row * 0x85ebca6bu) % blocks;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint blocks =
+        (active + MFQ_DSV41_THREADS - 1u) / MFQ_DSV41_THREADS;
+    for (uint iteration = 0u; iteration < blocks; ++iteration) {
+        if (state[0] >
+            MFQ_DSV41_CANDIDATES - MFQ_DSV41_THREADS) {
+            mfq_dsv41_compact_topk(
+                candidate_keys,
+                candidate_indices,
+                histogram,
+                greater_partials,
+                tie_partials,
+                state,
+                tid,
+                simd_group,
+                lane);
+        }
+
+        const uint block = state[7];
+        const uint index = block * MFQ_DSV41_THREADS + tid;
+        const bool in_range = index < active;
+        const uint key = in_range
+            ? mfq_dsv41_ordered_float(x[input_base + index])
+            : 0u;
+        const bool accepted = in_range && key > state[1];
+        const uint lane_prefix = metal::simd_prefix_exclusive_sum(
+            uint(accepted));
+        if (lane == 31u) {
+            group_counts[simd_group] =
+                lane_prefix + uint(accepted);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0u) {
+            const uint count = lane < MFQ_DSV41_SIMD_GROUPS
+                ? group_counts[lane]
+                : 0u;
+            const uint offset = metal::simd_prefix_exclusive_sum(count);
+            if (lane < MFQ_DSV41_SIMD_GROUPS) {
+                group_counts[lane] = offset;
+            }
+            if (lane == MFQ_DSV41_SIMD_GROUPS - 1u) {
+                state[4] = state[0];
+                state[5] = offset + count;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (accepted) {
+            const uint slot = state[4]
+                + group_counts[simd_group]
+                + lane_prefix;
+            candidate_keys[slot] = key;
+            candidate_indices[slot] = index;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            state[0] = state[4] + state[5];
+            const uint next_block = state[7] + state[6];
+            state[7] = next_block >= blocks
+                ? next_block - blocks
+                : next_block;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (state[0] > MFQ_DSV41_TOPK) {
+        mfq_dsv41_compact_topk(
+            candidate_keys,
+            candidate_indices,
+            histogram,
+            greater_partials,
+            tie_partials,
+            state,
+            tid,
+            simd_group,
+            lane);
+    }
+    for (uint position = tid;
+         position < MFQ_DSV41_TOPK;
+         position += MFQ_DSV41_THREADS) {
+        out[output_base + position] = int(candidate_indices[position]);
+    }
+)MFQ_METAL";
+
 constexpr const char* kPrefillPlanSource = R"MFQ_METAL(
     uint linear = thread_position_in_grid.x;
     if (linear >= uint(TOTAL)) {

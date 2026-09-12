@@ -45,6 +45,15 @@ mlx::core::array deepseek_v4_kv_fp8_sim_prefix(
 mlx::core::array deepseek_v41_kv_fp8_sim(
     const mlx::core::array& input);
 
+// M3 Ultra fast path for the released D=512 V4.1 window-KV preparation.
+mlx::core::array deepseek_v41_fused_kv_prepare(
+    const mlx::core::array& input,
+    const mlx::core::array& weight,
+    float eps,
+    int rotary_dimension,
+    const mlx::core::array& cosine,
+    const mlx::core::array& sine);
+
 class MlxDeepseekV4PoolState {
 public:
     static MlxDeepseekV4PoolState allocate(
