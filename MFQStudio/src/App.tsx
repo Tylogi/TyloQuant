@@ -823,6 +823,7 @@ type IconName =
   | "activity"
   | "chat"
   | "chart"
+  | "check"
   | "clock"
   | "copy"
   | "flask"
@@ -869,6 +870,7 @@ function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
       {name === "activity" && <><path d="M3 12h4l2.5-7 5 14 2.5-7h4" /></>}
       {name === "chat" && <><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" /></>}
       {name === "chart" && <><path d="M4 19V5M4 19h16" /><path d="m7 15 4-4 3 2 5-6" /></>}
+      {name === "check" && <path d="m5 12.5 4.5 4.5L19 7.5" />}
       {name === "clock" && <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3.5 2" /></>}
       {name === "copy" && <><rect height="13" rx="2" width="11" x="8" y="8" /><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" /></>}
       {name === "flask" && <><path d="M9 3h6M10 3v6l-5.7 9.2A1.8 1.8 0 0 0 5.8 21h12.4a1.8 1.8 0 0 0 1.5-2.8L14 9V3" /><path d="M7.5 15h9" /></>}
@@ -952,7 +954,11 @@ function ModelMonogram({
   state: ModelMonogramState;
 }) {
   const initial = Array.from(name.trim())[0]?.toLocaleUpperCase() || "E";
-  return <span aria-hidden="true" className={`model-monogram ${state}`}>{initial}</span>;
+  return (
+    <span aria-hidden="true" className={`model-monogram ${state}`}>
+      {state === "idle" ? <img src="/mfq-mark.svg" alt="" /> : initial}
+    </span>
+  );
 }
 
 function MetricTile({
@@ -1561,6 +1567,7 @@ export default function App() {
   const [modelBrowserOpen, setModelBrowserOpen] = useState(false);
   const [modelDirectoryPath, setModelDirectoryPath] = useState("");
   const [studioToken, setStudioToken] = useState("");
+  const [endpointCopied, setEndpointCopied] = useState(false);
   const [editDraft, setEditDraft] = useState<EditDraft | null>(null);
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [voiceLevel, setVoiceLevel] = useState(0);
@@ -1738,6 +1745,17 @@ export default function App() {
     voiceRef.current?.setPlayback(settings.playbackEnabled);
     document.documentElement.dataset.theme = settings.theme;
   }, [settings]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === ",") {
+        event.preventDefault();
+        openStudioPage("dashboard", "settings");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(STORED_PRESETS_KEY, JSON.stringify(storedPresets));
@@ -2484,6 +2502,8 @@ export default function App() {
   async function copyEndpoint() {
     try {
       await navigator.clipboard.writeText(studio?.service_url || "http://127.0.0.1:8090");
+      setEndpointCopied(true);
+      window.setTimeout(() => setEndpointCopied(false), 1600);
     } catch (cause) {
       setError(errorMessage(cause));
     }
@@ -3852,7 +3872,7 @@ export default function App() {
           <nav className="sectioned-nav" aria-label={tr("推理", "Inference")}>
             <section>
               <div className="sidebar-group-label">{tr("推理", "Inference")}</div>
-              <button className={view === "dashboard" && dashboardPage === "overview" ? "active" : ""} onClick={() => openStudioPage("dashboard", "overview")} type="button"><Icon name="gauge" />{tr("概览", "Overview")}<span>{formatNumber(runtime?.active_requests || 0)}</span></button>
+              <button className={view === "dashboard" && dashboardPage === "overview" ? "active" : ""} onClick={() => openStudioPage("dashboard", "overview")} type="button"><Icon name="gauge" />{tr("概览", "Overview")}{Number(runtime?.active_requests || 0) > 0 && <span>{formatNumber(runtime?.active_requests || 0)}</span>}</button>
               <button className={view === "dashboard" && dashboardPage === "models" ? "active" : ""} onClick={() => openStudioPage("dashboard", "models")} type="button"><Icon name="folder" />{tr("模型", "Models")}</button>
               <button className={view === "dashboard" && dashboardPage === "connections" ? "active" : ""} onClick={openServerPage} type="button"><Icon name="server-rack" />{tr("服务器", "Server")}</button>
               <button className={view === "dashboard" && dashboardPage === "cache" ? "active" : ""} onClick={() => openStudioPage("dashboard", "cache")} type="button"><Icon name="memory" />{tr("资源", "Resources")}</button>
@@ -3994,7 +4014,7 @@ export default function App() {
               </TMPanel> : <EmptyPanel icon="memory" title={tr("推理内存尚未上报", "Runtime memory is unavailable")} message={tr("服务器就绪后会显示模型驻留与缓存状态。", "Memory residency and cache state appear when the server is ready.")} />}
               <div className="overview-footer-grid">
                 <TMPanel className="overview-endpoint-panel">
-                  <div className="overview-panel-title"><Icon name="link" size={15} /><h2>{tr("OpenAI 兼容端点", "OpenAI-compatible endpoint")}</h2><button aria-label={tr("复制端点", "Copy endpoint")} onClick={() => void copyEndpoint()} title={tr("复制端点", "Copy endpoint")} type="button"><Icon name="copy" size={14} /></button></div>
+                  <div className="overview-panel-title"><Icon name="link" size={15} /><h2>{tr("OpenAI 兼容端点", "OpenAI-compatible endpoint")}</h2><button aria-label={endpointCopied ? tr("已复制", "Copied") : tr("复制端点", "Copy endpoint")} className={endpointCopied ? "copied" : ""} onClick={() => void copyEndpoint()} title={endpointCopied ? tr("已复制", "Copied") : tr("复制端点", "Copy endpoint")} type="button"><Icon name={endpointCopied ? "check" : "copy"} size={14} /></button></div>
                   <code>{studio?.service_url || "http://127.0.0.1:8090"}</code>
                   <p>{tr("可直接用于 OpenAI SDK；默认回环地址不经过云端。", "Use this base URL with OpenAI SDKs. The default loopback address sends no traffic to the cloud.")}</p>
                 </TMPanel>
