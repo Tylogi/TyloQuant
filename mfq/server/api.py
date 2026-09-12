@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from mfq.server.auth import ApiKeyManager, required_scope
+from mfq.server.backend import BackendError
 from mfq.server.models import (
     SHA256_PATTERN,
     ApiKeyList,
@@ -94,6 +95,16 @@ from mfq.server.models import (
     UpdateRuntimeProfileRequest,
     UpdateSessionRequest,
 )
+from mfq.server.openai_compat import (
+    OpenAIRequestError,
+    backend_error_status,
+    collect_chat_completion,
+    parse_chat_request,
+    stream_chat_completion,
+)
+from mfq.server.openai_compat import (
+    error_body as openai_error_body,
+)
 from mfq.server.service import ServerService, ServiceError
 from mfq.server.storage import ApiKeyNotFoundError, StorageError
 
@@ -153,7 +164,9 @@ def create_app(
 
     @app.middleware("http")
     async def protect_and_harden(request: Request, call_next: Any) -> Response:
-        if (api_key or api_keys is not None) and request.url.path.startswith("/api/"):
+        if (api_key or api_keys is not None) and request.url.path.startswith(
+            ("/api/", "/v1")
+        ):
             authorization = request.headers.get("authorization", "")
             supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
             authenticated = api_keys.authenticate(supplied) if api_keys is not None else None
@@ -232,6 +245,77 @@ def create_app(
             "service": "mfq-server",
             "protocol_version": "1.0",
         }
+
+    @app.get("/v1", include_in_schema=False)
+    async def openai_root() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "service": "mfq-server",
+            "endpoints": ["/v1/models", "/v1/chat/completions"],
+        }
+
+    @app.get("/v1/models", include_in_schema=False)
+    async def openai_models() -> dict[str, Any]:
+        models = await require_service().runtime_models()
+        data = models.get("data") if isinstance(models, dict) else None
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": item["id"],
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "mfq",
+                }
+                for item in (data if isinstance(data, list) else [])
+                if isinstance(item, dict)
+                and isinstance(item.get("id"), str)
+                and item["id"]
+            ],
+        }
+
+    @app.post("/v1/chat/completions", include_in_schema=False)
+    async def openai_chat_completions(request: Request) -> Response:
+        try:
+            body = await request.json()
+        except ValueError as error:
+            return JSONResponse(
+                status_code=400,
+                content=openai_error_body(str(error)),
+            )
+        try:
+            parsed = parse_chat_request(body)
+        except OpenAIRequestError as error:
+            return JSONResponse(
+                status_code=400,
+                content=openai_error_body(str(error), param=error.param),
+            )
+        backend = require_service().backend
+        if parsed.stream:
+            return StreamingResponse(
+                stream_chat_completion(
+                    backend,
+                    parsed,
+                    disconnected=request.is_disconnected,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        try:
+            result = await collect_chat_completion(backend, parsed)
+        except BackendError as error:
+            return JSONResponse(
+                status_code=backend_error_status(error),
+                content=openai_error_body(
+                    str(error),
+                    error_type=error.code,
+                    code=error.status_code,
+                ),
+            )
+        return JSONResponse(content=result)
 
     @app.post(
         "/api/v1/auth/keys",

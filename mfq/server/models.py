@@ -323,6 +323,10 @@ class ToolFunctionDefinition(ProtocolModel):
     name: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
     description: str | None = Field(default=None, max_length=8192)
     parameters: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
+    # OpenAI-compatible clients commonly serialize this field even when it is
+    # false.  Native runtimes may derive their own grammar from ``parameters``,
+    # but the API must still accept and preserve the standard tool definition.
+    strict: bool | None = False
 
 
 class ToolDefinition(ProtocolModel):
@@ -369,6 +373,11 @@ ResponseFormat = Annotated[
 
 
 class ResponsePerformance(ProtocolModel):
+    # Runtime telemetry evolves faster than the versioned request contract.
+    # Preserve newly added metrics instead of turning a successful generation
+    # into a protocol error merely because the API process is one revision old.
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
     prefill_tokens: int = Field(ge=0)
     ttft_ms: float = Field(ge=0.0)
     prefill_ms: float = Field(ge=0.0)
@@ -389,6 +398,24 @@ class ResponsePerformance(ProtocolModel):
     mtp_drafted_tokens: int = Field(default=0, ge=0)
     mtp_accepted_tokens: int = Field(default=0, ge=0)
     mtp_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    mtp_selected_depth: int = Field(default=0, ge=0, le=5)
+    mtp_depth_0_cycles: int = Field(default=0, ge=0)
+    mtp_depth_1_cycles: int = Field(default=0, ge=0)
+    mtp_depth_2_cycles: int = Field(default=0, ge=0)
+    mtp_depth_3_cycles: int = Field(default=0, ge=0)
+    mtp_depth_4_cycles: int = Field(default=0, ge=0)
+    mtp_depth_5_cycles: int = Field(default=0, ge=0)
+    mtp_position_1_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    mtp_position_2_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    mtp_position_3_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    mtp_position_4_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    mtp_position_5_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    mtp_depth_0_cycle_ms: float = Field(default=0.0, ge=0.0)
+    mtp_depth_1_cycle_ms: float = Field(default=0.0, ge=0.0)
+    mtp_depth_2_cycle_ms: float = Field(default=0.0, ge=0.0)
+    mtp_depth_3_cycle_ms: float = Field(default=0.0, ge=0.0)
+    mtp_depth_4_cycle_ms: float = Field(default=0.0, ge=0.0)
+    mtp_depth_5_cycle_ms: float = Field(default=0.0, ge=0.0)
     mtp_target_ms: float = Field(default=0.0, ge=0.0)
     mtp_head_ms: float = Field(default=0.0, ge=0.0)
     mtp_rollback_ms: float = Field(default=0.0, ge=0.0)

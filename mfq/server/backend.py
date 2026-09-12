@@ -12,11 +12,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 
 from mfq.server.capabilities import capabilities_for_architecture
+from mfq.server.dsml import DSMLParseError, DSMLStreamParser, DSMLToolCall
 from mfq.server.models import (
     ModelCapabilities,
     ResponseFormat,
@@ -27,6 +28,7 @@ from mfq.server.models import (
     ToolChoice,
     ToolDefinition,
 )
+from mfq.server.reasoning import TaggedReasoningParser
 from mfq.server.vision import (
     MiniCPMO45VisionProcessor,
     VisionProcessingError,
@@ -151,6 +153,30 @@ class OpenAIChatBackend:
         tool_choice: ToolChoice = "auto",
         response_format: ResponseFormat | None = None,
     ) -> AsyncIterator[BackendDelta]:
+        deepseek_v4 = self._is_deepseek_v4(model)
+        tagged_reasoning = self._uses_tagged_reasoning_fallback(
+            model,
+            sampling=sampling,
+        )
+        reasoning_parser = (
+            TaggedReasoningParser(start_in_reasoning=True)
+            if tagged_reasoning
+            else None
+        )
+        dsml_parser = (
+            DSMLStreamParser(
+                {
+                    tool.function.name: tool.function.parameters
+                    for tool in tools
+                }
+            )
+            if deepseek_v4 and tools and tool_choice != "none"
+            else None
+        )
+        pending_dsml_calls: list[DSMLToolCall] = []
+        native_tool_calls_seen = False
+        next_dsml_index = 0
+        last_backend_request_id: str | None = None
         backend_messages = list(messages)
         multimodal: dict[str, Any] | None = None
         cleanup_paths: tuple[Path, ...] = ()
@@ -206,7 +232,11 @@ class OpenAIChatBackend:
             "mtp_max_draft_tokens": sampling.mtp_max_draft_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "reasoning_format": "auto",
+            # DeepSeek V4 puts the opening <think> marker in the rendered
+            # prompt and emits native tool calls as DSML.  Parse both tagged
+            # protocols at this API boundary so streaming and collected
+            # responses follow one OpenAI-compatible contract.
+            "reasoning_format": "none" if deepseek_v4 else "auto",
             "chat_template_kwargs": {
                 "enable_thinking": sampling.enable_thinking,
             },
@@ -248,9 +278,100 @@ class OpenAIChatBackend:
                 saw_done = False
                 async for data in self._iter_sse_data(response):
                     if data == "[DONE]":
+                        trailing_reasoning = ""
+                        trailing_content = ""
+                        if reasoning_parser is not None:
+                            trailing_reasoning, trailing_content = reasoning_parser.finish()
+                            reasoning_parser = None
+                        if dsml_parser is not None:
+                            try:
+                                visible, parsed = dsml_parser.feed(trailing_content)
+                                final_visible, final_parsed = dsml_parser.finish()
+                            except DSMLParseError as error:
+                                raise BackendProtocolError(
+                                    f"invalid DeepSeek DSML output: {error}"
+                                ) from error
+                            trailing_content = visible + final_visible
+                            pending_dsml_calls.extend(parsed)
+                            pending_dsml_calls.extend(final_parsed)
+                            dsml_parser = None
+                        parsed_tool_deltas: tuple[BackendToolCallDelta, ...] = ()
+                        if pending_dsml_calls and not native_tool_calls_seen:
+                            parsed_tool_deltas = self._dsml_tool_call_deltas(
+                                pending_dsml_calls,
+                                start_index=next_dsml_index,
+                            )
+                            next_dsml_index += len(parsed_tool_deltas)
+                        pending_dsml_calls.clear()
+                        if trailing_reasoning or trailing_content or parsed_tool_deltas:
+                            yield BackendDelta(
+                                content_delta=trailing_content,
+                                reasoning_delta=trailing_reasoning,
+                                tool_calls=parsed_tool_deltas,
+                                finish_reason=(
+                                    "tool_calls" if parsed_tool_deltas else None
+                                ),
+                                backend_request_id=last_backend_request_id,
+                            )
                         saw_done = True
                         break
                     delta = self._parse_event(data)
+                    if delta.backend_request_id is not None:
+                        last_backend_request_id = delta.backend_request_id
+                    if reasoning_parser is not None:
+                        if delta.reasoning_delta:
+                            # A backend with a working structured parser is
+                            # authoritative; do not parse its content twice.
+                            reasoning_parser = None
+                        else:
+                            reasoning, content = reasoning_parser.feed(
+                                delta.content_delta
+                            )
+                            if delta.finish_reason is not None:
+                                trailing_reasoning, trailing_content = (
+                                    reasoning_parser.finish()
+                                )
+                                reasoning += trailing_reasoning
+                                content += trailing_content
+                                reasoning_parser = None
+                            delta = replace(
+                                delta,
+                                content_delta=content,
+                                reasoning_delta=reasoning,
+                            )
+                    if delta.tool_calls:
+                        native_tool_calls_seen = True
+                    if dsml_parser is not None:
+                        try:
+                            content, parsed = dsml_parser.feed(delta.content_delta)
+                            pending_dsml_calls.extend(parsed)
+                            if delta.finish_reason is not None:
+                                trailing, parsed = dsml_parser.finish()
+                                content += trailing
+                                pending_dsml_calls.extend(parsed)
+                                dsml_parser = None
+                        except DSMLParseError as error:
+                            raise BackendProtocolError(
+                                f"invalid DeepSeek DSML output: {error}"
+                            ) from error
+
+                        parsed_tool_deltas = ()
+                        finish_reason = delta.finish_reason
+                        if finish_reason is not None and pending_dsml_calls:
+                            if not native_tool_calls_seen:
+                                parsed_tool_deltas = self._dsml_tool_call_deltas(
+                                    pending_dsml_calls,
+                                    start_index=next_dsml_index,
+                                )
+                                next_dsml_index += len(parsed_tool_deltas)
+                                finish_reason = "tool_calls"
+                            pending_dsml_calls.clear()
+                        delta = replace(
+                            delta,
+                            content_delta=content,
+                            tool_calls=delta.tool_calls + parsed_tool_deltas,
+                            finish_reason=finish_reason,
+                        )
                     if delta.performance is not None and processor_ms > 0.0:
                         performance = self._with_processor_timing(
                             delta.performance,
@@ -278,6 +399,36 @@ class OpenAIChatBackend:
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+    def _uses_tagged_reasoning_fallback(
+        self,
+        model: str,
+        *,
+        sampling: SamplingParams,
+    ) -> bool:
+        if not sampling.enable_thinking:
+            return False
+        return self._is_deepseek_v4(model)
+
+    def _is_deepseek_v4(self, model: str) -> bool:
+        identity = (self._model_type or model).casefold().replace("-", "_")
+        return "deepseek_v4" in identity
+
+    @staticmethod
+    def _dsml_tool_call_deltas(
+        calls: Sequence[DSMLToolCall],
+        *,
+        start_index: int,
+    ) -> tuple[BackendToolCallDelta, ...]:
+        return tuple(
+            BackendToolCallDelta(
+                index=start_index + offset,
+                call_id=f"call_{uuid4().hex}",
+                name=call.name,
+                arguments_delta=call.arguments,
+            )
+            for offset, call in enumerate(calls)
+        )
 
     async def fork_session(self, source_session_id: UUID, target_session_id: UUID) -> bool:
         return await self._session_control_request(

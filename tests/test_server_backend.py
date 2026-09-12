@@ -67,6 +67,11 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
                     "decode_tps": 1500.0,
                     "generation_ms": 14.0,
                     "generation_tps": 214.0,
+                    "mtp_selected_depth": 5.0,
+                    "mtp_depth_5_cycles": 3.0,
+                    "mtp_position_5_acceptance_rate": 0.5,
+                    "mtp_depth_5_cycle_ms": 2.1,
+                    "future_runtime_metric": 123.0,
                     "sampling": {
                         "max_tokens": 12,
                         "temperature": 0.25,
@@ -107,6 +112,7 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
                             "function": {
                                 "name": "lookup",
                                 "description": "Look up a value",
+                                "strict": False,
                                 "parameters": {
                                     "type": "object",
                                     "properties": {"q": {"type": "string"}},
@@ -143,6 +149,11 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
         assert deltas[3].performance is not None
         assert deltas[3].performance.multimodal_ms == 3.0
         assert deltas[3].performance.model_prefill_ms == 7.0
+        assert deltas[3].performance.mtp_selected_depth == 5
+        assert deltas[3].performance.mtp_depth_5_cycles == 3
+        assert deltas[3].performance.mtp_position_5_acceptance_rate == 0.5
+        assert deltas[3].performance.mtp_depth_5_cycle_ms == 2.1
+        assert deltas[3].performance.model_dump()["future_runtime_metric"] == 123.0
 
     asyncio.run(run())
     assert captured["authorization"] == f"Bearer {backend_key}"
@@ -162,8 +173,149 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
         "reasoning_effort": "high",
     }
     assert payload["tools"][0]["function"]["name"] == "lookup"
+    assert payload["tools"][0]["function"]["strict"] is False
     assert payload["tool_choice"]["function"]["name"] == "lookup"
     assert payload["response_format"]["json_schema"]["schema"]["type"] == "object"
+
+
+def test_backend_splits_deepseek_v4_raw_reasoning_across_sse_chunks() -> None:
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        events = [
+            {"id": "native-id", "choices": [{"delta": {"content": "plan</thi"}}]},
+            {"id": "native-id", "choices": [{"delta": {"content": "nk>final"}}]},
+            {
+                "id": "native-id",
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+        body += "data: [DONE]\n\n"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=body,
+        )
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = OpenAIChatBackend("http://backend", client=client)
+        backend._model_type = "deepseek_v4_vision"
+        deltas = [
+            delta
+            async for delta in backend.stream(
+                model="DeepSeek-V4-Flash-Vision-Exp",
+                messages=[{"role": "user", "content": "hello"}],
+                sampling=SamplingParams(enable_thinking=True),
+            )
+        ]
+        await client.aclose()
+        assert "".join(delta.reasoning_delta for delta in deltas) == "plan"
+        assert "".join(delta.content_delta for delta in deltas) == "final"
+        assert deltas[-1].finish_reason == "stop"
+        assert {delta.backend_request_id for delta in deltas} == {"native-id"}
+
+    asyncio.run(run())
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["reasoning_format"] == "none"
+
+
+def test_backend_converts_deepseek_v4_dsml_content_to_openai_tool_calls() -> None:
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        events = [
+            {
+                "id": "native-tool-id",
+                "choices": [
+                    {
+                        "delta": {
+                            "content": "I'll use it.\n\n<｜DSML｜tool_ca",
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "native-tool-id",
+                "choices": [
+                    {
+                        "delta": {
+                            "content": (
+                                "lls>\n<｜DSML｜invoke name=\"write\">\n"
+                                "<｜DSML｜parameter name=\"content\" string=\"true\">"
+                                "hello</｜DSML｜parameter>\n"
+                                "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+                            ),
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "native-tool-id",
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+        body += "data: [DONE]\n\n"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=body,
+        )
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = OpenAIChatBackend("http://backend", client=client)
+        backend._model_type = "deepseek_v4_vision"
+        tool = ToolDefinition.model_validate(
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "description": "Write content",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                        "required": ["content"],
+                    },
+                },
+            }
+        )
+        deltas = [
+            delta
+            async for delta in backend.stream(
+                model="DeepSeek-V4-Flash-Vision-Exp",
+                messages=[{"role": "user", "content": "write hello"}],
+                sampling=SamplingParams(enable_thinking=False),
+                tools=[tool],
+                tool_choice="required",
+            )
+        ]
+        await client.aclose()
+
+        content = "".join(delta.content_delta for delta in deltas)
+        tool_deltas = [tool for delta in deltas for tool in delta.tool_calls]
+        assert content == "I'll use it.\n\n"
+        assert "DSML" not in content
+        assert len(tool_deltas) == 1
+        assert tool_deltas[0].index == 0
+        assert tool_deltas[0].call_id is not None
+        assert tool_deltas[0].call_id.startswith("call_")
+        assert tool_deltas[0].name == "write"
+        assert json.loads(tool_deltas[0].arguments_delta) == {"content": "hello"}
+        assert deltas[-1].finish_reason == "tool_calls"
+
+    asyncio.run(run())
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["reasoning_format"] == "none"
+    assert payload["tool_choice"] == "required"
 
 
 def test_backend_explicit_cancel_retries_the_native_activation_boundary() -> None:
