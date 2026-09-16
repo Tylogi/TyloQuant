@@ -640,7 +640,7 @@ mfq_tensor_backend::Tensor matmul(
             row_q.data_ptr<std::uint8_t>(),
             row_symbol_byte_offsets.data_ptr<std::int32_t>(),
             input.data_ptr<float>(),
-            output.data_ptr<float>(),
+            output.template data_ptr<float>(),
             layout, rows, stream);
     } else {
         dispatch_mmq<MXFP8>(

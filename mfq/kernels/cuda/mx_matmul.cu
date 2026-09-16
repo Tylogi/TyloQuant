@@ -1244,9 +1244,9 @@ void launch_mxfp4_backward_vec4_small_m(
         values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(
             output_gradient.data_ptr<mfq_half>()),
-        partials.data_ptr<float>(), rows, outputs, width);
+        partials.template data_ptr<float>(), rows, outputs, width);
     mfq_packed_backward::launch_split_float_reduce_to_half(
-        partials.data_ptr<float>(),
+        partials.template data_ptr<float>(),
         reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
         rows, width, output_groups, stream);
 }
@@ -1418,10 +1418,10 @@ void launch_mxfp8_backward_scalar_small_m(
         values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(
             output_gradient.data_ptr<mfq_half>()),
-        partials.data_ptr<float>(),
+        partials.template data_ptr<float>(),
         rows, outputs, width);
     mfq_packed_backward::launch_split_float_reduce_to_half(
-        partials.data_ptr<float>(),
+        partials.template data_ptr<float>(),
         reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
         rows, width, output_groups, stream);
 }
@@ -1512,10 +1512,10 @@ void launch_mxfp8_backward_vec4_small_m(
         values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(
             output_gradient.data_ptr<mfq_half>()),
-        partials.data_ptr<float>(),
+        partials.template data_ptr<float>(),
         rows, outputs, width);
     mfq_packed_backward::launch_split_float_reduce_to_half(
-        partials.data_ptr<float>(),
+        partials.template data_ptr<float>(),
         reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
         rows, width, output_groups, stream);
 }
