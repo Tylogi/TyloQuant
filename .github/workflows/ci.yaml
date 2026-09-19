@@ -1,0 +1,73 @@
+name: Native build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CUDA_VERSION: "13.2.0"
+
+jobs:
+  macos-metal:
+    name: macOS Metal
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - name: Sync dependencies
+        run: uv sync --extra daemon --extra metal
+
+      - name: Build
+        run: uv run mfq build
+
+  linux-cuda:
+    name: Linux CUDA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - name: Install CUDA
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: local
+          linux-local-args: '["--toolkit"]'
+
+      - name: Sync dependencies
+        run: uv sync --extra daemon
+
+      - name: Build
+        run: uv run mfq build
+
+  windows-cuda:
+    name: Windows CUDA
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - name: Install CUDA
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: local
+
+      - name: Sync dependencies
+        run: uv sync --extra daemon
+
+      - name: Build
+        run: uv run mfq build
