@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 import runpy
 
@@ -43,10 +44,29 @@ def test_native_preparation_uses_parallel_cache_for_evaluation_too():
         "ops/mlx_linear_attention.cpp", "ops/mlx_sparse_attention.cpp", "models/flash_next/qwen4_ops.cpp"]:
         source = (METAL / path).read_text()
         assert "kernel_device(" in source
-        assert "mlx::core::metal::device(" not in source
+        for match in re.finditer(r"mlx::core::metal::device\(", source):
+            function = source.rfind("\n}", 0, match.start())
+            block = source[function:source.find("\n}", match.end())]
+            assert path == "ops/mlx_moe.cpp"
+            assert any(name in block for name in (
+                "bool uses_indirect_expert_pages(",
+                "void retain_indirect_resources(",
+                "MlxMfeWeight MlxMfeWeight::with_prepared_page_resources(",
+            ))
+            assert ".get_kernel(" not in block and ".get_library(" not in block
+        assert not re.search(r"metal::device\([^;]*\.(?:get_kernel|get_library)\(", source)
     source = (METAL / "runtime/mlx_kernel_cache.cpp").read_text()
     assert source.index("precompiled_library(device_") < source.index("auto config =")
     assert "promise.set_exception(std::current_exception())" in source
+    assert "return get_kernel(name, library, name, {});" in source
+    assert "return cached(*cache, key," in source
+    assert "descriptor->setSpecializedName(" in source
+    assert "values->setConstantValue(value, type, index);" in source
+    sparse = (METAL / "ops/mlx_sparse_attention.cpp").read_text()
+    specialized = sparse.split('const std::string name = "mfq_sdpa_decode_sparse_"', 1)[1].split(";", 2)[1]
+    assert "return device.get_kernel(" in specialized
+    assert "std::to_string(partitions_)" in specialized
+    assert "std::to_string(params_.block_size), constants)" in specialized
 
 
 def test_compile_command_fails_without_a_source_catalog(tmp_path, monkeypatch):

@@ -700,7 +700,7 @@ public:
             const std::string type = dtype_ == mlx::core::float16 ? "f16" : "bf16";
             (void)device.get_kernel("mfq_sdpa_decode_2pass_2_" + type + "_256", library);
             const std::string name = "mfq_sdpa_decode_sparse_" + type + "_256";
-            return mlx::core::metal::device(stream().device).get_kernel(
+            return device.get_kernel(
                 name, library, name + "_sparse_" + std::to_string(partitions_) + "_bs" + std::to_string(params_.block_size), constants);
         }
         auto* library = device.get_library(
