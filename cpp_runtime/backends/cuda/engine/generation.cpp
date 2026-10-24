@@ -576,7 +576,14 @@ template <class Model> struct CudaGenerationContext {
     void release() {
         if (batching) return; // Each row owns its slot cleanup.
         trace_expert_cache("end");
-        try { reset(); }
+        try {
+            reset();
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+            // A request may finish at its first sampled token, before any
+            // decode call has retired the shared prefill workspace.
+            release_moe_prefill_buffers(model.execution->moe_expert_cache);
+#endif
+        }
         catch (...) { graph.invalidate(); throw; }
         if (std::uncaught_exceptions()) graph.invalidate();
     }

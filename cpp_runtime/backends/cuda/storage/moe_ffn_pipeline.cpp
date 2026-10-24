@@ -67,7 +67,8 @@ StreamFlagWrite stream_flag_writer() {
 struct Mapped {
     void* host=nullptr;void* device=nullptr;std::size_t bytes=0;
     std::shared_ptr<Mapped> shared_owner;
-    explicit Mapped(std::size_t n):bytes(n) {
+    explicit Mapped(std::size_t n,bool allocate=true):bytes(n) {
+        if(!allocate)return;
         const auto allocation=cudaHostAlloc(&host,n,cudaHostAllocMapped);
         if(mfq::cuda::pinned_allocation_rejected(allocation)) {
             (void)cudaGetLastError();
@@ -180,11 +181,13 @@ std::function<mfq::MoeCpuCalibration::Observation()> cpu_calibration_work(
 }
 
 struct MoeFfnPrefillHostWorkspace {
-    std::shared_ptr<Mapped> x,ids,cpu;
-    MoeFfnPrefillHostWorkspace(int tokens,int routes,int width)
+    std::shared_ptr<Mapped> x,ids,cpu,flags,kind,local;
+    MoeFfnPrefillHostWorkspace(int tokens,int routes,int width,int experts)
         :x(std::make_shared<Mapped>(std::size_t(tokens)*width*sizeof(float))),
          ids(std::make_shared<Mapped>(std::size_t(tokens)*routes*sizeof(int32_t))),
-         cpu(std::make_shared<Mapped>(std::size_t(tokens)*routes*width*sizeof(mfq_half))) {}
+         cpu(std::make_shared<Mapped>(std::size_t(tokens)*routes*width*sizeof(mfq_half))),
+         flags(std::make_shared<Mapped>(6*64)),kind(std::make_shared<Mapped>(std::size_t(experts)*sizeof(int32_t))),
+         local(std::make_shared<Mapped>(std::size_t(experts)*3*sizeof(int32_t))) {}
 };
 
 class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
@@ -332,9 +335,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         int active_tokens=0;
         StreamFlagWrite ready_writer=nullptr;
         Cell(int t,int k,int width,int experts,cudaStream_t stream,bool eager):tokens(t),routes(k),entries(t*k),
-            x(eager?64:std::size_t(t)*width*sizeof(float)),host_ids(eager?64:std::size_t(t)*k*sizeof(int32_t)),flags(6*64),
-            kind(std::size_t(experts)*sizeof(int32_t)),local(std::size_t(experts)*3*sizeof(int32_t)),
-            cpu(eager?64:std::size_t(t)*k*width*sizeof(mfq_half)),graphs(std::make_unique<mfq::cuda::GraphRegistry>(stream)) {
+            x(std::size_t(t)*width*sizeof(float),!eager),host_ids(std::size_t(t)*k*sizeof(int32_t),!eager),
+            flags(6*64,!eager),kind(std::size_t(experts)*sizeof(int32_t),!eager),
+            local(std::size_t(experts)*3*sizeof(int32_t),!eager),
+            cpu(std::size_t(t)*k*width*sizeof(mfq_half),!eager),
+            graphs(std::make_unique<mfq::cuda::GraphRegistry>(stream)) {
             const auto gpu=tb::TensorOptions().device(tb::kCUDA);
             input=tb::zeros({t,width},gpu.dtype(tb::kFloat16));ids=tb::zeros({t,k},gpu.dtype(tb::kInt32));
             weights=tb::zeros({t,k},gpu.dtype(tb::kFloat32));
@@ -392,6 +397,119 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         int group_size=prefill_group_capacity;
     };
     std::unique_ptr<PrefillStream> prefill_stream_;
+    std::array<MixedMoeRuntime,3> resident_prefill_projections_;
+    struct ResidentPrefillTimes {
+        mfq::cuda::Event begin{cudaEventDefault},end{cudaEventDefault};
+        bool pending=false,enrolled=false;
+    };
+    std::unique_ptr<ResidentPrefillTimes> resident_prefill_times_;
+
+    void observe_resident_prefill() {
+        if(!resident_prefill_times_ || !resident_prefill_times_->pending)return;
+        auto& timing=*resident_prefill_times_;
+        timing.end.synchronize();
+        float ms=0;
+        MFQ_CUDA_CHECK(cudaEventElapsedTime(&ms,timing.begin.get(),timing.end.get()));
+        cache_->stats_.pipeline_gpu_ns+=int64_t(ms*1e6);
+        timing.pending=false;
+    }
+
+    bool all_experts_resident() const {
+        for(const auto& source:sources_)for(int expert=0;expert<experts_;++expert)
+            if(!source->quant_source_->gpu_resident(expert))return false;
+        return true;
+    }
+
+    tb::Tensor resident_prefill(CudaExecutionContext& execution,const tb::Tensor& input,
+            const tb::Tensor& ids,const tb::Tensor& weights) {
+        const int tokens=int(ids.size(0)),entries=int(ids.numel());
+        if(swiglu_limit_<=0 && execution.config.moe_ffn_fused_activation &&
+                !cache_->pipeline_sigmoid_table_.defined())
+            cache_->pipeline_sigmoid_table_=moe_swiglu_sigmoid_table_cuda();
+        auto publication=std::static_pointer_cast<Mapped>(cache_->pipeline_prefill_route_publication_);
+        const auto bytes=64+std::size_t(entries)*sizeof(int32_t);
+        if(!publication || publication->bytes<bytes) {
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream_));
+            publication=std::make_shared<Mapped>(bytes);
+            cache_->pipeline_prefill_route_publication_=publication;
+        }
+        *publication->h<uint32_t>()=0;
+        mfq::cuda::moe_publish_routes(nullptr,ids.data_ptr<int32_t>(),nullptr,publication->d<int32_t>()+16,
+            publication->d<uint32_t>(),0,entries,stream_);
+        auto shared=shared_?shared_(execution,input):tb::Tensor{};
+        const auto route=build_moe_route_plan(ids,experts_);
+        observe_resident_prefill();
+        if(!resident_prefill_times_)resident_prefill_times_=std::make_unique<ResidentPrefillTimes>();
+        auto& timing=*resident_prefill_times_;
+        if(!timing.enrolled) {
+            cache_->pipeline_prefill_release_.push_back([owner=weak_from_this()] {
+                if(auto pipeline=owner.lock()) {
+                    pipeline->observe_resident_prefill();
+                    pipeline->resident_prefill_times_->enrolled=false;
+                }
+            });
+            timing.enrolled=true;
+        }
+        timing.begin.record(stream_);
+        const auto projection=[&](int p,const tb::Tensor& x) {
+            auto& runtime=resident_prefill_projections_[p];
+            if(runtime.pools.empty()) {
+                runtime.n_experts=experts_;
+                runtime.out_per_expert=sources_[p]->cpu_->out_per_expert;
+                runtime.neuron_len=sources_[p]->cpu_->neuron_len;
+                runtime.prefill_only=true;
+                for(const auto& cohort:sources_[p]->cohorts_)runtime.pools.push_back(cohort.active);
+                const auto mma=mfq::cuda::runtime_options::moe_prefill_compact_mma();
+                initialize_mixed_nvq_dispatch(runtime,execution.config,mma && *mma);
+            }
+            if(!cache_->pipeline_prefill_activations_)
+                cache_->pipeline_prefill_activations_=std::make_shared<MixedMoeRuntime>();
+            // Keep only weight metadata per layer. Quantized activations share
+            // one capacity across layers and are retired at the prefill boundary.
+            struct ScratchLifetime {
+                MixedMoeRuntime& runtime;
+                ~ScratchLifetime() {
+                    runtime.nint_input_plans.clear();
+                    runtime.nvq_active_plans.clear();
+                    runtime.activation_workspaces.clear();
+                }
+            } scratch{runtime};
+            for(const auto& geometry:runtime.activation_geometry()) {
+                const MixedMoeTransformKey transform{geometry.transform_block,geometry.transform_seed};
+                const MixedMoeActivationKey key{int(x.size(0)),geometry.groups,geometry.gs,x.get_device(),transform};
+                runtime.activation_workspaces.insert_or_assign(key,
+                    cache_->pipeline_prefill_activations_->prefill_activation_workspace(
+                        x,int(x.size(0)),geometry.groups,geometry.gs,transform));
+            }
+            return runtime.forward(execution.config,execution.kl_mmq,execution.force_moe_prefill_mma_off,
+                execution.force_moe_pool_path,x,route);
+        };
+        auto gate=projection(0,input);
+        auto up=up_only_?gate:combined_gate_up_?gate.narrow(-1,ff_,ff_).contiguous():projection(1,input);
+        if(combined_gate_up_)gate=gate.narrow(-1,0,ff_).contiguous();
+        auto hidden=up_only_?relu_squared_cuda(gate.contiguous()):
+            activation(gate,up,execution.config.moe_ffn_fused_activation);
+        auto output=projection(2,hidden);
+        if(shared.defined())output=moe_weighted_reduce_cuda(output,weights)+shared;
+        timing.end.record(stream_);
+        timing.pending=true;
+        const auto route_started=std::chrono::steady_clock::now();
+        mfq::cuda::wait_route_publication(publication->h<uint32_t>(),stream_);
+        cache_->stats_.pipeline_route_wait_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-route_started).count();
+        const auto plan_started=std::chrono::steady_clock::now();
+        const std::vector<int32_t> routed(publication->h<int32_t>()+16,publication->h<int32_t>()+16+entries);
+        const auto plan=mfq::plan_moe_dispatch(routed,experts_,0,[](int){return true;},[](int){return false;});
+        cache_->stats_.pipeline_plan_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-plan_started).count();
+        if(observer_)observer_(plan);
+        cache_->record_compute_use();
+        cache_->moe_residency_->after_layer(sources_[0]->layer_id_,routed,tokens,false,false);
+        // Tensor frees and shared activation reuse follow their consumers on
+        // this stream. Collect timing at reuse/release without a layer barrier.
+        ++cache_->stats_.pipeline_serves;
+        return output;
+    }
 
     static int64_t prefill_align(int64_t bytes) {return (bytes+255)&~int64_t(255);}
     static int64_t prefill_cohort_bytes(const MoeCachedCohort& cohort,int capacity) {
@@ -1565,21 +1683,26 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     }
     void initialize(Cell& cell,CudaExecutionContext& execution,bool window=false) {
         cell.in_window=window;
-        const auto prefill_graph=mfq::cuda::runtime_options::moe_prefill_graph();
         cell.batch_decode=cell.tokens<=8 || (cell.tokens<=32 && execution.continuous_batch_cache_serial);
-        // SSD payloads are leased per demand. Eager prefill must bind this
-        // call's fields, rather than retain a graph over an evicted payload.
-        cell.graph_replay=window || cell.batch_decode ||
-            (!cache_->ssd_experts() && (!prefill_graph || *prefill_graph!=0));
+        // Only decode/verify widths retain fixed-address graph workspaces.
+        // Ordinary prefill cells live for one layer invocation on every tier.
+        cell.graph_replay=window || cell.batch_decode;
         if(!cell.graph_replay) {
             cell.eager_done=std::make_unique<mfq::cuda::Event>(cudaEventDisableTiming);
-            const auto key=std::to_string(cell.tokens)+":"+std::to_string(cell.routes)+":"+std::to_string(width_);
+            const auto key=std::to_string(cell.tokens)+":"+std::to_string(cell.routes)+":"+
+                std::to_string(width_)+":"+std::to_string(experts_);
             auto& workspace=cache_->pipeline_prefill_host_workspaces_[key];
-            if(!workspace)workspace=std::make_shared<MoeFfnPrefillHostWorkspace>(cell.tokens,cell.routes,width_);
+            if(!workspace)workspace=std::make_shared<MoeFfnPrefillHostWorkspace>(cell.tokens,cell.routes,width_,experts_);
             // The next route publication follows the previous merge on the
             // compute stream. Host input reads and CPU writes start only after
             // that publication, so layers cannot use this scratch concurrently.
             cell.x.borrow(workspace->x);cell.host_ids.borrow(workspace->ids);cell.cpu.borrow(workspace->cpu);
+            cell.flags.borrow(workspace->flags);
+            cell.kind.borrow(workspace->kind);
+            cell.local.borrow(workspace->local);
+            std::memset(cell.flags.host,0,cell.flags.bytes);
+            std::memset(cell.kind.host,0,cell.kind.bytes);
+            std::memset(cell.local.host,0xff,cell.local.bytes);
         }
         cell.ready_writer=window?stream_flag_writer():nullptr;
         cell.two_stage=execution.config.moe_two_stage_ffn && cell.batch_decode && cell.routes+(shared_?1:0)<=32 &&
@@ -2019,11 +2142,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         }
         if(window)return;
         if(!cell.graph_replay) {
-            // Prime format metadata and activation workspaces with all waits
-            // released. Eager prefill temporaries are stream-ordered and must
-            // not be retained by the decode graph pool.
+            // Prime allocations before host-gated kernels: allocation-budget
+            // checks can synchronize the device while those kernels wait.
             launch_body(cell,execution);
-            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream_));cell.output={};
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream_));
+            cell.output={};
             return;
         }
         // Warm the allocation/workspace shape, then capture exactly the same
@@ -4423,6 +4546,7 @@ public:
             if(auto pipeline=owner.lock()) {
                 pipeline->cells_.clear();pipeline->prediction_cells_.clear();pipeline->window_routes_.clear();
                 pipeline->cached_expert_fields_.reset();
+                pipeline->resident_prefill_projections_={};
             }
         });
         cache_->pipeline_decode_indirect_.push_back([owner=weak_from_this()] {
@@ -4508,13 +4632,33 @@ public:
             try {return streamed_prefill(execution,input,ids,weights);}
             catch(...) {handle_prefill_failure();throw;}
         }
+        if(!window && !batch_decode && !masked_rows && !cache_->pipeline_dispatch_capture_required_ &&
+                cache_->pipeline_dispatch_replay_.empty() && all_experts_resident()) {
+            try {return resident_prefill(execution,input,ids,weights);}
+            catch(...) {handle_prefill_failure();throw;}
+        }
         const auto tile=execution.continuous_batch_ffn_tile;
         const bool final_tile=tile+1==execution.continuous_batch_ffn_tiles;
-        auto& cell=cells_[{tokens,routes,window,batch_decode,tile}];
+        // Mapped flags are not stream-ordered allocations. Retire their GPU
+        // and DMA consumers before destroying a transient cell, including an
+        // initialization/serve failure with kernels waiting on host flags.
+        struct PrefillLifetime {
+            std::unique_ptr<Cell> cell;
+            cudaStream_t compute,transfer;
+            ~PrefillLifetime() {
+                if(!cell)return;
+                if(std::uncaught_exceptions() && cell->flags.host) {
+                    publish(cell->flags.h<uint32_t>()+64);
+                    publish(cell->flags.h<uint32_t>()+80);
+                    for(int i=1;i<4;++i)publish(cell->flags.h<uint32_t>()+16*i);
+                }
+                (void)cudaStreamSynchronize(compute);
+                (void)cudaStreamSynchronize(transfer);
+            }
+        } prefill{{},stream_,cache_->weight_stream_};
+        auto& cell=!window && !batch_decode?prefill.cell:cells_[{tokens,routes,window,batch_decode,tile}];
         if(!cell) {
-            const auto prefill_graph=mfq::cuda::runtime_options::moe_prefill_graph();
-            const bool eager=!window && !batch_decode &&
-                (cache_->ssd_experts() || (prefill_graph && *prefill_graph==0));
+            const bool eager=!window && !batch_decode;
             cell=std::make_unique<Cell>(tokens,routes,width_,experts_,stream_,eager);
             initialize(*cell,execution,window!=nullptr);
         }
@@ -4628,6 +4772,11 @@ public:
             serve(*cell);cache_->record_compute_use();
             std::vector<int32_t> routed(cell->host_ids.h<int32_t>(),cell->host_ids.h<int32_t>()+cell->entries);
             cache_->moe_residency_->after_layer(sources_[0]->layer_id_,routed,tokens,false,cell->allow_padding);
+            if(prefill.cell) {
+                cell->eager_done->synchronize();
+                observe_gpu(*cell);
+                cell->pending=false;
+            }
         }
         catch(...) {failed_=true;publish(cell->flags.h<uint32_t>()+64);publish(cell->flags.h<uint32_t>()+80);for(int i=1;i<4;++i)publish(cell->flags.h<uint32_t>()+16*i);throw;}
         if(!cell->graph_replay) {
