@@ -12,6 +12,7 @@
 #include "storage/moe_expert_cache_internal.h"
 #include "storage/weight_loader.h"
 #include "moe.h"
+#include "mfe_ffn_runtime.h"
 #include "core/rope.h"
 #include "mfq/moe_dispatch_plan.h"
 #include "mfq/runtime.h"
@@ -24,6 +25,8 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <cmath>
+#include <iomanip>
 namespace tb=mfq_tensor_backend;
 namespace {
 std::size_t bytes(const MixedMoePool& p) {
@@ -199,35 +202,142 @@ int verify_shared_input(const std::filesystem::path& root) {
     MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));context->end_graph_pool(stream);return cases;
 }
 
+struct NintDispatchError {
+    double value=0.0,grouped_mass=0.0,pool_mass=0.0;
+};
+
+// Decode the original CPU payload, independently of the device's expert-stride repacking.
+NintDispatchError nint_dispatch_reference(const NintCpu& weight,const Workspace& input,int source,int row) {
+    mfq_half scale_half,minimum_half;
+    std::memcpy(&scale_half,&weight.neuron_scale_h[row],sizeof(scale_half));
+    std::memcpy(&minimum_half,&weight.neuron_min_h[row],sizeof(minimum_half));
+    const double outer_scale=static_cast<float>(scale_half),outer_minimum=static_cast<float>(minimum_half);
+    const auto* codes=input.qx.data_ptr<int8_t>()+int64_t(source)*weight.ng*weight.gs;
+    const auto* scales=input.xscale.data_ptr<float>()+int64_t(source)*weight.ng;
+    NintDispatchError result;
+    for(int group=0;group<weight.ng;++group) {
+        const auto metadata=int64_t(row)*weight.ng+group;
+        const double scale=outer_scale*weight.sub_scale[metadata];
+        const double minimum=outer_minimum*weight.sub_min[metadata];
+        int dot=0,sum=0;
+        for(int chunk=0;chunk<weight.gs;chunk+=4) {
+            int chunk_dot=0,chunk_sum=0;
+            for(int element=chunk;element<std::min(chunk+4,weight.gs);++element) {
+                const int column=group*weight.gs+element;
+                const auto bit=weight.row_q_bit_offsets[row]+int64_t(column)*weight.row_q_bits[row];
+                const int code=cpu_load_packed_bits(weight.q_packed.data(),weight.q_packed.size(),
+                    bit,weight.row_q_bits[row]);
+                chunk_dot+=code*codes[column];
+                chunk_sum+=codes[column];
+            }
+            dot+=chunk_dot;
+            sum+=chunk_sum;
+            result.pool_mass+=scales[group]*(std::abs(scale*chunk_dot)+std::abs(minimum*chunk_sum));
+        }
+        result.value+=scales[group]*(scale*dot-minimum*sum);
+        result.grouped_mass+=scales[group]*(std::abs(scale*dot)+std::abs(minimum*sum));
+    }
+    return result;
+}
+
+double nint_dispatch_error_bound(double value,double mass,int iterations,int groups) {
+    // Integer dots/sums fit int32 and are exact in FP32 (gs<=64, q<=255, |x|<=127).
+    // Each affine term has at most four rounded operations before accumulation:
+    // row*sub, *dot (or *sum), subtraction, *xscale. FMA can only reduce this count.
+    // A lane adds ceil(G/32) grouped terms, or ceil(G/floor(32/ceil(gs/4))) pool chunks,
+    // followed by five warp tree levels.
+    // Thus |FP32-R| <= gamma_(4+iterations+5) * sum(|positive term|+|negative term|),
+    // gamma_n=n*u/(1-n*u), u=2^-24. The scalar FP64 oracle has gamma_(G+4), u=2^-53.
+    // FP16 storage adds u16*|R|+(1+u16)*FP32_bound plus half a subnormal ULP.
+    const double u32=std::ldexp(1.0,-24),u64=std::ldexp(1.0,-53),u16=std::ldexp(1.0,-11);
+    const double n32=iterations+9,n64=groups+4;
+    const double arithmetic=(n32*u32/(1-n32*u32)+n64*u64/(1-n64*u64))*mass;
+    return u16*std::abs(value)+(1+u16)*arithmetic+std::ldexp(1.0,-25);
+}
+
+struct NintDispatchStats {
+    int64_t values=0,different=0,grouped_closer=0,pool_closer=0;
+    double grouped_squared=0.0,pool_squared=0.0,grouped_max=0.0,pool_max=0.0,max_bound_ratio=0.0;
+};
+
+void verify_nint_dispatch_output(const tb::Tensor& actual,const tb::Tensor& expected,
+        const std::vector<NintCpu>& weights,const std::vector<Workspace>& inputs,
+        const std::vector<int32_t>& selected,bool down,int tokens,int step,std::vector<NintDispatchStats>& stats) {
+    if(actual.sizes()!=expected.sizes() || actual.scalar_type()!=tb::kFloat16 ||
+            expected.scalar_type()!=tb::kFloat16)
+        throw std::runtime_error("grouped NINT output shape or dtype differs from original pool kernels");
+    auto x=actual.cpu().to(tb::kFloat32).contiguous(),y=expected.cpu().to(tb::kFloat32).contiguous();
+    const auto* a=x.data_ptr<float>();
+    const auto* b=y.data_ptr<float>();
+    const int output=int(actual.size(2));
+    for(int pair=0;pair<int(selected.size());++pair) {
+        const int expert=selected[pair],pool=expert/3,local=expert%3;
+        const bool owned=pool<int(weights.size()) && local!=step;
+        for(int row=0;row<output;++row) {
+            const auto index=int64_t(pair)*output+row;
+            if(!owned) {
+                if(a[index]!=0.0f || b[index]!=0.0f)
+                    throw std::runtime_error("unowned NINT route did not remain exactly zero");
+                continue;
+            }
+            const auto& weight=weights[pool];
+            const auto reference=nint_dispatch_reference(weight,inputs[pool],down?pair:pair/10,local*output+row);
+            const int chunks=(weight.gs+3)/4,groups_per_warp=32/chunks;
+            const int pool_iterations=(weight.ng+groups_per_warp-1)/groups_per_warp;
+            const bool grouped=weight.gs==24 || weight.gs==28;
+            const double grouped_bound=nint_dispatch_error_bound(reference.value,
+                grouped?reference.grouped_mass:reference.pool_mass,
+                grouped?(weight.ng+31)/32:pool_iterations,weight.ng);
+            const double pool_bound=nint_dispatch_error_bound(
+                reference.value,reference.pool_mass,pool_iterations,weight.ng);
+            const double ae=std::abs(a[index]-reference.value),be=std::abs(b[index]-reference.value);
+            if(!std::isfinite(a[index]) || !std::isfinite(b[index]) || !std::isfinite(reference.value) ||
+                    !std::isfinite(grouped_bound) || !std::isfinite(pool_bound) || ae>grouped_bound || be>pool_bound) {
+                std::ostringstream message;
+                message<<std::setprecision(12)<<"NINT output exceeds FP32 reduction + FP16 storage error bound"
+                    <<" down="<<down<<" tokens="<<tokens<<" step="<<step<<" index="<<index
+                    <<" bits="<<int(weight.row_q_bits[local*output+row])<<" reference="<<reference.value
+                    <<" grouped="<<a[index]<<" pool="<<b[index]
+                    <<" grouped_bound="<<grouped_bound<<" pool_bound="<<pool_bound;
+                throw std::runtime_error(message.str());
+            }
+            auto& s=stats[pool];
+            if(a[index]!=b[index] && !s.different)
+                std::cout<<std::setprecision(12)<<"nint_dispatch_difference bits="<<weight.bits
+                    <<" down="<<down<<" tokens="<<tokens<<" step="<<step<<" index="<<index
+                    <<" grouped="<<a[index]<<" pool="<<b[index]<<" reference="<<reference.value
+                    <<" grouped_error="<<ae<<" pool_error="<<be
+                    <<" grouped_bound="<<grouped_bound<<" pool_bound="<<pool_bound<<'\n';
+            ++s.values;
+            s.different+=a[index]!=b[index];
+            s.grouped_closer+=ae<be;
+            s.pool_closer+=be<ae;
+            s.grouped_squared+=ae*ae;
+            s.pool_squared+=be*be;
+            s.grouped_max=std::max(s.grouped_max,ae);
+            s.pool_max=std::max(s.pool_max,be);
+            s.max_bound_ratio=std::max({s.max_bound_ratio,ae/grouped_bound,be/pool_bound});
+        }
+    }
+}
+
 int verify_nint_dispatch(const std::filesystem::path& root) {
     CudaExecutionContext execution;int cases=0;
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     const auto stream=mfq_current_cuda_stream();
     context->begin_graph_pool(stream);
-    const auto same=[](const tb::Tensor& a,const tb::Tensor& b,bool down,int tokens,int step) {
-        auto x=a.cpu().contiguous(),y=b.cpu().contiguous();
-        if(x.sizes()!=y.sizes() || x.scalar_type()!=y.scalar_type())
-            throw std::runtime_error("grouped NINT output shape or dtype differs from original pool kernels");
-        if(std::memcmp(x.data_ptr(),y.data_ptr(),x.numel()*x.element_size())) {
-            const auto* actual=static_cast<const uint8_t*>(x.data_ptr());
-            const auto* expected=static_cast<const uint8_t*>(y.data_ptr());
-            std::size_t byte=0;while(actual[byte]==expected[byte])++byte;
-            const auto index=byte/x.element_size();
-            auto xf=x.to(tb::kFloat32),yf=y.to(tb::kFloat32);
-            std::ostringstream message;message<<"grouped NINT output differs from original pool kernels"
-                <<" down="<<down<<" tokens="<<tokens<<" step="<<step<<" index="<<index
-                <<" actual="<<xf.data_ptr<float>()[index]<<" expected="<<yf.data_ptr<float>()[index];
-            throw std::runtime_error(message.str());
-        }
-    };
+    std::vector<NintDispatchStats> stats(4);
     for(bool down:{false,true}) {
         const int width=down?640:2560,output=down?2560:640;
         MixedMoeRuntime runtime;runtime.n_experts=512;runtime.neuron_len=width;
         runtime.out_per_expert=output;runtime.partial_experts=true;
         int index=0;
+        std::vector<NintCpu> weights;
         for(const std::string format:{"nint4","nint5","nint6","nint8"}) {
             auto model=mfq::open_model_source((root/(format+(down?"-2560-640.mfq":"-640-2560.mfq"))).string());
-            auto single=make_mixed_moe_runtime(load_mfe_cpu(*model,"linear.weight"),true,execution.config);
+            auto cpu=load_mfe_cpu(*model,"linear.weight");
+            for(const auto& pool:cpu.pools)weights.push_back(pool.weight);
+            auto single=make_mixed_moe_runtime(cpu,true,execution.config);
             for(auto& pool:single->pools) {
                 std::vector<int32_t> local(512,-1);for(int e=0;e<3;++e)local[index*3+e]=e;
                 pool.expert_local=tb::tensor(local).to(tb::kCUDA);runtime.pools.push_back(std::move(pool));
@@ -258,13 +368,44 @@ int verify_nint_dispatch(const std::filesystem::path& root) {
                 }
                 x.copy_(tb::tensor(values).reshape(x.sizes().vec()).to(tb::kFloat16).to(tb::kCUDA));
                 ids.copy_(tb::tensor(selected).reshape({tokens,10}).to(tb::kCUDA));
-                execution.config.moe_nint_heterogeneous_decode=false;auto expected=forward();
-                execution.config.moe_nint_heterogeneous_decode=true;window.run();same(actual,expected,down,tokens,step);
+                execution.config.moe_nint_heterogeneous_decode=false;
+                auto expected=forward();
+                std::vector<Workspace> inputs;
+                for(const auto& weight:weights) {
+                    const auto workspace=runtime.activation_workspace(x,int(x.numel()/width),weight.ng,weight.gs,{});
+                    Workspace input;
+                    input.qx=workspace.qx.cpu().contiguous();
+                    input.xscale=workspace.xscale.cpu().contiguous();
+                    inputs.push_back(std::move(input));
+                }
+                execution.config.moe_nint_heterogeneous_decode=true;
+                window.run();
+                for(std::size_t p=0;p<weights.size();++p) {
+                    const auto workspace=runtime.activation_workspace(
+                        x,int(x.numel()/width),weights[p].ng,weights[p].gs,{});
+                    const auto qx=workspace.qx.cpu().contiguous(),scale=workspace.xscale.cpu().contiguous();
+                    if(std::memcmp(qx.data_ptr(),inputs[p].qx.data_ptr(),qx.numel()*qx.element_size()) ||
+                            std::memcmp(scale.data_ptr(),inputs[p].xscale.data_ptr(),
+                                scale.numel()*scale.element_size())) {
+                        throw std::runtime_error(
+                            "grouped NINT quantized input or scales differ from original pool kernels");
+                    }
+                }
+                verify_nint_dispatch_output(actual,expected,weights,inputs,selected,down,tokens,step,stats);
                 ++cases;
             }
         }
     }
-    std::cout<<"nint_dispatch_cases="<<cases<<" real640/2560 four-format original-pool bytes, shared/routed inputs and changing ownership graphs exact PASS\n";
+    for(std::size_t p=0;p<stats.size();++p) {
+        const auto& s=stats[p];
+        std::cout<<"nint_dispatch_accuracy bits="<<(p==3?8:p+4)<<" values="<<s.values
+            <<" different="<<s.different<<" grouped_closer="<<s.grouped_closer<<" pool_closer="<<s.pool_closer
+            <<" grouped_rmse="<<std::sqrt(s.grouped_squared/s.values)<<" pool_rmse="<<std::sqrt(s.pool_squared/s.values)
+            <<" grouped_max="<<s.grouped_max<<" pool_max="<<s.pool_max<<" max_bound_ratio="<<s.max_bound_ratio<<'\n';
+    }
+    std::cout<<"nint_dispatch_cases="<<cases
+        <<" real640/2560 four-format FP64 oracle, FP32/FP16 error bounds,"
+        <<" exact input bytes/scales and unowned zeros PASS\n";
     MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));context->end_graph_pool(stream);
     return cases;
 }
@@ -1207,6 +1348,7 @@ int verify_active_nvq(const std::filesystem::path& root) {
     std::cout<<"active_nvq_cases="<<cases<<" active_nvq_formats="<<formats.size()<<" actual640/2560, shared/routed input,1/3/8tokens, repeated/invalid/empty routes, changing ownership and original heterogeneous kernel bytes exact PASS\n";
     return cases;
 }
+#include "moe_ffn_reference_test.h"
 int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cache=false,bool comparison=false,
         bool compare_input_views=false,bool compare_default_math=false,bool compare_e8_narrow=false,
         bool compare_resident_overlap=false,bool compare_dense=false,bool compare_nint_whole=false,
@@ -1251,6 +1393,8 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
     } environment(transfer_cache);
     const std::array<std::string,3> formats={"nint5","nvq3j-l","nvq2j-xl"};
     std::array<std::shared_ptr<const QuantLinear>,3> shared;
+    std::array<NintCpu,3> shared_cpu;
+    std::unique_ptr<MoeSharedOutputReference> reference;
     for(int p=0;p<3;++p) {
         const int output=p==2?2560:640,width=p==2?640:2560;
         const std::array<const char*,3> roles={"gate","up","down"};
@@ -1258,6 +1402,7 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
         if(!stream)throw std::runtime_error("missing released shared FFN tensor fixture");
         const std::vector<uint8_t> blob((std::istreambuf_iterator<char>(stream)),std::istreambuf_iterator<char>());
         const auto cpu=unpack_nint(blob);
+        shared_cpu[p]=cpu;
         if(cpu.gs!=24 || cpu.bits!=6 || cpu.neuron_len!=width || cpu.out!=output)
             throw std::runtime_error("released shared FFN fixture geometry mismatch");
         QuantLinear weight;weight.nint=to_gpu_nint(cpu);weight.logical_out=output;weight.logical_neuron_len=width;
@@ -1390,53 +1535,17 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
                 transfers+=kind==mfq::MoeDispatchKind::GpuTransfer;
                 resident+=kind==mfq::MoeDispatchKind::GpuResident;
             }
-            if(result.sizes()!=expected.sizes() || result.scalar_type()!=expected.scalar_type() ||
-                std::memcmp(result.data_ptr(),expected.data_ptr(),result.numel()*result.element_size())) {
-                if(result.sizes()==expected.sizes() && result.scalar_type()==expected.scalar_type()) {
-                    const auto* a=static_cast<const unsigned char*>(result.data_ptr());
-                    const auto* e=static_cast<const unsigned char*>(expected.data_ptr());
-                    int64_t first=-1,differences=0;
-                    for(int64_t i=0;i<result.numel();++i)
-                        if(std::memcmp(a+i*result.element_size(),e+i*result.element_size(),result.element_size())) {
-                            if(first<0)first=i;
-                            ++differences;
-                        }
-                    const auto actual_values=result.to(tb::kFloat32).contiguous();
-                    const auto expected_values=expected.to(tb::kFloat32).contiguous();
-                    std::ostringstream detail;detail.precision(9);
-                    detail<<"shared_output_first_difference="<<first<<" differences="<<differences
-                        <<" actual="<<actual_values.data_ptr<float>()[first]
-                        <<" expected="<<expected_values.data_ptr<float>()[first]<<" dispatch=";
-                    for(const auto kind:plans[1].kinds)detail<<int(kind)<<',';
-                    std::cerr<<detail.str()<<'\n';
-                    // Diagnose the shared contribution independently, retaining
-                    // the original weighted byte-equality failure below.
-                    const auto saved_weights=weights.clone();weights.zero_();mfq_cuda_synchronize();
-                    tb::Tensor shared_expected,shared_actual;
-                    {MfqCudaStreamGuard guard(streams[0]);
-                        math_environment.select(false);
-                        shared_expected=forwards[0](executions[0],input,ids,weights).cpu().contiguous();}
-                    math_environment.select(true);
-                    if(graph)window.run();else actual=forwards[1](executions[1],input,ids,weights);
-                    shared_actual=actual.cpu().contiguous();
-                    weights.copy_(saved_weights);mfq_cuda_synchronize();
-                    const auto shared_a=shared_actual.to(tb::kFloat32),shared_e=shared_expected.to(tb::kFloat32);
-                    int64_t shared_first=-1,shared_differences=0;
-                    for(int64_t i=0;i<shared_actual.numel();++i)
-                        if(std::memcmp(static_cast<const unsigned char*>(shared_actual.data_ptr())+i*shared_actual.element_size(),
-                                static_cast<const unsigned char*>(shared_expected.data_ptr())+i*shared_expected.element_size(),shared_actual.element_size())) {
-                            if(shared_first<0)shared_first=i;
-                            ++shared_differences;
-                        }
-                    std::ostringstream shared_detail;shared_detail.precision(9);
-                    shared_detail<<"zero_route_weights_differences="<<shared_differences;
-                    if(shared_first>=0)shared_detail<<" first="<<shared_first<<" actual="<<shared_a.data_ptr<float>()[shared_first]
-                        <<" expected="<<shared_e.data_ptr<float>()[shared_first];
-                    std::cerr<<shared_detail.str()<<'\n';
-                }
-                throw std::runtime_error("weighted shared two-stage output is not byte exact, tokens="+
-                    std::to_string(tokens)+" routes="+std::to_string(routes)+" step="+std::to_string(step)+
-                    " graph="+std::to_string(graph)+" gate_dtype="+std::to_string(int(gate_type)));
+            if(result.sizes()!=expected.sizes() || result.scalar_type()!=expected.scalar_type())
+                throw std::runtime_error("weighted shared two-stage output shape or dtype mismatch");
+            for(const auto& value:{result,expected}) {
+                const auto numeric=value.to(tb::kFloat32).contiguous();
+                for(int64_t i=0;i<numeric.numel();++i)if(!std::isfinite(numeric.data_ptr<float>()[i]))
+                    throw std::runtime_error("weighted shared output is not finite");
+            }
+            if(std::memcmp(result.data_ptr(),expected.data_ptr(),result.numel()*result.element_size())) {
+                if(!reference)reference=std::make_unique<MoeSharedOutputReference>(root,formats,executions[0]);
+                reference->verify(executions[0],input,ids,weights,selected,plans[0],shared,shared_cpu,
+                    shared_gate(executions[0],input),result,expected);
             }
             for(const auto& mode:sources)for(const auto& s:mode)
                 if(s->expert_disk_reads_after_preload())throw std::runtime_error("weighted shared fusion read expert SSD after preload");
@@ -1491,7 +1600,11 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
     }
     if(((!transfer_cache || comparison) && !cpu) || !transfers || !resident)throw std::runtime_error("weighted shared fusion omitted a dispatch tier");
     std::cout<<(compare_nint_whole?"nint_whole_pipeline_cases=":compare_dense?"nvq_dense_pipeline_cases=":compare_resident_overlap?"resident_overlap_pipeline_cases=":compare_e8_narrow?"e8_narrow_pipeline_cases=":compare_default_math?"default_math_pipeline_cases=":compare_input_views?"shared_window_input_view_cases=":transfer_cache?"transfer_cache_shared_cases=":"two_stage_shared_cases=")<<cases<<" cpu_positions="<<cpu<<" transfer_positions="<<transfers
-        <<" resident_positions="<<resident<<" mixed G/U/Down, released shared adaptive NINT6 gs24/sub7, Float/Half/BFloat gate, changing weighted graphs and partial VRAM/RAM exact PASS\n";
+        <<" resident_positions="<<resident<<" mixed G/U/Down, released shared adaptive NINT6 gs24/sub7,"
+        <<" Float/Half/BFloat gate, changing weighted graphs and partial VRAM/RAM FP64 error bounds PASS\n";
+    if(reference)std::cout<<"weighted_shared_accuracy checks="<<reference->checks
+        <<" max_bound_ratio="<<reference->max_bound_ratio<<" quantized_rows="<<reference->quantized_rows
+        <<" hidden_checks="<<reference->hidden_checks<<'\n';
     if(comparison)std::cout<<"transfer_comparison_shared_cases="<<cases<<" passes=108 replay_guards=36 equal_dma=1 fixed_primary=1 PASS\n";
     if(phased_serves)std::cout<<"phased_transfer_shared_cases="<<phased_serves<<" PASS\n";
     if(mapped_serves)std::cout<<"mapped_copy_shared_cases="<<mapped_serves<<" mapped_bytes="<<mapped_bytes<<" PASS\n";
@@ -2753,9 +2866,13 @@ int main(int argc,char** argv)try {
             auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(cache,std::to_string(i),cold[i],1,0,std::to_string(i)));
             (i==2 ? down : gu).push_back(weight);
         }
+        mfq::MoeDispatchPlan observed_dispatch;
+        int observed_dispatch_cases=0;
+        auto ffn=make_moe_ffn_pipeline(gu,down,{},
+            [&](const mfq::MoeDispatchPlan& plan){observed_dispatch=plan;});
+        if(!ffn)throw std::runtime_error("MFQ FFN was not enabled");
         finalize_moe_expert_cache(cache);
         const auto initial_host=cold[0]->host_cache()->stats();
-        auto ffn=make_moe_ffn_pipeline(gu,down);if(!ffn)throw std::runtime_error("MFQ FFN was not enabled");
         std::ifstream f(root/(format+"-640-2560.input.f32"),std::ios::binary);
         std::vector<float> inputs(3*2560);f.read(reinterpret_cast<char*>(inputs.data()),inputs.size()*sizeof(float));
         if(!f)throw std::runtime_error("missing real input fixture");
@@ -2886,7 +3003,10 @@ int main(int argc,char** argv)try {
             if(tokens==1 && iteration==4) {
                 for(const auto& s:cold)if(!s->gpu_resident(2) || s->gpu_resident(0) ||
                     !s->host_cache()->contains(s->host_key(0)) || s->host_cache()->contains(s->host_key(2)))
-                    throw std::runtime_error(format+" routing heat did not exchange VRAM and RAM ownership");
+                    throw std::runtime_error(format+" routing heat did not exchange VRAM and RAM ownership: gpu0="+
+                        std::to_string(s->gpu_resident(0))+" gpu2="+std::to_string(s->gpu_resident(2))+
+                        " ram0="+std::to_string(s->host_cache()->contains(s->host_key(0)))+
+                        " ram2="+std::to_string(s->host_cache()->contains(s->host_key(2))));
             }
             std::vector<float> input(tokens*2560);for(int t=0;t<tokens;++t)std::copy_n(inputs.data()+(t%3)*2560,2560,input.data()+t*2560);
             auto x=tb::tensor(input).reshape({tokens,2560}).to(tb::kFloat16).to(tb::kCUDA);
@@ -2894,18 +3014,21 @@ int main(int argc,char** argv)try {
             for(int p=0;p<tokens*3;++p)selected[p]=iteration<2 ? (p+iteration)%3 : iteration<6 ? 2 : 0;
             auto ids=tb::tensor(selected).reshape({tokens,3}).to(tb::kCUDA);
             auto weights=tb::ones({tokens,3},x.options().dtype(tb::kFloat32));
-            auto resident=[&](int e){return std::all_of(cold.begin(),cold.end(),[&](const auto& s){return s->gpu_resident(e);});};
-            auto dispatch=mfq::plan_moe_dispatch(selected,3,0,resident,[](int){return true;});
-            int misses=0;for(const auto& group:dispatch.groups)misses+=group.kind!=mfq::MoeDispatchKind::GpuResident;
-            dispatch=mfq::plan_moe_dispatch(selected,3,tokens>8 ? misses : static_cast<std::size_t>(misses*moe_expert_cache_ram_pcie_fraction(cache)),resident,[](int){return true;});
             auto actual=ffn(execution,x,ids,weights).to(tb::kCPU).to(tb::kFloat32).contiguous();
+            if(observed_dispatch.kinds.size()!=selected.size())
+                throw std::runtime_error("FFN dispatch observer omitted route assignments");
+            ++observed_dispatch_cases;
             auto route=build_moe_route_plan(ids,3);
             auto gu_gpu=tb::cat({baseline[0].forward(execution,x,route),baseline[1].forward(execution,x,route)},-1);
             auto g=gu_gpu.narrow(-1,0,640),u=gu_gpu.narrow(-1,640,640);
             auto expected_gpu=baseline[2].forward(execution,(g*tb::sigmoid(g))*u,route).to(tb::kCPU).to(tb::kFloat32).contiguous();
             for(int t=0;t<tokens;++t)for(int r=0;r<3;++r) {
                 const int e=selected[t*3+r];
-                const bool gpu=dispatch.kinds[t*3+r]!=mfq::MoeDispatchKind::Cpu;
+                const auto kind=observed_dispatch.kinds[t*3+r];
+                if(kind!=mfq::MoeDispatchKind::Cpu && kind!=mfq::MoeDispatchKind::GpuResident &&
+                        kind!=mfq::MoeDispatchKind::GpuTransfer)
+                    throw std::runtime_error("FFN dispatch observer assigned an invalid route kind");
+                const bool gpu=kind!=mfq::MoeDispatchKind::Cpu;
                 tb::Tensor expected;
                 if(!gpu) {
                     auto input_cpu=x.narrow(0,t,1).to(tb::kCPU).to(tb::kFloat32).contiguous();
@@ -2923,8 +3046,11 @@ int main(int argc,char** argv)try {
                 for(int column=0;column<2560;++column) {
                     const float reference=gpu ? expected_gpu.data_ptr<float>()[(t*3+r)*2560+column] : expected.data_ptr<float>()[column];
                     const float value=actual.data_ptr<float>()[(t*3+r)*2560+column];
-                    if(!std::isfinite(value) || std::abs(value-reference)>2e-5+1e-3*std::abs(reference))
-                        throw std::runtime_error(format+" FFN graph/tier mismatch at "+std::to_string(t*3+r)+","+std::to_string(column)+" value="+std::to_string(value)+" expected="+std::to_string(reference));
+                    if(std::isfinite(value) && std::isfinite(reference) &&
+                        std::abs(value-reference)<=2e-5+1e-3*std::abs(reference))continue;
+                    throw std::runtime_error(format+" FFN graph/tier mismatch tokens="+std::to_string(tokens)+
+                        " iteration="+std::to_string(iteration)+" at "+std::to_string(t*3+r)+","+
+                        std::to_string(column)+" value="+std::to_string(value)+" expected="+std::to_string(reference));
                 }
             }
             for(const auto& s:cold)if(s->expert_disk_reads_after_preload()!=0)throw std::runtime_error("FFN replay reread expert SSD");
@@ -2933,6 +3059,7 @@ int main(int argc,char** argv)try {
                 throw std::runtime_error("adaptive exchange allocated another retained RAM expert");
             ++cases;
         }
+        std::cout<<"ffn_dispatch_oracle format="<<format<<" observed_cases="<<observed_dispatch_cases<<'\n';
         {
             auto adaptive_stream=mfq_get_stream_from_pool();MfqCudaStreamGuard adaptive_guard(adaptive_stream);
             CudaExecutionContext adaptive;adaptive.config.moe_ram_pcie_fraction.reset();
@@ -3028,12 +3155,15 @@ int main(int argc,char** argv)try {
         // Two successive expert layers share transfer arenas. Changing input
         // and routes must reach both layers in one launch without a wait on an
         // event queued behind the same, still-in-flight graph.
-        auto second=make_moe_ffn_pipeline(gu,down);
+        mfq::MoeDispatchPlan second_dispatch;
+        auto second=make_moe_ffn_pipeline(gu,down,{},
+            [&](const mfq::MoeDispatchPlan& plan){second_dispatch=plan;});
         for(int tokens:{1,3,12}) {
             auto x=tb::zeros({tokens,2560},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
             auto ids=tb::zeros({tokens,3},x.options().dtype(tb::kInt32));
             auto weights=tb::ones({tokens,3},x.options().dtype(tb::kFloat32));
-            mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());tb::Tensor output;
+            mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+            tb::Tensor output,graph_first;
             for(int step=0;step<3;++step) {
                 finish_moe_expert_exchanges(cache);
                 std::vector<float> input(tokens*2560);for(int i=0;i<tokens*2560;++i)input[i]=inputs[(i+step*17)%inputs.size()];
@@ -3043,9 +3173,29 @@ int main(int argc,char** argv)try {
                 auto first=ffn(execution,x,ids,weights);
                 // Synthetic fixture weights amplify coherent inputs strongly.
                 // Bound the inter-layer input while keeping its graph dependency.
-                auto expected=second(execution,tb::tanh(first.mean(1))*.0001,ids,weights).to(tb::kCPU).to(tb::kFloat32).contiguous();
-                window.capture([&]{auto a=ffn(execution,x,ids,weights);output=second(execution,tb::tanh(a.mean(1))*.0001,ids,weights);},[]{},[&]{output={};});
+                const auto next_input=tb::tanh(first.mean(1))*.0001;
+                const auto eager=second(execution,next_input,ids,weights).cpu().to(tb::kFloat32).contiguous();
+                const auto expected_eager=moe_ffn_reference_parts(execution,next_input,ids,
+                    baseline,oracle,second_dispatch);
+                for(int64_t i=0;i<eager.numel();++i)if(!std::isfinite(eager.data_ptr<float>()[i]) ||
+                    std::abs(eager.data_ptr<float>()[i]-expected_eager.data_ptr<float>()[i])>
+                        2e-5+1e-3*std::abs(expected_eager.data_ptr<float>()[i]))
+                    throw std::runtime_error(format+
+                        " two-layer eager output differs from its observed dispatch oracle");
+                window.capture([&] {
+                    graph_first=ffn(execution,x,ids,weights);
+                    output=second(execution,tb::tanh(graph_first.mean(1))*.0001,ids,weights);
+                },[]{},[&]{output={};graph_first={};});
                 window.run();auto actual=output.to(tb::kCPU).to(tb::kFloat32).contiguous();
+                const auto first_actual=graph_first.cpu().to(tb::kFloat32).contiguous();
+                const auto first_expected=moe_ffn_reference_parts(execution,x,ids,baseline,oracle,observed_dispatch);
+                for(int64_t i=0;i<first_actual.numel();++i)if(!std::isfinite(first_actual.data_ptr<float>()[i]) ||
+                    std::abs(first_actual.data_ptr<float>()[i]-first_expected.data_ptr<float>()[i])>
+                        2e-5+1e-3*std::abs(first_expected.data_ptr<float>()[i]))
+                    throw std::runtime_error(format+
+                        " two-layer graph first layer differs from its observed dispatch oracle");
+                const auto expected=moe_ffn_reference_parts(execution,tb::tanh(graph_first.mean(1))*.0001,
+                    ids,baseline,oracle,second_dispatch);
                 for(int64_t i=0;i<actual.numel();++i)if(!std::isfinite(actual.data_ptr<float>()[i]) ||
                     std::abs(actual.data_ptr<float>()[i]-expected.data_ptr<float>()[i])>2e-5+1e-3*std::abs(expected.data_ptr<float>()[i]))
                     throw std::runtime_error(format+" two-layer window mismatch tokens="+std::to_string(tokens)+" step="+std::to_string(step)+" at "+std::to_string(i)+" actual="+std::to_string(actual.data_ptr<float>()[i])+" expected="+std::to_string(expected.data_ptr<float>()[i]));
@@ -3150,8 +3300,13 @@ int main(int argc,char** argv)try {
         }
         if(execution.config.moe_direct_ram) {
             if(counter("pipeline_ram_registered_bytes")<=0 || counter("pipeline_direct_ram_bytes")<=0 ||
-                counter("pipeline_staged_ram_bytes")!=0)
-                throw std::runtime_error(format+" did not retain registered RAM transfers across cache exchanges");
+                counter("pipeline_staged_ram_bytes")!=0) {
+                throw std::runtime_error(format+
+                    " did not retain registered RAM transfers across cache exchanges: registered="+
+                    std::to_string(counter("pipeline_ram_registered_bytes"))+" direct="+
+                    std::to_string(counter("pipeline_direct_ram_bytes"))+" staged="+
+                    std::to_string(counter("pipeline_staged_ram_bytes")));
+            }
             ++registered_ram_cases;
         }else if(counter("pipeline_ram_registered_bytes") || counter("pipeline_direct_ram_bytes"))
             throw std::runtime_error("disabled direct RAM transfer still registered memory");
@@ -3160,7 +3315,7 @@ int main(int argc,char** argv)try {
         <<" transactions="<<transactions<<" adaptive="<<adaptive_cases<<" wire="<<wire_checks<<'\n';
     std::cout<<"registered_ram_cases="<<registered_ram_cases<<'\n';
     std::cout<<"two_stage_format_cases="<<two_stage_format_cases<<" two_stage_shared_cases="<<two_stage_shared_cases<<'\n';
-    std::cout<<"transfer_cache_shared_exact_cases="<<transfer_cache_shared_cases<<'\n';
+    std::cout<<"transfer_cache_shared_cases="<<transfer_cache_shared_cases<<'\n';
     std::cout<<"cpu_profile_cases="<<cpu_profile_cases<<" optional observations/failure continuity checked\n";
     std::cout<<"dma_profile_cases="<<dma_profile_cases<<" dma_profile_samples="<<dma_profile_samples
         <<" dma_profile_window_samples="<<dma_profile_window_samples
