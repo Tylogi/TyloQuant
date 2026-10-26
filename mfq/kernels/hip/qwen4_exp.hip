@@ -542,6 +542,66 @@ template<int Items>__global__ __launch_bounds__(256) void qsa_decode_select_kern
  if(tid<3 && tid<(end+1)%4)output[size_t(token)*2051+2048+tid]=end+1-(end+1)%4+tid;
 }
 
+// A global top512 key must be in its partition's top512. Sort short partitions,
+// then rank each retained key against the other sorted lists in parallel.
+__global__ __launch_bounds__(256) void qsa_decode_select_parts(const float* scores,
+    uint64_t* partial,int pools,const int64_t* positions) {
+    using Sort=hipcub::BlockRadixSort<float,256,8,int32_t>;
+    extern __shared__ __align__(16) unsigned char temporary[];
+    auto& storage=*reinterpret_cast<Sort::TempStorage*>(temporary);
+    const int tid=threadIdx.x,part=blockIdx.x;
+    const int64_t end=positions[0];
+    if(end+1<=2048)return;
+    float keys[8];int32_t indices[8];
+    #pragma unroll
+    for(int j=0;j<8;++j) {
+        const int index=part*2048+tid*8+j;
+        keys[j]=index<pools && (index+1)*4-1<=end?scores[index]:-INFINITY;
+        indices[j]=index;
+    }
+    // Blocked input order is increasing index, preserving stable score ties.
+    Sort(storage).SortDescendingBlockedToStriped(keys,indices,0,32);
+    #pragma unroll
+    for(int j=0;j<2;++j) {
+        unsigned bits=__float_as_uint(keys[j]);
+        if(!(bits&0x7fffffffu))bits=0;
+        const unsigned ordered=bits^((bits>>31)?0xffffffffu:0x80000000u);
+        const int index=indices[j];
+        partial[part*512+tid+j*256]=index<pools && (index+1)*4-1<=end?
+            (uint64_t(ordered)<<15)|uint64_t(32767-index):0;
+    }
+}
+
+__global__ __launch_bounds__(256) void qsa_decode_select_merge(const uint64_t* partial,
+    int32_t* output,int parts,const int64_t* positions) {
+    const int tid=threadIdx.x,index=blockIdx.x*256+tid,part=index/512,local=index%512;
+    const int64_t end=positions[0];
+    if(end+1<=2048) {
+        if(!blockIdx.x)for(int i=tid;i<2051;i+=256)output[i]=i<=end?i:-1;
+        return;
+    }
+    if(!blockIdx.x && tid<3)
+        output[2048+tid]=tid<(end+1)%4?int(end+1-(end+1)%4+tid):-1;
+    const uint64_t key=partial[index];
+    if(!key)return;
+    int rank=local;
+    for(int other=0;other<parts && rank<512;++other) {
+        if(other==part)continue;
+        int lo=0,hi=512;
+        while(lo<hi) {
+            const int middle=(lo+hi)/2;
+            if(partial[other*512+middle]>key)lo=middle+1;
+            else hi=middle;
+        }
+        rank+=lo;
+    }
+    if(rank<512) {
+        const int selected=32767-int(key&32767);
+        #pragma unroll
+        for(int k=0;k<4;++k)output[rank*4+k]=selected*4+k;
+    }
+}
+
 __global__ void qsa_rank_kernel(const float* scores,const int64_t* positions,
     float* ranked,int64_t total,int pools,int pool) {
     for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<total;i+=int64_t(gridDim.x)*blockDim.x)
@@ -621,6 +681,20 @@ Tensor qsa_graph_select(const Tensor& scores,const Tensor& positions,int64_t poo
                 scores.data_ptr<float>(),selected.data_ptr<int32_t>(),pools,positions.data_ptr<int64_t>());
         };
         if(pools==2048)launch.template operator()<8>();else launch.template operator()<9>();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
+    }
+    if(scores.size(1)==1 && pool==4 && budget==2048 && pools>2304 && pools<=16512 &&
+       qsa_prefill_gfx942(scores.get_device())) {
+        auto selected=tb::empty({1,1,columns},scores.options().dtype(tb::kInt32));
+        const int parts=(pools+2047)/2048;
+        auto temporary=tb::empty({parts*512},scores.options().dtype(tb::kInt64));
+        auto* keys=reinterpret_cast<uint64_t*>(temporary.data_ptr<int64_t>());
+        using Sort=hipcub::BlockRadixSort<float,256,8,int32_t>;
+        constexpr size_t bytes=sizeof(Sort::TempStorage);static_assert(bytes<=49152);
+        qsa_decode_select_parts<<<parts,256,bytes,mfq_current_cuda_stream()>>>(
+            scores.data_ptr<float>(),keys,pools,positions.data_ptr<int64_t>());
+        qsa_decode_select_merge<<<parts*2,256,0,mfq_current_cuda_stream()>>>(
+            keys,selected.data_ptr<int32_t>(),parts,positions.data_ptr<int64_t>());
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
     }
     auto ranked=tb::empty_like(scores);
