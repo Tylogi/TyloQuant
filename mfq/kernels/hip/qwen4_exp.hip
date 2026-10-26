@@ -8,6 +8,7 @@
 #include <cmath>
 #include <limits>
 #include <type_traits>
+#include <hipcub/hipcub.hpp>
 #include "mfq_hip_compat.h"
 
 namespace mfq_qwen4_exp {
@@ -443,6 +444,35 @@ Tensor block_scores(const Tensor& query, const Tensor& pooled) {
 }
 
 namespace {
+// Score/index keys preserve the stable lower-index order for tied scores.
+template<int Items>__global__ __launch_bounds__(256) void qsa_prefill_select_kernel(const float* scores,int32_t* output,int pools,int offset){
+ using Sort=hipcub::BlockRadixSort<uint64_t,256,Items>;
+ extern __shared__ __align__(16) unsigned char temporary[];
+ auto& storage=*reinterpret_cast<typename Sort::TempStorage*>(temporary);
+ const int tid=threadIdx.x,token=blockIdx.x,end=offset+token;
+ for(int i=tid;i<2051;i+=256)output[size_t(token)*2051+i]=-1;
+ uint64_t keys[Items];
+ #pragma unroll
+ for(int j=0;j<Items;++j){const int index=tid+j*256;uint64_t key=0;
+  if(index<pools && (index+1)*4-1<=end){unsigned bits=__float_as_uint(scores[size_t(token)*pools+index]);
+   if(!(bits&0x7fffffffu))bits=0;
+   const unsigned ordered=bits^((bits>>31)?0xffffffffu:0x80000000u);
+   key=(uint64_t(ordered)<<13)|uint64_t(8191-index);
+  }
+  keys[j]=key;
+ }
+ __syncthreads();
+ Sort(storage).SortDescendingBlockedToStriped(keys,0,45);
+ #pragma unroll
+ for(int j=0;j<Items;++j){const int rank=tid+j*256;
+  if(rank<512 && keys[j]){const int index=8191-int(keys[j]&8191);
+   #pragma unroll
+   for(int k=0;k<4;++k)output[size_t(token)*2051+rank*4+k]=index*4+k;
+  }
+ }
+ if(tid<3 && tid<(end+1)%4)output[size_t(token)*2051+2048+tid]=end+1-(end+1)%4+tid;
+}
+
 __global__ void qsa_rank_kernel(const float* scores,const int64_t* positions,
     float* ranked,int64_t total,int pools,int pool) {
     for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<total;i+=int64_t(gridDim.x)*blockDim.x)
@@ -465,6 +495,27 @@ __global__ void qsa_selected_kernel(const int64_t* indices,const int64_t* positi
         selected[i]=int32_t(value);
     }
 }
+}
+
+Tensor qsa_prefill_select(const Tensor& scores,int64_t query_offset) {
+    if(!scores.defined() || !scores.is_cuda() || scores.scalar_type()!=tb::kFloat32 ||
+       !scores.is_contiguous() || scores.dim()!=3 || scores.size(0)!=1 ||
+       scores.size(1)<128 || scores.size(1)>65535 || scores.size(2)<1 || scores.size(2)>8192 ||
+       query_offset<0 || query_offset>INT_MAX-scores.size(1) || !qsa_prefill_gfx942(scores.get_device()))return Tensor{};
+    MfqCudaGuard guard(scores.device());
+    auto selected=tb::empty({1,scores.size(1),2051},scores.options().dtype(tb::kInt32));
+    const auto launch=[&]<int Items>() {
+        using Sort=hipcub::BlockRadixSort<uint64_t,256,Items>;
+        constexpr size_t bytes=sizeof(typename Sort::TempStorage);static_assert(bytes<=65536);
+        if constexpr(bytes>49152)MFQ_CUDA_CHECK(hipFuncSetAttribute(
+            reinterpret_cast<const void*>(qsa_prefill_select_kernel<Items>),hipFuncAttributeMaxDynamicSharedMemorySize,bytes));
+        qsa_prefill_select_kernel<Items><<<unsigned(scores.size(1)),256,bytes,mfq_current_cuda_stream()>>>(
+            scores.data_ptr<float>(),selected.data_ptr<int32_t>(),int(scores.size(2)),int(query_offset));
+    };
+    if(scores.size(2)<=2048)launch.template operator()<8>();
+    else if(scores.size(2)<=4096)launch.template operator()<16>();
+    else launch.template operator()<32>();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
 }
 
 Tensor qsa_graph_select(const Tensor& scores,const Tensor& positions,int64_t pool,int64_t budget) {

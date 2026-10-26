@@ -25,6 +25,8 @@ std::vector<Tensor> gated_residual_post_norm(
     const Tensor& branch, const Tensor& residual, const Tensor& injection,
     const Tensor& norm, int64_t hc_count, double eps);
 Tensor block_scores(const Tensor&, const Tensor&);
+// Optional gfx942 PP selector for pool4/budget2048; undefined means unsupported.
+Tensor qsa_prefill_select(const Tensor& scores,int64_t query_offset);
 Tensor qsa_graph_select(const Tensor& scores,const Tensor& positions,int64_t pool,int64_t budget);
 std::vector<Tensor> ple_gate_norm_hip(const Tensor&,const Tensor&,const Tensor&,const Tensor&,
     int64_t hidden,int64_t streams,double eps);

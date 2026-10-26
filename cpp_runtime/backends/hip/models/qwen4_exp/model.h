@@ -923,8 +923,9 @@ class Qsa {
                 return mfq_qwen4_exp::block_scores(p.iq, pooled);
             },
             [&](const Tensor &scores, const Projection &p, const Tensor &pooled) {
-                auto ids =
-                    select_pooled_blocks(scores, offset, offset + t, c_.pool, c_.budget, true);
+                Tensor ids;
+                if(c_.pool==4 && c_.budget==2048)ids=mfq_qwen4_exp::qsa_prefill_select(scores,offset);
+                if(!ids.defined())ids=select_pooled_blocks(scores,offset,offset+t,c_.pool,c_.budget,true);
                 if (selection_trace)
                     *selection_trace = {scores, ids, p.iq, pooled};
                 return ids;
