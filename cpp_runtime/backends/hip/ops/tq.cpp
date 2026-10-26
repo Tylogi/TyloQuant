@@ -221,7 +221,7 @@ tb::Tensor TqWeight::forward(tb::Tensor input) const {
         (neuron_len>=512 || tokens*area>=(1LL<<27));
     // Only enable the direct FP32 geometry that beats the existing native
     // caller. Weights are reconstructed in LDS; workspace holds activations.
-    if(type==2 && tokens==2048 && neuron_len==2560 && (out==6144 || out==12288) && !view.columns &&
+    if(type==2 && tokens==2048 && neuron_len==2560 && (out==6144 || out==10240 || out==12288) && !view.columns &&
             mfq_tq_prefill_f32_supported(image.get_device())) {
         auto result=tb::empty(shape,x.options());
         const auto bytes=mfq_tq_prefill_f32_workspace(view,int(tokens));

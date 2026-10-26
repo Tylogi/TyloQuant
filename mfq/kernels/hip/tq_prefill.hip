@@ -119,7 +119,7 @@ template<int BM,int BK>__global__ __launch_bounds__(256) void two_phase(
   #pragma unroll
   for(int i=tid;i<Vectors;i+=256) {
    const int local_row=i/(BK/8),column=kb+(i%(BK/8))*8,row=n0+local_row;
-   PackedStore store{w+local_row*BK,(i%(BK/8))*8,(local_row&(BK/4-1))*4};
+   PackedStore store{w+local_row*BK,(i%(BK/8))*8,((local_row>>1)&(BK/4-1))*4};
    if(row<m.rows && column<m.stored_columns) {
     const auto& data=prepared[i/256];
     if(m.columns)mfq_tq_vector::visit_values<8,true,true,0,PackedStore,false,2,true>(m.words,descriptors[i/256],m.scales,static_cast<const half*>(m.relative),nullptr,nullptr,row,column,m.stored_columns,m.gslog,store,data.raw,data.columns);
@@ -134,7 +134,7 @@ template<int BM,int BK>__global__ __launch_bounds__(256) void two_phase(
    const half* input=phase?low:high;
    #pragma unroll
    for(int i=tid;i<BM*(BK/8);i+=256) {
-    const int row=i/(BK/8),column=(i%(BK/8))*8,mask=(row&(BK/4-1))*4;
+    const int row=i/(BK/8),column=(i%(BK/8))*8,mask=((row>>1)&(BK/4-1))*4;
     const uint4 packed=t0+row<tokens && kb+column<m.input_columns?
      *reinterpret_cast<const uint4*>(input+size_t(t0+row)*m.input_columns+kb+column):uint4{};
     *reinterpret_cast<uint2*>(x+row*BK+(column^mask))=make_uint2(packed.x,packed.y);
@@ -147,7 +147,7 @@ template<int BM,int BK>__global__ __launch_bounds__(256) void two_phase(
    }
    #pragma unroll
    for(int k=0;k<BK;k+=16) {
-    const int wr=wave*16+(lane&15),wc=(k+(lane>>4)*4)^((lane&(BK/4-1))*4);
+    const int wr=wave*16+(lane&15),wc=(k+(lane>>4)*4)^(((lane>>1)&(BK/4-1))*4);
     const auto a=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(w+wr*BK+wc));
     #pragma unroll
     for(int mt=0;mt<BM/16;mt+=4) {
