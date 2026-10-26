@@ -11,9 +11,11 @@ set(MFQ_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 option(MFQ_ENABLE_FATAL_TESTS "Enable opt-in fatal diagnostic injection (test builds only)" OFF)
 if(MSVC)
     # Retain Release optimization while making native fatal stacks actionable.
+    # /Z7 keeps debug info in each object: deterministic /pathmap builds would
+    # otherwise hide the per-target compile PDBs from the linker (LNK4099).
     add_compile_options(
-        "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:/Zi>"
-        "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-Xcompiler=/Zi>")
+        "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:/Z7>"
+        "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-Xcompiler=/Z7>")
     add_link_options("$<$<CONFIG:Release>:/DEBUG>" "$<$<CONFIG:Release>:/OPT:REF>"
         "$<$<CONFIG:Release>:/OPT:ICF>" "/PDBALTPATH:%_PDB%")
     set(CMAKE_PDB_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
