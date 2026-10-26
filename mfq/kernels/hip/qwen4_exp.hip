@@ -627,9 +627,10 @@ Tensor attention_gate(const Tensor& attended, const Tensor& gate, bool half_outp
 }
 
 Tensor causal_gqa_attention_gate(const Tensor& q, const Tensor& k, const Tensor& v,
-    const Tensor& positions, const Tensor& gate, int64_t columns, bool half_output) {
+    const Tensor& positions, const Tensor& gate, int64_t columns, bool half_output,
+    bool consecutive_positions) {
     return mfq_selected_attention::causal_gated(q, k, v, positions, gate, columns,
-        1.0 / std::sqrt(double(q.size(3))), half_output);
+        1.0 / std::sqrt(double(q.size(3))), half_output,true,true,consecutive_positions);
 }
 
 } // namespace mfq_qwen4_exp

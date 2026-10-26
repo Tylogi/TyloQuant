@@ -21,7 +21,8 @@ Tensor causal(const Tensor& query,const Tensor& key,const Tensor& value,
     const Tensor& positions,int64_t columns,double scale);
 Tensor causal_gated(const Tensor& query, const Tensor& key, const Tensor& value,
     const Tensor& positions, const Tensor& gate, int64_t columns, double scale,
-    bool half_output, bool fused_mma_gate = true, bool fused_mma_prepare = true);
+    bool half_output, bool fused_mma_gate = true, bool fused_mma_prepare = true,
+    bool consecutive_positions = false);
 Tensor mma_reduce_gated(const Tensor& partial_output, const Tensor& metadata,
     const Tensor& gate, bool half_output, int kv_heads, int total_blocks,
     int blocks_per_tile, int query_columns, int head_columns);

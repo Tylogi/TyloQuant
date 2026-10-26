@@ -464,7 +464,7 @@ Tensor causal(const Tensor& q,const Tensor& k,const Tensor& v,
 
 Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
     const Tensor& positions, const Tensor& gate, int64_t columns, double scale,
-    bool half_output, bool fused_mma_gate, bool fused_mma_prepare) {
+    bool half_output, bool fused_mma_gate, bool fused_mma_prepare, bool consecutive_positions) {
     attention_shapes(q, k, v);
     values({&q, &gate});
     MFQ_RUNTIME_CHECK(gate.dim() == 4 && gate.size(0) == q.size(0) && gate.size(1) == q.size(2) &&
@@ -484,6 +484,16 @@ Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
     if (q.size(3) == 256) {
         auto key = k.to(tb::kFloat16).contiguous(), value = v.to(tb::kFloat16).contiguous();
         if (fused_mma_prepare && q.numel()) {
+            if(consecutive_positions && q.size(2)>=128 && q.size(1)==24 && key.size(1)==2) {
+                hipDeviceProp_t properties{};
+                MFQ_CUDA_CHECK(hipGetDeviceProperties(&properties,q.get_device()));
+                if(std::strncmp(properties.gcnArchName,"gfx942",6)==0) {
+                    auto attended=mfq_sparse_attn_mma::launch<256,256,4,4,false>(
+                        q,key,value,Tensor{},Tensor{},Tensor{},Tensor{},scale,
+                        "causal_gqa_query_tiles",fused_mma_gate?gate:Tensor{},half_output,cache_positions,columns);
+                    return fused_mma_gate?attended:gated(attended,gate,half_output);
+                }
+            }
             auto attended = mfq_sparse_attn_mma::launch<256, 256, 1, 16, false>(
                 q, key, value, Tensor{}, Tensor{}, Tensor{}, Tensor{}, scale,
                 "causal_gqa_attention_gate", fused_mma_gate ? gate : Tensor{}, half_output,

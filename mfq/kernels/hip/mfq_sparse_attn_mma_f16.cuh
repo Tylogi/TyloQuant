@@ -128,15 +128,25 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
         tile_input.query_head_stride = input.query_head_stride;
         tile_input.query_column_stride = input.query_column_stride;
         tile_input.half_query = input.half_query;
-        int64_t end = input.wide_positions ? static_cast<const int64_t*>(input.positions)[jt]
-            : static_cast<const int32_t*>(input.positions)[jt];
+        // Multi-query causal tiles are used only for caller-proven consecutive
+        // positions. The last query bounds KV reads for the complete tile.
+        const int query_last=min(M-1,(jt+1)*ncols1-1);
+        int64_t end = input.wide_positions ? static_cast<const int64_t*>(input.positions)[query_last]
+            : static_cast<const int32_t*>(input.positions)[query_last];
         end = end < -1 ? -1 : end;
         end = end >= max_seq ? max_seq - 1 : end;
         end = end >= input.causal_columns ? input.causal_columns - 1 : end;
-        tile_input.causal_query_offset = static_cast<int>(end) - jt;
+        tile_input.causal_query_offset = static_cast<int>(end) - query_last;
         tile_input.causal_row_count = static_cast<int>(end + 1);
     }
 
+    if constexpr(DKQ==256 && DV==256 && !V_is_K_view && !needs_fixup && !is_fixup) {
+        if(input.positions) {
+            constexpr int batch=ggml_cuda_fattn_mma_get_nbatch_fa(DKQ,DV,ncols);
+            // Keep one fully masked iteration for an empty causal row.
+            kb0_stop=min(kb0_stop,max(1,(tile_input.causal_row_count+batch-1)/batch));
+        }
+    }
     if constexpr(SplitKV) {
         tile_input.secondary_kv=input.secondary_kv;
         tile_input.kv_split_index=input.kv_split_index;
@@ -169,7 +179,7 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
         V_is_K_view ? DKQ / 2 : DV / 2,
         sequence_mask == nullptr ? 0 : selected,
         jt, zt_gqa, kb0_start, kb0_stop, row_indices,
-        input.positions != nullptr, 0, tile_input);
+        input.positions != nullptr, -selected, tile_input);
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view,bool SplitKV=false,bool Unsplit=false>
@@ -195,8 +205,8 @@ __global__ void sparse_attention_kernel(
     uint3 ne01,
     RuntimeInput input) {
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(TURING_MMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE))
-    static_assert(ncols1 == 1,
-        "selected-token tiles require one index row per query tile");
+    static_assert(ncols1==1 || (DKQ==256 && DV==256 && !V_is_K_view),
+        "multi-query tiles require causal 256-wide attention");
     static_assert(DKQ % 2 == 0 && DV % 2 == 0, "attention widths must be even");
     static_assert(!V_is_K_view || DV <= DKQ, "V view exceeds K width");
 
@@ -278,8 +288,8 @@ Tensor launch(
     const Tensor& positions = Tensor{},
     int64_t causal_columns = 0,
     const Tensor& secondary_kv = Tensor{}) {
-    static_assert(ncols1 == 1,
-        "selected-token tiles require one index row per query tile");
+    static_assert(ncols1==1 || (DKQ==256 && DV==256 && !V_is_K_view),
+        "multi-query tiles require causal 256-wide attention");
     constexpr int ncols = ncols1 * ncols2;
     MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
         q.size(0) <= INT_MAX && q.size(1) <= INT_MAX && q.size(2) <= INT_MAX &&
@@ -291,6 +301,7 @@ Tensor launch(
     const int kv_heads = static_cast<int>(k.size(1));
     const int max_seq = static_cast<int>(k.size(2));
     const bool causal = positions.defined();
+    MFQ_RUNTIME_CHECK(ncols1==1 || causal,name,": selected index rows require single-query tiles");
     if(secondary_kv.defined()) {
         MFQ_RUNTIME_CHECK(V_is_K_view && !causal && B==1 && M==1 && kv_heads==1 &&
             secondary_kv.is_cuda() && secondary_kv.device()==k.device() && secondary_kv.is_contiguous() &&
@@ -428,8 +439,9 @@ Tensor launch(
     const int blocks_per_tile = rounded_blocks / ntiles_dst;
     // Keep the existing launch grid and reduction order; specialize only work
     // that already assigns one complete query tile to a block.
-    if constexpr(DKQ==512 && DV==512 && ncols1==1 && ncols2>=32 && V_is_K_view && !SplitKV) {
-        if(M>=128 && blocks_per_tile==1) {
+    if constexpr(!SplitKV && ((DKQ==512 && DV==512 && ncols1==1 && ncols2>=32 && V_is_K_view) ||
+        (DKQ==256 && DV==256 && !V_is_K_view))) {
+        if(M>=128 && blocks_per_tile==1 && (DKQ!=256 || causal)) {
             kernel=sparse_attention_kernel<DKQ,DV,ncols1,ncols2,V_is_K_view,SplitKV,true>;
             static bool direct_shmem[32]={};
             if(!direct_shmem[device]) {

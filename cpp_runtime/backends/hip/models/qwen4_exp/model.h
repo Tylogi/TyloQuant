@@ -891,7 +891,7 @@ class Qsa {
                     auto absolute=tb::arange(t,p.query.options().dtype(tb::kInt64))+offset;
                     auto gated=mfq_qwen4_exp::causal_gqa_attention_gate(p.query,
                         p.key.permute({0,2,1,3}),p.value.permute({0,2,1,3}),absolute,p.gate,
-                        offset+t,hidden.scalar_type()==tb::kFloat16);
+                        offset+t,hidden.scalar_type()==tb::kFloat16,true);
                     gate_applied=true;return gated;
                 }
                 return attend(p.query,p.key.permute({0,2,1,3}),p.value.permute({0,2,1,3}),{},offset);
