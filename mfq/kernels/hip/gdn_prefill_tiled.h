@@ -1,9 +1,25 @@
 // Copyright 2026 MFQ contributors. SPDX-License-Identifier: Apache-2.0
 #pragma once
 namespace mfq_hip_gdn_prefill {
+
+template<int Shift> __device__ __forceinline__ float add_rotated16(float value) {
+#if defined(__gfx942__)
+ // Descending rotations 8,4,2,1 retain the butterfly's FP32 pair sums.
+ // Each completed step repeats its partial sum within the smaller period.
+ return value+__int_as_float(__builtin_amdgcn_mov_dpp(
+     __float_as_int(value),0x120+Shift,0xf,0xf,false));
+#else
+ return value+__shfl_xor(value,Shift,16);
+#endif
+}
+
+__device__ __forceinline__ float sum16(float value) {
+ value=add_rotated16<8>(value);value=add_rotated16<4>(value);
+ value=add_rotated16<2>(value);return add_rotated16<1>(value);
+}
 template<bool Transposed,int C>__global__ __launch_bounds__(256) void recurrent(
- const float* q,const float* k,const float* v,const float* g,
- const float* beta,const float* initial,float* output,float* final_state,
+ const float* __restrict__ q,const float* __restrict__ k,const float* __restrict__ v,const float* __restrict__ g,
+ const float* __restrict__ beta,const float* initial,float* __restrict__ output,float* final_state,
  int query_heads,int value_heads,int tokens,bool tiled_heads) {
  constexpr int D=128,Lanes=16,Rows=8,Columns=16;
  __shared__ float keys[C*D],queries[C*D],values[C*Columns],decays[C],betas[C];
@@ -34,14 +50,12 @@ template<bool Transposed,int C>__global__ __launch_bounds__(256) void recurrent(
    float key[Rows],query[Rows],projection=0.f;
    #pragma unroll
    for(int r=0;r<Rows;++r){key[r]=keys[t*D+r*Lanes+lane];query[r]=queries[t*D+r*Lanes+lane];projection+=state[r]*key[r];}
-   #pragma unroll
-   for(int shift=8;shift;shift/=2)projection+=__shfl_xor(projection,shift,Lanes);
+   projection=sum16(projection);
    const float decay=decays[t],delta=(values[t*Columns+tid/Lanes]-decay*projection)*betas[t];
    float result=0.f;
    #pragma unroll
    for(int r=0;r<Rows;++r){state[r]=decay*state[r]+key[r]*delta;result+=state[r]*query[r];}
-   #pragma unroll
-   for(int shift=8;shift;shift/=2)result+=__shfl_xor(result,shift,Lanes);
+   result=sum16(result);
    if(!lane)output[vb+size_t(start+t)*D+column]=result*0.08838834764831845f;
   }
   __syncthreads();
