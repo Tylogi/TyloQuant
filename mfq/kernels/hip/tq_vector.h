@@ -6,6 +6,9 @@ namespace mfq_tq_vector {
 using U4=uint32_t __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ uint32_t dot_bytes(uint32_t a,uint32_t b,uint32_t c) {
 #if defined(__HIP_DEVICE_COMPILE__) && __has_builtin(__builtin_amdgcn_udot4)
+#if defined(__gfx942__)
+ if(b==0x01010101u)return __builtin_amdgcn_sad_u8(a,0u,c);
+#endif
  return __builtin_amdgcn_udot4(a,b,c,false);
 #else
  return c+(a&255)+((a>>8)&255)+((a>>16)&255)+(a>>24);
