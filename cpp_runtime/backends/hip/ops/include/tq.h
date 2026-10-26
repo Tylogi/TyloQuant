@@ -19,6 +19,10 @@ TqWeight to_device_tq(const std::vector<std::uint8_t>&,std::int64_t columns,int 
 bool tq_q8_enabled();
 std::vector<mfq_tensor_backend::Tensor> tq_forward_group(
     const std::vector<const TqWeight*>&,mfq_tensor_backend::Tensor);
+// GDN auxiliaries retain BF16 activation/output rounding, promoted to FP32.
+std::vector<mfq_tensor_backend::Tensor> tq_forward_group_bf16(
+    const std::vector<const TqWeight*>&,mfq_tensor_backend::Tensor,
+    const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&);
 mfq_tensor_backend::Tensor tq_swiglu(
     const TqWeight&,const TqWeight&,mfq_tensor_backend::Tensor);
 mfq_tensor_backend::Tensor tq_forward_residual(

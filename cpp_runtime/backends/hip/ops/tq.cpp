@@ -95,6 +95,27 @@ std::vector<tb::Tensor> tq_forward_group(
     return result;
 }
 
+std::vector<tb::Tensor> tq_forward_group_bf16(const std::vector<const TqWeight*>& weights,
+        tb::Tensor input,const tb::Tensor& alpha,const tb::Tensor& beta) {
+    MFQ_RUNTIME_CHECK(weights.size()==2 && input.is_cuda() && input.scalar_type()==tb::kFloat32 &&
+        input.numel()==weights[0]->neuron_len,"mixed TQ input group requires one FP32 token");
+    const MfqCudaGuard guard(input.get_device());const auto x=input.contiguous();
+    std::vector<tb::Tensor> result;TqProjectionPlan plan{};plan.count=2;
+    for(int i=0;i<2;++i) {
+        auto shape=x.sizes().vec();shape.back()=weights[i]->out;
+        result.push_back(tb::empty(shape,x.options()));plan.jobs[i]={weights[i]->view,result.back().data_ptr(),0};
+    }
+    for(const auto& w:{alpha,beta}) {
+        MFQ_RUNTIME_CHECK(w.is_cuda() && w.device()==x.device() && w.is_contiguous() &&
+            w.scalar_type()==tb::kBFloat16 && w.dim()==2 && w.size(1)==x.size(-1),"mixed input BF16 matrix differs");
+        auto shape=x.sizes().vec();shape.back()=w.size(0);result.push_back(tb::empty(shape,x.options()));
+    }
+    status(mfq_tq_group_bf16(plan,x.data_ptr<float>(),reinterpret_cast<const uint16_t*>(alpha.data_ptr()),
+        reinterpret_cast<const uint16_t*>(beta.data_ptr()),result[2].data_ptr<float>(),result[3].data_ptr<float>(),
+        int(alpha.size(0)),int(beta.size(0)),mfq_current_cuda_stream()));
+    return result;
+}
+
 tb::Tensor tq_swiglu(const TqWeight& gate,const TqWeight& up,tb::Tensor input) {
     if(!input.is_cuda() || input.numel()!=gate.neuron_len || input.size(-1)!=gate.neuron_len ||
        gate.neuron_len!=up.neuron_len || gate.out!=up.out ||

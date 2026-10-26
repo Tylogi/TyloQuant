@@ -26,5 +26,6 @@ extern "C" int mfq_tq_materialize(ProjectionView, void*, int, hipStream_t);
 extern "C" int mfq_tq_materialize_bf16(ProjectionView, void*, int, hipStream_t);
 extern "C" int mfq_tq_prefill_f32_supported(int);
 extern "C" int mfq_tq_prefill_f32(ProjectionView,const float*,float*,int,void*,std::uint64_t,hipStream_t);
+extern "C" int mfq_tq_group_bf16(TqProjectionPlan,const float*,const std::uint16_t*,const std::uint16_t*,float*,float*,int,int,hipStream_t);
 extern "C" int mfq_tq_q8_tokens(ProjectionView, const void*, void*, int, int,
     void*, std::uint64_t, hipStream_t);

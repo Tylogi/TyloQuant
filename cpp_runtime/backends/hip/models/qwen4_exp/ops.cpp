@@ -231,6 +231,22 @@ struct BlockLoader : weight_loader::Loader {
     auto gdn(GdnWeights weights, const Config &c) const {
         std::vector<Linear> projections{weights.qkv,weights.gate,weights.alpha,weights.beta};
         weights.input_projection=weight_loader::grouped_linear(execution,projections);
+        auto q=weight_loader::linear_weight(projections[0]),g=weight_loader::linear_weight(projections[1]);
+        auto a=weight_loader::linear_weight(projections[2]),b=weight_loader::linear_weight(projections[3]);
+        const auto tq_input=[&](const auto& w){return w && w->is_tq() && !w->tensor_parallel() &&
+            w->tq.image.is_cuda() && w->out()>=w->neuron_len();};
+        const auto dense_gate=[&](const auto& w){return w && w->is_dense() && !w->tensor_parallel() &&
+            w->dense.is_cuda() && w->dense.is_contiguous() && w->dense.scalar_type()==tb::kBFloat16 &&
+            w->dense.dim()==2 && w->out()>0 && w->out()<=64 && w->neuron_len()==c.hidden;};
+        if(weights.input_projection && tq_input(q) && tq_input(g) && dense_gate(a) && dense_gate(b)) {
+            // GDN promotes these BF16 auxiliaries to FP32 before its core.
+            // Keep the generic grouped-linear output dtype contract intact.
+            weights.input_projection=[previous=weights.input_projection,q,g,a,b](CudaExecutionContext& ex,const Tensor& x) {
+                if(!tq_q8_enabled() && x.is_cuda() && x.scalar_type()==tb::kFloat32 && x.numel()==x.size(-1))
+                    return tq_forward_group_bf16({&q->tq,&g->tq},x,a->dense,b->dense);
+                return previous(ex,x);
+            };
+        }
         weights.qkv=std::move(projections[0]);weights.gate=std::move(projections[1]);
         weights.alpha=std::move(projections[2]);weights.beta=std::move(projections[3]);
         return std::make_unique<Gdn>(std::move(weights), c.key_heads, c.value_heads, c.linear_width,
