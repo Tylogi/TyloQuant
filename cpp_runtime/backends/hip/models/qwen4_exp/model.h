@@ -240,7 +240,7 @@ class Gdn {
                 return projected;
             },
             [&](Tensor projected) {
-                if(fused_decode_ && fused_preparation_ && t>=2 && t<=8 && d_<=256 && kernel_<=8 &&
+                if(fused_decode_ && fused_preparation_ && t>=2 && t<=65535 && d_<=256 && kernel_<=8 &&
                     (projected.scalar_type()==tb::kFloat16 || projected.scalar_type()==tb::kFloat32)) {
                     auto weight=w_.conv;
                     if(weight.dim()==2 && weight.size(0)==channels && weight.size(1)==kernel_)
@@ -251,7 +251,7 @@ class Gdn {
                         (alpha.scalar_type()!=tb::kFloat16 && alpha.scalar_type()!=tb::kFloat32)) {
                         alpha=alpha.to(tb::kFloat32);beta=beta.to(tb::kFloat32);
                     }
-                    auto prepared=linear_conv_qkv_gate_short_cuda(previous,projected,weight,
+                    auto prepared=linear_conv_qkv_gate_prefill_cuda(previous,projected,weight,
                         alpha.reshape({b,t,nv_}),beta.reshape({b,t,nv_}),w_.dt_bias,w_.a_log,nk_,nv_,d_,1e-6);
                     prepared_gates={prepared[4],prepared[5]};
                     return std::array<Tensor,4>{prepared[0],prepared[1],prepared[2],prepared[3]};
@@ -848,30 +848,14 @@ class Qsa {
             t <= c_.maximum - offset && full_positions.size(-1) == offset + t &&
                 (!use_cache || (offset == values_.position() && offset == index_.position())),
             "Qwen4 QSA cache/position geometry mismatch");
+        bool gate_applied=false;
         return mfq::models::qwen4_exp::sparse_attention(
             offset + t, c_.budget, use_cache,
             [&] {
-                auto pair = w_.query(execution, hidden).reshape({b, t, c_.heads, 2 * c_.width});
-                auto gate = pair.narrow(-1, c_.width, c_.width);
-                auto query = rms_norm(pair.narrow(-1, 0, c_.width),
-                                      w_.query_norm.to(tb::kFloat32) + 1, c_.eps)
-                                 .permute({0, 2, 1, 3});
-                auto key =
-                    rms_norm(w_.key(execution, hidden).reshape({b, t, c_.kv_heads, c_.width}),
-                             w_.key_norm.to(tb::kFloat32) + 1, c_.eps)
-                        .permute({0, 2, 1, 3});
-                auto value = w_.value(execution, hidden).reshape({b, t, c_.kv_heads, c_.width});
-                query = rotary_->forward(query, current_positions);
-                key = rotary_->forward(key, current_positions).permute({0, 2, 1, 3});
-                auto iqk = w_.index_query_key(execution, hidden);
-                auto iq = rms_norm(iqk.narrow(-1, 0, c_.index_heads * c_.index_width)
-                                       .reshape({b, t, c_.index_heads, c_.index_width}),
-                                   w_.index_query_norm.to(tb::kFloat32) + 1, c_.eps)
-                              .permute({0, 2, 1, 3});
-                iq = rotary_->forward(iq, current_positions).permute({0, 2, 1, 3});
-                auto raw = iqk.narrow(-1, c_.index_heads * c_.index_width, c_.index_width);
-                return Projection{gate, query, quantization_.enabled()?encode_key(key):key,
-                    quantization_.enabled()?encode_value(value):value, iq, raw};
+                auto projected=project(execution,hidden,current_positions,offset+t>c_.budget);
+                projected.key=encode_key(projected.key);
+                projected.value=encode_value(projected.value);
+                return projected;
             },
             [&](Projection &p) {
                 p.key = keys_.append(p.key.reshape({b, t, -1}))
@@ -881,6 +865,14 @@ class Qsa {
                 p.raw = index_.append(p.raw);
             },
             [&](const Projection &p) {
+                if(!quantization_.enabled() && c_.width==256 &&
+                    (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)) {
+                    auto absolute=tb::arange(t,p.query.options().dtype(tb::kInt64))+offset;
+                    auto gated=mfq_qwen4_exp::causal_gqa_attention_gate(p.query,
+                        p.key.permute({0,2,1,3}),p.value.permute({0,2,1,3}),absolute,p.gate,
+                        offset+t,hidden.scalar_type()==tb::kFloat16);
+                    gate_applied=true;return gated;
+                }
                 return attend(p.query,p.key.permute({0,2,1,3}),p.value.permute({0,2,1,3}),{},offset);
             },
             [&](const Projection &p) {
@@ -891,9 +883,12 @@ class Qsa {
                                   .to(tb::kFloat32)
                                   .mean(2)
                                   .to(raw.scalar_type());
-                pooled = rms_norm(pooled, w_.index_key_norm.to(tb::kFloat32) + 1, c_.eps);
                 auto starts = tb::arange(pools, raw.options().dtype(tb::kInt64)) * c_.pool;
                 auto positions = full_positions.index_select(-1, starts);
+                if(fused_projection_ && rotary_->fused() &&
+                    (pooled.scalar_type()==tb::kFloat16 || pooled.scalar_type()==tb::kFloat32))
+                    return rotary_->forward_normalized(pooled.unsqueeze(2),w_.index_key_norm,positions,c_.eps).squeeze(1);
+                pooled = rms_norm(pooled, w_.index_key_norm.to(tb::kFloat32) + 1, c_.eps);
                 pooled = rotary_->forward(pooled.unsqueeze(1), positions).squeeze(1);
                 return pooled;
             },
@@ -911,7 +906,8 @@ class Qsa {
                 return attend(p.query,p.key.permute({0,2,1,3}),p.value.permute({0,2,1,3}),ids,offset);
             },
             [&](Tensor attended, const Projection &p) {
-                auto gated = attended.to(tb::kFloat32) * tb::sigmoid(p.gate.to(tb::kFloat32));
+                auto gated=gate_applied?attended:mfq_qwen4_exp::attention_gate(attended,p.gate,
+                    hidden.scalar_type()==tb::kFloat16);
                 return w_.output(
                     execution, gated.reshape({b, t, c_.heads * c_.width}).to(hidden.scalar_type()));
             },

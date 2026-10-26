@@ -694,7 +694,12 @@ TqRowTable::TqRowTable(const mfq::ModelSource& source,const std::string& name) {
         const auto* record=source.find_tensor(part);
         if(!unique.insert(part).second || !record || record->dtype!="TQ")
             throw std::invalid_argument("invalid TQ row segment: "+part);
-        auto rows=std::make_shared<mfq::TqRows>(record->nbytes,source.tensor_reader(part));
+        // Keep the compressed table on the CPU. Sparse row selection should
+        // copy only the requested ranges, without a seek/read syscall for
+        // every descriptor, selector and payload in a long prompt.
+        auto reader=source.mapped_tensor_reader(part);
+        if(!reader)reader=source.tensor_reader(part);
+        auto rows=std::make_shared<mfq::TqRows>(record->nbytes,std::move(reader));
         if(columns_<1 || columns_>rows->layout().width)throw std::invalid_argument("TQ table logical width differs");
         if(end>UINT64_MAX-rows->layout().rows || storage_bytes_>UINT64_MAX-record->nbytes)
             throw std::overflow_error("TQ row table size exceeds bounds");

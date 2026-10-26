@@ -298,7 +298,7 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
         if(prepare_injection)activated=[weight,forward](CudaExecutionContext& execution,const Tensor& input,
                 int64_t streams,bool injection) {
             if(injection && input.is_cuda() && input.is_contiguous() && input.scalar_type()==tb::kFloat32 &&
-               input.size(-1)==weight->dense.size(1) && input.numel()/input.size(-1)<=8)
+               input.size(-1)==weight->dense.size(1) && input.numel()/input.size(-1)<=65535)
                 return dense_gr_injection_cuda(weight->dense,input,streams);
             auto value=forward(execution,input);
             return injection?mfq_qwen4_exp::gated_residual_injection(value,streams):

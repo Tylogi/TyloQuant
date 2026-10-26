@@ -545,6 +545,13 @@ Tensor dense(const Tensor& query, const Tensor& key, const Tensor& value,
         query.size(2) <= count - offset, "attention query range is outside the cache");
     MFQ_RUNTIME_CHECK(std::isfinite(scale), "attention scale must be finite");
     MfqCudaGuard guard(query.device());
+    if(query.size(3)==256 && half_or_float(query) &&
+            key.scalar_type()==tb::kFloat16 && value.scalar_type()==tb::kFloat16) {
+        auto positions=tb::arange(query.size(2),query.options().dtype(tb::kInt64))+offset;
+        return mfq_sparse_attn_mma::launch<256,256,1,16,false>(
+            query,key.contiguous(),value.contiguous(),Tensor{},Tensor{},Tensor{},Tensor{},
+            scale,"qwen4_dense_causal_gqa",Tensor{},false,positions,count);
+    }
     const auto options = query.options().dtype(tb::kInt64);
     const auto kp = tb::arange(count, options).unsqueeze(0);
     const auto qp = tb::arange(query.size(2), options).unsqueeze(1) + offset;

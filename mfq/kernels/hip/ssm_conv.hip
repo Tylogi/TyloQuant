@@ -679,9 +679,9 @@ std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_prefill_cuda(
     return {qo, ko, vo, new_state};
 }
 
-// Short verification windows keep the projected Q/K/V together. Their V
-// convolution also prepares the recurrent gates, with the original FP order.
-std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_short_cuda(
+// Fused prefill keeps projected Q/K/V together and prepares recurrent gates
+// during V convolution. Every token is independent of the recurrent state.
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_prefill_cuda(
     mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor qkv,
     mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,
     mfq_tensor_backend::Tensor beta,mfq_tensor_backend::Tensor dt_bias,
@@ -689,10 +689,10 @@ std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_short_cuda(
 {
     namespace tb=mfq_tensor_backend;
     MFQ_RUNTIME_CHECK(qkv.is_cuda() && (qkv.scalar_type()==tb::kFloat16 || qkv.scalar_type()==tb::kFloat32) &&
-        qkv.dim()==3 && qkv.size(1)>=2 && qkv.size(1)<=8 && nk>0 && nv>0 && nv%nk==0 &&
+        qkv.dim()==3 && qkv.size(1)>=2 && qkv.size(1)<=65535 && nk>0 && nv>0 && nv%nk==0 &&
         width>0 && width<=256 && qkv.stride(2)==1 && qkv.stride(1)>=qkv.size(2) &&
         (qkv.size(0)==1 || qkv.stride(0)>=qkv.size(1)*qkv.stride(1)),
-        "short GDN requires row-strided FP16/FP32 QKV and 2-8 tokens");
+        "GDN prefill requires row-strided FP16/FP32 QKV and 2-65535 tokens");
     const int B=int(qkv.size(0)),T=int(qkv.size(1)),K=int(state.size(1))+1;
     const int qkC=int(2*nk*width),vsz=int(nv*width),C=qkC+vsz;
     MFQ_RUNTIME_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type()==tb::kFloat32 &&
@@ -738,4 +738,14 @@ std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_short_cuda(
     else dispatch.template operator()<float>();
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return {q,k,v,next,decay,bt};
+}
+
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_short_cuda(
+    mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor qkv,
+    mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,
+    mfq_tensor_backend::Tensor beta,mfq_tensor_backend::Tensor dt_bias,
+    mfq_tensor_backend::Tensor a_log,int64_t nk,int64_t nv,int64_t width,double eps) {
+    MFQ_RUNTIME_CHECK(qkv.dim()==3 && qkv.size(1)>=2 && qkv.size(1)<=8,
+        "short GDN requires 2-8 tokens");
+    return linear_conv_qkv_gate_prefill_cuda(state,qkv,weight,alpha,beta,dt_bias,a_log,nk,nv,width,eps);
 }

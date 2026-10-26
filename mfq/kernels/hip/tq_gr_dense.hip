@@ -87,7 +87,7 @@ mfq_tensor_backend::Tensor dense_gr_injection_cuda(const mfq_tensor_backend::Ten
         input.scalar_type()==tb::kFloat32 && weight.dim()==2 && input.dim()>0 &&
         weight.size(0)>0 && weight.size(0)<=4 && input.size(-1)==weight.size(1) &&
         weight.size(1)>0 && weight.size(1)<=INT_MAX && streams>0 &&
-        input.numel()/weight.size(1)>0 && input.numel()/weight.size(1)<=8,
+        input.numel()/weight.size(1)>0 && input.numel()/weight.size(1)<=65535,
         "invalid GR dense injection geometry");
     MfqCudaGuard guard(input.device());auto shape=input.sizes().vec();shape.back()=weight.size(0);
     auto output=tb::empty(shape,input.options());

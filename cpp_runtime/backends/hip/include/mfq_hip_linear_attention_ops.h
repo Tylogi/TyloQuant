@@ -58,6 +58,12 @@ std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_short_cuda(
     mfq_tensor_backend::Tensor beta,mfq_tensor_backend::Tensor dt_bias,
     mfq_tensor_backend::Tensor a_log,int64_t nk,int64_t nv,int64_t width,double eps);
 
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_prefill_cuda(
+    mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor qkv,
+    mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,
+    mfq_tensor_backend::Tensor beta,mfq_tensor_backend::Tensor dt_bias,
+    mfq_tensor_backend::Tensor a_log,int64_t nk,int64_t nv,int64_t width,double eps);
+
 std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_checkpoint_cuda(
     mfq_tensor_backend::Tensor qkv, mfq_tensor_backend::Tensor output_gate,
     mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta,

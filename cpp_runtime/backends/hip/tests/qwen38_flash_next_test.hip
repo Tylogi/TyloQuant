@@ -374,7 +374,8 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
         auto up=clamp(a.at(1).to(kFloat32),-limit,limit);
         return {(silu(gate)*up).to(kFloat16).contiguous()};
     }
-    if(op=="gdn_short")return linear_conv_qkv_gate_short_cuda(a.at(0),a.at(1),a.at(2),a.at(3),a.at(4),a.at(5),a.at(6),p.at("key_heads"),p.at("value_heads"),p.at("width"),p.value("eps",1e-6));
+    if(op=="gdn_short" || op=="gdn_prefill")return (op=="gdn_short"?linear_conv_qkv_gate_short_cuda:linear_conv_qkv_gate_prefill_cuda)(a.at(0),a.at(1),a.at(2),a.at(3),a.at(4),a.at(5),a.at(6),p.at("key_heads"),p.at("value_heads"),p.at("width"),p.value("eps",1e-6));
+    if(op=="qsa_dense")return {mfq_qwen4_exp::dense_gqa_attention(a.at(0),a.at(1),a.at(2),p.value("offset",int64_t(0)))};
     if(op=="ssm_scan")return selective_state_scan_prefill_cuda(a.at(0),a.at(1),a.at(2),a.at(3),a.at(4),a.at(5),a.at(6),a.at(7),p.value("low",0.0),p.value("high",1e30));
     if(op=="ssm_decode")return {selective_state_scan_decode_cuda(a.at(0),a.at(1),a.at(2),a.at(3),a.at(4),a.at(5),a.at(6),a.at(7),p.value("low",0.0),p.value("high",1e30)),a.at(0)};
     if(op=="ssm_norm")return {grouped_gated_rms_norm_cuda(a.at(0),a.at(1),a.at(2),p.at("group"),p.value("eps",1e-5))};
@@ -1219,6 +1220,7 @@ int main(int argc, char** argv) {
                         return {stack(parts,1)};
                     }
                     if(router_tq) {
+                        if(params.value("projection_only",false))return {router_tq->forward(tensors.at(0))};
                         std::vector<Tensor> result;
                         if(params.value("legacy",false))result={router_tq->forward(tensors.at(1)),
                             mfq_tensor_backend::sigmoid(mfq_selected_attention::promoted_matmul(tensors.at(1),tensors.at(0).transpose(-1,-2)))};
