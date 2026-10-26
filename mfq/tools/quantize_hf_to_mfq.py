@@ -3548,7 +3548,6 @@ def _plan(
     is_glm_dsa = model_config.get("model_type") == "glm_moe_dsa"
     is_glm5_next = model_config.get("model_type") == "glm5_next_text"
     is_flash_next = model_config.get("model_type") in _FLASH_NEXT_TEXT_TYPES
-    is_deepseek_v41 = model_config.get("model_type") == "deepseek_v41_text"
     is_minicpmo45 = _is_minicpmo45_config(raw_config)
     source_exclusions = _source_quantization_exclusions(raw_config) if is_flash_next else ()
     if is_glm_dsa and recipe_types is not None:
@@ -3558,9 +3557,14 @@ def _plan(
             "GLM-5-Next GGUF recipe mapping is not implemented; "
             "use the native HF conversion policy or a calibration scheme"
         )
-    if is_deepseek_v41 and recipe_types is not None:
+    if (
+        recipe_types is not None
+        and canonical_schema is not None
+        and canonical_schema.architecture in {"deepseek_v4", "deepseek_v41"}
+    ):
+        family = "DeepSeek-V4.1" if canonical_schema.architecture == "deepseek_v41" else "DeepSeek-V4"
         raise ValueError(
-            "DeepSeek-V4.1 has no GGUF recipe mapping; use an MFQ standard "
+            f"{family} has no GGUF recipe mapping; use an MFQ standard "
             "preset or a calibration scheme"
         )
     source_quantizations, source_auxiliaries = _source_quantizations(inventory, raw_config)
@@ -3712,9 +3716,9 @@ def _plan(
                 pass
             elif (
                 (gguf_name is None or gguf_name not in recipe_types)
-                # A registered UD recipe pins the main text only; MTP keeps its
-                # own precision policy and is reported outside the ceiling.
-                and descriptor.scope is not TensorScope.PREDICTOR
+                # Text recipes need not name auxiliary scopes. Their explicit
+                # quantization policy must still retain every planned tensor.
+                and descriptor.scope not in {TensorScope.PREDICTOR, TensorScope.VISION}
             ):
                 if recipe_name_mapper is not None:
                     raise ValueError(
@@ -3844,10 +3848,10 @@ def _plan(
                     )
                 elif (
                     name.startswith("mtp.")
-                    or descriptor.scope is TensorScope.PREDICTOR
+                    or descriptor.scope in {TensorScope.PREDICTOR, TensorScope.VISION}
                 ) and gguf_type is None:
-                    # An MTP head without a recipe entry keeps the family
-                    # default integer precision instead of dense storage.
+                    # Auxiliary matrices absent from a text recipe use the
+                    # requested default integer precision when opted in.
                     target = default_nint_dtype if len(shape) in (2, 3) else dense_dtype
                 else:
                     target, anchor_gguf_name, anchor_type = _target_for_recipe_name(

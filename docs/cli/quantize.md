@@ -35,6 +35,9 @@ uv sync --extra metal --extra train
 GGUF quantization requires a recipe. A prepared `--scheme` (also accepted as
 `--ew-scheme`) can add per-tensor or Expert-Wise overrides. Use `--imatrix` to
 supply a native MFQ, GGUF, or legacy llama.cpp importance matrix.
+For architectures without an activation calibration backend, generate
+[uniform importance](calibrate.md#uniform-importance-without-calibration) with
+`mfq calibrate imatrix --uniform`.
 
 ## Basic NINT quantization
 

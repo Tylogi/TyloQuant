@@ -1067,31 +1067,33 @@ def _release(device: torch.device) -> None:
         torch.mps.empty_cache()
 
 
+def imatrix_model_type(model: str | Path) -> str:
+    """Validate calibration support before tokenizer, accelerator or model loading."""
+    from mfq.architectures.hf_config import load_hf_model_config, text_section
+
+    raw = load_hf_model_config(model)
+    model_type = str(text_section(raw).get("model_type", raw.get("model_type", "")))
+    family = model_type.removesuffix("_text")
+    if family not in {"nemotron_h", "gemma4", "qwen3_5", "qwen3_5_moe"}:
+        raise ValueError(
+            f"activation imatrix calibration does not support architecture {model_type!r}; "
+            "use mfq calibrate imatrix --uniform --model MODEL --output OUTPUT "
+            "for calibration-free uniform importance (no corpus or accelerator required)"
+        )
+    return model_type
+
+
 def _backend(model: Path, device: torch.device, attention: str):
-    from transformers import AutoConfig
-
-    config_path = Path(model) / "config.json"
-    if config_path.is_file():
-        from mfq.architectures.hf_config import load_hf_model_config, text_section
-
-        raw = load_hf_model_config(model)
-        outer_type = str(raw.get("model_type", ""))
-        if outer_type == "nemotron_h_omni" or outer_type.removesuffix("_text") == "nemotron_h":
-            from mfq.calibration.layerwise_nemotron_h import NemotronHLayerwiseBackend
-
-            backend = NemotronHLayerwiseBackend(
-                model, device=device, attention=attention
-            )
-            return backend, str(text_section(raw).get("model_type", outer_type))
-
-    outer = AutoConfig.from_pretrained(model, local_files_only=True, trust_remote_code=True)
-    config = getattr(outer, "text_config", outer)
-    model_type = str(getattr(config, "model_type", ""))
+    model_type = imatrix_model_type(model)
     # Conditional-generation checkpoints expose the language model through a
     # ``*_text`` sub-config, while text-only checkpoints use the family name
     # directly.  Backend selection is a property of that family, not of the
     # outer multimodal wrapper.
     backend_family = model_type.removesuffix("_text")
+    if backend_family == "nemotron_h":
+        from mfq.calibration.layerwise_nemotron_h import NemotronHLayerwiseBackend
+
+        return NemotronHLayerwiseBackend(model, device=device, attention=attention), model_type
     if backend_family == "gemma4":
         from mfq.calibration.layerwise_gemma4 import Gemma4LayerwiseBackend
 
@@ -1105,7 +1107,7 @@ def _backend(model: Path, device: torch.device, attention: str):
             ),
             model_type,
         )
-    raise ValueError(f"generic imatrix does not yet support model type {model_type!r}")
+    raise AssertionError(f"validated imatrix backend has no implementation: {model_type}")
 
 
 def _targets(
@@ -1207,6 +1209,7 @@ def collect_imatrix(
     output_path = Path(output).resolve()
     if output_path.exists():
         raise FileExistsError(f"imatrix already exists: {output_path}")
+    imatrix_model_type(root)
     target_device = torch.device(device)
     if target_device.type not in {"cuda", "mps"}:
         raise ValueError("imatrix device must be CUDA or MPS")
@@ -1456,4 +1459,5 @@ __all__ = [
     "ActivationImatrixCollector",
     "ImatrixTarget",
     "collect_imatrix",
+    "imatrix_model_type",
 ]
