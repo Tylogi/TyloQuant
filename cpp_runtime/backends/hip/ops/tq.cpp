@@ -98,7 +98,8 @@ std::vector<tb::Tensor> tq_forward_group(
 std::vector<tb::Tensor> tq_forward_group_bf16(const std::vector<const TqWeight*>& weights,
         tb::Tensor input,const tb::Tensor& alpha,const tb::Tensor& beta) {
     MFQ_RUNTIME_CHECK(weights.size()==2 && input.is_cuda() && input.scalar_type()==tb::kFloat32 &&
-        input.numel()==weights[0]->neuron_len,"mixed TQ input group requires one FP32 token");
+        input.size(-1)==weights[0]->neuron_len && input.numel()/input.size(-1)>=1 &&
+        input.numel()/input.size(-1)<=6,"mixed TQ input group requires one to six FP32 rows");
     const MfqCudaGuard guard(input.get_device());const auto x=input.contiguous();
     std::vector<tb::Tensor> result;TqProjectionPlan plan{};plan.count=2;
     for(int i=0;i<2;++i) {
@@ -112,7 +113,7 @@ std::vector<tb::Tensor> tq_forward_group_bf16(const std::vector<const TqWeight*>
     }
     status(mfq_tq_group_bf16(plan,x.data_ptr<float>(),reinterpret_cast<const uint16_t*>(alpha.data_ptr()),
         reinterpret_cast<const uint16_t*>(beta.data_ptr()),result[2].data_ptr<float>(),result[3].data_ptr<float>(),
-        int(alpha.size(0)),int(beta.size(0)),mfq_current_cuda_stream()));
+        int(alpha.size(0)),int(beta.size(0)),int(x.numel()/x.size(-1)),mfq_current_cuda_stream()));
     return result;
 }
 

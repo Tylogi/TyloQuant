@@ -242,7 +242,8 @@ struct BlockLoader : weight_loader::Loader {
             // GDN promotes these BF16 auxiliaries to FP32 before its core.
             // Keep the generic grouped-linear output dtype contract intact.
             weights.input_projection=[previous=weights.input_projection,q,g,a,b](CudaExecutionContext& ex,const Tensor& x) {
-                if(!tq_q8_enabled() && x.is_cuda() && x.scalar_type()==tb::kFloat32 && x.numel()==x.size(-1))
+                if(!tq_q8_enabled() && x.is_cuda() && x.scalar_type()==tb::kFloat32 && x.size(1)==1 &&
+                        x.numel()/x.size(-1)>=1 && x.numel()/x.size(-1)<=6)
                     return tq_forward_group_bf16({&q->tq,&g->tq},x,a->dense,b->dense);
                 return previous(ex,x);
             };

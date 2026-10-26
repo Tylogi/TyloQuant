@@ -15,6 +15,8 @@ namespace {
 __global__ __launch_bounds__(256) void tq_bf16_input_group(TqProjectionPlan plan,
         const float* input,const uint16_t* a,const uint16_t* b,float* alpha,float* beta,int ar,int br) {
     const int tid=threadIdx.x,lane=tid&63,wave=tid>>6;
+    const int token=blockIdx.y;
+    input+=size_t(token)*plan.jobs[0].weight.input_columns;
     if(int(blockIdx.x)<ar+br) {
         const bool second=int(blockIdx.x)>=ar;
         const int row=int(blockIdx.x)-(second?ar:0),width=plan.jobs[0].weight.input_columns;
@@ -31,7 +33,7 @@ __global__ __launch_bounds__(256) void tq_bf16_input_group(TqProjectionPlan plan
         __syncthreads();
         if(!tid) {
             float total=0;for(int i=0;i<4;++i)total=__fadd_rn(total,partial[i]);
-            (second?beta:alpha)[row]=__bfloat162float(__float2bfloat16(total));
+            (second?beta:alpha)[size_t(token)*(second?br:ar)+row]=__bfloat162float(__float2bfloat16(total));
         }
         return;
     }
@@ -45,7 +47,7 @@ __global__ __launch_bounds__(256) void tq_bf16_input_group(TqProjectionPlan plan
         else mfq_tq_cuda_exact::generic_dispatch<2,false,1,1,8>(m,row,input,0,1,m.input_columns,value);
     }
     for(int shift=32;shift;shift>>=1)value[0]+=__shfl_down(value[0],shift,64);
-    if(!lane && row<m.rows)static_cast<float*>(job.output)[row]=value[0]+(m.bias?m.bias[row]:0.f);
+    if(!lane && row<m.rows)static_cast<float*>(job.output)[size_t(token)*m.rows+row]=value[0]+(m.bias?m.bias[row]:0.f);
 }
 __global__ __launch_bounds__(256) void tq_gr_down_injection_kernel(ProjectionView weight,
         const uint16_t* injection,const float* input,float* low,float* gates,int streams) {
@@ -102,8 +104,8 @@ __global__ void dense_gr_injection_kernel(const uint16_t* weight,const float* in
 }
 
 extern "C" int mfq_tq_group_bf16(TqProjectionPlan plan,const float* input,
-        const uint16_t* a,const uint16_t* b,float* alpha,float* beta,int ar,int br,hipStream_t stream) {
-    if(plan.count!=2 || !input || !a || !b || !alpha || !beta || ar<1 || br<1 || ar>64 || br>64)
+        const uint16_t* a,const uint16_t* b,float* alpha,float* beta,int ar,int br,int tokens,hipStream_t stream) {
+    if(plan.count!=2 || !input || !a || !b || !alpha || !beta || ar<1 || br<1 || ar>64 || br>64 || tokens<1 || tokens>6)
         return int(hipErrorInvalidValue);
     int blocks=0;
     for(int i=0;i<2;++i) {
@@ -112,7 +114,7 @@ extern "C" int mfq_tq_group_bf16(TqProjectionPlan plan,const float* input,
             return int(hipErrorInvalidValue);
         blocks+=(m.rows+3)/4;plan.jobs[i].block_end=blocks;
     }
-    tq_bf16_input_group<<<ar+br+blocks,256,0,stream>>>(plan,input,a,b,alpha,beta,ar,br);
+    tq_bf16_input_group<<<dim3(ar+br+blocks,tokens),256,0,stream>>>(plan,input,a,b,alpha,beta,ar,br);
     return int(hipGetLastError());
 }
 
