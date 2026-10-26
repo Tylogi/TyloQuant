@@ -45,6 +45,58 @@ __global__ void tq_shared_add_kernel(const uint16_t* routed,const uint16_t* shar
         __fmul_rn(mfq_tq_cuda_exact::number<0>(shared[column]),coefficient[0]));
 }
 
+__global__ __launch_bounds__(256) void tq_moe_inputs_kernel(ProjectionView router,ProjectionView gate,ProjectionView up,
+ const uint16_t* shared_gate,const uint16_t* input,uint16_t* logits,float* coefficient,uint16_t* output){
+ const int group=int(blockIdx.x),router_groups=1+(router.rows+3)/4;
+ if(group<router_groups){
+
+    using namespace mfq_tq_cuda_exact;
+    const int tid=threadIdx.x,lane=tid&63,wave=tid>>6;
+    if(!group) {
+        float sum=0.f;
+        for(int column=tid;column<router.input_columns;column+=256)
+            sum=__fmaf_rn(__uint_as_float(uint32_t(shared_gate[column])<<16),number<0>(input[column]),sum);
+        for(int shift=32;shift;shift>>=1)sum+=__shfl_down(sum,shift,64);
+        __shared__ float partial[4];if(!lane)partial[wave]=sum;
+        __syncthreads();
+        if(!tid) {
+            float total=0.f;for(int i=0;i<4;++i)total=__fadd_rn(total,partial[i]);
+            coefficient[0]=1.f/(1.f+expf(-total));
+        }
+        return;
+    }
+    const int row=(int(group)-1)*4+wave;
+    float value[1]{};
+    if(row<router.rows) {
+        if(router.columns)generic_dispatch<0,true,1,1,16>(router,row,input,0,1,router.input_columns,value);
+        else generic_dispatch<0,false,1,1,16>(router,row,input,0,1,router.input_columns,value);
+    }
+    for(int shift=32;shift;shift>>=1)value[0]+=__shfl_down(value[0],shift,64);
+    if(!lane && row<router.rows)logits[row]=rounded<0>(value[0]+(router.bias?router.bias[row]:0.f));
+
+ }else{const int local_group=group-router_groups;
+
+    using namespace mfq_tq_cuda_exact;
+    const int wave=threadIdx.x/64,lane=threadIdx.x&63,role=wave&1,slot=wave/2,row=int(local_group)*2+slot;
+    const auto weight=role?up:gate;
+    float value[1]{};
+    if(row<weight.rows) {
+        if(weight.columns)generic_dispatch<0,true,1,1,16>(weight,row,input,0,1,weight.input_columns,value);
+        else generic_dispatch<0,false,1,1,16>(weight,row,input,0,1,weight.input_columns,value);
+    }
+    for(int shift=32;shift;shift>>=1)value[0]+=__shfl_down(value[0],shift,64);
+    __shared__ float joined[2][2];
+    if(!lane && row<weight.rows)joined[slot][role]=number<0>(rounded<0>(value[0]+(weight.bias?weight.bias[row]:0.f)));
+    __syncthreads();
+    if(!role && !lane && row<weight.rows) {
+        const float g=joined[slot][0],u=joined[slot][1];
+        const float sigmoid=number<0>(rounded<0>(1.f/(1.f+expf(-g))));
+        const float silu=number<0>(rounded<0>(__fmul_rn(g,sigmoid)));
+        output[row]=rounded<0>(__fmul_rn(silu,u));
+    }
+
+ }
+}
 __global__ __launch_bounds__(256) void tq_shared_finish_kernel(ProjectionView down,
  const uint16_t* hidden,const uint16_t* pairs,const float* weights,const float* coefficient,float* output,int routes){
  using namespace mfq_tq_cuda_exact;
@@ -133,6 +185,27 @@ std::vector<mfq_tensor_backend::Tensor> tq_router_gate_cuda(ProjectionView route
         reinterpret_cast<const uint16_t*>(gate.data_ptr()),reinterpret_cast<const uint16_t*>(input.data_ptr()),
         reinterpret_cast<uint16_t*>(logits.data_ptr()),coefficient.data_ptr<float>());
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();return {logits,coefficient};
+}
+
+std::vector<mfq_tensor_backend::Tensor> tq_moe_inputs_cuda(ProjectionView router,
+ const mfq_tensor_backend::Tensor& shared_gate,ProjectionView gate,ProjectionView up,
+ const mfq_tensor_backend::Tensor& input){
+ namespace tb=mfq_tensor_backend;
+ MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.scalar_type()==tb::kFloat16 &&
+  input.numel()==router.input_columns && input.size(-1)==router.input_columns && router.rows>0 &&
+  shared_gate.device()==input.device() && shared_gate.is_contiguous() && shared_gate.scalar_type()==tb::kBFloat16 &&
+  shared_gate.dim()==2 && shared_gate.size(0)==1 && shared_gate.size(1)==router.input_columns &&
+  gate.rows>0 && gate.rows==up.rows && gate.input_columns==router.input_columns &&
+  up.input_columns==router.input_columns,"invalid joint TQ MoE input projections");
+ MfqCudaGuard guard(input.device());auto shape=input.sizes().vec();shape.back()=router.rows;
+ auto logits=tb::empty(shape,input.options());shape.back()=1;
+ auto coefficient=tb::empty(shape,input.options().dtype(tb::kFloat32));shape.back()=gate.rows;
+ auto hidden=tb::empty(shape,input.options());
+ tq_moe_inputs_kernel<<<1+(router.rows+3)/4+(gate.rows+1)/2,256,0,mfq_current_cuda_stream()>>>(
+  router,gate,up,reinterpret_cast<const uint16_t*>(shared_gate.data_ptr()),
+  reinterpret_cast<const uint16_t*>(input.data_ptr()),reinterpret_cast<uint16_t*>(logits.data_ptr()),
+  coefficient.data_ptr<float>(),reinterpret_cast<uint16_t*>(hidden.data_ptr()));
+ MFQ_CUDA_KERNEL_LAUNCH_CHECK();return {logits,coefficient,hidden};
 }
 
 mfq_tensor_backend::Tensor tq_shared_add_cuda(const mfq_tensor_backend::Tensor& routed,

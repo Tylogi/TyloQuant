@@ -138,12 +138,13 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
            shared_gate_weight->dense.sizes().vec()==std::vector<int64_t>({1,c.hidden}) &&
            sg_weight && su_weight && sg_weight->is_tq() && su_weight->is_tq() &&
            source.numel()==c.hidden && c.hidden==2560 && !tq_q8_enabled()) {
-            auto projected=tq_router_gate_cuda(router_weight->tq.view,shared_gate_weight->dense,source);
+            auto projected=tq_moe_inputs_cuda(router_weight->tq.view,shared_gate_weight->dense,
+                sg_weight->tq.view,su_weight->tq.view,source);
             auto selected=moe_topk_cuda(projected[0].contiguous(),c.topk,
                 routing.activation==mfq::models::RouterActivation::sigmoid,
                 routing.activation==mfq::models::RouterActivation::sqrt_softplus,
                 routing.normalize,routing.delayed_softmax,mfq_nullopt,1e-20,routing.scale);
-            auto hidden=tq_shared_swiglu_cuda(sg_weight->tq.view,su_weight->tq.view,source);
+            auto hidden=projected[2];
             if(sd_weight && sd_weight->is_tq() && tq->gate->shards.empty() &&
                sd_weight->tq.out>=sd_weight->tq.neuron_len && sd_weight->tq.neuron_len%8==0)
                 return tq->forward(source,selected[0],selected[1],0.f,&sd_weight->tq,hidden,projected[1]).reshape(x.sizes());
