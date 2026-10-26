@@ -46,6 +46,7 @@ inline void mfq_cuda_synchronize() {
     MFQ_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
     MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(
         ::mfq::cuda::current_stream(device).stream()));
+    ::mfq::cuda::default_context(device)->check_input_error(::mfq::cuda::current_stream(device).stream());
 }
 
 template <typename... Values>

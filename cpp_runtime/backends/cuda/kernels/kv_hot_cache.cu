@@ -3,7 +3,7 @@
 #include "../runtime/batch_decode_inputs.h"
 #include <algorithm>
 #include <limits>
-#include <cassert>
+#include "mfq_cuda_input_error.cuh"
 #include <cstdlib>
 #include <cuda_fp16.h>
 
@@ -23,14 +23,16 @@ __global__ void reset_hot_cache(int32_t* mapping,int32_t* ids,Stamp* requested,S
     if(thread<7)control[thread]=0;
     if(cold_control && thread<3)cold_control[thread]=thread==2?cells:0;
 }
-__device__ int take_cold(int32_t* free_rows,int32_t* control,int capacity) {
+__device__ int take_cold(int32_t* free_rows,int32_t* control,int capacity,DeviceInputError* error) {
     int n=atomicAdd(control+1,0);
     while(n>0) {const int previous=atomicCAS(control+1,n,n-1);if(previous==n)return free_rows[n-1];n=previous;}
-    const int row=atomicAdd(control,1);assert(row<capacity);return row;
+    const int row=atomicAdd(control,1);
+    return valid_device_index(row,capacity,error,6)?row:-1;
 }
 __global__ void discard_exclusive(const int64_t* positions,int count,int32_t* mapping,int32_t* ids,
-        int32_t* cold_map,int32_t* free_rows,int32_t* free_gpu,int32_t* control) {
+        int32_t* cold_map,int32_t* free_rows,int32_t* free_gpu,int32_t* control,int maximum,DeviceInputError* error) {
     for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<count;i+=blockDim.x*gridDim.x) {
+        if(!valid_device_index(positions[i],maximum,error,6))continue;
         const int row=int(positions[i]),slot=mapping[row],cold=cold_map[row];
         if(slot>=0){ids[slot]=-1;free_gpu[atomicAdd(control+2,1)]=slot;}
         mapping[row]=-1;cold_map[row]=-1;
@@ -39,18 +41,21 @@ __global__ void discard_exclusive(const int64_t* positions,int count,int32_t* ma
 }
 template<class Word> __global__ void evict_append_slots(Word* cold_keys,Word* cold_values,const Word* keys,const Word* values,
         const int64_t* positions,int count,int cells,int cold_cells,int heads,int kw,int vw,int32_t* mapping,int32_t* ids,
-        int32_t* cold_map,int32_t* free_rows,int32_t* free_gpu,int32_t* control,Stamp* cursor) {
+        int32_t* cold_map,int32_t* free_rows,int32_t* free_gpu,int32_t* control,Stamp* cursor,
+        int maximum,DeviceInputError* error) {
     const int lane=threadIdx.x%32,i=blockIdx.x*4+threadIdx.x/32;
     if(i>=min(count,cells))return;
+    if(!valid_device_index(positions[count-min(count,cells)+i],maximum,error,6))return;
     int slot=-1,row=-1,cold=-1;
     if(lane==0) {
         int n=atomicAdd(control+2,0);
         while(n>0){const int prior=atomicCAS(control+2,n,n-1);if(prior==n){slot=free_gpu[n-1];ids[slot]=-2;break;}n=prior;}
         while(slot<0){const int candidate=int(atomicAdd(cursor,Stamp{1})%cells),old=ids[candidate];
             if(old>=0 && atomicCAS(ids+candidate,old,-2)==old){slot=candidate;row=old;}}
-        if(row>=0)cold=take_cold(free_rows,control,cold_cells);
+        if(row>=0)cold=take_cold(free_rows,control,cold_cells,error);
     }
     slot=__shfl_sync(0xffffffff,slot,0);row=__shfl_sync(0xffffffff,row,0);cold=__shfl_sync(0xffffffff,cold,0);
+    if(row>=0 && cold<0)return;
     if(row>=0) {
         for(int x=lane;x<heads*kw;x+=32)cold_keys[(int64_t(x/kw)*cold_cells+cold)*kw+x%kw]=keys[(int64_t(x/kw)*cells+slot)*kw+x%kw];
         for(int x=lane;x<heads*vw;x+=32)cold_values[(int64_t(x/vw)*cold_cells+cold)*vw+x%vw]=values[(int64_t(x/vw)*cells+slot)*vw+x%vw];
@@ -60,12 +65,15 @@ template<class Word> __global__ void evict_append_slots(Word* cold_keys,Word* co
 }
 template<class Word> __global__ void append_exclusive(const Word* input_k,const Word* input_v,Word* keys,Word* values,
         Word* cold_keys,Word* cold_values,const int64_t* positions,int count,int cells,int cold_cells,int heads,int kw,int vw,
-        int32_t* mapping,int32_t* ids,Stamp* epochs,int32_t* cold_map,int32_t* free_rows,int32_t* control) {
+        int32_t* mapping,int32_t* ids,Stamp* epochs,int32_t* cold_map,int32_t* free_rows,int32_t* control,
+        int maximum,DeviceInputError* error) {
     const int lane=threadIdx.x%32;
     for(int i=blockIdx.x*4+threadIdx.x/32;i<count;i+=gridDim.x*4) {
+        if(!valid_device_index(positions[i],maximum,error,6))continue;
         const int row=int(positions[i]);const bool resident=i>=count-cells;
-        int slot=resident?mapping[row]:(lane==0?take_cold(free_rows,control,cold_cells):0);
+        int slot=resident?mapping[row]:(lane==0?take_cold(free_rows,control,cold_cells,error):0);
         slot=__shfl_sync(0xffffffff,slot,0);
+        if(!valid_device_index(slot,resident?cells:cold_cells,error,6))continue;
         const int stride=resident?cells:cold_cells;
         Word* out_k=resident?keys:cold_keys;Word* out_v=resident?values:cold_values;
         for(int x=lane;x<heads*kw;x+=32)out_k[(int64_t(x/kw)*stride+slot)*kw+x%kw]=input_k[(int64_t(x/kw)*count+i)*kw+x%kw];
@@ -88,7 +96,7 @@ template<class Word> __global__ void append_exclusive_decode(
         int32_t* cold_map,int32_t* free_rows,int32_t* free_gpu,int32_t* control,Stamp* hot_control,
         const void* index_rows,void* index_storage,int index_width,int64_t index_stride,
         bool index_input_half,bool index_output_half,bool begin_prepare,bool float_keys,bool float_values,
-        const int64_t* states,const int64_t* enabled,int rows,int field,int row) {
+        const int64_t* states,const int64_t* enabled,int rows,int field,int row,DeviceInputError* error) {
     if(states) {
         if(!enabled[row])return;
         const auto at=[&](int offset){return 2*(int64_t(field+offset)*rows+row);};
@@ -109,16 +117,24 @@ template<class Word> __global__ void append_exclusive_decode(
         hot_control=reinterpret_cast<Stamp*>(states[at(HotKvStateFields::Control)]);
     }
     __shared__ int slots[32],old_rows[32],cold_rows[32];
+    __shared__ bool valid;
     const int tid=threadIdx.x;
     const int team=count==1?128:count==2?64:32;
     const int lane=tid&(team-1),worker=tid/team;
     // The graph serializes users of this cache. Plan all rewritten rows first,
     // then reserve disjoint slots; no per-row global atomic or grid barrier.
     if(tid==0) {
+        valid=count<=cells && maximum==cells+cold_cells;
+        for(int i=0;i<count;++i)
+            valid=valid_device_index(positions[i],maximum,error,6) && valid;
+    }
+    __syncthreads();
+    if(!valid)return;
+    if(tid==0) {
         int free_count=control[1],gpu_count=control[2],next_cold=control[0];
         Stamp cursor=hot_control[1];
         for(int i=0;i<count;++i) {
-            const int row=int(positions[i]);assert(row>=0 && row<maximum);
+            const int row=int(positions[i]);
             const int slot=mapping[row],cold=cold_map[row];
             if(slot>=0){ids[slot]=-1;free_gpu[gpu_count++]=slot;}
             if(cold>=0)free_rows[free_count++]=cold;
@@ -132,12 +148,12 @@ template<class Word> __global__ void append_exclusive_decode(
                     const int candidate=int(cursor++%Stamp(cells));
                     if(ids[candidate]>=0){slot=candidate;row=ids[slot];break;}
                 }
-                assert(slot>=0);
+                if(!valid_device_index(slot,cells,error,6)){valid=false;break;}
             }
             ids[slot]=-2;
             if(row>=0) {
                 cold=free_count>0?free_rows[--free_count]:next_cold++;
-                assert(cold<cold_cells);
+                if(!valid_device_index(cold,cold_cells,error,6)){valid=false;break;}
             }
             slots[i]=slot;old_rows[i]=row;cold_rows[i]=cold;
         }
@@ -145,6 +161,7 @@ template<class Word> __global__ void append_exclusive_decode(
         if(begin_prepare){++hot_control[0];hot_control[2]=0;hot_control[6]=positions[count-1]<cells;}
     }
     __syncthreads();
+    if(!valid)return;
     for(int i=worker;i<count;i+=blockDim.x/team) {
         const int slot=slots[i],cold=cold_rows[i];
         for(int x=lane;x<heads*kw;x+=team) {
@@ -292,32 +309,64 @@ HotKvView HotKvCache::view() const {
         exclusive()?cold_mapping.data_ptr<int32_t>():nullptr,exclusive()?cold_keys.size(2):0};
 }
 void HotKvCache::set_cold_storage(const tb::Tensor& k,const tb::Tensor& v) {
-    MFQ_RUNTIME_CHECK(defined() && k.size(2)==mapping.numel()-keys.size(2) && k.size(2)>0,"invalid exclusive KV capacity");
+    MFQ_RUNTIME_CHECK(defined() && k.dim()==4 && v.dim()==4 && k.size(2)>0 &&
+        k.size(2)==mapping.numel()-keys.size(2) && v.size(2)==k.size(2) &&
+        k.size(0)==1 && v.size(0)==1 && k.size(1)==keys.size(1) && v.size(1)==values.size(1) &&
+        k.size(3)==keys.size(3) && v.size(3)==values.size(3) &&
+        k.scalar_type()==keys.scalar_type() && v.scalar_type()==values.scalar_type() &&
+        k.device()==keys.device() && v.device()==values.device() && k.is_contiguous() && v.is_contiguous(),
+        "invalid exclusive KV capacity or storage geometry");
     cold_keys=k;cold_values=v;
     cold_mapping=tb::full({mapping.numel()},-1,mapping.options());
     free_cold=tb::empty({k.size(2)},mapping.options());free_gpu=tb::arange(keys.size(2),mapping.options());
     cold_control=tb::zeros({3},mapping.options());cold_control.narrow(0,2,1).fill_(keys.size(2));
 }
+void HotKvCache::validate_exclusive_capacity() const {
+    MFQ_RUNTIME_CHECK(exclusive() && keys.dim()==4 && values.dim()==4 && cold_keys.dim()==4 && cold_values.dim()==4,
+        "exclusive KV storage must have four dimensions");
+    const auto cells=keys.size(2),cold_cells=cold_keys.size(2),maximum=mapping.numel();
+    MFQ_RUNTIME_CHECK(cells>0 && cold_cells>0 && maximum<=INT_MAX && cells+cold_cells==maximum &&
+        values.size(2)==cells && cold_values.size(2)==cold_cells &&
+        slot_ids.numel()==cells && epochs.numel()==cells && cold_mapping.numel()==maximum &&
+        free_cold.numel()==cold_cells && free_gpu.numel()==cells && cold_control.numel()==3 && control.numel()==7,
+        "exclusive KV capacity mismatch: hot + cold must equal logical capacity and allocation table extents");
+    for(const auto* tensor:{&keys,&values,&cold_keys,&cold_values,&mapping,&slot_ids,&epochs,
+            &cold_mapping,&free_cold,&free_gpu,&cold_control,&control})
+        MFQ_RUNTIME_CHECK(tensor->is_cuda() && tensor->is_contiguous() && tensor->device()==keys.device(),
+            "exclusive KV storage and allocation tables must be contiguous on the same CUDA device");
+}
 void HotKvCache::append(const tb::Tensor& k,const tb::Tensor& v,const tb::Tensor& positions) {
-    MFQ_RUNTIME_CHECK(exclusive() && k.size(2)==positions.numel() && v.size(2)==positions.numel(),"exclusive KV append geometry mismatch");
+    validate_exclusive_capacity();
+    MFQ_RUNTIME_CHECK(k.dim()==4 && v.dim()==4 && k.size(0)==1 && v.size(0)==1 &&
+        k.size(1)==keys.size(1) && v.size(1)==values.size(1) &&
+        k.size(2)==positions.numel() && v.size(2)==positions.numel() &&
+        k.size(3)==keys.size(3) && v.size(3)==values.size(3) &&
+        k.device()==keys.device() && v.device()==keys.device() && positions.device()==keys.device(),
+        "exclusive KV append geometry or device mismatch");
+    MFQ_RUNTIME_CHECK(positions.numel()<=mapping.numel(),"exclusive KV append exceeds logical capacity");
     if(append_decode(k,v,positions))return;
-    auto source_k=k.contiguous(),source_v=v.contiguous(),pos=positions.to(tb::kInt64).contiguous();
+    auto source_k=k.to(keys.scalar_type()).contiguous(),source_v=v.to(values.scalar_type()).contiguous();
+    auto pos=positions.to(tb::kInt64).contiguous();
     const int count=int(pos.numel()),cells=int(keys.size(2)),cold_cells=int(cold_keys.size(2)),heads=int(keys.size(1)),kw=int(keys.size(3)),vw=int(values.size(3));
     if(!count)return;
     auto* map=mapping.data_ptr<int32_t>();auto* ids=slot_ids.data_ptr<int32_t>();auto* cold=cold_mapping.data_ptr<int32_t>();
     auto* free=free_cold.data_ptr<int32_t>();auto* meta=cold_control.data_ptr<int32_t>();
     auto* gpu_free=free_gpu.data_ptr<int32_t>();
-    discard_exclusive<<<std::min(65535,(count+255)/256),256,0,mfq_current_cuda_stream()>>>(pos.data_ptr<int64_t>(),count,map,ids,cold,free,gpu_free,meta);
+    auto* error=default_context(keys.get_device())->input_error(mfq_current_cuda_stream());
+    discard_exclusive<<<std::min(65535,(count+255)/256),256,0,mfq_current_cuda_stream()>>>(
+        pos.data_ptr<int64_t>(),count,map,ids,cold,free,gpu_free,meta,int(mapping.numel()),error);
     #define MFQ_APPEND_EXCLUSIVE(W) \
         evict_append_slots<<<(std::min(count,cells)+3)/4,128,0,mfq_current_cuda_stream()>>>( \
             reinterpret_cast<W*>(cold_keys.data_ptr()),reinterpret_cast<W*>(cold_values.data_ptr()), \
             reinterpret_cast<const W*>(keys.data_ptr()),reinterpret_cast<const W*>(values.data_ptr()),pos.data_ptr<int64_t>(), \
-            count,cells,cold_cells,heads,kw,vw,map,ids,cold,free,gpu_free,meta,reinterpret_cast<Stamp*>(control.data_ptr())+1); \
+            count,cells,cold_cells,heads,kw,vw,map,ids,cold,free,gpu_free,meta, \
+            reinterpret_cast<Stamp*>(control.data_ptr())+1,int(mapping.numel()),error); \
         append_exclusive<<<std::min(65535,(count+3)/4),128,0,mfq_current_cuda_stream()>>>( \
             reinterpret_cast<const W*>(source_k.data_ptr()),reinterpret_cast<const W*>(source_v.data_ptr()), \
             reinterpret_cast<W*>(keys.data_ptr()),reinterpret_cast<W*>(values.data_ptr()), \
             reinterpret_cast<W*>(cold_keys.data_ptr()),reinterpret_cast<W*>(cold_values.data_ptr()),pos.data_ptr<int64_t>(), \
-            count,cells,cold_cells,heads,kw,vw,map,ids,reinterpret_cast<Stamp*>(epochs.data_ptr()),cold,free,meta)
+            count,cells,cold_cells,heads,kw,vw,map,ids,reinterpret_cast<Stamp*>(epochs.data_ptr()), \
+            cold,free,meta,int(mapping.numel()),error)
     if(keys.element_size()==2){MFQ_APPEND_EXCLUSIVE(uint16_t);}else{MFQ_APPEND_EXCLUSIVE(uint32_t);}
     #undef MFQ_APPEND_EXCLUSIVE
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
@@ -329,6 +378,7 @@ bool HotKvCache::append_decode(const tb::Tensor& k,const tb::Tensor& v,const tb:
     if((!inputs && option && option[0]=='0') || !exclusive() || positions.numel()<1 || positions.numel()>32 ||
         positions.numel()>keys.size(2) || positions.scalar_type()!=tb::kInt64 || !positions.is_contiguous())return false;
     if(!inputs && !option && positions.numel()>8)return false;
+    validate_exclusive_capacity();
     MFQ_RUNTIME_CHECK(!inputs || (!index_rows.defined() && !index_storage.defined() && !begin_prepare),
         "indirect KV append requires separate index updates");
     const int count=int(positions.numel()),cells=int(keys.size(2)),cold_cells=int(cold_keys.size(2)),heads=int(keys.size(1)),
@@ -366,13 +416,15 @@ bool HotKvCache::append_decode(const tb::Tensor& k,const tb::Tensor& v,const tb:
             k.scalar_type()==tb::kFloat32 && keys.scalar_type()==tb::kFloat16,
             v.scalar_type()==tb::kFloat32 && values.scalar_type()==tb::kFloat16,
             inputs?inputs->states().data_ptr<int64_t>():nullptr,
-            inputs?inputs->enabled().data_ptr<int64_t>():nullptr,inputs?int(inputs->rows()):0,int(field),int(row));
+            inputs?inputs->enabled().data_ptr<int64_t>():nullptr,inputs?int(inputs->rows()):0,int(field),int(row),
+            default_context(keys.get_device())->input_error(mfq_current_cuda_stream()));
     };
     if(keys.element_size()==2)launch(uint16_t{});else if(keys.element_size()==4)launch(uint32_t{});else return false;
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();return true;
 }
 void HotKvCache::bind_decode_state(BatchDecodeInputs& inputs,int64_t field,int64_t row) const {
-    MFQ_RUNTIME_CHECK(exclusive(),"indirect KV state requires exclusive tiers");
+    validate_exclusive_capacity();
+    inputs.validate_position(row,mapping.numel());
     const tb::Tensor* tensors[]={&keys,&values,&cold_keys,&cold_values,&mapping,&slot_ids,&epochs,
         &cold_mapping,&free_cold,&free_gpu,&cold_control,&control};
     for(int offset=0;offset<HotKvStateFields::Count;++offset)

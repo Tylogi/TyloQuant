@@ -62,6 +62,7 @@ public:
 private:
     int device_ = 0;
     cudaEvent_t event_ = nullptr;
+    cudaStream_t stream_ = nullptr;
 };
 
 class Stream final {
@@ -182,9 +183,16 @@ struct DeviceMemoryStats {
     std::size_t peak = 0;
 };
 
+// Written only on invalid device inputs; checked after the owning stream completes.
+struct DeviceInputError {
+    int operation = 0;
+    std::int64_t index = 0, extent = 0;
+};
+
 class Context final : public std::enable_shared_from_this<Context> {
 public:
     explicit Context(int device);
+    ~Context() noexcept;
 
     int device() const noexcept { return device_; }
     Stream& stream() noexcept { return stream_; }
@@ -197,6 +205,8 @@ public:
     // Process-owned pages, including idle allocator pages and CUDA libraries.
     std::size_t resident_memory_usage() const;
     std::size_t available_memory() const;
+    DeviceInputError* input_error(cudaStream_t stream);
+    void check_input_error(cudaStream_t stream) const;
     void reclaim_idle_memory();
     // Temporarily reuse already charged expert-cache storage on one ordered
     // compute stream. Graph/resident allocations never enter this workspace.
@@ -252,6 +262,12 @@ private:
     };
     std::unique_ptr<WorkspaceLoan> workspace_loan_;
     std::unordered_map<cudaStream_t, GraphPool> graph_pools_;
+    mutable std::mutex input_error_mutex_;
+    struct InputErrorStorage {
+        std::shared_ptr<DeviceInputError> host;
+        DeviceInputError* device = nullptr;
+    };
+    std::unordered_map<cudaStream_t, InputErrorStorage> input_errors_;
 };
 
 std::shared_ptr<Context> default_context(int device = 0);

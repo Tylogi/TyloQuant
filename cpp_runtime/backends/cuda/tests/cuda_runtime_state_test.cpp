@@ -938,6 +938,8 @@ static void check_exclusive_kv() {
     }
 }
 
+#include "kv_bounds_test.h"
+
 static void check_decode_kv_append() {
     namespace tb=mfq_tensor_backend;
     auto stream=mfq_get_stream_from_pool();MfqCudaStreamGuard guard(stream);
@@ -1490,6 +1492,7 @@ int main(int argc, char** argv) try {
     if(argc==2 && std::string(argv[1])=="--mfe-transfer-bench") {benchmark_mfe_transfer();return 0;}
     if(argc==2 && std::string(argv[1])=="--mfe-transfer-check") {benchmark_mfe_transfer(false);return 0;}
     if(argc==2 && std::string(argv[1])=="--kv-append-check") {
+        check_kv_bounds();
         check_exclusive_kv();check_decode_kv_append();
         std::cout<<"Exclusive short KV/index append and graph replay checks passed\n";return 0;
     }

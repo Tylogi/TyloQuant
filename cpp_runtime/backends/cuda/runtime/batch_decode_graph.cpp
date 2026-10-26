@@ -72,6 +72,14 @@ void BatchDecodeInputs::upload() {
     states_.copy_(host_states_);
 }
 
+void BatchDecodeInputs::validate_position(int64_t row, int64_t maximum) const {
+    MFQ_RUNTIME_CHECK(row >= 0 && row < rows_, "invalid decode row");
+    const auto* metadata = host_metadata_.data_ptr<int64_t>();
+    MFQ_RUNTIME_CHECK(!metadata[3 * rows_ + row] ||
+        (metadata[rows_ + row] >= 0 && metadata[rows_ + row] < maximum),
+        "exclusive KV decode position exceeds logical capacity");
+}
+
 void BatchDecodeInputs::copy_from(const BatchDecodeInputs& source) {
     host_metadata_.copy_(source.host_metadata_);
     host_states_.copy_(source.host_states_);

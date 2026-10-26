@@ -365,6 +365,7 @@ void DecodeWindow::run() {
             }
         }
         // Only after all GPU consumers finish may adaptation overwrite L1.
+        default_context(current_stream().device_index())->check_input_error(stream_);
         checkpoint("finish");
         for(auto& task:tasks_)if(task.finish)task.finish();
         sample(finish_ns_);

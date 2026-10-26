@@ -466,6 +466,35 @@ int main() {
             assert(ops.chunks.size() == chunks);
         }
     }
+    // A serial model defers all seven peers before allocating request state,
+    // including when the caller initially requested a wider serving capacity.
+    for (const auto capacity : {1, 8}) {
+        TestOps ops;
+        RequestExecutor executor(capacity);
+        auto model_info = info();
+        model_info.batch_capacity = 1;
+        for (int row = 0; row < 8; ++row) {
+            const auto id = std::to_string(row);
+            assert(executor.admit(request(id), nullptr, model_info, ops) == Admission::accepted);
+            for (int pending = row + 1; pending < 8; ++pending) {
+                const auto result = executor.admit(request(std::to_string(pending)), nullptr, model_info, ops);
+                assert(result == Admission::deferred);
+            }
+            assert(executor.status().available == 0);
+            int terminals = 0;
+            for (int tick = 0; !executor.empty() && tick < 12; ++tick) {
+                const auto result = executor.step({id}, ops);
+                assert(ops.live <= 1);
+                for (const auto& event : result.events)
+                    if (terminal(event.data)) {
+                        assert(std::holds_alternative<Completed>(event.data));
+                        ++terminals;
+                    }
+            }
+            assert(executor.empty() && terminals == 1 && ops.live == 0);
+        }
+        assert(ops.resets == 8);
+    }
     // An ineligible peer must not execute when another batched request cancels.
     {
         TestOps ops;

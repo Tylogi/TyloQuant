@@ -13,10 +13,15 @@ namespace {
 using mfq::engine::KvAdmissionBytes;
 using mfq::engine::kv_admission_multiply;
 using mfq::engine::prefill_budget_add;
-constexpr std::size_t workspace_headroom = std::size_t(1) << 30;
+template<class Model> std::size_t workspace_headroom(const Model& model, int device) {
+    const auto rows = mfq::engine::prefill_workspace_row_bytes(
+        model.hidden_size(), model.hc_mult(), model.num_attention_heads(), model.head_dim());
+    return mfq::engine::prefill_workspace_headroom(default_context(device)->memory_stats().limit, rows);
+}
 
+template<class Model>
 KvAdmissionBytes available_bytes(const KvAdmissionBytes& geometry, const BatchMemoryProvider& memory,
-                                  std::size_t transfer_bytes) {
+                                  std::size_t transfer_bytes, const Model& model) {
     const auto evictable = memory.evictable ? memory.evictable() : KvAdmissionBytes{};
     KvAdmissionBytes result;
     for (const auto& [device, width] : geometry) {
@@ -25,7 +30,7 @@ KvAdmissionBytes available_bytes(const KvAdmissionBytes& geometry, const BatchMe
         auto bytes = context->available_memory();
         if (const auto it = evictable.find(device); it != evictable.end())
             bytes = prefill_budget_add(bytes, it->second);
-        const auto headroom = prefill_budget_add(workspace_headroom, transfer_bytes);
+        const auto headroom = prefill_budget_add(workspace_headroom(model, device), transfer_bytes);
         result[device] = bytes > headroom ? bytes - headroom : 0;
     }
     return result;
@@ -86,7 +91,7 @@ std::size_t token_geometry(const Qwen4CausalLm& model) {
 mfq::engine::KvAdmissionBytes QwenBatchOperations::admission_available() const {
     const auto geometry = token_geometry(model_);
     const auto transfer = moe_prefill_workspace_budget(execution_.moe_expert_cache, false).transfer_bytes;
-    auto available = available_bytes(geometry, memory_, transfer);
+    auto available = available_bytes(geometry, memory_, transfer, model_);
     const auto paged = state_adapter_.paged_kv_stats();
     const auto recurrent = recurrent_geometry(model_);
     for (const auto& [device, width] : geometry) {
@@ -156,7 +161,7 @@ void QwenBatchOperations::reclaim_prefill_memory(const std::shared_ptr<Request>&
         }
         if (state_adapter_.paged_kv_enabled())
             bytes = prefill_budget_add(bytes, kv_admission_multiply(1024 - 16, width));
-        bytes = prefill_budget_add(bytes, prefill_budget_add(workspace_headroom, transfer));
+        bytes = prefill_budget_add(bytes, prefill_budget_add(workspace_headroom(model_, device), transfer));
     }
     memory_.reclaim(required);
 }
@@ -164,7 +169,7 @@ void QwenBatchOperations::reclaim_prefill_memory(const std::shared_ptr<Request>&
 mfq::engine::KvAdmissionBytes FlashNextBatchOperations::admission_available() const {
     const auto device = execution_.layer_placement.primary_device();
     const auto transfer = moe_prefill_workspace_budget(execution_.moe_expert_cache, false).transfer_bytes;
-    auto available = available_bytes({{device, token_geometry(model_)}}, memory_, transfer);
+    auto available = available_bytes({{device, token_geometry(model_)}}, memory_, transfer, model_);
     if (config_.kv_budget_bytes) {
         std::size_t used = 0;
         for (const auto& weak : requests_) {
@@ -243,7 +248,7 @@ void FlashNextBatchOperations::reclaim_prefill_memory(const std::shared_ptr<Requ
     auto required = admission_cost(request, 0);
     const auto transfer = moe_prefill_workspace_budget(execution_.moe_expert_cache, false).transfer_bytes;
     for (auto& [device, bytes] : required)
-        bytes = prefill_budget_add(bytes, prefill_budget_add(workspace_headroom, transfer));
+        bytes = prefill_budget_add(bytes, prefill_budget_add(workspace_headroom(model_, device), transfer));
     memory_.reclaim(required);
 }
 
