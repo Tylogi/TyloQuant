@@ -1,6 +1,7 @@
 #include "cuda_runtime_config.h"
 #include "cuda_execution.h"
 #include "generation.h"
+#include "prefill_recovery.h"
 #include "storage/model_loader.h"
 #include "storage/weight_loader.h"
 #include "storage/moe_expert_cache.h"
@@ -186,6 +187,7 @@ struct CudaEngineState {
             // caps above three need additional verification storage.
             const int depth=std::max(3,requested);
             if(depth==graph_draft_depth && language.graph_registry)return;
+            PrefillAllocationScope allocation_scope;
             const auto started=std::chrono::steady_clock::now();
             preparing_graph_depth=true;
             try {
@@ -252,6 +254,14 @@ struct CudaEngineState {
                 cache.reserve_ram(bytes);reclaim_moe_optional_host(execution->moe_expert_cache,bytes);
             });
         allocation_ceiling=mfq::cuda::default_context(execution->layer_placement.primary_device())->memory_stats().limit;
+        language.reclaim_prefill_workspace=[this] {
+            graph.invalidate();
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                qwen4_release_decode_graphs(language,components.mtp.get());
+            graph_draft_depth=0;
+            release_graph_expert_space();
+            cache.trim_hot(0);
+        };
         if (config.continuous_batch.max_sequences) {
             if constexpr (std::is_same_v<Model, Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)
                 batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
@@ -391,6 +401,7 @@ struct CudaEngineState {
     }
     ~CudaEngineState() {
         language.restore_decode_workspace={};
+        language.reclaim_prefill_workspace={};
         try {release_graph_expert_space();}
         catch(const std::exception& error) {std::cerr<<"runtime_mtp_workspace_cache cleanup_error="<<error.what()<<'\n';}
         if(execution->kv_memory)execution->kv_memory->set_reservation({});
@@ -471,14 +482,35 @@ struct CudaEngineState {
         throw std::invalid_argument("model has no multimodal component");
     }
     auto advance_preparation(mfq::StepSequence<Prepared>& preparation) {
+        mfq::cuda::PrefillAllocationScope allocation_scope;
         PrefillCudaTimer timer;
         auto step = preparation.next();
         MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
         return std::pair{std::move(step), timer.elapsed_ms()};
     }
+    void recover_preparation(const std::exception_ptr& failure,bool reclaimed) {
+        if(!mfq::engine::prefill_resource_failure(failure))std::rethrow_exception(failure);
+        internal::reclaim_prefill_memory(language);
+        language.reset(1);
+        if(components.mtp)components.mtp->reset(1);
+        if(reclaimed)throw MfqResourceExhausted("vision prefill resource exhausted after workspace reclamation: "+
+            mfq::engine::prefill_failure_message(failure));
+        std::cerr<<"runtime_prefill_retry scope=vision action=reclaim\n";
+    }
     Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared,
                              const RequestId& id, bool batched) {
-        if(!batched)prepare_graph_depth(input);
+        if(!batched) {
+            try {prepare_graph_depth(input);}
+            catch(...) {
+                const auto failure=std::current_exception();
+                if(!prefill_resource_failure(failure))std::rethrow_exception(failure);
+                internal::reclaim_prefill_memory(language);
+                language.reset(1);
+                if(components.mtp)components.mtp->reset(1);
+                std::cerr<<"runtime_prefill_retry scope=graph action=reclaim reason="
+                    <<prefill_failure_message(failure)<<'\n';
+            }
+        }
         return internal::generate(language, graph, cache, config,
                                   input, output, batched ? nullptr : components.mtp.get(), std::move(prepared),
                                   batched ? batching.get() : nullptr, id);

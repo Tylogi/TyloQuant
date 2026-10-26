@@ -28,6 +28,16 @@ void check(cudaError_t status, const char* expression, const char* file, int lin
 void check(cublasStatus_t status, const char* expression, const char* file, int line);
 void record_gpu_timestamp(uint64_t* timestamps, std::size_t index, cudaStream_t stream);
 
+// Fault injection is opt-in through MFQ_TEST_CUDA_PREFILL_FAIL_AFTER and counts
+// only allocations within prefill, including nested predictor/vision work.
+class PrefillAllocationScope final {
+public:
+    PrefillAllocationScope();
+    ~PrefillAllocationScope();
+    PrefillAllocationScope(const PrefillAllocationScope&)=delete;
+    PrefillAllocationScope& operator=(const PrefillAllocationScope&)=delete;
+};
+
 #define MFQ_NATIVE_CUDA_CHECK(expression) \
     ::mfq::cuda::check((expression), #expression, __FILE__, __LINE__)
 

@@ -348,6 +348,7 @@ struct CudaExecutionContext {
     bool force_moe_unfused_reduce = false;
     bool force_moe_materialized_swiglu = false;
     bool force_moe_prefill_mma_off = false;
+    std::size_t prefill_moe_route_bytes = 0;
     KlMmqState kl_mmq;
     std::unordered_set<int> dsv4_cpu_offload_layers;
     int64_t dsv4_cpu_offload_host_bytes = 0;

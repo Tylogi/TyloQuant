@@ -14,6 +14,7 @@
 #include "runtime/native_dma_batch.h"
 #include "mfq_cuda_context.h"
 #include "mfq/runtime.h"
+#include "prefill_retry.h"
 #include "mfe_ffn_runtime.h"
 #include "quant_linear.h"
 #include <cuda.h>
@@ -1105,7 +1106,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         try { std::rethrow_exception(std::current_exception()); }
         catch(const std::exception& error) {
             const std::string message=error.what();
-            if(dynamic_cast<const MfqResourceExhausted*>(&error) ||
+            if(mfq::engine::prefill_resource_failure(std::current_exception()) ||
                     message.starts_with("CUDA process VRAM limit exceeded:") ||
                     message.starts_with("CUDA VRAM limit exceeded:") ||
                     message.starts_with("CUDA pinned allocation failed:")) {

@@ -21,7 +21,7 @@ from tests.test_native_nint_ple import _worker_tokenizer
 
 
 @pytest.mark.parametrize("bits", [0, 4])
-def test_cuda_qwen4_image_and_mtp(tmp_path, bits):
+def test_cuda_qwen4_image_and_mtp(tmp_path, bits, _fault_after=0, _fault_scope=1):
     executable = os.environ.get("MFQ_CUDA_RESOURCE_TEST_RUNTIME")
     if not executable:
         pytest.skip("set MFQ_CUDA_RESOURCE_TEST_RUNTIME to a CUDA mfq-runtime")
@@ -70,6 +70,10 @@ def test_cuda_qwen4_image_and_mtp(tmp_path, bits):
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log,
                 env=dict(os.environ, MFQ_KV_TURBOQUANT_BITS=str(bits), MFQ_RUNTIME_DISABLE_PREFIX_CACHE="1",
                     MFQ_CUDA_VISION_RESIDENT=str(int(resident)),
+                    MFQ_TEST_CUDA_PREFILL_FAIL_AFTER=str(_fault_after if not resident else 0),
+                    MFQ_TEST_CUDA_PREFILL_FAIL_COUNT="1",
+                    MFQ_TEST_CUDA_PREFILL_FAIL_SCOPE=str(_fault_scope),
+                    MFQ_QWEN4_WARMUP_MTP="0" if _fault_after else os.environ.get("MFQ_QWEN4_WARMUP_MTP", "1"),
                     MFQ_MTP_HOST_PROMPT_HISTORY=str(int(not resident))))
             client = StdioRuntimeClient(process, control_timeout_seconds=20)
             try:
@@ -118,3 +122,17 @@ def test_cuda_qwen4_image_and_mtp(tmp_path, bits):
     actual, streamed_bytes = asyncio.run(run(False))
     assert actual == expected
     assert streamed_bytes < resident_bytes
+
+
+def test_cuda_vision_prefill_reclaims_and_retries(tmp_path):
+    test_cuda_qwen4_image_and_mtp(tmp_path, 0, _fault_after=5)
+    trace = (tmp_path / "worker-False.log").read_text(errors="replace")
+    assert trace.count("runtime_prefill_retry scope=vision") == 1, trace
+    assert "cleanup_error" not in trace
+
+
+def test_cuda_prepared_image_prefill_replays_positions_and_embeddings(tmp_path):
+    test_cuda_qwen4_image_and_mtp(tmp_path, 0, _fault_after=1, _fault_scope=6)
+    trace = (tmp_path / "worker-False.log").read_text(errors="replace")
+    assert "runtime_prefill_retry scope=request" in trace, trace
+    assert "cleanup_error" not in trace
