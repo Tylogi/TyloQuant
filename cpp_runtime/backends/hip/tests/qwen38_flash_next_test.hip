@@ -24,6 +24,7 @@
 #include "mfq/kernels/hip/deepseek_v4_fp4.h"
 #include "mfq/kernels/hip/deepseek_v4_hc.h"
 #include "tq.h"
+extern "C" uint64_t mfq_tq_prefill_f32_workspace(ProjectionView,int);
 #include "mfq/model_source.h"
 #include "storage/transformer_loader.h"
 #include "core/axial_patch_vision.h"
@@ -1220,7 +1221,22 @@ int main(int argc, char** argv) {
                         return {stack(parts,1)};
                     }
                     if(router_tq) {
-                        if(params.value("projection_only",false))return {router_tq->forward(tensors.at(0))};
+                        if(params.value("projection_only",false)) {
+                            if(params.value("legacy_projection",false))return {mfq_tensor_backend::linear(
+                                tensors.at(0),router_tq->materialize(mfq_tensor_backend::kFloat32))};
+                            if(params.value("direct_prefill",false)) {
+                                const auto input=tensors.at(0).contiguous();
+                                const int tokens=int(input.numel()/router_tq->neuron_len);
+                                auto shape=input.sizes().vec();shape.back()=router_tq->out;
+                                auto result=mfq_tensor_backend::empty(shape,input.options());
+                                const auto bytes=mfq_tq_prefill_f32_workspace(router_tq->view,tokens);
+                                auto workspace=mfq_tensor_backend::empty({int64_t(bytes)},input.options().dtype(mfq_tensor_backend::kUInt8));
+                                MFQ_CUDA_CHECK(static_cast<hipError_t>(mfq_tq_prefill_f32(router_tq->view,input.data_ptr<float>(),
+                                    result.data_ptr<float>(),tokens,workspace.data_ptr(),bytes,mfq_current_cuda_stream())));
+                                return {result};
+                            }
+                            return {router_tq->forward(tensors.at(0))};
+                        }
                         std::vector<Tensor> result;
                         if(params.value("legacy",false))result={router_tq->forward(tensors.at(1)),
                             mfq_tensor_backend::sigmoid(mfq_selected_attention::promoted_matmul(tensors.at(1),tensors.at(0).transpose(-1,-2)))};

@@ -28,8 +28,8 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
     float anchor=__half2float(__ushort_as_half(uint16_t(descriptor>>40)));
     int ringwords=8*bits;
     static_assert(V>0 && 256%V==0,"Decode vectors must divide an independent ring");
-    static_assert(!Prepared || (V==8 && Columns && !RawBook && HalfOutput==2),
-                  "Prepared tiles contain eight aligned column-scaled half weights");
+    static_assert(!Prepared || (V==8 && !RawBook && HalfOutput==2),
+                  "Prepared tiles contain eight aligned half weights");
     // Callers assign aligned V-weight vectors. Their bit offsets cannot have
     // every possible low five bits: even precisions with V=16 are word-aligned.
     int minimum=((256/V-1)-((col/V)%(256/V)))*(V*bits);

@@ -87,6 +87,7 @@ set(MFQ_HIP_KERNEL_SOURCES
     ${MFQ_HIP_KERNEL_ROOT}/tq_shared.hip
     ${MFQ_HIP_KERNEL_ROOT}/tq_moe.hip
     ${MFQ_HIP_KERNEL_ROOT}/tq_projection.hip
+    ${MFQ_HIP_KERNEL_ROOT}/tq_prefill.hip
     ${MFQ_HIP_KERNEL_ROOT}/tq_q8.hip
     ${MFQ_HIP_KERNEL_ROOT}/tq_input_gate.hip
     ${MFQ_HIP_KERNEL_ROOT}/acc.hip

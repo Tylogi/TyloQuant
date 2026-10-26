@@ -5,6 +5,7 @@
 #include "moe.h"
 #include "qwen4_exp.h"
 extern "C" int mfq_tq_gr(ProjectionView,const void*,const void*,void*,int,int,int,int,hipStream_t);
+extern "C" uint64_t mfq_tq_prefill_f32_workspace(ProjectionView,int);
 #include "mfq_hip_moe_ops.h"
 #include "tq_input_gate.h"
 #include "tq_residual.h"
@@ -217,6 +218,17 @@ tb::Tensor TqWeight::forward(tb::Tensor input) const {
     }
     const bool staged=!small && neuron_len>64 && area>=16384 &&
         (neuron_len>=512 || tokens*area>=(1LL<<27));
+    // Only enable the direct FP32 geometry that beats the existing native
+    // caller. Weights are reconstructed in LDS; workspace holds activations.
+    if(type==2 && tokens==2048 && neuron_len==2560 && (out==6144 || out==12288) && !view.columns &&
+            mfq_tq_prefill_f32_supported(image.get_device())) {
+        auto result=tb::empty(shape,x.options());
+        const auto bytes=mfq_tq_prefill_f32_workspace(view,int(tokens));
+        auto workspace=tb::empty({static_cast<int64_t>(bytes)},x.options().dtype(tb::kUInt8));
+        status(mfq_tq_prefill_f32(view,x.data_ptr<float>(),result.data_ptr<float>(),int(tokens),
+            workspace.data_ptr(),bytes,mfq_current_cuda_stream()));
+        return result;
+    }
     if(staged) {
         const auto compute=type==0?tb::kFloat16:tb::kFloat32;
         auto w=materialize(compute);
