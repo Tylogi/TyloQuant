@@ -116,6 +116,33 @@ __global__ __launch_bounds__(256) void tq_shared_finish_kernel(ProjectionView do
  }
 }
 
+template<int C> __global__ __launch_bounds__(256) void tq_shared_finish_batch_kernel(ProjectionView down,
+ const uint16_t* hidden,const uint16_t* pairs,const float* weights,const mfq_tq_cuda_exact::S<C>* coefficient,float* output,int routes,int tokens){
+ using namespace mfq_tq_cuda_exact;
+ const int wave=threadIdx.x/64,lane=threadIdx.x&63,row=int(blockIdx.x)*4+wave,first=int(blockIdx.y)*2;
+ float value[2]{};
+ if(row<down.rows){
+  if(down.columns)generic_dispatch<0,true,1,2,16>(down,row,hidden,first,tokens,down.input_columns,value);
+  else generic_dispatch<0,false,1,2,16>(down,row,hidden,first,tokens,down.input_columns,value);
+ }
+ #pragma unroll
+ for(int t=0;t<2;++t){
+  #pragma unroll
+  for(int shift=32;shift;shift>>=1)value[t]+=__shfl_down(value[t],shift,64);
+ }
+ if(!lane&&row<down.rows){
+  #pragma unroll
+  for(int t=0;t<2;++t)if(first+t<tokens){
+   const int token=first+t;
+   const float shared=number<0>(rounded<0>(value[t]+(down.bias?down.bias[row]:0.f)));
+   float sum=0.f;
+   for(int r=0;r<routes;++r)sum=__fadd_rn(sum,__fmul_rn(number<0>(pairs[(size_t(token)*routes+r)*down.rows+row]),weights[token*routes+r]));
+   const float routed=number<0>(rounded<0>(sum));
+   output[size_t(token)*down.rows+row]=__fadd_rn(routed,__fmul_rn(shared,number<C>(coefficient[token])));
+  }
+ }
+}
+
 __global__ __launch_bounds__(256) void tq_shared_swiglu_batch_kernel(ProjectionView gate,ProjectionView up,
  const uint16_t* input,uint16_t* output,int tokens){
  using namespace mfq_tq_cuda_exact;
@@ -228,17 +255,28 @@ mfq_tensor_backend::Tensor tq_shared_finish_cuda(ProjectionView down,
  const mfq_tensor_backend::Tensor& weights,const mfq_tensor_backend::Tensor& coefficient){
  namespace tb=mfq_tensor_backend;
  MFQ_RUNTIME_CHECK(hidden.is_cuda() && hidden.is_contiguous() && hidden.scalar_type()==tb::kFloat16 &&
-  hidden.dim()==2 && hidden.size(0)==1 && hidden.size(1)==down.input_columns && down.input_columns>0 &&
+  hidden.dim()==2 && hidden.size(0)>=1 && hidden.size(0)<=6 && hidden.size(1)==down.input_columns && down.input_columns>0 &&
   down.input_columns%8==0 && down.rows>=down.input_columns && pairs.device()==hidden.device() &&
-  pairs.is_contiguous() && pairs.scalar_type()==tb::kFloat16 && pairs.dim()==3 && pairs.size(0)==1 &&
+  pairs.is_contiguous() && pairs.scalar_type()==tb::kFloat16 && pairs.dim()==3 && pairs.size(0)==hidden.size(0) &&
   pairs.size(1)>0 && pairs.size(1)<=INT_MAX && pairs.size(2)==down.rows && weights.device()==hidden.device() &&
-  weights.is_contiguous() && weights.scalar_type()==tb::kFloat32 && weights.numel()==pairs.size(1) &&
-  coefficient.device()==hidden.device() && coefficient.is_contiguous() && coefficient.scalar_type()==tb::kFloat32 &&
-  coefficient.numel()==1,"invalid TQ shared Down/reduction geometry");
- MfqCudaGuard guard(hidden.device());auto output=tb::empty({1,down.rows},hidden.options().dtype(tb::kFloat32));
- tq_shared_finish_kernel<<<(down.rows+3)/4,256,0,mfq_current_cuda_stream()>>>(down,
+  weights.is_contiguous() && weights.scalar_type()==tb::kFloat32 && weights.numel()==pairs.size(0)*pairs.size(1) &&
+  coefficient.device()==hidden.device() && coefficient.is_contiguous() &&
+  (coefficient.scalar_type()==tb::kFloat32 || (hidden.size(0)>1 && coefficient.scalar_type()==tb::kBFloat16)) &&
+  coefficient.numel()==hidden.size(0),"invalid TQ shared Down/reduction geometry");
+ MfqCudaGuard guard(hidden.device());const int tokens=int(hidden.size(0));
+ auto output=tb::empty({tokens,down.rows},hidden.options().dtype(tb::kFloat32));
+ if(tokens==1)tq_shared_finish_kernel<<<(down.rows+3)/4,256,0,mfq_current_cuda_stream()>>>(down,
   reinterpret_cast<const uint16_t*>(hidden.data_ptr()),reinterpret_cast<const uint16_t*>(pairs.data_ptr()),
   weights.data_ptr<float>(),coefficient.data_ptr<float>(),output.data_ptr<float>(),int(pairs.size(1)));
+ else {
+  const dim3 grid((down.rows+3)/4,(tokens+1)/2);
+  #define FINISH(C,P) tq_shared_finish_batch_kernel<C><<<grid,256,0,mfq_current_cuda_stream()>>>(down,\
+   reinterpret_cast<const uint16_t*>(hidden.data_ptr()),reinterpret_cast<const uint16_t*>(pairs.data_ptr()),\
+   weights.data_ptr<float>(),P,output.data_ptr<float>(),int(pairs.size(1)),tokens)
+  if(coefficient.scalar_type()==tb::kBFloat16){FINISH(1,reinterpret_cast<const uint16_t*>(coefficient.data_ptr()));}
+  else {FINISH(2,coefficient.data_ptr<float>());}
+  #undef FINISH
+ }
  MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
 }
 

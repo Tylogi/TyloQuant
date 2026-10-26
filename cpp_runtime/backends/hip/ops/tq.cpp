@@ -569,9 +569,9 @@ struct TqMoePeer {
 tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,tb::Tensor weights,float limit,
         const TqWeight* shared_down,tb::Tensor shared_hidden,tb::Tensor shared_coefficient)const {
     if(shared_down && (!gate || !down || !gate->shards.empty() ||
-        input_value.scalar_type()!=tb::kFloat16 || input_value.dim()!=2 || input_value.size(0)!=1 ||
+        input_value.scalar_type()!=tb::kFloat16 || input_value.dim()!=2 || input_value.size(0)<1 || input_value.size(0)>6 ||
         ids.dim()!=2 || ids.size(1)<1 || shared_down->image.device()!=input_value.device()))
-        throw std::invalid_argument("fused TQ shared finish requires one local FP16 request");
+        throw std::invalid_argument("fused TQ shared finish requires one to six local FP16 rows");
     if(gate && !gate->shards.empty()) {
         if(!up || !down || gate->shards.size()!=up->shards.size() || gate->shards.size()!=down->shards.size())
             throw std::invalid_argument("TQ expert shard banks differ");

@@ -129,7 +129,7 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
         tq->up=gate_up.tq_projections[1];tq->down=down.tq_projections[0];
     }
     auto pipeline=tq?MoeFfnForward{}:make_moe_ffn_pipeline(gate_up.projections,down.projections,shared,{},std::move(shared_weights),prefetch);
-    return [gate_up, down, router, shared, pipeline, tq, c,router_weight,shared_gate_weight,sg_weight,su_weight,sd,sd_weight](CudaExecutionContext &execution,
+    return [gate_up, down, router, shared, pipeline, tq, c,router_weight,shared_gate_weight,sg_weight,su_weight,sd,sd_weight,shared_gate](CudaExecutionContext &execution,
                                                                const Tensor &x) {
         auto source = x.reshape({-1, c.hidden}).to(tb::kFloat16);
         const auto routing = c.routing();
@@ -151,6 +151,23 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
             auto shared_output=sd(execution,hidden);
             auto routed=tq->forward(source,selected[0],selected[1]);
             return tq_shared_add_cuda(routed,shared_output,projected[1]).reshape(x.sizes());
+        }
+        // fused TQ concurrent ending: preserve the native shared coefficient dtype.
+        if(tq && tq->gate->shards.empty() && c.hidden==2560 && source.size(0)>=2 && source.size(0)<=6 &&
+           router_weight && router_weight->is_tq() && shared_gate_weight && shared_gate_weight->is_dense() &&
+           shared_gate_weight->dense.scalar_type()==tb::kBFloat16 &&
+           sg_weight && su_weight && sd_weight && sg_weight->is_tq() && su_weight->is_tq() && sd_weight->is_tq() &&
+           sd_weight->tq.out>=sd_weight->tq.neuron_len && sd_weight->tq.neuron_len%8==0 && !tq_q8_enabled()) {
+            auto logits=router(execution,source).contiguous();
+            auto selected=moe_topk_cuda(logits,c.topk,
+                routing.activation==mfq::models::RouterActivation::sigmoid,
+                routing.activation==mfq::models::RouterActivation::sqrt_softplus,
+                routing.normalize,routing.delayed_softmax,mfq_nullopt,1e-20,routing.scale);
+            auto coefficient=tb::sigmoid(shared_gate(execution,source)).contiguous();
+            auto hidden=tq_shared_swiglu_cuda(sg_weight->tq.view,su_weight->tq.view,source);
+            if(coefficient.scalar_type()==tb::kBFloat16 || coefficient.scalar_type()==tb::kFloat32)
+                return tq->forward(source,selected[0],selected[1],0.f,&sd_weight->tq,hidden,coefficient).reshape(x.sizes());
+            return (tq->forward(source,selected[0],selected[1])+coefficient*sd(execution,hidden)).reshape(x.sizes());
         }
         return mfq::models::mixture_of_experts(
             [&] { return router(execution, source).contiguous(); },
