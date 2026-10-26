@@ -410,4 +410,3 @@ std::vector<mfq_tensor_backend::Tensor> mfq_hip_gdn_stateful::decode(
     }
     return {output,conv,state};
 }
-

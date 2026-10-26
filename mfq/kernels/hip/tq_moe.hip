@@ -449,7 +449,7 @@ template<int BM,int Threads,bool Skip>struct SwizzledInputCache {
             const int i=threadIdx.x+j*Threads,token=i/8,k=(i%8)*8,compact=first+token;
             const int pair=i<BM*8 && compact<last?plan.pairs[compact]:-1;
             source[j]=(columns&7)==0 && pair>=0?input+size_t(routed?pair:pair/plan.routes)*columns+k:nullptr;
-            
+
         }
         }
     }
@@ -458,7 +458,7 @@ template<int BM,int Threads,bool Skip>struct SwizzledInputCache {
         for(int j=0;j<Count;++j) {
             const int i=threadIdx.x+j*Threads,token=i/8,k=(i%8)*8;
             if(i<BM*8) {
-                
+
                 const uint4 value=source[j] && kb+k<columns?*reinterpret_cast<const uint4*>(source[j]+kb):uint4{};
                 const int mask=(token&15)*4;
                 *reinterpret_cast<uint2*>(output+token*64+(k^mask))=make_uint2(value.x,value.y);

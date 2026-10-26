@@ -211,4 +211,3 @@ bool cuda_qwen4_paged_checkpoint_needs_update(const CudaPagedPayload& payload,co
     if(present>1)throw CudaSessionStateError("invalid Qwen4 predictor presence");
     return !present;
 }
-
