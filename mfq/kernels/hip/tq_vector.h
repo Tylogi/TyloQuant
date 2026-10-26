@@ -105,6 +105,12 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
                 int pos=(255-((col+j+t)&255))*bits-first*32,wi=pos/32;
                 state=__funnelshift_r(select_word(chunks,NW,wi),select_word(chunks,NW,wi+1),pos&31)&65535;
             }
+            // Prepared gfx942 PP tiles need a byte sum; SAD against zero
+            // avoids the redundant multiply-by-one operand of dot4.
+#if defined(__gfx942__)
+            if constexpr(Prepared)sum[t]=__builtin_amdgcn_sad_u8(state*0x83dcd12du,0u,0x6400u);
+            else
+#endif
             sum[t]=dot_bytes(state*0x83dcd12du,0x01010101u,0x6400u);
         }
         half2 base=__halves2half2(__ushort_as_half(sum[0]),__ushort_as_half(sum[1]));
