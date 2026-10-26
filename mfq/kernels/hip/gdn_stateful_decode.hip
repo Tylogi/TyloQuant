@@ -302,8 +302,9 @@ __global__ void gdn_stateful_decode_kernel(const Qkv* qkv,const Gate* output_gat
     }
 }
 
-__global__ void gdn_stateful_split_epilogue(const float* workspace,const float* gate,
-    const float* weight,float* output,int value_heads,int64_t gate_stride,double eps,bool silu_gate) {
+template<bool CommitConvolution> __global__ void gdn_stateful_split_epilogue(const float* workspace,const float* gate,
+    const float* weight,float* output,int value_heads,int64_t gate_stride,double eps,bool silu_gate,
+    const float* qkv,float* convolution,int key_heads,int64_t qkv_stride) {
     const int group=blockIdx.x,tid=threadIdx.x,batch=group/value_heads,head=group%value_heads;
     const auto* x=workspace+size_t(group)*129;
     __shared__ float sum;
@@ -325,6 +326,26 @@ __global__ void gdn_stateful_split_epilogue(const float* workspace,const float* 
     const float sigmoid=__fdiv_rn(1.f,__fadd_rn(1.f,expf(-z)));
     const float activation=silu_gate?__fmul_rn(z,sigmoid):sigmoid;
     output[size_t(group)*128+tid]=__fmul_rn(__fmul_rn(__fmul_rn(x[tid],inverse),weight[tid]),activation);
+    if constexpr(CommitConvolution) {
+        // Every state block has finished reading history before this kernel.
+        // Each lane owns one channel, so its forward history shift is safe.
+        const int channels=(2*key_heads+value_heads)*128;
+        const size_t history=size_t(batch)*3*channels,input=int64_t(batch)*qkv_stride;
+        const int vc=2*key_heads*128+head*128+tid;
+        convolution[history+vc]=convolution[history+channels+vc];
+        convolution[history+channels+vc]=convolution[history+2*channels+vc];
+        convolution[history+2*channels+vc]=qkv[input+vc];
+        const int group_size=value_heads/key_heads;
+        if(head%group_size==0) {
+            const int qc=(head/group_size)*128+tid,kc=key_heads*128+qc;
+            convolution[history+qc]=convolution[history+channels+qc];
+            convolution[history+kc]=convolution[history+channels+kc];
+            convolution[history+channels+qc]=convolution[history+2*channels+qc];
+            convolution[history+channels+kc]=convolution[history+2*channels+kc];
+            convolution[history+2*channels+qc]=qkv[input+qc];
+            convolution[history+2*channels+kc]=qkv[input+kc];
+        }
+    }
 }
 
 namespace {
@@ -358,7 +379,8 @@ std::vector<mfq_tensor_backend::Tensor> mfq_hip_gdn_stateful::decode(
     double convolution_eps,double norm_eps,bool silu_gate,bool output_half,
     bool transposed_state,mfq_tensor_backend::Tensor workspace,bool inplace_state,
     mfq_tensor_backend::Tensor state_addresses,
-    mfq_tensor_backend::Tensor checkpoint_convolution,mfq_tensor_backend::Tensor checkpoint_recurrent) {
+    mfq_tensor_backend::Tensor checkpoint_convolution,mfq_tensor_backend::Tensor checkpoint_recurrent,
+    bool inplace_convolution) {
     constexpr int threads=256;
     const auto* tile_option=std::getenv("MFQ_HIP_GDN_STATE_TILES");
     const int tiles=tile_option?std::atoi(tile_option):1;
@@ -412,20 +434,27 @@ std::vector<mfq_tensor_backend::Tensor> mfq_hip_gdn_stateful::decode(
         "GDN decode core vector width disagrees");
     MfqCudaGuard guard(device);
     auto output=tb::empty({batch,1,value_heads*width},qkv.options().dtype(output_half?tb::kFloat16:tb::kFloat32));
-    auto conv=tb::empty({batch,taps-1,channels},convolution_state.options());
     auto state=inplace_state?recurrent_state:tb::empty_like(recurrent_state);
     const bool dpp=tiles==1 && batch<=6 && key_heads==16 && value_heads==48 && width==128 && taps==4 &&
         channels_first && transposed_state && inplace_state && !independent &&
         !checkpoint_convolution.defined() && !output_half && qkv.scalar_type()==tb::kFloat32 &&
         alpha.scalar_type()==tb::kFloat32 && gdn_stateful_gfx942(qkv.get_device());
     const bool separate=dpp && batch<=2 && !tile_option;
+    const auto overlaps_history=[&](const tb::Tensor& value) {
+        const auto begin=reinterpret_cast<uintptr_t>(value.data_ptr());
+        const auto history=reinterpret_cast<uintptr_t>(convolution_state.data_ptr());
+        return begin<history+convolution_state.nbytes() && history<begin+value.nbytes();
+    };
+    const bool commit_convolution=inplace_convolution && separate && qkv.is_contiguous() && output_gate.is_contiguous() &&
+        !overlaps_history(qkv) && !overlaps_history(output_gate) && !overlaps_history(norm_weight);
+    auto conv=commit_convolution?convolution_state:tb::empty({batch,taps-1,channels},convolution_state.options());
     if((tiles>1 || separate) && !workspace.defined() && !independent)workspace=tb::zeros({batch,value_heads,width+1},convolution_state.options());
     MFQ_RUNTIME_CHECK(!workspace.defined() || (real(workspace) &&
         workspace.sizes().vec()==std::vector<int64_t>({state_batch,value_heads,width+1})),
         "GDN decode core workspace shape/device/dtype disagrees");
     if(dpp) {
-        const auto run=[&]<int Tiles,bool Separate>() {
-            hipLaunchKernelGGL((gdn_stateful_decode_kernel<Tiles,float,float,float,128,4,false,0,false,true,Separate>),
+        const auto run=[&]<int Tiles,bool Separate,bool InplaceConvolution=false>() {
+            hipLaunchKernelGGL((gdn_stateful_decode_kernel<Tiles,float,float,float,128,4,InplaceConvolution,0,false,true,Separate>),
                 dim3(unsigned(batch*value_heads*Tiles)),dim3(256),0,mfq_current_cuda_stream(),
                 qkv.data_ptr<float>(),output_gate.data_ptr<float>(),alpha.data_ptr<float>(),beta.data_ptr<float>(),
                 convolution_state.data_ptr<float>(),recurrent_state.data_ptr<float>(),convolution_weight.data_ptr<float>(),
@@ -435,10 +464,13 @@ std::vector<mfq_tensor_backend::Tensor> mfq_hip_gdn_stateful::decode(
                 workspace.defined()?workspace.data_ptr<float>():nullptr,nullptr,qkv.stride(0),output_gate.stride(0),true,nullptr,nullptr);
         };
         if(separate) {
-            run.template operator()<8,true>();
-            gdn_stateful_split_epilogue<<<unsigned(batch*value_heads),128,0,mfq_current_cuda_stream()>>>(
-                workspace.data_ptr<float>(),output_gate.data_ptr<float>(),norm_weight.data_ptr<float>(),output.data_ptr<float>(),
-                int(value_heads),output_gate.stride(0),norm_eps,silu_gate);
+            const auto finish=[&]<bool Commit>() {
+                gdn_stateful_split_epilogue<Commit><<<unsigned(batch*value_heads),128,0,mfq_current_cuda_stream()>>>(
+                    workspace.data_ptr<float>(),output_gate.data_ptr<float>(),norm_weight.data_ptr<float>(),output.data_ptr<float>(),
+                    int(value_heads),output_gate.stride(0),norm_eps,silu_gate,qkv.data_ptr<float>(),conv.data_ptr<float>(),int(key_heads),qkv.stride(0));
+            };
+            if(commit_convolution){run.template operator()<8,true,true>();finish.template operator()<true>();}
+            else{run.template operator()<8,true>();finish.template operator()<false>();}
             static std::atomic_flag reported=ATOMIC_FLAG_INIT;
             if(!reported.test_and_set(std::memory_order_relaxed))
                 std::fprintf(stderr,"native_gdn_split tiles=8 stages=2 atomic_join=0 state=f32\n");

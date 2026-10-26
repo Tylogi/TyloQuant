@@ -474,9 +474,9 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     double convolution_eps, double norm_eps, bool silu_gate, bool output_half,
     bool transposed_state,
     mfq_tensor_backend::Tensor workspace,bool inplace_state,
-    mfq_tensor_backend::Tensor state_addresses) {
+    mfq_tensor_backend::Tensor state_addresses,bool inplace_convolution) {
     return mfq_hip_gdn_stateful::decode(qkv,output_gate,alpha,beta,convolution_state,recurrent_state,convolution_weight,dt_bias,a_log,norm_weight,
-        key_heads,value_heads,width,convolution_eps,norm_eps,silu_gate,output_half,transposed_state,workspace,inplace_state,state_addresses,{},{});
+        key_heads,value_heads,width,convolution_eps,norm_eps,silu_gate,output_half,transposed_state,workspace,inplace_state,state_addresses,{},{},inplace_convolution);
 }
 
 std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_checkpoint_cuda(

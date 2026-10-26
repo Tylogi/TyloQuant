@@ -50,7 +50,7 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     double convolution_eps, double norm_eps, bool silu_gate, bool output_half,
     bool transposed_state,
     mfq_tensor_backend::Tensor workspace={},bool inplace_state=false,
-    mfq_tensor_backend::Tensor state_addresses={});
+    mfq_tensor_backend::Tensor state_addresses={},bool inplace_convolution=false);
 
 std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_short_cuda(
     mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor qkv,

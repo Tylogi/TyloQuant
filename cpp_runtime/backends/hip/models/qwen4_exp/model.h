@@ -218,11 +218,11 @@ class Gdn {
                         projections[2].reshape({b,t,nv_}),projections[3].reshape({b,t,nv_}),previous,state_,
                         weight,w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
                         w_.norm.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
-                        x.scalar_type()==tb::kFloat16,true,core_workspace_,true);
+                        x.scalar_type()==tb::kFloat16,true,core_workspace_,true,{},true);
                 };
                 auto decoded=decode();
                 auto output=w_.output(execution,decoded[0]);
-                conv_.copy_(decoded[1]);return output;
+                if(conv_.data_ptr()!=decoded[1].data_ptr())conv_.copy_(decoded[1]);return output;
             }
         }
         return mfq::models::gated_delta_attention(

@@ -12,5 +12,6 @@ std::vector<mfq_tensor_backend::Tensor> decode(
     double convolution_eps,double norm_eps,bool silu_gate,bool output_half,
     bool transposed_state,mfq_tensor_backend::Tensor workspace,bool inplace_state,
     mfq_tensor_backend::Tensor state_addresses,
-    mfq_tensor_backend::Tensor checkpoint_convolution,mfq_tensor_backend::Tensor checkpoint_recurrent);
+    mfq_tensor_backend::Tensor checkpoint_convolution,mfq_tensor_backend::Tensor checkpoint_recurrent,
+    bool inplace_convolution=false);
 }
