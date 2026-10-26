@@ -321,6 +321,52 @@ std::vector<Tensor> gated_residual_post_norm(const Tensor& branch,const Tensor& 
 }
 
 namespace {
+// Fuse four FP32 index-head products, ReLU and head summation over a32-token tile.
+// A34-float LDS row distributes the scalar MFMA reads across banks.
+template<class Q,class K>__global__ __launch_bounds__(256) void qsa_prefill_scores_kernel(const Q* query,const K* pool,float* scores,
+ int tokens,int pools,int64_t qb,int64_t qt,int64_t qh,int64_t pb,int64_t pp){
+#if defined(__gfx942__)
+ using F4=float __attribute__((ext_vector_type(4)));
+ __shared__ float q[4*32*34],p[64*34];
+ const int tid=threadIdx.x,lane=tid&63,wave=tid>>6,batch=blockIdx.z;
+ const int t0=blockIdx.y*32,p0=blockIdx.x*64;
+ F4 acc[4][2]{};
+ for(int kb=0;kb<128;kb+=32){
+  for(int at=tid;at<4*32*32;at+=256){const int c=at%32,t=(at/32)%32,h=at/(32*32);
+   q[(h*32+t)*34+c]=t0+t<tokens?float(query[int64_t(batch)*qb+int64_t(t0+t)*qt+int64_t(h)*qh+kb+c]):0.f;}
+  for(int at=tid;at<64*32;at+=256){const int c=at%32,row=at/32;
+   p[row*34+c]=p0+row<pools?float(pool[int64_t(batch)*pb+int64_t(p0+row)*pp+kb+c]):0.f;}
+  __syncthreads();
+  #pragma unroll
+  for(int k=0;k<32;k+=4){const float a=p[(wave*16+(lane&15))*34+k+(lane>>4)];
+   #pragma unroll
+   for(int h=0;h<4;++h){
+    #pragma unroll
+    for(int mt=0;mt<2;++mt){const float b=q[(h*32+mt*16+(lane&15))*34+k+(lane>>4)];
+     acc[h][mt]=__builtin_amdgcn_mfma_f32_16x16x4f32(a,b,acc[h][mt],0,0,0);}
+   }
+  }
+  __syncthreads();
+ }
+ #pragma unroll
+ for(int mt=0;mt<2;++mt){const int t=t0+mt*16+(lane&15);
+  #pragma unroll
+  for(int j=0;j<4;++j){const int key=p0+wave*16+(lane>>4)*4+j;
+   if(t<tokens && key<pools){float total=0.f;
+    #pragma unroll
+    for(int h=0;h<4;++h)total+=fmaxf(acc[h][mt][j],0.f);
+    scores[(int64_t(batch)*tokens+t)*pools+key]=total*0.08838834764831845f;}
+  }
+ }
+#endif
+}
+bool qsa_prefill_gfx942(int device) {
+ static thread_local int previous=-1;static thread_local bool supported=false;
+ if(previous!=device){hipDeviceProp_t properties{};MFQ_CUDA_CHECK(hipGetDeviceProperties(&properties,device));
+  supported=std::strncmp(properties.gcnArchName,"gfx942",6)==0;previous=device;}
+ return supported;
+}
+
 // Eight independent pooled keys per CTA reuse the four short index queries.
 // Convert cached FP16 keys in registers, retaining FP32 scoring arithmetic.
 template<class Query,class Key>
@@ -350,6 +396,27 @@ __global__ __launch_bounds__(256) void qsa_decode_scores_kernel(const Query* que
 Tensor block_scores(const Tensor& query, const Tensor& pooled) {
     mfq_selected_attention::values({&query, &pooled});
     MfqCudaGuard guard(query.device());
+    if(query.dim()==4 && pooled.dim()==3 && query.size(0)==1 && pooled.size(0)==1 &&
+        query.size(1)>=128 && query.size(1)<=65535 && query.size(2)==4 && query.size(3)==128 &&
+        pooled.size(1)>0 && pooled.size(1)<=INT_MAX && pooled.size(2)==128 &&
+        query.stride(3)==1 && pooled.stride(2)==1 &&
+        (query.scalar_type()==tb::kFloat32 || query.scalar_type()==tb::kFloat16) &&
+        (pooled.scalar_type()==tb::kFloat32 || pooled.scalar_type()==tb::kFloat16) && qsa_prefill_gfx942(query.get_device())) {
+        auto scores=tb::empty({1,query.size(1),pooled.size(1)},query.options().dtype(tb::kFloat32));
+        const auto launch=[&]<class Q,class K>() {
+            qsa_prefill_scores_kernel<Q,K><<<dim3((pooled.size(1)+63)/64,(query.size(1)+31)/32),256,0,mfq_current_cuda_stream()>>>(
+                query.data_ptr<Q>(),pooled.data_ptr<K>(),scores.data_ptr<float>(),int(query.size(1)),int(pooled.size(1)),
+                query.stride(0),query.stride(1),query.stride(2),pooled.stride(0),pooled.stride(1));
+        };
+        if(query.scalar_type()==tb::kFloat32){
+            if(pooled.scalar_type()==tb::kFloat32)launch.template operator()<float,float>();
+            else launch.template operator()<float,mfq_half>();
+        }else{
+            if(pooled.scalar_type()==tb::kFloat32)launch.template operator()<mfq_half,float>();
+            else launch.template operator()<mfq_half,mfq_half>();
+        }
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return scores;
+    }
     if(query.dim()==4 && pooled.dim()==3 && query.size(0)==pooled.size(0) &&
         query.size(1)>0 && query.size(1)<=6 && query.size(2)==4 && query.size(3)==128 &&
         pooled.size(2)==128 && pooled.size(1)>0 && query.stride(3)==1 && pooled.stride(2)==1 &&
