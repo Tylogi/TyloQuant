@@ -60,6 +60,11 @@ public:
     // Switch only after execution and captured graphs using this module finish.
     void set_fused(bool enabled) { fused_ = enabled; }
     bool fused() const { return fused_; }
+    // Optional single-token FP16 pool4 update; false preserves the caller's path.
+    bool update_pooled_cache(
+        const mfq_tensor_backend::Tensor& raw,const mfq_tensor_backend::Tensor& weight,
+        const mfq_tensor_backend::Tensor& positions,const mfq_tensor_backend::Tensor& cache_positions,
+        const mfq_tensor_backend::Tensor& pooled,double eps,int64_t pool) const;
     mfq_tensor_backend::Tensor forward_normalized(
         const mfq_tensor_backend::Tensor& value, const mfq_tensor_backend::Tensor& weight,
         const mfq_tensor_backend::Tensor& positions, double eps,

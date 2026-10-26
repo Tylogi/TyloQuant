@@ -829,14 +829,17 @@ class Qsa {
             auto gated=attended.to(tb::kFloat32)*tb::sigmoid(p.gate.to(tb::kFloat32));
             return w_.output(execution,gated.reshape({1,t,c_.heads*c_.width}).to(hidden.scalar_type()));
         }
-        auto block=(cache_positions/c_.pool).to(tb::kInt64);
-        auto row=(block.unsqueeze(-1)*c_.pool+tb::arange(c_.pool,block.options())).clamp(0,c_.maximum-1);
-        auto pooled=index_.storage().index_select(1,row.reshape({-1})).reshape({1,t,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
-        pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
-        auto delta=positions-cache_positions;
-        auto block_positions=block*c_.pool+delta;
-        pooled=rotary_->forward(pooled.unsqueeze(1),block_positions).squeeze(1);
-        graph_pooled_.index_copy_(1,block,pooled);
+        if(!(fused_projection_ && rotary_->update_pooled_cache(index_.storage(),w_.index_key_norm,
+                positions,cache_positions,graph_pooled_,c_.eps,c_.pool))) {
+            auto block=(cache_positions/c_.pool).to(tb::kInt64);
+            auto row=(block.unsqueeze(-1)*c_.pool+tb::arange(c_.pool,block.options())).clamp(0,c_.maximum-1);
+            auto pooled=index_.storage().index_select(1,row.reshape({-1})).reshape({1,t,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
+            pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
+            auto delta=positions-cache_positions;
+            auto block_positions=block*c_.pool+delta;
+            pooled=rotary_->forward(pooled.unsqueeze(1),block_positions).squeeze(1);
+            graph_pooled_.index_copy_(1,block,pooled);
+        }
         auto scores=mfq_qwen4_exp::block_scores(p.iq,graph_pooled_);
         auto selected=mfq_qwen4_exp::qsa_graph_select(scores.contiguous(),cache_positions,c_.pool,c_.budget);
         if(!quantization_.enabled() && t==1 && c_.width==256 && fused_projection_ && rotary_->fused() &&
