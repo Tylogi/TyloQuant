@@ -267,6 +267,13 @@ Tensor sparse(const Tensor& q, const Tensor& k, const Tensor& v,
             static_cast<int>(key.size(2)));
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         if (use_qsa_mma) {
+            if(query.size(2)>=128 && query.size(1)==24 && key.size(1)==2) {
+                hipDeviceProp_t properties{};
+                MFQ_CUDA_CHECK(hipGetDeviceProperties(&properties,query.get_device()));
+                if(std::strncmp(properties.gcnArchName,"gfx942",6)==0)
+                    return mfq_sparse_attn_mma::launch<256,256,1,16,false,false,true>(
+                        query,key,value,safe_indices,mask,Tensor{},Tensor{},scale,"qwen4_sparse_compact_lds");
+            }
             return mfq_sparse_attn_mma::launch<256, 256, 1, 16, false>(
                 query, key, value, safe_indices, mask, Tensor{}, Tensor{},
                 scale, "qwen4_sparse_gqa_attention");
