@@ -524,13 +524,13 @@ template<int Items>__global__ __launch_bounds__(256) void qsa_decode_select_kern
 
 // A global top512 key must be in its partition's top512. Sort short partitions,
 // then rank each retained key against the other sorted lists in parallel.
-__global__ __launch_bounds__(256) void qsa_decode_select_parts(const float* scores,
-    uint64_t* partial,int pools,const int64_t* positions) {
+template<bool HostPosition>__global__ __launch_bounds__(256) void qsa_decode_select_parts(const float* scores,
+    uint64_t* partial,int pools,const int64_t* positions,int64_t offset) {
     using Sort=hipcub::BlockRadixSort<float,256,8,int32_t>;
     extern __shared__ __align__(16) unsigned char temporary[];
     auto& storage=*reinterpret_cast<Sort::TempStorage*>(temporary);
     const int tid=threadIdx.x,part=blockIdx.x;
-    const int64_t end=positions[0];
+    const int64_t end=HostPosition?offset:positions[0];
     if(end+1<=2048)return;
     float keys[8];int32_t indices[8];
     #pragma unroll
@@ -552,10 +552,10 @@ __global__ __launch_bounds__(256) void qsa_decode_select_parts(const float* scor
     }
 }
 
-__global__ __launch_bounds__(256) void qsa_decode_select_merge(const uint64_t* partial,
-    int32_t* output,int parts,const int64_t* positions) {
+template<bool HostPosition>__global__ __launch_bounds__(256) void qsa_decode_select_merge(const uint64_t* partial,
+    int32_t* output,int parts,const int64_t* positions,int64_t offset) {
     const int tid=threadIdx.x,index=blockIdx.x*256+tid,part=index/512,local=index%512;
-    const int64_t end=positions[0];
+    const int64_t end=HostPosition?offset:positions[0];
     if(end+1<=2048) {
         if(!blockIdx.x)for(int i=tid;i<2051;i+=256)output[i]=i<=end?i:-1;
         return;
@@ -609,10 +609,22 @@ __global__ void qsa_selected_kernel(const int64_t* indices,const int64_t* positi
 Tensor qsa_prefill_select(const Tensor& scores,int64_t query_offset) {
     if(!scores.defined() || !scores.is_cuda() || scores.scalar_type()!=tb::kFloat32 ||
        !scores.is_contiguous() || scores.dim()!=3 || scores.size(0)!=1 ||
-       scores.size(1)<128 || scores.size(1)>65535 || scores.size(2)<1 || scores.size(2)>16384 ||
+       (scores.size(1)!=1 && scores.size(1)<128) || scores.size(1)>65535 || scores.size(2)<1 || scores.size(2)>16384 ||
        query_offset<0 || query_offset>INT_MAX-scores.size(1) || !qsa_prefill_gfx942(scores.get_device()))return Tensor{};
     MfqCudaGuard guard(scores.device());
     auto selected=tb::empty({1,scores.size(1),2051},scores.options().dtype(tb::kInt32));
+    if(scores.size(1)==1 && query_offset>=2048 && scores.size(2)>2304) {
+        const int pools=int(scores.size(2)),parts=(pools+2047)/2048;
+        auto temporary=tb::empty({parts*512},scores.options().dtype(tb::kInt64));
+        auto* keys=reinterpret_cast<uint64_t*>(temporary.data_ptr<int64_t>());
+        using Sort=hipcub::BlockRadixSort<float,256,8,int32_t>;
+        constexpr size_t bytes=sizeof(Sort::TempStorage);static_assert(bytes<=49152);
+        qsa_decode_select_parts<true><<<parts,256,bytes,mfq_current_cuda_stream()>>>(
+            scores.data_ptr<float>(),keys,pools,nullptr,query_offset);
+        qsa_decode_select_merge<true><<<parts*2,256,0,mfq_current_cuda_stream()>>>(
+            keys,selected.data_ptr<int32_t>(),parts,nullptr,query_offset);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
+    }
     if(scores.size(2)>8192) {
         auto temporary=tb::empty({scores.size(1),2048},scores.options());
         using First=hipcub::BlockRadixSort<float,256,32,int32_t>;
@@ -633,7 +645,10 @@ Tensor qsa_prefill_select(const Tensor& scores,int64_t query_offset) {
         qsa_prefill_select_kernel<Items><<<unsigned(scores.size(1)),256,bytes,mfq_current_cuda_stream()>>>(
             scores.data_ptr<float>(),selected.data_ptr<int32_t>(),int(scores.size(2)),int(query_offset));
     };
-    if(scores.size(2)<=2048)launch.template operator()<8>();
+    if(scores.size(1)==1 && scores.size(2)<=512)launch.template operator()<2>();
+    else if(scores.size(1)==1 && scores.size(2)<=1024)launch.template operator()<4>();
+    else if(scores.size(2)<=2048)launch.template operator()<8>();
+    else if(scores.size(1)==1 && scores.size(2)<=2304)launch.template operator()<9>();
     else if(scores.size(2)<=4096)launch.template operator()<16>();
     else launch.template operator()<32>();
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
@@ -668,10 +683,10 @@ Tensor qsa_graph_select(const Tensor& scores,const Tensor& positions,int64_t poo
         auto* keys=reinterpret_cast<uint64_t*>(temporary.data_ptr<int64_t>());
         using Sort=hipcub::BlockRadixSort<float,256,8,int32_t>;
         constexpr size_t bytes=sizeof(Sort::TempStorage);static_assert(bytes<=49152);
-        qsa_decode_select_parts<<<parts,256,bytes,mfq_current_cuda_stream()>>>(
-            scores.data_ptr<float>(),keys,pools,positions.data_ptr<int64_t>());
-        qsa_decode_select_merge<<<parts*2,256,0,mfq_current_cuda_stream()>>>(
-            keys,selected.data_ptr<int32_t>(),parts,positions.data_ptr<int64_t>());
+        qsa_decode_select_parts<false><<<parts,256,bytes,mfq_current_cuda_stream()>>>(
+            scores.data_ptr<float>(),keys,pools,positions.data_ptr<int64_t>(),0);
+        qsa_decode_select_merge<false><<<parts*2,256,0,mfq_current_cuda_stream()>>>(
+            keys,selected.data_ptr<int32_t>(),parts,positions.data_ptr<int64_t>(),0);
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
     }
     auto ranked=tb::empty_like(scores);
