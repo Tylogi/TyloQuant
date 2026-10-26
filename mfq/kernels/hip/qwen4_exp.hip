@@ -473,6 +473,46 @@ template<int Items>__global__ __launch_bounds__(256) void qsa_prefill_select_ker
  if(tid<3 && tid<(end+1)%4)output[size_t(token)*2051+2048+tid]=end+1-(end+1)%4+tid;
 }
 
+__global__ __launch_bounds__(256) void qsa_prefill_select_parts(const float* scores,uint64_t* partial,int pools,int offset){
+ using Sort=hipcub::BlockRadixSort<uint64_t,256,32>;
+ extern __shared__ __align__(16) unsigned char temporary[];
+ auto& storage=*reinterpret_cast<typename Sort::TempStorage*>(temporary);
+ const int tid=threadIdx.x,token=blockIdx.x,part=blockIdx.y,end=offset+token;
+ uint64_t keys[32];
+ #pragma unroll
+ for(int j=0;j<32;++j){const int index=part*8192+tid+j*256;uint64_t key=0;
+  if(index<pools && (index+1)*4-1<=end){unsigned bits=__float_as_uint(scores[size_t(token)*pools+index]);
+   if(!(bits&0x7fffffffu))bits=0;
+   const unsigned ordered=bits^((bits>>31)?0xffffffffu:0x80000000u);
+   key=(uint64_t(ordered)<<14)|uint64_t(16383-index);
+  }
+  keys[j]=key;
+ }
+ Sort(storage).SortDescendingBlockedToStriped(keys,0,46);
+ #pragma unroll
+ for(int j=0;j<2;++j)partial[size_t(token)*1024+part*512+tid+j*256]=keys[j];
+}
+__global__ __launch_bounds__(256) void qsa_prefill_select_merge(const uint64_t* partial,int32_t* output,int offset){
+ using Sort=hipcub::BlockRadixSort<uint64_t,256,4>;
+ extern __shared__ __align__(16) unsigned char temporary[];
+ auto& storage=*reinterpret_cast<typename Sort::TempStorage*>(temporary);
+ const int tid=threadIdx.x,token=blockIdx.x,end=offset+token;
+ for(int i=tid;i<2051;i+=256)output[size_t(token)*2051+i]=-1;
+ uint64_t keys[4];
+ #pragma unroll
+ for(int j=0;j<4;++j)keys[j]=partial[size_t(token)*1024+tid+j*256];
+ __syncthreads();Sort(storage).SortDescendingBlockedToStriped(keys,0,46);
+ #pragma unroll
+ for(int j=0;j<2;++j){const int rank=tid+j*256;
+  if(keys[j]){const int index=16383-int(keys[j]&16383);
+   #pragma unroll
+   for(int k=0;k<4;++k)output[size_t(token)*2051+rank*4+k]=index*4+k;
+  }
+ }
+ if(tid<3 && tid<(end+1)%4)output[size_t(token)*2051+2048+tid]=end+1-(end+1)%4+tid;
+}
+
+
 __global__ void qsa_rank_kernel(const float* scores,const int64_t* positions,
     float* ranked,int64_t total,int pools,int pool) {
     for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<total;i+=int64_t(gridDim.x)*blockDim.x)
@@ -500,10 +540,25 @@ __global__ void qsa_selected_kernel(const int64_t* indices,const int64_t* positi
 Tensor qsa_prefill_select(const Tensor& scores,int64_t query_offset) {
     if(!scores.defined() || !scores.is_cuda() || scores.scalar_type()!=tb::kFloat32 ||
        !scores.is_contiguous() || scores.dim()!=3 || scores.size(0)!=1 ||
-       scores.size(1)<128 || scores.size(1)>65535 || scores.size(2)<1 || scores.size(2)>8192 ||
+       scores.size(1)<128 || scores.size(1)>65535 || scores.size(2)<1 || scores.size(2)>16384 ||
        query_offset<0 || query_offset>INT_MAX-scores.size(1) || !qsa_prefill_gfx942(scores.get_device()))return Tensor{};
     MfqCudaGuard guard(scores.device());
     auto selected=tb::empty({1,scores.size(1),2051},scores.options().dtype(tb::kInt32));
+    if(scores.size(2)>8192) {
+        auto temporary=tb::empty({scores.size(1),1024},scores.options().dtype(tb::kInt64));
+        using First=hipcub::BlockRadixSort<uint64_t,256,32>;
+        using Second=hipcub::BlockRadixSort<uint64_t,256,4>;
+        constexpr size_t first=sizeof(First::TempStorage),second=sizeof(Second::TempStorage);
+        static_assert(first<=65536 && second<=65536);
+        if constexpr(first>49152)MFQ_CUDA_CHECK(hipFuncSetAttribute(
+            reinterpret_cast<const void*>(qsa_prefill_select_parts),hipFuncAttributeMaxDynamicSharedMemorySize,first));
+        auto* keys=reinterpret_cast<uint64_t*>(temporary.data_ptr<int64_t>());
+        qsa_prefill_select_parts<<<dim3(unsigned(scores.size(1)),2),256,first,mfq_current_cuda_stream()>>>(
+            scores.data_ptr<float>(),keys,int(scores.size(2)),int(query_offset));
+        qsa_prefill_select_merge<<<unsigned(scores.size(1)),256,second,mfq_current_cuda_stream()>>>(
+            keys,selected.data_ptr<int32_t>(),int(query_offset));
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
+    }
     const auto launch=[&]<int Items>() {
         using Sort=hipcub::BlockRadixSort<uint64_t,256,Items>;
         constexpr size_t bytes=sizeof(typename Sort::TempStorage);static_assert(bytes<=65536);
