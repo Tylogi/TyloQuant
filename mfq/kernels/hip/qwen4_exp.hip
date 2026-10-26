@@ -444,74 +444,54 @@ Tensor block_scores(const Tensor& query, const Tensor& pooled) {
 }
 
 namespace {
-// Score/index keys preserve the stable lower-index order for tied scores.
+// Stable FP32 radix sorting retains lower-index ties without sorting index bits.
 template<int Items>__global__ __launch_bounds__(256) void qsa_prefill_select_kernel(const float* scores,int32_t* output,int pools,int offset){
- using Sort=hipcub::BlockRadixSort<uint64_t,256,Items>;
- extern __shared__ __align__(16) unsigned char temporary[];
- auto& storage=*reinterpret_cast<typename Sort::TempStorage*>(temporary);
+ using Sort=hipcub::BlockRadixSort<float,256,Items,int32_t>;
+ extern __shared__ __align__(16) unsigned char temporary[];auto& storage=*reinterpret_cast<typename Sort::TempStorage*>(temporary);
  const int tid=threadIdx.x,token=blockIdx.x,end=offset+token;
  for(int i=tid;i<2051;i+=256)output[size_t(token)*2051+i]=-1;
- uint64_t keys[Items];
+ float keys[Items];int32_t values[Items];
  #pragma unroll
- for(int j=0;j<Items;++j){const int index=tid+j*256;uint64_t key=0;
-  if(index<pools && (index+1)*4-1<=end){unsigned bits=__float_as_uint(scores[size_t(token)*pools+index]);
-   if(!(bits&0x7fffffffu))bits=0;
-   const unsigned ordered=bits^((bits>>31)?0xffffffffu:0x80000000u);
-   key=(uint64_t(ordered)<<13)|uint64_t(8191-index);
-  }
-  keys[j]=key;
- }
- __syncthreads();
- Sort(storage).SortDescendingBlockedToStriped(keys,0,45);
+ for(int j=0;j<Items;++j){const int index=tid*Items+j;keys[j]=index<pools && (index+1)*4-1<=end?scores[size_t(token)*pools+index]:-INFINITY;values[j]=index;}
+ __syncthreads();Sort(storage).SortDescendingBlockedToStriped(keys,values,0,32);
  #pragma unroll
- for(int j=0;j<Items;++j){const int rank=tid+j*256;
-  if(rank<512 && keys[j]){const int index=8191-int(keys[j]&8191);
+ for(int j=0;j<2;++j){const int index=values[j],rank=tid+j*256;
+  if(index<pools && (index+1)*4-1<=end){
    #pragma unroll
    for(int k=0;k<4;++k)output[size_t(token)*2051+rank*4+k]=index*4+k;
   }
  }
  if(tid<3 && tid<(end+1)%4)output[size_t(token)*2051+2048+tid]=end+1-(end+1)%4+tid;
 }
-
-__global__ __launch_bounds__(256) void qsa_prefill_select_parts(const float* scores,uint64_t* partial,int pools,int offset){
- using Sort=hipcub::BlockRadixSort<uint64_t,256,32>;
- extern __shared__ __align__(16) unsigned char temporary[];
- auto& storage=*reinterpret_cast<typename Sort::TempStorage*>(temporary);
+__global__ __launch_bounds__(256) void qsa_prefill_select_parts(const float* scores,float* partial,int32_t* indices,int pools,int offset){
+ using Sort=hipcub::BlockRadixSort<float,256,32,int32_t>;
+ extern __shared__ __align__(16) unsigned char temporary[];auto& storage=*reinterpret_cast<Sort::TempStorage*>(temporary);
  const int tid=threadIdx.x,token=blockIdx.x,part=blockIdx.y,end=offset+token;
- uint64_t keys[32];
+ float keys[32];int32_t values[32];
  #pragma unroll
- for(int j=0;j<32;++j){const int index=part*8192+tid+j*256;uint64_t key=0;
-  if(index<pools && (index+1)*4-1<=end){unsigned bits=__float_as_uint(scores[size_t(token)*pools+index]);
-   if(!(bits&0x7fffffffu))bits=0;
-   const unsigned ordered=bits^((bits>>31)?0xffffffffu:0x80000000u);
-   key=(uint64_t(ordered)<<14)|uint64_t(16383-index);
-  }
-  keys[j]=key;
- }
- Sort(storage).SortDescendingBlockedToStriped(keys,0,46);
+ for(int j=0;j<32;++j){const int index=part*8192+tid*32+j;keys[j]=index<pools && (index+1)*4-1<=end?scores[size_t(token)*pools+index]:-INFINITY;values[j]=index;}
+ Sort(storage).SortDescendingBlockedToStriped(keys,values,0,32);
  #pragma unroll
- for(int j=0;j<2;++j)partial[size_t(token)*1024+part*512+tid+j*256]=keys[j];
+ for(int j=0;j<2;++j){const size_t out=size_t(token)*1024+part*512+tid+j*256;partial[out]=keys[j];indices[out]=values[j];}
 }
-__global__ __launch_bounds__(256) void qsa_prefill_select_merge(const uint64_t* partial,int32_t* output,int offset){
- using Sort=hipcub::BlockRadixSort<uint64_t,256,4>;
- extern __shared__ __align__(16) unsigned char temporary[];
- auto& storage=*reinterpret_cast<typename Sort::TempStorage*>(temporary);
+__global__ __launch_bounds__(256) void qsa_prefill_select_merge(const float* partial,const int32_t* indices,int32_t* output,int pools,int offset){
+ using Sort=hipcub::BlockRadixSort<float,256,4,int32_t>;
+ extern __shared__ __align__(16) unsigned char temporary[];auto& storage=*reinterpret_cast<Sort::TempStorage*>(temporary);
  const int tid=threadIdx.x,token=blockIdx.x,end=offset+token;
  for(int i=tid;i<2051;i+=256)output[size_t(token)*2051+i]=-1;
- uint64_t keys[4];
+ float keys[4];int32_t values[4];
  #pragma unroll
- for(int j=0;j<4;++j)keys[j]=partial[size_t(token)*1024+tid+j*256];
- __syncthreads();Sort(storage).SortDescendingBlockedToStriped(keys,0,46);
+ for(int j=0;j<4;++j){const size_t index=size_t(token)*1024+tid*4+j;keys[j]=partial[index];values[j]=indices[index];}
+ __syncthreads();Sort(storage).SortDescendingBlockedToStriped(keys,values,0,32);
  #pragma unroll
- for(int j=0;j<2;++j){const int rank=tid+j*256;
-  if(keys[j]){const int index=16383-int(keys[j]&16383);
+ for(int j=0;j<2;++j){const int index=values[j],rank=tid+j*256;
+  if(index<pools && (index+1)*4-1<=end){
    #pragma unroll
    for(int k=0;k<4;++k)output[size_t(token)*2051+rank*4+k]=index*4+k;
   }
  }
  if(tid<3 && tid<(end+1)%4)output[size_t(token)*2051+2048+tid]=end+1-(end+1)%4+tid;
 }
-
 
 template<int Items>__global__ __launch_bounds__(256) void qsa_decode_select_kernel(const float* scores,int32_t* output,int pools,const int64_t* positions){
  using Sort=hipcub::BlockRadixSort<uint64_t,256,Items>;
@@ -634,25 +614,22 @@ Tensor qsa_prefill_select(const Tensor& scores,int64_t query_offset) {
     MfqCudaGuard guard(scores.device());
     auto selected=tb::empty({1,scores.size(1),2051},scores.options().dtype(tb::kInt32));
     if(scores.size(2)>8192) {
-        auto temporary=tb::empty({scores.size(1),1024},scores.options().dtype(tb::kInt64));
-        using First=hipcub::BlockRadixSort<uint64_t,256,32>;
-        using Second=hipcub::BlockRadixSort<uint64_t,256,4>;
+        auto temporary=tb::empty({scores.size(1),2048},scores.options());
+        using First=hipcub::BlockRadixSort<float,256,32,int32_t>;
+        using Second=hipcub::BlockRadixSort<float,256,4,int32_t>;
         constexpr size_t first=sizeof(First::TempStorage),second=sizeof(Second::TempStorage);
-        static_assert(first<=65536 && second<=65536);
-        if constexpr(first>49152)MFQ_CUDA_CHECK(hipFuncSetAttribute(
-            reinterpret_cast<const void*>(qsa_prefill_select_parts),hipFuncAttributeMaxDynamicSharedMemorySize,first));
-        auto* keys=reinterpret_cast<uint64_t*>(temporary.data_ptr<int64_t>());
+        static_assert(first<=49152 && second<=49152);
+        auto* keys=temporary.data_ptr<float>();
+        auto* indices=reinterpret_cast<int32_t*>(keys+size_t(scores.size(1))*1024);
         qsa_prefill_select_parts<<<dim3(unsigned(scores.size(1)),2),256,first,mfq_current_cuda_stream()>>>(
-            scores.data_ptr<float>(),keys,int(scores.size(2)),int(query_offset));
+            scores.data_ptr<float>(),keys,indices,int(scores.size(2)),int(query_offset));
         qsa_prefill_select_merge<<<unsigned(scores.size(1)),256,second,mfq_current_cuda_stream()>>>(
-            keys,selected.data_ptr<int32_t>(),int(query_offset));
+            keys,indices,selected.data_ptr<int32_t>(),int(scores.size(2)),int(query_offset));
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
     }
     const auto launch=[&]<int Items>() {
-        using Sort=hipcub::BlockRadixSort<uint64_t,256,Items>;
-        constexpr size_t bytes=sizeof(typename Sort::TempStorage);static_assert(bytes<=65536);
-        if constexpr(bytes>49152)MFQ_CUDA_CHECK(hipFuncSetAttribute(
-            reinterpret_cast<const void*>(qsa_prefill_select_kernel<Items>),hipFuncAttributeMaxDynamicSharedMemorySize,bytes));
+        using Sort=hipcub::BlockRadixSort<float,256,Items,int32_t>;
+        constexpr size_t bytes=sizeof(typename Sort::TempStorage);static_assert(bytes<=49152);
         qsa_prefill_select_kernel<Items><<<unsigned(scores.size(1)),256,bytes,mfq_current_cuda_stream()>>>(
             scores.data_ptr<float>(),selected.data_ptr<int32_t>(),int(scores.size(2)),int(query_offset));
     };
