@@ -1515,6 +1515,8 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
     }
     const int input_rows = x.dim() == 3 ? tokens * routes : tokens;
     const bool stable = input_rows <= MoeActivationWorkspace::stable_row_limit;
+    const EagerActivationScratch<decltype(activation_workspaces)> eager_scratch{
+        activation_workspaces, !stable};
     const int result_width = epilogue_mode == 0
         ? out_per_expert
         : out_per_expert / 2;

@@ -2478,6 +2478,45 @@ void verify_resident_prefill(const std::filesystem::path& root) {
     }
     std::cout<<"resident_prefill_cases="<<cases<<" gated/ungated NINT/NVQ output and release PASS\n";
 }
+void verify_eager_activation_release(const std::filesystem::path& root) {
+    // Prompt-sized activation scratch (more than 2048 rows) must not stay on
+    // each MoE weight after its projection call, or a long prompt keeps one
+    // buffer per layer resident until the next request.
+    CudaExecutionContext execution;
+    auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    const auto eager_entries=[](const auto& workspaces) {
+        return std::count_if(workspaces.begin(),workspaces.end(),
+            [](const auto& entry){return entry.first.input_rows==0;});
+    };
+    int cases=0;
+    for(const std::string format:{"nint5","nvq3j-512"}) {
+        auto model=mfq::open_model_source((root/(format+"-640-2560.mfq")).string());
+        auto mixed=make_mixed_moe_runtime(load_mfe_cpu(*model,"linear.weight"),true,execution.config);
+        auto weight=load_mfe_gpu(execution,*model,"linear.weight");
+        int64_t first=-1;
+        for(int tokens:{2304,4608,2304}) {
+            {
+                auto x=tb::full({tokens,2560},.001,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+                auto ids=tb::arange(3,x.options().dtype(tb::kInt32)).unsqueeze(0).expand({tokens,3}).contiguous();
+                const auto route=build_moe_route_plan(ids,3);
+                auto a=mixed->forward(execution.config,execution.kl_mmq,false,false,x,route);
+                auto b=weight.forward(execution,x,route);
+                if(!tb::isfinite(a.to(tb::kFloat32)).all().item<bool>() ||
+                        !tb::isfinite(b.to(tb::kFloat32)).all().item<bool>())
+                    throw std::runtime_error("eager MoE projection produced non-finite output");
+            }
+            if(eager_entries(mixed->activation_workspaces) || eager_entries(*weight.activation_workspaces))
+                throw std::runtime_error("MoE projection retained eager prefill activation scratch");
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
+            const auto allocated=int64_t(context->memory_stats().allocated);
+            if(first<0)first=allocated;
+            else if(allocated>first)
+                throw std::runtime_error("a longer prompt grew resident MoE activation scratch");
+            ++cases;
+        }
+    }
+    std::cout<<"eager_activation_release_cases="<<cases<<" NINT/NVQ mixed+weight PASS\n";
+}
 void verify_activation_workspace_reuse() {
     for(bool mixed:{false,true}) {
         MfeWeight weight;MixedMoeRuntime runtime;
@@ -2585,6 +2624,7 @@ int main(int argc,char** argv)try {
     auto cuda_context=mfq::cuda::default_context(mfq_current_cuda_device());
     if(argc==3) {
         if(std::string(argv[2])=="--resident-prefill-check") {verify_resident_prefill(root);return 0;}
+        if(std::string(argv[2])=="--eager-activation-check") {verify_eager_activation_release(root);return 0;}
         if(std::string(argv[2])=="--online-budget-check") {verify_online_expert_budget(root);return 0;}
         if(std::string(argv[2])=="--mfe-shared-early-check") {
             for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,false,false,false,false,false,false,false,true);
@@ -2779,6 +2819,7 @@ int main(int argc,char** argv)try {
     }
     verify_transfer_hit_reservation(root);
     verify_resident_prefill(root);
+    verify_eager_activation_release(root);
     verify_rounded_swiglu();
     verify_resident_classification();
     verify_active_nvq(root);
