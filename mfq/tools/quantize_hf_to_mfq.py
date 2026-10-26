@@ -3830,7 +3830,9 @@ def _plan(
                     else dense_dtype
                 )
             elif recipe_types is not None:
-                if canonical_name.endswith(".attention.indexer.query_key.weight"):
+                # An MTP head has no GGUF recipe name and takes the predictor
+                # branch below; only recipe-named indexers carry a Q/K pair.
+                if gguf_name is not None and canonical_name.endswith(".attention.indexer.query_key.weight"):
                     key_alias = gguf_name.replace("q_proj.weight", "k_proj.weight")
                     if recipe_types.get(key_alias) != gguf_type:
                         raise ValueError("fused Qwen4 indexer Q/K requires matching recipe types")
