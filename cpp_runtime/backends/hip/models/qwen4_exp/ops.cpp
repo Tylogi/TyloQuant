@@ -106,7 +106,7 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
     auto shared=[sg,su,sd,shared_gate,sg_weight,su_weight](CudaExecutionContext& execution,const Tensor& source) {
         if(sg_weight && su_weight && sg_weight->is_tq() && su_weight->is_tq() &&
            source.is_cuda() && source.is_contiguous() && source.scalar_type()==tb::kFloat16 &&
-           source.numel()==source.size(-1) && !tq_q8_enabled()) {
+           source.numel()/source.size(-1)>=1 && source.numel()/source.size(-1)<=6 && !tq_q8_enabled()) {
             auto hidden=tq_shared_swiglu_cuda(sg_weight->tq.view,su_weight->tq.view,source);
             return tb::sigmoid(shared_gate(execution,source))*sd(execution,hidden);
         }

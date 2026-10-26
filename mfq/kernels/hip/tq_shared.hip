@@ -6,7 +6,9 @@
 #include <climits>
 #include "tq_projection.h"
 #include "tq_vector.h"
+#define MFQ_TQ_ROW_HELPERS_ONLY
 #include "tq_float_tokens.h"
+#undef MFQ_TQ_ROW_HELPERS_ONLY
 
 namespace {
 __global__ __launch_bounds__(256) void tq_router_gate_kernel(ProjectionView router,const uint16_t* gate,
@@ -41,6 +43,38 @@ __global__ void tq_shared_add_kernel(const uint16_t* routed,const uint16_t* shar
     const int column=int(blockIdx.x)*256+threadIdx.x;
     if(column<width)output[column]=__fadd_rn(mfq_tq_cuda_exact::number<0>(routed[column]),
         __fmul_rn(mfq_tq_cuda_exact::number<0>(shared[column]),coefficient[0]));
+}
+
+__global__ __launch_bounds__(256) void tq_shared_swiglu_batch_kernel(ProjectionView gate,ProjectionView up,
+ const uint16_t* input,uint16_t* output,int tokens){
+ using namespace mfq_tq_cuda_exact;
+ const int wave=threadIdx.x/64,lane=threadIdx.x&63,role=wave&1,slot=wave/2,row=int(blockIdx.x)*2+slot,first=blockIdx.y*2;
+ const auto weight=role?up:gate;
+ float value[2]{};
+ if(row<weight.rows){
+  if(weight.columns)generic_dispatch<0,true,1,2,16>(weight,row,input,first,tokens,weight.input_columns,value);
+  else generic_dispatch<0,false,1,2,16>(weight,row,input,first,tokens,weight.input_columns,value);
+ }
+ #pragma unroll
+ for(int t=0;t<2;++t){
+  #pragma unroll
+  for(int shift=32;shift;shift>>=1)value[t]+=__shfl_down(value[t],shift,64);
+ }
+ __shared__ float joined[2][2][2];
+ if(!lane && row<weight.rows){
+  #pragma unroll
+  for(int t=0;t<2;++t)joined[slot][role][t]=number<0>(rounded<0>(value[t]+(weight.bias?weight.bias[row]:0.f)));
+ }
+ __syncthreads();
+ if(!role && !lane && row<weight.rows){
+  #pragma unroll
+  for(int t=0;t<2;++t)if(first+t<tokens){
+   const float g=joined[slot][0][t],u=joined[slot][1][t];
+   const float sigmoid=number<0>(rounded<0>(1.f/(1.f+expf(-g))));
+   const float silu=number<0>(rounded<0>(__fmul_rn(g,sigmoid)));
+   output[size_t(first+t)*gate.rows+row]=rounded<0>(__fmul_rn(silu,u));
+  }
+ }
 }
 
 __global__ __launch_bounds__(256) void tq_shared_swiglu_kernel(ProjectionView gate,ProjectionView up,
@@ -101,12 +135,15 @@ mfq_tensor_backend::Tensor tq_shared_swiglu_cuda(ProjectionView gate,ProjectionV
         const mfq_tensor_backend::Tensor& input) {
     namespace tb=mfq_tensor_backend;
     MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.scalar_type()==tb::kFloat16 &&
-        input.numel()==gate.input_columns && input.size(-1)==gate.input_columns &&
-        gate.rows==up.rows && gate.input_columns==up.input_columns && gate.rows>0,
+        gate.input_columns>0 && input.size(-1)==gate.input_columns && input.numel()/gate.input_columns>=1 &&
+        input.numel()/gate.input_columns<=6 && gate.rows==up.rows && gate.input_columns==up.input_columns && gate.rows>0,
         "invalid TQ shared SwiGLU geometry");
     MfqCudaGuard guard(input.device());auto shape=input.sizes().vec();shape.back()=gate.rows;
     auto output=tb::empty(shape,input.options());
-    tq_shared_swiglu_kernel<<<(gate.rows+1)/2,256,0,mfq_current_cuda_stream()>>>(gate,up,
+    const int tokens=int(input.numel()/gate.input_columns);
+    if(tokens==1)tq_shared_swiglu_kernel<<<(gate.rows+1)/2,256,0,mfq_current_cuda_stream()>>>(gate,up,
         reinterpret_cast<const uint16_t*>(input.data_ptr()),reinterpret_cast<uint16_t*>(output.data_ptr()));
+    else tq_shared_swiglu_batch_kernel<<<dim3((gate.rows+1)/2,(tokens+1)/2),256,0,mfq_current_cuda_stream()>>>(gate,up,
+        reinterpret_cast<const uint16_t*>(input.data_ptr()),reinterpret_cast<uint16_t*>(output.data_ptr()),tokens);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
 }

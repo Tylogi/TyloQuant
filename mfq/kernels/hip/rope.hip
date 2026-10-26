@@ -402,7 +402,8 @@ __global__ __launch_bounds__(256) void rotary_pooled_cache_kernel(
     }
     const float mean=__fdiv_rn(squares[0],128.f);
     const float shifted=float(double(mean)+eps);
-    const float inverse=float(1.0/::sqrt(double(shifted)));
+    // Match the native contiguous FP32 rsqrt expression before FP16 rounding.
+    const float inverse=1.f/::sqrtf(shifted);
     if(tid<128)normalized[tid]=float(__half(
         __fmul_rn(__fmul_rn(pooled[tid],inverse),__fadd_rn(weight[tid],1.f))));
     __syncthreads();
