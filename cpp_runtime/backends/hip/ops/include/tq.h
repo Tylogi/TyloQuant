@@ -66,12 +66,15 @@ class TqRowTable {
     std::vector<std::uint64_t> ends_;
     std::int64_t columns_=0;
     std::uint64_t storage_bytes_=0;
+    bool parallel_reads_=true;
 public:
     TqRowTable(const mfq::ModelSource&,const std::string&);
     std::uint64_t rows()const noexcept{return ends_.back();}
     std::int64_t width()const noexcept{return columns_;}
     std::uint64_t storage_bytes()const noexcept{return storage_bytes_;}
+    bool parallel_reads()const noexcept{return parallel_reads_;}
     std::size_t row_image_bytes_bound()const;
+    ProjectionView stage_row(std::uint64_t,std::uint8_t*,std::uint8_t*,std::size_t)const;
     std::vector<std::uint8_t> slice_rows(std::uint64_t begin,std::uint64_t end)const;
     mfq_tensor_backend::Tensor lookup(const std::int64_t*,std::size_t,const mfq_tensor_backend::Device&)const;
     mfq_tensor_backend::Tensor lookup(mfq_tensor_backend::Tensor)const;

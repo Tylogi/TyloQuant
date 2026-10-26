@@ -20,6 +20,7 @@ extern "C" uint64_t mfq_tq_prefill_f32_workspace(ProjectionView,int);
 #include <cstdio>
 #include <unordered_map>
 #include <unordered_set>
+#include <future>
 #include <climits>
 
 namespace tb=mfq_tensor_backend;
@@ -710,7 +711,7 @@ TqRowTable::TqRowTable(const mfq::ModelSource& source,const std::string& name) {
         // copy only the requested ranges, without a seek/read syscall for
         // every descriptor, selector and payload in a long prompt.
         auto reader=source.mapped_tensor_reader(part);
-        if(!reader)reader=source.tensor_reader(part);
+        if(!reader){parallel_reads_=false;reader=source.tensor_reader(part);}
         auto rows=std::make_shared<mfq::TqRows>(record->nbytes,std::move(reader));
         if(columns_<1 || columns_>rows->layout().width)throw std::invalid_argument("TQ table logical width differs");
         if(end>UINT64_MAX-rows->layout().rows || storage_bytes_>UINT64_MAX-record->nbytes)
@@ -745,6 +746,27 @@ std::size_t TqRowTable::row_image_bytes_bound()const {
         bytes=std::max(bytes,((64+8+scales+3)&~std::size_t(3))+m.width+32);
     }
     return (bytes+7)&~std::size_t(7);
+}
+ProjectionView TqRowTable::stage_row(std::uint64_t row,std::uint8_t* host,
+        std::uint8_t* device,std::size_t capacity)const {
+    if(row>=rows())throw std::out_of_range("TQ staged row is out of bounds");
+    const auto segment=std::upper_bound(ends_.begin(),ends_.end(),row)-ends_.begin();
+    const auto start=segment?ends_[segment-1]:0;
+    const auto& m=segments_[segment]->layout();
+    const auto scale_bytes=m.columns?m.scale_bytes:(m.groups+1)/2;
+    const auto packed=72+scale_bytes,words=(packed+3)&~std::size_t(3);
+    if(capacity<words+std::size_t(m.width)+32)
+        throw std::overflow_error("TQ staged row image exceeds capacity");
+    const auto wire=segments_[segment]->slice_row_into(row-start,host,capacity);
+    const auto packed_bytes=wire-packed,relative=words+packed_bytes;
+    std::memmove(host+words,host+packed,packed_bytes);
+    constexpr std::uint16_t gains[]{0x3400,0x34d0,0x35ca,0x36f7,0x3830,0x390a,0x3a10,0x3b4b,
+        0x3c63,0x3d47,0x3e59,0x3fa4,0x4098,0x4187,0x42a6,0x4400};
+    std::memcpy(host+relative,gains,sizeof(gains));
+    int gslog=0;for(auto gs=m.gs;gs>1;gs>>=1)++gslog;
+    return {reinterpret_cast<const std::uint32_t*>(device+words),
+        reinterpret_cast<const std::uint64_t*>(device+64),device+72,device+relative,nullptr,
+        1,int(m.width),int(columns_),gslog,int(m.columns)};
 }
 tb::Tensor TqRowTable::lookup(const std::int64_t* ids,std::size_t count,const tb::Device& device)const {
     if(!device.is_cuda() || !count || !ids)throw std::invalid_argument("TQ table lookup requires CUDA and row IDs");
@@ -961,22 +983,46 @@ public:
         if(shape!=shape_ || ids.size()!=std::size_t(count_))throw std::invalid_argument("TQ stage upload shape changed");
         const MfqCudaGuard guard(device_);
         retain_stream();
-        std::unordered_map<std::int64_t,ProjectionView> unique;
-        std::vector<ProjectionView> views;views.reserve(ids.size());
+        std::unordered_map<std::int64_t,std::size_t> unique;
+        unique.reserve(ids.size());
+        std::vector<std::int64_t> selected;selected.reserve(ids.size());
+        std::vector<std::size_t> inverse;inverse.reserve(ids.size());
+        auto* views=static_cast<ProjectionView*>(host_->data());
         for(const auto id:ids) {
             if(id<0 || std::uint64_t(id/rows_per_shard_)>=tables_.size())
                 throw std::out_of_range("TQ stage shard ID is out of bounds");
-            const auto [position,inserted]=unique.try_emplace(id);
-            if(inserted) {
-                const auto shard=id/rows_per_shard_,row=id%rows_per_shard_;
-                position->second=pack_row(tables_[shard]->slice_rows(row,row+1),unique.size()-1);
-            }
-            views.push_back(position->second);
+            const auto [position,inserted]=unique.try_emplace(id,selected.size());
+            if(inserted)selected.push_back(id);
+            inverse.push_back(position->second);
         }
-        std::memcpy(host_->data(),views.data(),views.size()*sizeof(views[0]));
+        std::vector<ProjectionView> prepared(selected.size());
+        const auto gather=[&](std::size_t begin,std::size_t end) {
+            for(auto index=begin;index<end;++index) {
+                const auto id=selected[index],shard=id/rows_per_shard_,row=id%rows_per_shard_;
+                const auto offset=images_offset_+index*image_stride_;
+                prepared[index]=tables_[shard]->stage_row(row,
+                    static_cast<std::uint8_t*>(host_->data())+offset,packet_address_+offset,image_stride_);
+            }
+        };
+        if(selected.size()>=4096 && std::all_of(tables_.begin(),tables_.end(),[](const auto& table){return table->parallel_reads();})) {
+            // Mapped readers copy independent ranges. Keep all HIP calls on
+            // the caller thread and parallelize only CPU row preparation.
+            std::vector<std::future<void>> workers;
+            const auto grain=(selected.size()+3)/4;
+            for(std::size_t worker=1;worker<4;++worker) {
+                const auto begin=worker*grain,end=std::min(selected.size(),begin+grain);
+                workers.push_back(std::async(std::launch::async,gather,begin,end));
+            }
+            gather(0,std::min(grain,selected.size()));
+            for(auto& worker:workers)worker.get();
+        } else gather(0,selected.size());
+        for(std::size_t index=0;index<ids.size();++index) {
+            views[index]=prepared[inverse[index]];
+        }
         if(!mapped_) {
             mfq_hip_record_stream(packet_,mfq_get_current_cuda_stream(device_.index));
-            MFQ_CUDA_CHECK(hipMemcpyAsync(packet_address_,host_->data(),bytes_,hipMemcpyHostToDevice,mfq_current_cuda_stream()));
+            const auto used=images_offset_+unique.size()*image_stride_;
+            MFQ_CUDA_CHECK(hipMemcpyAsync(packet_address_,host_->data(),used,hipMemcpyHostToDevice,mfq_current_cuda_stream()));
         }
     }
     void decode()override {

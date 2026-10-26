@@ -452,6 +452,24 @@ class NgramEmbedding {
         auto hashes = mfq::models::qwen4_exp::ngram_hashes(
             source, b, t, ngram_, heads_, eos_, multipliers_, offsets_, vocab_, context_, cache);
         auto &global = hashes.ids;
+        if(stage_factory_ && t>=128) {
+            const std::vector<int64_t> shape{b,t,nh};
+            const auto stream=mfq_current_cuda_stream();
+            if(!prefill_stage_ || prefill_shape_!=shape || prefill_stage_->output().device()!=ids.device() || prefill_stream_!=stream) {
+                prefill_stage_.reset();
+                prefill_stage_=stage_factory_(shape,ids.device());
+                prefill_shape_=shape;prefill_stream_=stream;
+            } else {
+                // The reused host packet and output belong to this stream.
+                // Finish its previous consumers before publishing new rows.
+                MFQ_CUDA_CHECK(hipStreamSynchronize(prefill_stream_));
+            }
+            prefill_stage_->upload(global,shape);prefill_stage_->decode();
+            auto result=prefill_stage_->output().clone();
+            if(hashed_ids)*hashed_ids=tb::tensor(global).reshape(shape).to(ids.device());
+            if(cache)context_=std::move(hashes.next);
+            return result.reshape({b,t,nh*dimension_});
+        }
         if(row_lookup_) {
             auto result=row_lookup_(global,ids.device());
             if(hashed_ids)*hashed_ids=tb::tensor(global).reshape({b,t,nh}).to(ids.device());
@@ -496,6 +514,9 @@ class NgramEmbedding {
     Context context_;
     std::shared_ptr<NintRowPipeline> pipeline_;
     RowLookup row_lookup_;StageFactory stage_factory_;
+    std::shared_ptr<RowStage> prefill_stage_;
+    std::vector<int64_t> prefill_shape_;
+    hipStream_t prefill_stream_=nullptr;
 };
 
 struct PleWeights {
