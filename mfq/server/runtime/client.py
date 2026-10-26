@@ -508,6 +508,8 @@ class HttpRuntimeClient:
             if isinstance(detail, dict):
                 code = str(detail.get("code") or detail.get("type") or code)
                 message = str(detail.get("message") or message)
+            if status_code == 503 and isinstance(parsed, dict) and parsed.get("status") == "unhealthy":
+                code = "runtime_unhealthy"
         except json.JSONDecodeError:
             pass
         return BackendError(

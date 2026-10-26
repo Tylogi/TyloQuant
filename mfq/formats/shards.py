@@ -541,7 +541,18 @@ class StreamingBlobShardWriter:
 
         tensor_count = sum(len(records) for records in self._record_shards)
         record_count = tensor_count + len(assets)
+        from mfq.disk_space import DiskSpaceRequirement, check_disk_space
+        prefix_bytes = sum(int(record.nbytes) for record in assets)
+        for split_no, tensor_records in enumerate(self._record_shards):
+            shard_assets = list(assets) if split_no == 0 else []
+            part_header = shard_header(header, split_no=split_no, split_count=shard_count,
+                tensor_count=tensor_count, record_count=record_count) if sharded_output else header
+            table = io.BytesIO()
+            _write_header_and_table(table, part_header, shard_assets + tensor_records)
+            prefix_bytes += table.tell()
         try:
+            check_disk_space([DiskSpaceRequirement(self.output, prefix_bytes, 'MFQ headers and runtime assets')],
+                             stage='streaming MFQ finalization')
             for split_no, (payload, tensor_records, payload_size) in enumerate(
                 zip(
                     self._payload_paths,
@@ -623,6 +634,8 @@ def write_blob_record_shards(
     overwrite: bool = False,
     consume_blobs: bool = False,
     before_publish: Callable[[Sequence[Path]], None] | None = None,
+    after_record: Callable[[BlobRecordLike], None] | None = None,
+    preflight: bool = True,
 ) -> list[Path]:
     """Stage all output files, then publish an MFQ file or shard set."""
 
@@ -651,6 +664,17 @@ def write_blob_record_shards(
 
     tensor_count = sum(not is_asset_record(record.name) for record in records)
     record_count = len(records)
+    if preflight:
+        from mfq.disk_space import DiskSpaceRequirement, check_disk_space
+        total = sum(int(record.nbytes) for record in records)
+        for split_no, shard_records in enumerate(planned):
+            part_header = shard_header(header, split_no=split_no, split_count=len(planned),
+                tensor_count=tensor_count, record_count=record_count) if sharded_output else header
+            table = io.BytesIO()
+            _write_header_and_table(table, part_header, shard_records)
+            total += table.tell()
+        check_disk_space([DiskSpaceRequirement(Path(output), total, 'final MFQ output')],
+                         stage='final MFQ assembly')
     try:
         for split_no, (destination, tmp, shard_records) in enumerate(
             zip(destinations, temporary, planned, strict=True)
@@ -671,6 +695,9 @@ def write_blob_record_shards(
                 _write_header_and_table(target, part_header, shard_records)
                 for record in shard_records:
                     _copy_record(record, target)
+                    if after_record is not None:
+                        target.flush()
+                        after_record(record)
             if tmp.stat().st_size <= 0:
                 raise RuntimeError(f"empty MFQ shard output: {tmp}")
 

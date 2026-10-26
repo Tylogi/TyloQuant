@@ -1045,6 +1045,12 @@ def convert(args: argparse.Namespace) -> None:
         )
         blob_root = temporary_root / "blobs"
         artifact_root = temporary_root / "codebooks"
+        from mfq.disk_space import DiskSpaceRequirement, check_disk_space
+        check_disk_space([
+            DiskSpaceRequirement(output, estimated_total, 'important-neuron MFQ output'),
+            DiskSpaceRequirement(blob_root, sum(s.low_nbytes+s.high_nbytes for s in splits),
+                                 'important-neuron fitted blobs'),
+        ], stage='important-neuron quantization')
         if temporary_root.exists() and not args.resume:
             raise FileExistsError(
                 f"IN temporary directory exists; use --resume: {temporary_root}"

@@ -254,6 +254,50 @@ def _quantize(args, resources):
         vision_bytes=auxiliary['vision'], mtp_bytes=auxiliary['predictor'])
     if args.dry_run:
         return
+    from mfq.disk_space import DiskSpaceRequirement, check_disk_space
+    from mfq.calibration.alphaq_fit import FittedPayloadCache
+    consume_fitted = bool(getattr(args, 'alphaq_consume_fitted', False))
+    if consume_fitted and (cache/'encoded-candidates.json').exists():
+        raise ValueError('--alphaq-consume-fitted requires fitted payloads, not a shared encoded-candidates cache')
+    file_bytes = budget.maximum_file_bytes + auxiliary_bytes
+    cache_bytes = file_bytes
+    cache_total = file_bytes
+    if (cache/'encoded-candidates.json').exists():
+        cache_bytes = 0  # Existing shared candidate files need no fitted copy.
+    # A saved allocation is tied to this source, imatrix and allocation policy.
+    # Credit only payloads whose complete fitting signature still matches it.
+    saved_scheme = allocation_root/'scheme.json'
+    saved_overrides = allocation_root/'native-overrides.json'
+    largest_payload = max((q._plan_blob_nbytes(p, NintSpec()) for p in plans), default=0)
+    if saved_scheme.exists() and saved_overrides.exists() and not (cache/'encoded-candidates.json').exists():
+        previous_plans = plan(load_scheme(saved_scheme), json.loads(saved_overrides.read_text()))
+        estimator = FittedPayloadCache(root, cache, imatrix, imatrix_sha, None,
+                                      artifact_root=allocation_root)
+        sizes = [q._plan_blob_nbytes(p, NintSpec(), allocation_root) for p in previous_plans]
+        cache_total = sum(sizes)
+        cache_bytes = estimator.pending_bytes(previous_plans, sizes)
+        largest_payload = max(sizes, default=0)
+    same_disk = False
+    if consume_fitted:
+        from mfq.disk_space import filesystem
+        same_disk = filesystem(cache)[0] == filesystem(output)[0]
+        # Allocation may concentrate precision in a single bank, so before the
+        # allocation is known use the native tensor size as the copy overlap.
+        if not saved_scheme.exists():
+            largest_payload = max(largest_payload, max((int(np.prod(p.shape))*4 for p in plans), default=0))
+    output_bytes = file_bytes
+    if same_disk:
+        # Cache growth is already counted below. Output replaces that cache;
+        # only the larger final total and one in-flight tensor must coexist.
+        output_bytes = max(0, file_bytes-cache_total) + largest_payload
+    sidecar_bytes = len(plans)*len(profiles)*(128 << 10)
+    if args.alphaq_allocator == 'natscale':
+        sidecar_bytes += sum((p.shape[0] if len(p.shape) == 3 else 1)*p.shape[-1]*8 for p in plans)
+    check_disk_space([
+        DiskSpaceRequirement(cache, cache_bytes, 'AlphaQ fitted payloads still to create'),
+        DiskSpaceRequirement(cache, sidecar_bytes, 'AlphaQ statistics and trained tables'),
+        DiskSpaceRequirement(output, output_bytes, 'final output including vision/MTP and copy overlap'),
+    ], stage='AlphaQ statistics, training and fitting')
     backend = resolve_quant_backend(args.backend, args.device)
     from mfq.calibration.alphaq_parallel import execution_devices, DeviceWorkers, train_and_fit
     devices = execution_devices(getattr(args, 'devices', ''), backend, args.device)
@@ -336,7 +380,7 @@ def _quantize(args, resources):
         encoded = FittedPayloadCache(root, cache, imatrix, imatrix_sha, backend,
             row_chunk=args.row_chunk, artifact_root=scheme_path.parent)
     low._alphaq_output = AlphaQOutput(root, tuple(final_plans), model_files(root), header, assets,
-                                     budget.maximum_file_bytes, encoded, ('vision', 'predictor'))
+                                     budget.maximum_file_bytes, encoded, ('vision', 'predictor'), consume_fitted)
     q.convert(low)
     from mfq.formats.io import open_mmap
     with open_mmap(output) as store:
