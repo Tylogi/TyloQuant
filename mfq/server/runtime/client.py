@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from itertools import count
@@ -12,6 +13,8 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+
+_logger = logging.getLogger(__name__)
 
 
 class BackendError(RuntimeError):
@@ -529,6 +532,7 @@ class StdioRuntimeClient:
         long_control_timeout_seconds: float = 1800.0,
         max_frame_bytes: int = 64 * 1024 * 1024,
         pending_event_limit: int = 64,
+        capture_stderr: bool = True,
     ) -> None:
         if process.stdin is None or process.stdout is None:
             raise ValueError("stdio runtime process requires stdin and stdout pipes")
@@ -547,6 +551,47 @@ class StdioRuntimeClient:
         self._reader_task: asyncio.Task[None] | None = None
         self._terminal_error: BackendError | None = None
         self._closed = False
+        self._capture_stderr = capture_stderr
+        self._stderr_tail = bytearray()
+        self._stderr_done = asyncio.Event()
+        self._stderr_task: asyncio.Task[None] | None = None
+        if getattr(process, "stderr", None) is None:
+            self._stderr_done.set()
+
+    def record_stderr(self, data: bytes) -> None:
+        """Retain a bounded tail; the pool may own the stderr reader/log sink."""
+        self._stderr_tail.extend(data)
+        del self._stderr_tail[:-32768]
+
+    def finish_stderr(self) -> None:
+        self._stderr_done.set()
+
+    async def _read_stderr(self) -> None:
+        try:
+            while data := await self._process.stderr.read(4096):
+                self.record_stderr(data)
+        finally:
+            self.finish_stderr()
+
+    async def _closed_stdout_error(self) -> BackendError:
+        status = getattr(self._process, "returncode", None)
+        if status is None and callable(getattr(self._process, "wait", None)):
+            with suppress(asyncio.TimeoutError):
+                status = await asyncio.wait_for(self._process.wait(), timeout=1.0)
+        # stdout/stderr EOF can race. Allow the independent stderr reader to
+        # retain the final fatal report before releasing all pending requests.
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._stderr_done.wait(), timeout=1.0)
+        description = "stdio runtime closed stdout"
+        if status is not None:
+            description = f"runtime process exited with status {status} (0x{status & 0xFFFFFFFF:08X})"
+        tail = self._stderr_tail.decode("utf-8", errors="replace").strip()
+        message = description + (f"; last stderr:\n{tail}" if tail else "; no stderr was captured")
+        _logger.error("%s", message)
+        cause = next((line for line in tail.splitlines() if line.startswith("runtime_fatal error=")), "")
+        if cause:
+            description += f"; {cause[:512]}"
+        return BackendError("backend_connection_error", description, retryable=True, status_code=503)
 
     @asynccontextmanager
     async def generate(
@@ -751,6 +796,8 @@ class StdioRuntimeClient:
         await self._write({"v": 1, "op": op, "params": params})
 
     async def _ensure_ready(self) -> None:
+        if self._capture_stderr and self._stderr_task is None and getattr(self._process, "stderr", None) is not None:
+            self._stderr_task = asyncio.create_task(self._read_stderr(), name=f"mfq-stderr-{self._process.pid}")
         if self._reader_task is None:
             self._reader_task = asyncio.create_task(
                 self._read_frames(),
@@ -797,11 +844,7 @@ class StdioRuntimeClient:
             while True:
                 raw = await stdout.readline()
                 if not raw:
-                    raise BackendError(
-                        "backend_connection_error",
-                        "stdio runtime closed stdout",
-                        retryable=True,
-                    )
+                    raise await self._closed_stdout_error()
                 if len(raw) > self.max_frame_bytes:
                     raise BackendProtocolError("stdio response exceeds the frame size limit")
                 try:

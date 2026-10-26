@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "mfq/fatal_diagnostics.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -311,6 +312,13 @@ void MfqScheduler::loop() noexcept {
                     for (auto& [id, request] : requests_) cancel(request);
                     reload.emplace(std::move(value));
                 }
+            } catch (const MfqBackendFailure& error) {
+                mfq::log_runtime_error("scheduler_control", error.what());
+                healthy = false;
+                value.reply.set_exception(std::current_exception());
+            } catch (const std::exception& error) {
+                mfq::log_runtime_error("scheduler_control", error.what());
+                value.reply.set_exception(std::current_exception());
             } catch (...) { value.reply.set_exception(std::current_exception()); }
         }, command);
         bool executable = false;
@@ -325,7 +333,7 @@ void MfqScheduler::loop() noexcept {
             for (const auto& id : ordered) {
                 auto& request = requests_.at(id);
                 flush(request);
-                if (stopping) cancel(request);
+                if (stopping || !healthy) cancel(request);
                 else if (request.input.deadline && *request.input.deadline <= Clock::now()) expire(request);
                 if (request.finished) continue;
                 if (request.input.deadline && !request.cancelling) wake_at = std::min(wake_at, *request.input.deadline);
@@ -336,10 +344,20 @@ void MfqScheduler::loop() noexcept {
                         admission_blocked = !request.admitted;
                     }
                     catch (const InferenceInputError& error) {
+                        mfq::log_runtime_error("admission", error.what());
                         publish(request, {id, Failed{error.code == InferenceInputErrorCode::Unsupported
                             ? "unsupported_input" : "invalid_request", error.what()}}); continue;
                     } catch (const std::invalid_argument& error) {
+                        mfq::log_runtime_error("admission", error.what());
                         publish(request, {id, Failed{"invalid_request", error.what()}}); continue;
+                    } catch (const MfqBackendFailure&) {
+                        throw;
+                    } catch (const MfqResourceExhausted& error) {
+                        mfq::log_runtime_error("admission", error.what());
+                        publish(request, {id, Failed{"resource_exhausted", error.what(), true}}); continue;
+                    } catch (const std::exception& error) {
+                        mfq::log_runtime_error("admission", error.what());
+                        publish(request, {id, Failed{"backend_failure", error.what()}}); continue;
                     }
                 }
                 if (!request.admitted) continue;
@@ -371,19 +389,21 @@ void MfqScheduler::loop() noexcept {
                 if (result.wake_at) wake_at = std::min(wake_at, *result.wake_at);
             }
         } catch (const std::exception& error) {
-            healthy = false;
+            mfq::log_runtime_error("scheduler", error.what());
+            healthy &= dynamic_cast<const MfqBackendFailure*>(&error) == nullptr && engine_.status().healthy;
             for (auto& [id, request] : requests_) {
                 try { if (request.admitted) engine_.cancel(id); } catch (...) {}
             }
-            try { (void)engine_.step({}); } catch (...) {}
+            try { healthy &= engine_.step({}).status.healthy; } catch (...) { healthy = false; }
             for (auto& [id, request] : requests_)
                 if (!request.finished)
                     try { publish(request, {id, Failed{"backend_failure", error.what()}}); } catch (...) {}
         } catch (...) {
-            healthy = false;
+            mfq::log_runtime_error("scheduler", "unknown backend error");
+            healthy &= engine_.status().healthy;
             for (auto& [id, request] : requests_)
                 try { engine_.cancel(id); } catch (...) {}
-            try { (void)engine_.step({}); } catch (...) {}
+            try { healthy &= engine_.step({}).status.healthy; } catch (...) { healthy = false; }
             for (auto& [id, request] : requests_)
                 if (!request.finished)
                     try { publish(request, {id, Failed{"backend_failure", "unknown backend error"}}); } catch (...) {}

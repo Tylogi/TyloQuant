@@ -15,6 +15,7 @@ param(
     [string] $CudaArchitectures = $env:MFQ_RELEASE_CUDA_ARCHITECTURES,
     [int] $Jobs = 0,
     [switch] $PortableOnly,
+    [switch] $IncludeNativeSymbols,
     [switch] $Clean
 )
 
@@ -511,6 +512,12 @@ function Stage-WindowsRuntime {
     param([Parameter(Mandatory)][hashtable] $Context)
 
     Reset-Directory $Context.WindowsRuntimeDirectory
+    if ($IncludeNativeSymbols) {
+        foreach ($name in @("mfq-runtime.pdb", "mfq-diagnostics.pdb")) {
+            Copy-Item -LiteralPath (Join-Path $Context.NativeOutput.DirectoryName $name) `
+                -Destination $Context.WindowsRuntimeDirectory -Force
+        }
+    }
     Copy-RuntimeDlls $Context.NativeOutput.DirectoryName $Context.WindowsRuntimeDirectory
     $cudaRuntimeDirectory = Find-CudaRuntimeDirectory $Context.CudaRoot
     foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {

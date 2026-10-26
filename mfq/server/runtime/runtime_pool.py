@@ -1042,7 +1042,7 @@ class RuntimePool:
             )
         )
         runtime_client = (
-            StdioRuntimeClient(process)
+            StdioRuntimeClient(process, capture_stderr=False)
             if self.transport == "stdio"
             else HttpRuntimeClient(f"http://127.0.0.1:{port}")
         )
@@ -4520,6 +4520,9 @@ class RuntimePool:
         if stream is None:
             return
         async for line in self._log_lines(stream):
+            runtime_client = getattr(instance.backend, "_runtime", None)
+            if isinstance(runtime_client, StdioRuntimeClient):
+                runtime_client.record_stderr(line.rstrip(b"\r\n") + b"\n")
             job_context = instance.context_job if isinstance(instance.context_job, JobContext) else context
             message = line.decode("utf-8", errors="replace").rstrip()
             normalized = message.casefold()
@@ -4580,6 +4583,10 @@ class RuntimePool:
                         )
                     },
                 )
+
+        runtime_client = getattr(instance.backend, "_runtime", None)
+        if isinstance(runtime_client, StdioRuntimeClient):
+            runtime_client.finish_stderr()
 
     async def _monitor(self, instance: _Runtime) -> None:
         process = instance.process

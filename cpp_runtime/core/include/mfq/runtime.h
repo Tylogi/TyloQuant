@@ -14,6 +14,13 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// A backend has lost execution state and cannot safely accept another request.
+// Input/encoder failures use ordinary exceptions and leave admission healthy.
+class MfqBackendFailure : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 struct MfqSamplingParams {
     int32_t max_tokens = 4096;
     double temperature = 1.0;

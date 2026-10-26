@@ -8,6 +8,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(MFQ_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 
+option(MFQ_ENABLE_FATAL_TESTS "Enable opt-in fatal diagnostic injection (test builds only)" OFF)
+if(MSVC)
+    # Retain Release optimization while making native fatal stacks actionable.
+    add_compile_options(
+        "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:/Zi>"
+        "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-Xcompiler=/Zi>")
+    add_link_options("$<$<CONFIG:Release>:/DEBUG>" "$<$<CONFIG:Release>:/OPT:REF>"
+        "$<$<CONFIG:Release>:/OPT:ICF>" "/PDBALTPATH:%_PDB%")
+    set(CMAKE_PDB_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+endif()
+
 option(
     MFQ_BUILD_METAL_RUNTIME
     "Build the native MLX/Metal runtime on Apple Silicon"

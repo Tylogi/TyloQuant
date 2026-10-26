@@ -93,10 +93,37 @@ def _decode_data_url(url: str, expected_prefix: str) -> bytes:
     mime_type = header[5:].split(";", 1)[0].lower()
     if not mime_type.startswith(expected_prefix):
         raise VisionProcessingError(f"expected {expected_prefix} media, got {mime_type}")
+    if not encoded:
+        raise VisionProcessingError("media data URL is empty")
     try:
-        return base64.b64decode(encoded, validate=True)
+        data = base64.b64decode(encoded, validate=True)
     except ValueError as error:
         raise VisionProcessingError("media data URL contains invalid base64") from error
+    if expected_prefix == "image/":
+        from PIL import Image
+
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                detected = Image.MIME.get(image.format)
+        except Exception as error:
+            raise VisionProcessingError(f"unable to decode image: {error}") from error
+        if detected and mime_type != detected:
+            raise VisionProcessingError(f"image MIME type {mime_type} does not match payload {detected}")
+    return data
+
+
+def validate_image_messages(messages: Any) -> None:
+    """Reject malformed images before an HTTP streaming response commits."""
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                spec = part.get("image_url")
+                if not isinstance(spec, dict) or not isinstance(spec.get("url"), str):
+                    raise VisionProcessingError("image_url content is missing its URL")
+                _decode_image(_decode_data_url(spec["url"], "image/"))
 
 
 def _decode_image(data: bytes) -> Any:
