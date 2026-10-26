@@ -839,6 +839,12 @@ class Qsa {
         graph_pooled_.index_copy_(1,block,pooled);
         auto scores=mfq_qwen4_exp::block_scores(p.iq,graph_pooled_);
         auto selected=mfq_qwen4_exp::qsa_graph_select(scores.contiguous(),cache_positions,c_.pool,c_.budget);
+        if(!quantization_.enabled() && t==1 && c_.width==256 && fused_projection_ && rotary_->fused() &&
+            (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)) {
+            auto gated=mfq_qwen4_exp::sparse_gqa_attention_gate(p.query,graph_keys_,graph_values_,
+                selected,p.gate,hidden.scalar_type()==tb::kFloat16);
+            return w_.output(execution,gated.reshape({1,t,c_.heads*c_.width}));
+        }
         auto attended=quantization_.enabled()?
             cuda_kv_attention(p.query,graph_keys_,graph_values_,quantization_,selected,cache_positions):
             mfq_qwen4_exp::sparse_gqa_attention(p.query,graph_keys_,graph_values_,selected);
@@ -924,6 +930,13 @@ class Qsa {
                 return ids;
             },
             [&](const Projection &p, Tensor ids) {
+                if(!quantization_.enabled() && t==1 && c_.width==256 &&
+                    (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)) {
+                    auto gated=mfq_qwen4_exp::sparse_gqa_attention_gate(p.query,
+                        p.key.permute({0,2,1,3}),p.value.permute({0,2,1,3}),ids,p.gate,
+                        hidden.scalar_type()==tb::kFloat16);
+                    gate_applied=true;return gated;
+                }
                 return attend(p.query,p.key.permute({0,2,1,3}),p.value.permute({0,2,1,3}),ids,offset);
             },
             [&](Tensor attended, const Projection &p) {

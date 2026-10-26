@@ -622,6 +622,11 @@ Tensor sparse_gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         q, k, v, indices, 1.0 / std::sqrt(double(q.size(3))), false);
 }
 
+Tensor sparse_gqa_attention_gate(const Tensor& q,const Tensor& k,const Tensor& v,
+    const Tensor& indices,const Tensor& gate,bool half_output) {
+    return mfq_selected_attention::sparse_gated(q,k,v,indices,1.0/std::sqrt(double(q.size(3))),gate,half_output);
+}
+
 Tensor attention_gate(const Tensor& attended, const Tensor& gate, bool half_output) {
     return mfq_selected_attention::gated(attended, gate, half_output);
 }
