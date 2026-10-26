@@ -4,12 +4,28 @@
 #include <cstdint>
 #include <limits>
 #include <cstdlib>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
 #include "mfq_tensor_backend.h"
 #include "mfq_hip_compat.h"
 #include "reduce.cuh"
 #include "gdn_stateful_decode.h"
 
-template<int tiles,class Qkv,class Gate,class Output,int FixedWidth=0,int FixedTaps=0,bool InplaceConv=false,int BroadcastNorm=0,bool Snapshot=false>
+template<bool Dpp> __device__ __forceinline__ float gdn_stateful_sum32(float value) {
+#if defined(__gfx942__)
+    if constexpr(Dpp) {
+        value+=__int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(value),(16<<10)|31));
+        value+=__int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(value),0x128,15,15,false));
+        value+=__int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(value),0x124,15,15,false));
+        value+=__int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(value),0x122,15,15,false));
+        return value+__int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(value),0x121,15,15,false));
+    }
+#endif
+    return warp_sum(value);
+}
+
+template<int tiles,class Qkv,class Gate,class Output,int FixedWidth=0,int FixedTaps=0,bool InplaceConv=false,int BroadcastNorm=0,bool Snapshot=false,bool Dpp=false,bool Separate=false>
 __global__ void gdn_stateful_decode_kernel(const Qkv* qkv,const Gate* output_gate,
     const Gate* alpha,const Gate* beta,const float* convolution_state,const float* recurrent_state,
     const float* convolution_weight,const float* dt_bias,const float* a_log,const float* norm_weight,
@@ -149,7 +165,7 @@ __global__ void gdn_stateful_decode_kernel(const Qkv* qkv,const Gate* output_gat
         float projected=0.f;
         #pragma unroll
         for(int row=0;row<4;++row)if(row<rows)projected+=states[row]*keys[row];
-        projected=warp_sum(projected);
+        projected=gdn_stateful_sum32<Dpp>(projected);
         const float delta=(value[column]-decay*projected)*bt;
         float result=0.f;
         #pragma unroll
@@ -165,13 +181,15 @@ __global__ void gdn_stateful_decode_kernel(const Qkv* qkv,const Gate* output_gat
             recurrent_out[state_head+index]=states[row];
             if constexpr(Snapshot)checkpoint_recurrent[state_head+index]=states[row];
         }
-        result=warp_sum(result);
+        result=gdn_stateful_sum32<Dpp>(result);
         if(lane==0) {
             const float computed=result*scale;
-            if(tiles==1)attended[column]=computed;
+            if(tiles==1 && !Separate)attended[column]=computed;
             else workspace[size_t(workspace_head)*(width+1)+column]=computed;
         }
     }
+    // A following kernel consumes these columns after all blocks complete.
+    if constexpr(Separate)return;
     if(tiles>1) {
         // Only warp leaders publish attended columns into the cross-tile
         // workspace. Recurrent state is consumed after kernel completion;
@@ -284,6 +302,43 @@ __global__ void gdn_stateful_decode_kernel(const Qkv* qkv,const Gate* output_gat
     }
 }
 
+__global__ void gdn_stateful_split_epilogue(const float* workspace,const float* gate,
+    const float* weight,float* output,int value_heads,int64_t gate_stride,double eps,bool silu_gate) {
+    const int group=blockIdx.x,tid=threadIdx.x,batch=group/value_heads,head=group%value_heads;
+    const auto* x=workspace+size_t(group)*129;
+    __shared__ float sum;
+    if(tid<32) {
+        const float a=__fadd_rn(0.f,__fmul_rn(x[tid],x[tid])),b=__fadd_rn(0.f,__fmul_rn(x[tid+64],x[tid+64]));
+        const float c=__fadd_rn(0.f,__fmul_rn(x[tid+32],x[tid+32])),d=__fadd_rn(0.f,__fmul_rn(x[tid+96],x[tid+96]));
+        float partial=__fadd_rn(__fadd_rn(a,b),__fadd_rn(c,d));
+        #pragma unroll
+        for(int shift=16;shift;shift/=2) {
+            const float other=__shfl_down(partial,shift,32);
+            if(tid<shift)partial=__fadd_rn(partial,other);
+        }
+        if(tid==0)sum=partial;
+    }
+    __syncthreads();
+    const float mean=__fdiv_rn(sum,128.f),variance=float(double(mean)+eps);
+    const float inverse=__fdiv_rn(1.f,__fsqrt_rn(variance));
+    const float z=gate[int64_t(batch)*gate_stride+head*128+tid];
+    const float sigmoid=__fdiv_rn(1.f,__fadd_rn(1.f,expf(-z)));
+    const float activation=silu_gate?__fmul_rn(z,sigmoid):sigmoid;
+    output[size_t(group)*128+tid]=__fmul_rn(__fmul_rn(__fmul_rn(x[tid],inverse),weight[tid]),activation);
+}
+
+namespace {
+bool gdn_stateful_gfx942(int device) {
+    static thread_local int cached_device=-1;
+    static thread_local bool enabled=false;
+    if(cached_device!=device) {
+        hipDeviceProp_t properties{};MFQ_CUDA_CHECK(hipGetDeviceProperties(&properties,device));
+        enabled=std::strncmp(properties.gcnArchName,"gfx942",6)==0;cached_device=device;
+    }
+    return enabled;
+}
+}
+
 __global__ void gdn_stateful_commit_convolution(const float* values,
     const int64_t* state_addresses,int64_t row_elements) {
     const int row=blockIdx.y;
@@ -359,10 +414,37 @@ std::vector<mfq_tensor_backend::Tensor> mfq_hip_gdn_stateful::decode(
     auto output=tb::empty({batch,1,value_heads*width},qkv.options().dtype(output_half?tb::kFloat16:tb::kFloat32));
     auto conv=tb::empty({batch,taps-1,channels},convolution_state.options());
     auto state=inplace_state?recurrent_state:tb::empty_like(recurrent_state);
-    if(tiles>1 && !workspace.defined() && !independent)workspace=tb::zeros({batch,value_heads,width+1},convolution_state.options());
+    const bool dpp=tiles==1 && batch<=6 && key_heads==16 && value_heads==48 && width==128 && taps==4 &&
+        channels_first && transposed_state && inplace_state && !independent &&
+        !checkpoint_convolution.defined() && !output_half && qkv.scalar_type()==tb::kFloat32 &&
+        alpha.scalar_type()==tb::kFloat32 && gdn_stateful_gfx942(qkv.get_device());
+    const bool separate=dpp && batch<=2 && !tile_option;
+    if((tiles>1 || separate) && !workspace.defined() && !independent)workspace=tb::zeros({batch,value_heads,width+1},convolution_state.options());
     MFQ_RUNTIME_CHECK(!workspace.defined() || (real(workspace) &&
         workspace.sizes().vec()==std::vector<int64_t>({state_batch,value_heads,width+1})),
         "GDN decode core workspace shape/device/dtype disagrees");
+    if(dpp) {
+        const auto run=[&]<int Tiles,bool Separate>() {
+            hipLaunchKernelGGL((gdn_stateful_decode_kernel<Tiles,float,float,float,128,4,false,0,false,true,Separate>),
+                dim3(unsigned(batch*value_heads*Tiles)),dim3(256),0,mfq_current_cuda_stream(),
+                qkv.data_ptr<float>(),output_gate.data_ptr<float>(),alpha.data_ptr<float>(),beta.data_ptr<float>(),
+                convolution_state.data_ptr<float>(),recurrent_state.data_ptr<float>(),convolution_weight.data_ptr<float>(),
+                dt_bias.data_ptr<float>(),a_log.data_ptr<float>(),norm_weight.data_ptr<float>(),output.data_ptr<float>(),
+                conv.data_ptr<float>(),state.data_ptr<float>(),int(key_heads),int(value_heads),128,4,0,
+                float(convolution_eps),norm_eps,silu_gate,true,alpha.stride(0),alpha.stride(2),beta.stride(0),beta.stride(2),
+                workspace.defined()?workspace.data_ptr<float>():nullptr,nullptr,qkv.stride(0),output_gate.stride(0),true,nullptr,nullptr);
+        };
+        if(separate) {
+            run.template operator()<8,true>();
+            gdn_stateful_split_epilogue<<<unsigned(batch*value_heads),128,0,mfq_current_cuda_stream()>>>(
+                workspace.data_ptr<float>(),output_gate.data_ptr<float>(),norm_weight.data_ptr<float>(),output.data_ptr<float>(),
+                int(value_heads),output_gate.stride(0),norm_eps,silu_gate);
+            static std::atomic_flag reported=ATOMIC_FLAG_INIT;
+            if(!reported.test_and_set(std::memory_order_relaxed))
+                std::fprintf(stderr,"native_gdn_split tiles=8 stages=2 atomic_join=0 state=f32\n");
+        } else run.template operator()<1,false>();
+        MFQ_CUDA_CHECK(hipGetLastError());return {output,conv,state};
+    }
     const auto launch=[&]<int Tiles,class Qkv,class Gate,class Output,bool Snapshot,int FixedWidth=0,int FixedTaps=0>() {
         hipLaunchKernelGGL((gdn_stateful_decode_kernel<Tiles,Qkv,Gate,Output,FixedWidth,FixedTaps,false,0,Snapshot>),
             dim3(unsigned(batch*value_heads*Tiles)),dim3(256),0,mfq_current_cuda_stream(),
