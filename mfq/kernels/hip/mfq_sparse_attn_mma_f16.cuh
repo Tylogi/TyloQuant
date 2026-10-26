@@ -447,7 +447,7 @@ Tensor launch(
     // that already assigns one complete query tile to a block.
     if constexpr(!SplitKV && ((DKQ==512 && DV==512 && ncols1==1 && ncols2>=32 && V_is_K_view) ||
         (DKQ==256 && DV==256 && !V_is_K_view))) {
-        if(M>=128 && blocks_per_tile==1 && (DKQ!=256 || causal)) {
+        if(M>=128 && blocks_per_tile==1 && (DKQ!=256 || causal || Compact)) {
             kernel=sparse_attention_kernel<DKQ,DV,ncols1,ncols2,V_is_K_view,SplitKV,true,Compact>;
             static bool direct_shmem[32]={};
             if(!direct_shmem[device]) {
