@@ -110,6 +110,10 @@ mfq_tensor_backend::Tensor mxfp8_embedding_lookup_cuda(
     mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales, mfq_tensor_backend::Tensor token_ids);
 mfq_tensor_backend::Tensor mxfp8_small_m_cuda(
     mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales, mfq_tensor_backend::Tensor x);
+mfq_tensor_backend::Tensor mxfp8_gate_up_clipped_swiglu_cuda(
+    mfq_tensor_backend::Tensor gate_values, mfq_tensor_backend::Tensor gate_scales,
+    mfq_tensor_backend::Tensor up_values, mfq_tensor_backend::Tensor up_scales,
+    mfq_tensor_backend::Tensor input, double limit);
 mfq_tensor_backend::Tensor mxfp8_matmul_f16_cuda(
     mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales, mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor mxfp8_small_m_f32_cuda(
@@ -207,3 +211,37 @@ mfq_tensor_backend::Tensor nvq_embedding_lookup_cuda(
     mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode);
+
+mfq_tensor_backend::Tensor nint_decode_f32_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,
+    mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    int64_t neuron_len, int64_t gs);
+
+mfq_tensor_backend::Tensor nint8_zero_dequant_f32_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, int64_t neuron_len);
+
+mfq_tensor_backend::Tensor mxfp8_groupwise_gemm_f16_cuda(mfq_tensor_backend::Tensor values,mfq_tensor_backend::Tensor scales,mfq_tensor_backend::Tensor input,int64_t groups);
+mfq_tensor_backend::Tensor mxfp8_groupwise_gemm_f32_cuda(mfq_tensor_backend::Tensor values,mfq_tensor_backend::Tensor scales,mfq_tensor_backend::Tensor input,int64_t groups);
+
+mfq_tensor_backend::Tensor nint_matmul_online_f16_cuda(
+    mfq_tensor_backend::Tensor bitstream,mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,mfq_tensor_backend::Tensor subgroup_scale,
+    mfq_tensor_backend::Tensor subgroup_minimum,mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_minimum,mfq_tensor_backend::Tensor input,int64_t group_size);
+mfq_tensor_backend::Tensor nint_matmul_fixed_bits_ws_cuda(
+    mfq_tensor_backend::Tensor bitstream,mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,mfq_tensor_backend::Tensor subgroup_scale,
+    mfq_tensor_backend::Tensor subgroup_minimum,mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_minimum,mfq_tensor_backend::Tensor input,
+    int64_t group_size,mfq_tensor_backend::Tensor quantized_input,
+    mfq_tensor_backend::Tensor input_scale,int uniform_bits);
+
+mfq_tensor_backend::Tensor nint_matmul_input_mul_fixed_bits_ws_cuda(
+    mfq_tensor_backend::Tensor bitstream,mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,mfq_tensor_backend::Tensor subgroup_scale,
+    mfq_tensor_backend::Tensor subgroup_minimum,mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_minimum,mfq_tensor_backend::Tensor input,
+    mfq_tensor_backend::Tensor gate,int64_t activation_mode,int64_t group_size,
+    mfq_tensor_backend::Tensor quantized_input,mfq_tensor_backend::Tensor input_scale,int uniform_bits);

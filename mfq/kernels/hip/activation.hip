@@ -409,3 +409,78 @@ void linear_gate_beta(
 }
 
 }  // namespace mfq::cuda::kernels
+
+template <typename scalar_t>
+__global__ void relu_squared_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ out,
+    size_t n)
+{
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += (size_t)gridDim.x * blockDim.x) {
+        const float value = fmaxf(activation_as_float(input[i]), 0.0f);
+        out[i] = activation_from_float<scalar_t>(value * value);
+    }
+}
+
+mfq_tensor_backend::Tensor relu_squared_cuda(mfq_tensor_backend::Tensor input)
+{
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous(),
+        "relu_squared: input must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(
+        input.scalar_type() == mfq_tensor_backend::kFloat32 ||
+        input.scalar_type() == mfq_tensor_backend::kFloat16 ||
+        input.scalar_type() == mfq_tensor_backend::kBFloat16,
+        "relu_squared: dtype must be f32, f16, or bf16");
+    auto out = mfq_tensor_backend::empty_like(input);
+    const size_t elements = (size_t)input.numel();
+    if (elements == 0) return out;
+    constexpr int block = 256;
+    const int grid = (int)std::min<size_t>(4096, (elements + block - 1) / block);
+    hipStream_t stream = mfq_current_cuda_stream();
+    if (input.scalar_type() == mfq_tensor_backend::kFloat32) {
+        relu_squared_kernel<float><<<grid, block, 0, stream>>>(
+            input.data_ptr<float>(), out.data_ptr<float>(), elements);
+    } else if (input.scalar_type() == mfq_tensor_backend::kFloat16) {
+        relu_squared_kernel<__half><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), elements);
+    } else {
+        relu_squared_kernel<__hip_bfloat16><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __hip_bfloat16*>(input.data_ptr<mfq_bfloat16>()),
+            reinterpret_cast<__hip_bfloat16*>(out.data_ptr<mfq_bfloat16>()), elements);
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+
+__global__ void clipped_silu_mul_kernel(const half* gate,const half* up,half* output,
+        int64_t count,float limit) {
+    const auto i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<count) {
+        const float g=fminf(__half2float(gate[i]),limit);
+        const float u=fminf(fmaxf(__half2float(up[i]),-limit),limit);
+        float activated=g/(1.0f+expf(-g));
+        // Preserve the FP32 materialization boundaries before the FP16 cast.
+        asm volatile("" : "+v"(activated));
+        float product=activated*u;
+        asm volatile("" : "+v"(product));
+        output[i]=__float2half_rn(product);
+    }
+}
+
+mfq_tensor_backend::Tensor clipped_silu_mul_cuda(mfq_tensor_backend::Tensor gate,
+        mfq_tensor_backend::Tensor up,double limit) {
+    MFQ_RUNTIME_CHECK(gate.is_cuda() && up.device()==gate.device() &&
+        gate.scalar_type()==mfq_tensor_backend::kFloat16 && up.scalar_type()==mfq_tensor_backend::kFloat16 &&
+        gate.sizes()==up.sizes() && gate.is_contiguous() && up.is_contiguous() && limit>0,
+        "clipped SwiGLU requires matching contiguous CUDA FP16 tensors and a positive limit");
+    auto output=mfq_tensor_backend::empty(gate.sizes(),gate.options());
+    if(gate.numel())clipped_silu_mul_kernel<<<unsigned((gate.numel()+255)/256),256,0,mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half*>(gate.data_ptr<mfq_half>()),reinterpret_cast<const half*>(up.data_ptr<mfq_half>()),
+        reinterpret_cast<half*>(output.data_ptr<mfq_half>()),gate.numel(),float(limit));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}

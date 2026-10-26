@@ -86,6 +86,10 @@ mfq_tensor_backend::Tensor attention_glm_mla576_decode_cuda(
 mfq_tensor_backend::Tensor glm_interleaved_rope_cuda(
     mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor positions,
     mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin, int64_t rotary_dim);
+mfq_tensor_backend::Tensor dsv4_tail_rope_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor positions,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin, int64_t rotary_dim,
+    bool float_output = false, bool token_major = false);
 mfq_tensor_backend::Tensor glm_dsa_indexer_scores_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor weights,
     int64_t query_offset, int64_t logical_k);

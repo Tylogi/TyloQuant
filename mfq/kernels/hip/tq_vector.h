@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 namespace mfq_tq_vector {
+using U4=uint32_t __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ uint32_t dot_bytes(uint32_t a,uint32_t b,uint32_t c) {
 #if defined(__HIP_DEVICE_COMPILE__) && __has_builtin(__builtin_amdgcn_udot4)
  return __builtin_amdgcn_udot4(a,b,c,false);
@@ -19,14 +20,16 @@ __device__ __forceinline__ uint32_t select_word(const uint32_t* chunks,int count
     return value;
 }
 
-template<int V,bool Lookup,bool Columns,int Bits,class Consumer,bool RawBook=false,int HalfOutput=0>
+template<int V,bool Lookup,bool Columns,int Bits,class Consumer,bool RawBook=false,int HalfOutput=0,bool Prepared=false>
 __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t descriptor,
         const void* selectors,const half* relative,const half* lut,const half* coefficients,
-        int row,int col,int width,int gslog,Consumer& consumer) {
+        int row,int col,int width,int gslog,Consumer& consumer,U4 raw={},U4 column_pairs={}) {
     int bits=Bits?Bits:int((descriptor>>32)&7)+1;
     float anchor=__half2float(__ushort_as_half(uint16_t(descriptor>>40)));
     int ringwords=8*bits;
     static_assert(V>0 && 256%V==0,"Decode vectors must divide an independent ring");
+    static_assert(!Prepared || (V==8 && Columns && !RawBook && HalfOutput==2),
+                  "Prepared tiles contain eight aligned column-scaled half weights");
     // Callers assign aligned V-weight vectors. Their bit offsets cannot have
     // every possible low five bits: even precisions with V=16 are word-aligned.
     int minimum=((256/V-1)-((col/V)%(256/V)))*(V*bits);
@@ -34,7 +37,7 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
     const uint32_t* ring=words+uint32_t(descriptor)+(col>>8)*ringwords;
     constexpr int STEP=V*(Bits?Bits:8);
     constexpr int ALIGN=STEP&-STEP;
-    constexpr int MAX_SHIFT=Bits?(ALIGN<32?32-ALIGN:0):31;
+    constexpr int MAX_SHIFT=Bits?(ALIGN<32?32-ALIGN:0):(Prepared?(32-V):31);
     constexpr int NW=(MAX_SHIFT+(V-1)*(Bits?Bits:8)+16+31)/32;
     uint32_t chunks[NW]={};
     #pragma unroll
@@ -42,7 +45,8 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
         int at=first+j;
         if constexpr(Bits>0 && (Bits&(Bits-1))==0)at&=8*Bits-1;
         else if(at>=ringwords)at-=ringwords;
-        chunks[j]=__ldg(ring+at);
+        if constexpr(Prepared)chunks[j]=raw[j];
+        else chunks[j]=__ldg(ring+at);
     }
     #ifdef TRELLIS_NORMALIZED_WINDOW
     constexpr int NORM=((V-1)*(Bits?Bits:8)+16+31)/32;
@@ -58,7 +62,7 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
         scale=__fmul_rn(anchor,__half2float(__ldg(relative+code)));
     }
     float column_scales[V];
-    if constexpr(!RawBook && Columns) {
+    if constexpr(!RawBook && Columns && !Prepared) {
         uint32_t packed_scale[V/2];
         // A compact RTRELL05 image aligns column scales to eight bytes;
         // pairs need four-byte alignment and also cover the compact tail.
@@ -81,6 +85,17 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
             } else if constexpr(V==4) {
                 const int pos=(V-1-j-t)*bits;
                 state=__funnelshift_r(normalized[0],normalized[1],pos)&65535;
+            } else if constexpr(V==8 && Prepared) {
+                const int pos=(V-1-j-t)*bits;
+                const uint64_t window=uint64_t(normalized[0])|(uint64_t(normalized[1])<<32);
+                if(j+t==0) {
+                    const uint32_t lo=pos<32?normalized[0]:normalized[1];
+                    const uint32_t hi=pos<32?normalized[1]:normalized[2];
+                    state=__funnelshift_r(lo,hi,pos&31);
+                } else if(j+t==4)state=__funnelshift_r(normalized[0],normalized[1],pos);
+                else if(j+t>=5)state=normalized[0]>>pos;
+                else state=uint32_t(window>>pos);
+                state&=65535;
             } else if constexpr(V==8) {
                 const int pos=(V-1-j-t)*bits;
                 const uint32_t lo=pos<32?normalized[0]:normalized[1];
@@ -98,7 +113,13 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
         if constexpr(RawBook)consumer(j,z.x,z.y);
         else {
         float s0=scale,s1=scale;
-        if constexpr(Columns){s0=column_scales[j];s1=column_scales[j+1];}
+        if constexpr(Columns) {
+            if constexpr(Prepared) {
+                uint32_t packed=column_pairs[j/2];asm volatile("" : "+v"(packed));
+                const auto columns=__half22float2(__builtin_bit_cast(half2,packed));
+                s0=__fmul_rn(anchor,columns.x);s1=__fmul_rn(anchor,columns.y);
+            } else {s0=column_scales[j];s1=column_scales[j+1];}
+        }
         float scaled0=__fmul_rn(z.x,s0),scaled1=__fmul_rn(z.y,s1);
         asm volatile("" : "+v"(scaled0), "+v"(scaled1));
         if constexpr(HalfOutput) {

@@ -17,16 +17,21 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cfloat>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "../../hip/include/moe_cache_transfer.h"
 #include "../hip/glu.cuh"
 #include "mfq_hip_compat.h"
+#include "moe_route.h"
+#include "moe_dense.cuh"
 
 
 void launch_nint_matmul_routed_cuda(
@@ -165,6 +170,8 @@ __device__ __forceinline__ float load_float<mfq_half>(const mfq_half * ptr, int 
     return __half2float(*reinterpret_cast<const __half *>(ptr + index));
 }
 
+#include "moe_topk512.cuh"
+
 __device__ __forceinline__ float moe_sqrt_softplus(float value) {
     const float softplus = value > 20.0f ? value : log1pf(expf(value));
     return sqrtf(softplus);
@@ -184,13 +191,15 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
         bool normalize,
         bool delayed_softmax,
         float norm_floor,
-        float scale) {
+        float scale,
+        int bias_stride) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     const int lane = threadIdx.x;
     if (row >= rows) {
         return;
     }
 
+    if (bias) bias += static_cast<size_t>(row) * bias_stride;
     const scalar_t * row_logits = logits + static_cast<size_t>(row) * experts;
     float softmax_max = -INFINITY;
     if (!use_sigmoid && !use_sqrt_softplus && !delayed_softmax) {
@@ -325,13 +334,15 @@ __global__ void __launch_bounds__(128) moe_topk_cached_kernel(
         bool normalize,
         bool delayed_softmax,
         float norm_floor,
-        float scale) {
+        float scale,
+        int bias_stride) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     const int lane = threadIdx.x;
     if (row >= rows) {
         return;
     }
 
+    if (bias) bias += static_cast<size_t>(row) * bias_stride;
     const scalar_t * row_logits = logits + static_cast<size_t>(row) * experts;
     float softmax_max = -INFINITY;
     if (!use_sigmoid && !use_sqrt_softplus && !delayed_softmax) {
@@ -573,6 +584,198 @@ __global__ void __launch_bounds__(256) moe_topk_1x256_8_kernel(
             ids[tid] = experts[tid];
             weights[tid] = value / denom;
         }
+    }
+}
+
+__global__ void __launch_bounds__(256) moe_router_gemv_kernel(
+        const half* input,const float* weight,float* output,int width) {
+    const int tid=threadIdx.x,lane=tid&63,wave=tid>>6;
+    weight+=size_t(blockIdx.x)*width;
+    float value=0.f;
+    for(int col=tid*4;col<width;col+=1024) {
+        const auto w=*reinterpret_cast<const float4*>(weight+col);
+        const auto x=*reinterpret_cast<const uint2*>(input+col);
+        const float2 a=__half22float2(__builtin_bit_cast(half2,x.x));
+        const float2 b=__half22float2(__builtin_bit_cast(half2,x.y));
+        value=__fmaf_rn(w.x,a.x,value);value=__fmaf_rn(w.y,a.y,value);
+        value=__fmaf_rn(w.z,b.x,value);value=__fmaf_rn(w.w,b.y,value);
+    }
+    #pragma unroll
+    for(int mask=32;mask>0;mask>>=1)value+=__shfl_down(value,mask,64);
+    __shared__ float partials[4];
+    if(lane==0)partials[wave]=value;
+    __syncthreads();
+    if(tid<32) {
+        value=tid<4?partials[tid]:0.f;
+        value=warp_sum(value);
+        if(tid==0)output[blockIdx.x]=value;
+    }
+}
+
+__global__ void __launch_bounds__(32) moe_topk384_6_sqrtsoftplus_kernel(
+        const float* __restrict__ logits,const float* __restrict__ bias,
+        int32_t* __restrict__ ids,float* __restrict__ weights,
+        int bias_stride,float norm_floor,float scale) {
+    const int lane=threadIdx.x,row=blockIdx.x;
+    logits+=size_t(row)*384;ids+=size_t(row)*6;weights+=size_t(row)*6;
+    if(bias)bias+=size_t(row)*bias_stride;
+    float scores[12];
+    #pragma unroll
+    for(int item=0;item<12;++item) {
+        const int expert=lane+item*32;
+        float raw=logits[expert];raw=isnan(raw)?-FLT_MAX:raw;
+        scores[item]=moe_sqrt_softplus(raw)+(bias?bias[expert]:0.f);
+    }
+    int selected=INT_MAX;
+    #pragma unroll 1
+    for(int rank=0;rank<6;++rank) {
+        float best=-INFINITY;int expert=INT_MAX;
+        #pragma unroll
+        for(int item=0;item<12;++item) {
+            const int candidate=lane+item*32;
+            if(scores[item]>best || (scores[item]==best && candidate<expert)) {
+                best=scores[item];expert=candidate;
+            }
+        }
+        #pragma unroll
+        for(int mask=16;mask>0;mask>>=1) {
+            const float other=__shfl_xor(best,mask,32);
+            const int other_id=__shfl_xor(expert,mask,32);
+            if(other>best || (other==best && other_id<expert)) {best=other;expert=other_id;}
+        }
+        if(lane==rank)selected=expert;
+        #pragma unroll
+        for(int item=0;item<12;++item)
+            if(expert==lane+item*32)scores[item]=__int_as_float(0x7fffffff);
+    }
+    float value=0.f;
+    if(lane<6) {
+        ids[lane]=selected;
+        float raw=selected<384?logits[selected]:-INFINITY;
+        raw=isnan(raw)?-FLT_MAX:raw;
+        value=selected<384?moe_sqrt_softplus(raw):-INFINITY;
+    }
+    const float denominator=fmaxf(warp_sum(value),norm_floor);
+    if(lane<6)weights[lane]=value/denominator*scale;
+}
+
+
+__device__ __forceinline__ uint64_t route_key(float score,int id) {
+    if(isnan(score))return 0;
+    if(score==0.f)score=0.f;
+    const uint32_t bits=__float_as_uint(score);
+    const uint32_t ordered=bits^((bits>>31)?0xffffffffu:0x80000000u);
+    return (uint64_t(ordered)<<32)|uint32_t(0xffffffffu-uint32_t(id));
+}
+__device__ __forceinline__ uint64_t key_xor(uint64_t v,int mask,int width) {
+    return uint64_t(__shfl_xor(uint32_t(v),mask,width))|
+        (uint64_t(__shfl_xor(uint32_t(v>>32),mask,width))<<32);
+}
+template<int Threads>__global__ __launch_bounds__(Threads) void moe_topk_key_kernel(
+        const float* logits,const float* bias,int32_t* ids,float* weights,
+        int bias_stride,float norm_floor,float scale) {
+    constexpr int Items=(384+Threads-1)/Threads,Waves=Threads/64;
+    const int tid=threadIdx.x,lane=tid&63,wave=tid>>6,row=blockIdx.x;
+    logits+=size_t(row)*384;ids+=size_t(row)*6;weights+=size_t(row)*6;
+    if(bias)bias+=size_t(row)*bias_stride;
+    uint64_t scores[Items];
+    #pragma unroll
+    for(int item=0;item<Items;++item) {
+        const int expert=tid+item*Threads;
+        float raw=expert<384?logits[expert]:-INFINITY;raw=isnan(raw)?-FLT_MAX:raw;
+        scores[item]=expert<384?route_key(moe_sqrt_softplus(raw)+(bias?bias[expert]:0.f),expert):0;
+    }
+    __shared__ uint64_t wave_keys[Waves];
+    __shared__ int winner;
+    int selected=INT_MAX;
+    #pragma unroll 1
+    for(int rank=0;rank<6;++rank) {
+        uint64_t best=route_key(-INFINITY,INT_MAX);
+        #pragma unroll
+        for(int item=0;item<Items;++item)best=scores[item]>best?scores[item]:best;
+        #pragma unroll
+        for(int mask=32;mask;mask>>=1){const auto other=key_xor(best,mask,64);best=other>best?other:best;}
+        int expert;
+        if constexpr(Waves>1) {
+            if(lane==0)wave_keys[wave]=best;
+            __syncthreads();
+            if(tid<32) {
+                best=tid<Waves?wave_keys[tid]:route_key(-INFINITY,INT_MAX);
+                #pragma unroll
+                for(int mask=Waves/2;mask;mask>>=1){const auto other=key_xor(best,mask,Waves);best=other>best?other:best;}
+                if(tid==0)winner=int(~uint32_t(best));
+            }
+            __syncthreads();expert=winner;
+        } else expert=int(~uint32_t(best));
+        if(tid==rank)selected=expert;
+        #pragma unroll
+        for(int item=0;item<Items;++item)if(expert==tid+item*Threads)scores[item]=0;
+    }
+    if(tid<32) {
+        float value=0;
+        if(tid<6){ids[tid]=selected;float raw=selected<384?logits[selected]:-INFINITY;raw=isnan(raw)?-FLT_MAX:raw;value=selected<384?moe_sqrt_softplus(raw):-INFINITY;}
+        const float denominator=fmaxf(warp_sum(value),norm_floor);
+        if(tid<6)weights[tid]=value/denominator*scale;
+    }
+}
+
+__global__ void __launch_bounds__(256) moe_topk384_6_parallel_kernel(
+        const float* __restrict__ logits,const float* __restrict__ bias,
+        int32_t* __restrict__ ids,float* __restrict__ weights,
+        int bias_stride,float norm_floor,float scale) {
+    const int tid=threadIdx.x,lane=tid&63,wave=tid>>6,row=blockIdx.x;
+    logits+=size_t(row)*384;ids+=size_t(row)*6;weights+=size_t(row)*6;
+    if(bias)bias+=size_t(row)*bias_stride;
+    float scores[2];
+    #pragma unroll
+    for(int item=0;item<2;++item) {
+        const int expert=tid+item*256;
+        float raw=expert<384?logits[expert]:-INFINITY;raw=isnan(raw)?-FLT_MAX:raw;
+        scores[item]=expert<384?moe_sqrt_softplus(raw)+(bias?bias[expert]:0.f):-INFINITY;
+    }
+    __shared__ float wave_scores[4];
+    __shared__ int wave_ids[4],winner;
+    int selected=INT_MAX;
+    #pragma unroll 1
+    for(int rank=0;rank<6;++rank) {
+        float best=-INFINITY;int expert=INT_MAX;
+        #pragma unroll
+        for(int item=0;item<2;++item) {
+            const int candidate=tid+item*256;
+            if(candidate<384 && (scores[item]>best || (scores[item]==best && candidate<expert))) {
+                best=scores[item];expert=candidate;
+            }
+        }
+        #pragma unroll
+        for(int mask=32;mask>0;mask>>=1) {
+            const float other=__shfl_xor(best,mask,64);const int other_id=__shfl_xor(expert,mask,64);
+            if(other>best || (other==best && other_id<expert)) {best=other;expert=other_id;}
+        }
+        if(lane==0) {wave_scores[wave]=best;wave_ids[wave]=expert;}
+        __syncthreads();
+        if(tid<32) {
+            best=tid<4?wave_scores[tid]:-INFINITY;expert=tid<4?wave_ids[tid]:INT_MAX;
+            #pragma unroll
+            for(int mask=2;mask>0;mask>>=1) {
+                const float other=__shfl_xor(best,mask,4);const int other_id=__shfl_xor(expert,mask,4);
+                if(other>best || (other==best && other_id<expert)) {best=other;expert=other_id;}
+            }
+            if(tid==0)winner=expert;
+        }
+        __syncthreads();
+        if(tid==rank)selected=winner;
+        #pragma unroll
+        for(int item=0;item<2;++item)
+            if(winner==tid+item*256)scores[item]=__int_as_float(0x7fffffff);
+    }
+    if(tid<32) {
+        float value=0.f;
+        if(tid<6) {
+            ids[tid]=selected;float raw=selected<384?logits[selected]:-INFINITY;
+            raw=isnan(raw)?-FLT_MAX:raw;value=selected<384?moe_sqrt_softplus(raw):-INFINITY;
+        }
+        const float denominator=fmaxf(warp_sum(value),norm_floor);
+        if(tid<6)weights[tid]=value/denominator*scale;
     }
 }
 
@@ -1167,6 +1370,111 @@ __device__ __forceinline__ void nint8_zero_moe_mma_profile(
     static_assert(BK % 16 == 0 && BK <= kMoeMmaMaxBkStride);
     static_assert(BM == 16 || BM == 32 || BM == 64);
 
+#if defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+    const int tid=int(threadIdx.y)*32+threadIdx.x;
+    const int lane=tid&63,wave=tid>>6;
+    using H4=_Float16 __attribute__((ext_vector_type(4)));
+    using F4=float __attribute__((ext_vector_type(4)));
+    F4 acc[MTILES]{};
+    const int chunks = (groups + GROUPS_PER_CHUNK - 1) / GROUPS_PER_CHUNK;
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        const int gbase = chunk * GROUPS_PER_CHUNK;
+        const int kb = gbase * GS;
+        const int weight_tasks = kMoeMmaBn * GROUPS_PER_CHUNK;
+        for (int task = tid; task < weight_tasks; task += 256) {
+            const int nn = task / GROUPS_PER_CHUNK;
+            const int gl = task - nn * GROUPS_PER_CHUNK;
+            const int gn = n0 + nn;
+            const int group = gbase + gl;
+            const bool valid = gn < out_per_expert && group < groups;
+            const int8_t * qg = nullptr;
+            float d = 0.0f;
+            if (valid) {
+                const int weight_row =
+                    local_expert * weight_out_stride + weight_row_offset + gn;
+                const size_t meta = static_cast<size_t>(weight_row) * groups + group;
+                qg = reinterpret_cast<const int8_t *>(q + meta * GS);
+                d = __half2float(scale[meta]);
+            }
+#pragma unroll
+            for (int i = 0; i < GS; ++i) {
+                const float value = valid
+                    ? d * static_cast<float>(qg[i])
+                    : 0.0f;
+                W_s[nn][gl * GS + i] = __float2half_rn(value);
+            }
+        }
+
+        constexpr int kActivationVectorWidth = 8;
+        static_assert(BK % kActivationVectorWidth == 0);
+        constexpr int kActivationVectorsPerRow =
+            BK / kActivationVectorWidth;
+        constexpr int kActivationVectors =
+            BM * kActivationVectorsPerRow;
+        for (int index = tid; index < kActivationVectors; index += 256) {
+            const int mm = index / kActivationVectorsPerRow;
+            const int vector_local =
+                index - mm * kActivationVectorsPerRow;
+            const int k_local = vector_local * kActivationVectorWidth;
+            const int compact = first + mm;
+            const int k = kb + k_local;
+            __half * destination = &X_s[mm][k_local];
+            int source_row = -1;
+            if (compact < last) {
+                const int pair = ids_dst[compact];
+                source_row = routed_input ? pair : pair / routes;
+            }
+            if (source_row < 0 || k >= k_real) {
+                *reinterpret_cast<int4 *>(destination) =
+                    make_int4(0, 0, 0, 0);
+            } else if ((k_real & 7) == 0 && k + 7 < k_real) {
+                *reinterpret_cast<int4 *>(destination) =
+                    *reinterpret_cast<const int4 *>(
+                        x + static_cast<size_t>(source_row) * k_real + k);
+            } else {
+#pragma unroll
+                for (int element = 0;
+                     element < kActivationVectorWidth;
+                     ++element) {
+                    destination[element] = k + element < k_real
+                        ? x[static_cast<size_t>(source_row) * k_real +
+                            k + element]
+                        : __float2half_rn(0.0f);
+                }
+            }
+        }
+        __syncthreads();
+
+
+        // One CDNA wave computes a 16-column expert tile. MFMA accumulates
+        // in FP32; only the final routed output is rounded to FP16.
+        #pragma unroll
+        for(int ks=0;ks<BK;ks+=16) {
+            const H4 a=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                &W_s[wave*16+(lane&15)][ks+(lane>>4)*4]));
+            #pragma unroll
+            for(int mi=0;mi<MTILES;++mi) {
+                const H4 b=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                    &X_s[mi*16+(lane&15)][ks+(lane>>4)*4]));
+                acc[mi]=__builtin_amdgcn_mfma_f32_16x16x16f16(a,b,acc[mi],0,0,0);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for(int mi=0;mi<MTILES;++mi) {
+        const int compact=first+mi*16+(lane&15);
+        if(compact<last) {
+            const int pair=ids_dst[compact];
+            #pragma unroll
+            for(int j=0;j<4;++j) {
+                const int gn=n0+wave*16+(lane>>4)*4+j;
+                if(gn<out_per_expert)out[size_t(pair)*out_per_expert+gn]=__float2half_rn(acc[mi][j]);
+            }
+        }
+    }
+    __syncthreads();
+#else
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int tid = warp * 32 + lane;
@@ -1317,6 +1625,7 @@ __device__ __forceinline__ void nint8_zero_moe_mma_profile(
         }
         __syncthreads();
     }
+#endif
 }
 
 template <int BM, bool COARSE_TILES = false>
@@ -1571,16 +1880,31 @@ void build_expert_map(
     int32_t * tertiary_experts_ptr = has_tertiary
         ? tertiary_tile_experts->data_ptr<int32_t>() : nullptr;
 
+    const MfqMoeRouteScanView scan_view{
+        counts.data_ptr<int32_t>(),cursors.data_ptr<int32_t>(),
+        expert_bounds.data_ptr<int32_t>(),tile_bounds.data_ptr<int32_t>(),
+        secondary_bounds_ptr,tertiary_bounds_ptr,experts,tile_m,
+        secondary_tile_m,tertiary_tile_m};
+    const MfqMoeRouteMapView map_view{
+        scan_view,ids.data_ptr<int32_t>(),ids_dst.data_ptr<int32_t>(),
+        tile_experts.data_ptr<int32_t>(),secondary_experts_ptr,tertiary_experts_ptr,pairs};
+    if(mfq_moe_route_map_fast_cuda(map_view,ids.get_device(),stream)) {
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
+    }
+
     MFQ_CUDA_CHECK(hipMemsetAsync(counts.data_ptr<int32_t>(), 0, experts * sizeof(int32_t), stream));
     const int block = 256;
     const int grid = ::min((pairs + block - 1) / block, 65535);
    hipLaunchKernelGGL(( count_experts_kernel), dim3(grid), dim3(block), 0, stream, 
         ids.data_ptr<int32_t>(), counts.data_ptr<int32_t>(), pairs, experts);
-   hipLaunchKernelGGL(( scan_expert_counts_kernel), dim3(1), dim3(1), 0, stream, 
+    if(!mfq_moe_route_scan_parallel_cuda(scan_view,ids.get_device(),stream)) {
+   hipLaunchKernelGGL(( scan_expert_counts_kernel), dim3(1), dim3(1), 0, stream,
         counts.data_ptr<int32_t>(), cursors.data_ptr<int32_t>(),
         expert_bounds.data_ptr<int32_t>(), tile_bounds.data_ptr<int32_t>(),
         secondary_bounds_ptr, tertiary_bounds_ptr, experts, tile_m,
         secondary_tile_m, tertiary_tile_m);
+    }
    hipLaunchKernelGGL(( fill_tile_experts_kernel), dim3((experts + 255) / 256), dim3(256), 0, stream, 
         tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
         secondary_bounds_ptr, secondary_experts_ptr,
@@ -1829,6 +2153,21 @@ void mfq::moe_cache_mapped_gather_cuda(
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+mfq_tensor_backend::Tensor moe_router_gemv_cuda(
+        mfq_tensor_backend::Tensor input,mfq_tensor_backend::Tensor weight) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.scalar_type()==tb::kFloat16 &&
+        input.dim()==2 && input.size(0)==1 && weight.is_cuda() && weight.device()==input.device() &&
+        weight.is_contiguous() && weight.scalar_type()==tb::kFloat32 && weight.dim()==2 &&
+        weight.size(0)>0 && weight.size(0)<=INT_MAX && weight.size(1)==input.size(1) &&
+        input.size(1)>0 && input.size(1)<=INT_MAX && input.size(1)%4==0,"invalid native MoE router GEMV");
+    MfqCudaGuard guard(input.device());
+    auto output=tb::empty({1,weight.size(0)},input.options().dtype(tb::kFloat32));
+    moe_router_gemv_kernel<<<int(weight.size(0)),256,0,mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half*>(input.data_ptr<mfq_half>()),weight.data_ptr<float>(),output.data_ptr<float>(),int(input.size(1)));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
+}
+
 std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
         mfq_tensor_backend::Tensor logits,
         int64_t top_k,
@@ -1857,12 +2196,16 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     MFQ_RUNTIME_CHECK(!(use_sigmoid && use_sqrt_softplus),
         "sigmoid and sqrt-softplus routing are mutually exclusive");
     const float * bias_ptr = nullptr;
+    int bias_stride = 0;
     if (bias.has_value()) {
         auto & value = bias.value();
         MFQ_RUNTIME_CHECK(value.is_cuda() && value.is_contiguous() && value.scalar_type() == mfq_tensor_backend::kFloat32 &&
-            value.numel() == experts, "bias must be contiguous CUDA float32 [experts]");
+            ((value.dim()==1 && value.size(0)==experts) ||
+             (value.dim()==2 && value.size(0)==rows && value.size(1)==experts)),
+            "bias must be contiguous float32 [experts] or [tokens,experts]");
         check_same_device(logits, value, "bias");
         bias_ptr = value.data_ptr<float>();
+        bias_stride = value.dim()==2 ? experts : 0;
     }
 
     auto ids = mfq_tensor_backend::empty({rows, top_k}, logits.options().dtype(mfq_tensor_backend::kInt32));
@@ -1897,6 +2240,47 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return {ids, weights};
     }
+    const char* topk512_flag = std::getenv("MFQ_MOE_TOPK_512");
+    const auto* topk512_batch = std::getenv("MFQ_MOE_TOPK_512_BATCH");
+    if ((rows == 1 || (rows <= 6 && (!topk512_batch || topk512_batch[0] != '0'))) &&
+            experts == 512 && top_k == 10 && bias_ptr == nullptr &&
+            !use_sigmoid && !use_sqrt_softplus && normalize && !delayed_softmax &&
+            (topk512_flag == nullptr || std::atoi(topk512_flag) != 0)) {
+        if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
+            hipLaunchKernelGGL((topk512_specialized_kernel<mfq_half, true>),
+                dim3(rows), dim3(32), 0, stream,
+                logits.data_ptr<mfq_half>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
+                static_cast<float>(norm_floor), static_cast<float>(scale));
+        } else {
+            hipLaunchKernelGGL((topk512_specialized_kernel<float, true>),
+                dim3(rows), dim3(32), 0, stream,
+                logits.data_ptr<float>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
+                static_cast<float>(norm_floor), static_cast<float>(scale));
+        }
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return {ids, weights};
+    }
+    static const int topk384_enabled=[] {
+        const char* value=std::getenv("MFQ_HIP_MOE_TOPK384");
+        return value?std::atoi(value):3;
+    }();
+    if(topk384_enabled && rows<=6 && experts==384 && top_k==6 &&
+       logits.scalar_type()==mfq_tensor_backend::kFloat32 &&
+       !use_sigmoid && use_sqrt_softplus && normalize && !delayed_softmax) {
+        if(topk384_enabled==3) {
+            moe_topk_key_kernel<256><<<rows,256,0,stream>>>(logits.data_ptr<float>(),bias_ptr,
+                ids.data_ptr<int32_t>(),weights.data_ptr<float>(),bias_stride,float(norm_floor),float(scale));
+            static const bool log=std::getenv("MFQ_HIP_MOE_TOPK384_LOG")!=nullptr;
+            static std::atomic_flag logged=ATOMIC_FLAG_INIT;
+            if(log && !logged.test_and_set(std::memory_order_relaxed))
+                std::fprintf(stderr,"native_moe_topk_key experts=384 top_k=6 threads=256\n");
+        } else if(topk384_enabled==2)
+        moe_topk384_6_parallel_kernel<<<rows,256,0,stream>>>(logits.data_ptr<float>(),bias_ptr,
+            ids.data_ptr<int32_t>(),weights.data_ptr<float>(),bias_stride,float(norm_floor),float(scale));
+        else moe_topk384_6_sqrtsoftplus_kernel<<<rows,32,0,stream>>>(logits.data_ptr<float>(),bias_ptr,
+            ids.data_ptr<int32_t>(),weights.data_ptr<float>(),bias_stride,float(norm_floor),float(scale));
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return {ids,weights};
+    }
     const dim3 block(32, 4);
     const int grid = (rows + 3) / 4;
     // Capacity is a register-cache bound; all routing parameters remain runtime values.
@@ -1909,13 +2293,13 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
             logits.data_ptr<mfq_half>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
-            static_cast<float>(norm_floor), static_cast<float>(scale));
+            static_cast<float>(norm_floor), static_cast<float>(scale), bias_stride);
     } else {
        hipLaunchKernelGGL(( moe_topk_cached_kernel<float>), dim3(grid), dim3(block), 0, stream, 
             logits.data_ptr<float>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
-            static_cast<float>(norm_floor), static_cast<float>(scale));
+            static_cast<float>(norm_floor), static_cast<float>(scale), bias_stride);
     }
     } else {
     if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
@@ -1923,13 +2307,13 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
             logits.data_ptr<mfq_half>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
-            static_cast<float>(norm_floor), static_cast<float>(scale));
+            static_cast<float>(norm_floor), static_cast<float>(scale), bias_stride);
     } else {
        hipLaunchKernelGGL(( moe_topk_kernel<float>), dim3(grid), dim3(block), 0, stream, 
             logits.data_ptr<float>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
-            static_cast<float>(norm_floor), static_cast<float>(scale));
+            static_cast<float>(norm_floor), static_cast<float>(scale), bias_stride);
     }
     }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2650,4 +3034,103 @@ mfq_tensor_backend::Tensor moe_weighted_reduce_shared_gate_cuda(
         tokens, routes, width);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+mfq_tensor_backend::Tensor moe_dense_matmul_hip(
+    const mfq_tensor_backend::Tensor& weight,const mfq_tensor_backend::Tensor& source,
+    const mfq_tensor_backend::Tensor& route_ids) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && source.is_cuda() && route_ids.is_cuda() &&
+        weight.device()==source.device() && weight.device()==route_ids.device() &&
+        weight.dim()==3 && route_ids.dim()==2 && (source.dim()==2 || source.dim()==3) &&
+        source.size(0)==route_ids.size(0) && source.size(-1)==weight.size(2) &&
+        (source.dim()==2 || source.size(1)==route_ids.size(1)) && weight.size(0)>0 && weight.size(0)<=4096 &&
+        weight.size(1)>0 && weight.size(1)<=INT_MAX && weight.size(2)>0 && weight.size(2)<=INT_MAX &&
+        route_ids.numel()<=INT_MAX,"invalid dense routed projection geometry");
+    const auto type=weight.scalar_type();
+    MFQ_RUNTIME_CHECK(type==tb::kFloat16 || type==tb::kBFloat16 || type==tb::kFloat32,"invalid dense expert dtype");
+    MfqCudaGuard guard(weight.device());
+    auto w=weight.contiguous(),x=source.to(type).contiguous(),ids=route_ids.to(tb::kInt32).contiguous();
+    const int tokens=ids.size(0),routes=ids.size(1),experts=w.size(0),rows=w.size(1),columns=w.size(2);
+    auto output=tb::zeros({tokens,routes,rows},w.options());
+    if(!ids.numel())return output;
+    const bool routed=x.dim()==3;
+    hipDeviceProp_t properties{};MFQ_CUDA_CHECK(hipGetDeviceProperties(&properties,w.get_device()));
+    const bool cdna=std::strncmp(properties.gcnArchName,"gfx90a",6)==0 ||
+        std::strncmp(properties.gcnArchName,"gfx94",5)==0;
+    std::vector<tb::Tensor> plan;
+    if(tokens>6 && cdna)plan=moe_build_expert_map_cuda(ids,experts,16);
+    const auto launch=[&](auto scalar) {
+        using Scalar=decltype(scalar);
+        if(plan.empty()) {
+            const int waves=256/properties.warpSize;
+            hipLaunchKernelGGL((mfq_hip_dense_moe::decode<Scalar>),dim3((rows+waves-1)/waves,ids.numel()),dim3(256),0,
+                mfq_current_cuda_stream(),w.data_ptr<Scalar>(),x.data_ptr<Scalar>(),ids.data_ptr<int32_t>(),
+                output.data_ptr<Scalar>(),experts,rows,columns,routes,routed);
+        } else {
+            const int64_t tasks=(int64_t(ids.numel())+experts)*((rows+63)/64);
+            const int blocks=int(std::min<int64_t>(4096,tasks));
+            hipLaunchKernelGGL((mfq_hip_dense_moe::grouped<Scalar>),dim3(blocks),dim3(256),0,
+                mfq_current_cuda_stream(),w.data_ptr<Scalar>(),x.data_ptr<Scalar>(),plan[0].data_ptr<int32_t>(),
+                plan[1].data_ptr<int32_t>(),plan[2].data_ptr<int32_t>(),plan[3].data_ptr<int32_t>(),
+                output.data_ptr<Scalar>(),experts,rows,columns,routes,routed);
+        }
+    };
+    if(type==tb::kFloat16)launch(mfq_half{});else if(type==tb::kBFloat16)launch(mfq_bfloat16{});else launch(float{});
+    MFQ_CUDA_CHECK(hipGetLastError());return output;
+}
+
+namespace {
+template<class Scalar>
+__global__ void dense_moe_glu_kernel(const Scalar* input,Scalar* output,int64_t count,int width) {
+    for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=int64_t(blockDim.x)*gridDim.x) {
+        const int64_t base=(i/width)*(2*width)+i%width;
+        const Scalar gate=input[base],up=input[base+width];
+        const Scalar sigmoid=static_cast<Scalar>(1.f/(1.f+expf(-float(gate))));
+        const Scalar activated=static_cast<Scalar>(__fmul_rn(float(gate),float(sigmoid)));
+        output[i]=static_cast<Scalar>(__fmul_rn(float(activated),float(up)));
+    }
+}
+template<class Scalar>
+__global__ void dense_moe_reduce_kernel(const Scalar* input,const float* weights,Scalar* output,
+    int64_t count,int width,int routes) {
+    for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=int64_t(blockDim.x)*gridDim.x) {
+        const int64_t token=i/width,column=i%width;float value=0.f;
+        for(int r=0;r<routes;++r)value=__fadd_rn(value,__fmul_rn(float(input[(token*routes+r)*width+column]),weights[token*routes+r]));
+        output[i]=static_cast<Scalar>(value);
+    }
+}
+}
+mfq_tensor_backend::Tensor moe_dense_swiglu_hip(const mfq_tensor_backend::Tensor& input) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.dim()==3 &&
+        input.size(2)>0 && input.size(2)%2==0,"invalid dense MoE GLU geometry");
+    const auto type=input.scalar_type();
+    MFQ_RUNTIME_CHECK(type==tb::kFloat16 || type==tb::kBFloat16 || type==tb::kFloat32,"invalid dense MoE GLU dtype");
+    MfqCudaGuard guard(input.device());auto shape=input.sizes().vec();shape.back()/=2;
+    auto output=tb::empty(shape,input.options());if(!output.numel())return output;
+    const int blocks=int(std::min<int64_t>(65535,(output.numel()+255)/256));
+    const auto launch=[&](auto scalar){using Scalar=decltype(scalar);
+        hipLaunchKernelGGL((dense_moe_glu_kernel<Scalar>),dim3(blocks),dim3(256),0,mfq_current_cuda_stream(),
+            input.data_ptr<Scalar>(),output.data_ptr<Scalar>(),output.numel(),int(shape.back()));};
+    if(type==tb::kFloat16)launch(mfq_half{});else if(type==tb::kBFloat16)launch(mfq_bfloat16{});else launch(float{});
+    MFQ_CUDA_CHECK(hipGetLastError());return output;
+}
+mfq_tensor_backend::Tensor moe_dense_weighted_reduce_hip(const mfq_tensor_backend::Tensor& input,
+    const mfq_tensor_backend::Tensor& weights) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.dim()==3 &&
+        weights.is_cuda() && weights.device()==input.device() && weights.is_contiguous() &&
+        weights.scalar_type()==tb::kFloat32 && weights.dim()==2 &&
+        weights.size(0)==input.size(0) && weights.size(1)==input.size(1),"invalid dense MoE reduction geometry");
+    const auto type=input.scalar_type();
+    MFQ_RUNTIME_CHECK(type==tb::kFloat16 || type==tb::kBFloat16 || type==tb::kFloat32,"invalid dense MoE reduction dtype");
+    MfqCudaGuard guard(input.device());auto output=tb::empty({input.size(0),input.size(2)},input.options());
+    if(!output.numel())return output;
+    const int blocks=int(std::min<int64_t>(65535,(output.numel()+255)/256));
+    const auto launch=[&](auto scalar){using Scalar=decltype(scalar);
+        hipLaunchKernelGGL((dense_moe_reduce_kernel<Scalar>),dim3(blocks),dim3(256),0,mfq_current_cuda_stream(),
+            input.data_ptr<Scalar>(),weights.data_ptr<float>(),output.data_ptr<Scalar>(),output.numel(),int(input.size(2)),int(input.size(1)));};
+    if(type==tb::kFloat16)launch(mfq_half{});else if(type==tb::kBFloat16)launch(mfq_bfloat16{});else launch(float{});
+    MFQ_CUDA_CHECK(hipGetLastError());return output;
 }

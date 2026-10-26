@@ -26,6 +26,7 @@
 #include "../hip/async_copy.cuh"
 #include "../hip/glu.cuh"
 #include "../../hip/include/mfq_tensor_backend.h"
+#include "mfq_hip_quant_ops.h"
 #include "../hip/packed_backward.cuh"
 #include "../hip/packed_nint.cuh"
 #include "mfq_hip_compat.h"
@@ -95,6 +96,7 @@ __global__ void nint8_one_quantize_reconstruct_kernel(
 }
 
 
+template<class Output>
 __global__ void nint_decode_rows_kernel(
         const uint8_t * __restrict__ bitstream,
         const uint8_t * __restrict__ row_q_bits,
@@ -103,7 +105,7 @@ __global__ void nint_decode_rows_kernel(
         const uint8_t * __restrict__ subgroup_minimum,
         const float * __restrict__ neuron_scale,
         const float * __restrict__ neuron_minimum,
-        __half * __restrict__ output,
+        Output * __restrict__ output,
         int rows,
         int groups,
         int group_size,
@@ -127,7 +129,7 @@ __global__ void nint_decode_rows_kernel(
             static_cast<float>(subgroup_scale[metadata]);
         const float minimum = neuron_minimum[row] *
             static_cast<float>(subgroup_minimum[metadata]);
-        output[index] = __float2half_rn(
+        output[index] = static_cast<Output>(
             scale * static_cast<float>(code) - minimum);
     }
 }
@@ -341,6 +343,7 @@ __device__ __forceinline__ void nint_prefill_load_activation_tile(
 }
 
 
+template<bool Bounded=false>
 __device__ __forceinline__ void nint_prefill_load_weight_tile(
         const uint8_t * __restrict__ expert_stream,
         const uint8_t * __restrict__ row_q_bits,
@@ -359,7 +362,7 @@ __device__ __forceinline__ void nint_prefill_load_weight_tile(
         int result_row_base,
         int column_base,
         int projection,
-        int thread) {
+        int thread,uint64_t packed_bytes=0) {
     constexpr int values_per_vector = 8;
     constexpr int vectors_per_row =
         kNintPrefillTileK / values_per_vector;
@@ -404,12 +407,21 @@ __device__ __forceinline__ void nint_prefill_load_weight_tile(
         const int valid_values = valid_row && column < input_width
             ? min(values_per_vector, input_width - column)
             : 0;
-        const uint64_t codes = valid_values > 0
-            ? unpack_nint_codes8_packed(
-                expert_stream,
-                row_bit_offset + static_cast<uint64_t>(column) * bits,
-                bits)
-            : 0u;
+        uint64_t codes=0;
+        if(valid_values>0) {
+            const uint64_t bit=row_bit_offset+uint64_t(column)*bits,byte=bit>>3;
+            if constexpr(Bounded) {
+                if(byte<=packed_bytes && packed_bytes-byte>=9)codes=unpack_nint_codes8_packed(expert_stream,bit,bits);
+                else {
+                    const int shift=int(bit&7),bytes=(shift+valid_values*bits+7)/8;
+                    uint64_t low=0;uint8_t high=0;
+                    for(int i=0;i<bytes;++i)if(byte+uint64_t(i)<packed_bytes) {
+                        if(i<8)low|=uint64_t(expert_stream[byte+i])<<(8*i);else high=expert_stream[byte+i];
+                    }
+                    codes=shift?(low>>shift)|(uint64_t(high)<<(64-shift)):low;
+                }
+            } else codes=unpack_nint_codes8_packed(expert_stream,bit,bits);
+        }
         const uint32_t code_mask = bits > 0 ? (1u << bits) - 1u : 0u;
         const size_t metadata_base = static_cast<size_t>(weight_row) * groups;
 
@@ -519,6 +531,136 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
         int pool_phase,
         int epilogue_mode,
         bool routed_input) {
+#if defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+    static_assert(
+        TileM == 16 || TileM == 32 || TileM == 64 || TileM == 128);
+    constexpr int matrix_tiles_m = TileM / 16;
+    constexpr int matrix_tiles_n = kNintPrefillTileN / 16;
+    constexpr int accumulators_per_warp = (matrix_tiles_m + 1) / 2;
+    constexpr int operand_halves =
+        (kNintPrefillTileN + TileM) * kNintPrefillStrideK;
+    constexpr int output_floats =
+        2 * kNintPrefillWarps * 16 * 16;
+    constexpr int operand_bytes = operand_halves * sizeof(__half);
+    constexpr int output_bytes = output_floats * sizeof(float);
+    constexpr int shared_bytes =
+        operand_bytes > output_bytes ? operand_bytes : output_bytes;
+    __shared__ __align__(16) uint8_t storage[shared_bytes];
+    __half * weight_tile = reinterpret_cast<__half *>(storage);
+    __half * activation_tile = weight_tile +
+        kNintPrefillTileN * kNintPrefillStrideK;
+
+    const int lane = static_cast<int>(threadIdx.x);
+    const int warp = static_cast<int>(threadIdx.y);
+    const int thread = warp * 32 + lane;
+    const int warp_m0 = warp / matrix_tiles_n;
+    const int warp_n = warp - warp_m0 * matrix_tiles_n;
+    const int result_rows = FusedGlu ? output_rows / 2 : output_rows;
+    constexpr int projections = FusedGlu ? 2 : 1;
+    const int output_tiles =
+        (result_rows + kNintPrefillTileN - 1) / kNintPrefillTileN;
+    const int total_tiles = tile_bounds[experts];
+    const int64_t total_tasks =
+        static_cast<int64_t>(total_tiles) * output_tiles;
+
+    const int physical_lane=thread&63,physical_wave=thread>>6;
+    using H4=_Float16 __attribute__((ext_vector_type(4)));
+    using F4=float __attribute__((ext_vector_type(4)));
+    const int64_t task_shift = total_tasks == 0
+        ? 0
+        : (static_cast<int64_t>(pool_phase) * 17 * output_tiles) %
+            total_tasks;
+    for (int64_t logical_task = blockIdx.x;
+         logical_task < total_tasks;
+         logical_task += gridDim.x) {
+        const int64_t task = (logical_task + task_shift) % total_tasks;
+        const int tile = static_cast<int>(task / output_tiles);
+        const int output_tile = static_cast<int>(
+            task - static_cast<int64_t>(tile) * output_tiles);
+        const int expert = tile_experts[tile];
+        const int local_expert = expert_local[expert];
+        if (local_expert < 0) {
+            continue;
+        }
+        const int local_tile = tile - tile_bounds[expert];
+        const int first = expert_bounds[expert] + local_tile * TileM;
+        const int last = min(first + TileM, expert_bounds[expert + 1]);
+        const int result_row_base = output_tile * kNintPrefillTileN;
+        const uint8_t * expert_stream = bitstream +
+            static_cast<size_t>(local_expert) * q_expert_stride;
+
+        F4 accumulators[projections][matrix_tiles_m]{};
+        const auto compute=[&](int projection,int column_base) {
+            #pragma unroll
+            for(int k=0;k<kNintPrefillTileK;k+=16) {
+                if(column_base+k<input_width) {
+                    const H4 a=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                        weight_tile+(physical_wave*16+(physical_lane&15))*kNintPrefillStrideK+k+(physical_lane>>4)*4));
+                    #pragma unroll
+                    for(int mi=0;mi<matrix_tiles_m;++mi) {
+                        const H4 b=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                            activation_tile+(mi*16+(physical_lane&15))*kNintPrefillStrideK+k+(physical_lane>>4)*4));
+                        accumulators[projection][mi]=__builtin_amdgcn_mfma_f32_16x16x16f16(a,b,accumulators[projection][mi],0,0,0);
+                    }
+                }
+            }
+        };
+        for (int column_base = 0; column_base < input_width;
+             column_base += kNintPrefillTileK) {
+            nint_prefill_load_activation_tile<AsyncActivation, TileM>(
+                input, ids_dst, activation_tile, first, last, routes,
+                input_width, column_base, routed_input, thread);
+            if constexpr (AsyncActivation) {
+                mfq::cuda_detail::copy_async_commit();
+            }
+            nint_prefill_load_weight_tile(
+                expert_stream, row_q_bits, row_q_bit_offsets,
+                subgroup_scale, subgroup_minimum, neuron_scale,
+                neuron_minimum, weight_tile, local_expert, output_rows,
+                result_rows, groups, group_size, input_width,
+                result_row_base, column_base, 0, thread);
+            if constexpr (AsyncActivation) {
+                mfq::cuda_detail::copy_async_wait();
+            }
+            __syncthreads();
+
+            compute(0,column_base);
+            __syncthreads();
+            if constexpr (FusedGlu) {
+                nint_prefill_load_weight_tile(
+                    expert_stream, row_q_bits, row_q_bit_offsets,
+                    subgroup_scale, subgroup_minimum, neuron_scale,
+                    neuron_minimum, weight_tile, local_expert, output_rows,
+                    result_rows, groups, group_size, input_width,
+                    result_row_base, column_base, 1, thread);
+                __syncthreads();
+                compute(1,column_base);
+                __syncthreads();
+            }
+        }
+        #pragma unroll
+        for(int mi=0;mi<matrix_tiles_m;++mi) {
+            const int compact=first+mi*16+(physical_lane&15);
+            if(compact<last) {
+                const int pair=ids_dst[compact];
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    const int row=result_row_base+physical_wave*16+(physical_lane>>4)*4+j;
+                    if(row<result_rows) {
+                        float value=accumulators[0][mi][j];
+                        if constexpr(FusedGlu) {
+                            const float gate=__half2float(__float2half_rn(value));
+                            const float up=__half2float(__float2half_rn(accumulators[1][mi][j]));
+                            value=mfq_glu_runtime(gate,up,epilogue_mode==2?1:0);
+                        }
+                        output[size_t(pair)*result_rows+row]=__float2half_rn(value);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+#else
     static_assert(
         TileM == 16 || TileM == 32 || TileM == 64 || TileM == 128);
     constexpr int matrix_tiles_m = TileM / 16;
@@ -746,8 +888,8 @@ __global__ void __launch_bounds__(256, 1) nint_matmul_tiled_prefill_kernel(
         }
         __syncthreads();
     }
+#endif
 }
-
 
 __global__ void __launch_bounds__(128) nint_mixed_routes_kernel(
         const int64_t* pointers,const int32_t* params,const int32_t* expert_pool,
@@ -1609,10 +1751,11 @@ __global__ void __launch_bounds__(128) nint_backward_input_kernel(
 }
 
 
+template<class Output>
 __global__ void nint8_zero_decode_rows_kernel(
         const int8_t * __restrict__ quantized,
         const __half * __restrict__ scale,
-        __half * __restrict__ output,
+        Output * __restrict__ output,
         int rows,
         int groups,
         int width) {
@@ -1626,7 +1769,7 @@ __global__ void nint8_zero_decode_rows_kernel(
         const int group = column / 32;
         const int lane = column & 31;
         const size_t block = static_cast<size_t>(row) * groups + group;
-        output[index] = __float2half_rn(
+        output[index] = static_cast<Output>(
             __half2float(scale[block]) * static_cast<float>(
                 quantized[block * 32 + lane]));
     }
@@ -1736,6 +1879,142 @@ mfq_tensor_backend::Tensor cublas_gemm_nt_f32_output(
     return result;
 }
 
+
+template<int GroupSize,int Bits,int MaximumRows>
+__device__ __forceinline__ void nint_fixed_row(
+        const uint8_t* stream,int actual_bits,uint64_t row_offset,
+        const uint8_t* sub_scale,const uint8_t* sub_min,float scale,float minimum,
+        const int8_t* input,const float* input_scale,__half* output,
+        int rows,int outputs,int groups,int output_row,uint64_t packed_bytes) {
+    constexpr int chunks=GroupSize/4,groups_per_warp=32/chunks;
+    const int lane=int(threadIdx.x),relative_group=lane/chunks,element=(lane%chunks)*4;
+    const int bits=Bits?Bits:actual_bits;
+    float accumulators[MaximumRows]{};
+    for(int group=relative_group<groups_per_warp?relative_group:groups;group<groups;group+=groups_per_warp) {
+        const int column=group*GroupSize+element;
+        const uint64_t bit_offset=row_offset+uint64_t(column)*bits;
+        const int weights=unpack_nint_codes4_words(stream,bit_offset,bits,packed_bytes);
+        const float inner_scale=float(sub_scale[group]),inner_minimum=float(sub_min[group]);
+        #pragma unroll
+        for(int row=0;row<MaximumRows;++row)if(row<rows) {
+            const auto* source=input+size_t(row)*groups*GroupSize+column;
+            const int activation=load_i8x4(source);
+            const int sum=__dp4a(0x01010101,activation,0);
+            const int dot=bits==8?__dp4a(weights^int(0x80808080u),activation,0)+128*sum:
+                __dp4a(weights,activation,0);
+            accumulators[row]+=input_scale[size_t(row)*groups+group]*
+                (scale*inner_scale*float(dot)-minimum*inner_minimum*float(sum));
+        }
+    }
+    #pragma unroll
+    for(int row=0;row<MaximumRows;++row) {
+        #pragma unroll
+        for(int offset=16;offset>0;offset>>=1)
+            accumulators[row]+=__shfl_xor_sync(0xffffffffu,accumulators[row],offset);
+        if(lane==0 && row<rows)output[size_t(row)*outputs+output_row]=__float2half_rn(accumulators[row]);
+    }
+}
+
+template<int GroupSize,int Bits,int MaximumRows>
+__global__ void __launch_bounds__(128) nint_fixed_group_kernel(
+        const uint8_t* stream,const uint8_t* row_bits,const int64_t* offsets,
+        const uint8_t* sub_scale,const uint8_t* sub_min,const float* scale,const float* minimum,
+        const int8_t* input,const float* input_scale,__half* output,
+        int rows,int outputs,int groups,uint64_t packed_bytes) {
+    const int row=int(blockIdx.x)*4+int(threadIdx.y);
+    if(row>=outputs)return;
+    const int actual_bits=int(row_bits[row]);
+    // Hints never replace mutable device metadata on a graph replay.
+    const auto compute=[&](auto selected) {
+        nint_fixed_row<GroupSize,decltype(selected)::value,MaximumRows>(stream,actual_bits,uint64_t(offsets[row]),
+            sub_scale+size_t(row)*groups,sub_min+size_t(row)*groups,scale[row],minimum[row],input,input_scale,
+            output,rows,outputs,groups,row,packed_bytes);
+    };
+    if(actual_bits==Bits)compute(std::integral_constant<int,Bits>{});
+    else compute(std::integral_constant<int,0>{});
+}
+
+// A projection decodes one 64-column weight tile directly into LDS. Four
+// wave64 groups each own 16 output columns, retaining FP32 accumulators.
+template<int TileM>
+__global__ void __launch_bounds__(256) nint_online_mfma_kernel(
+        const uint8_t* stream,const uint8_t* bits,const int64_t* offsets,
+        const uint8_t* sub_scale,const uint8_t* sub_min,
+        const float* scale,const float* minimum,const __half* input,
+        __half* output,float* partial,int rows,int outputs,int groups,int gs,
+        int width,int splits,uint64_t packed_bytes) {
+    __shared__ __align__(16) __half storage[(64+TileM)*72];
+    auto* weights=storage;auto* activations=storage+64*72;
+    const int thread=int(threadIdx.x),lane=thread&63,wave=thread>>6;
+    const int first_output=int(blockIdx.x)*64;
+#if defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+    using H4=_Float16 __attribute__((ext_vector_type(4)));
+    using F4=float __attribute__((ext_vector_type(4)));
+    F4 accumulators[TileM/16]{};
+#else
+    float accumulators[TileM*64/256]{};
+#endif
+    for(int base=int(blockIdx.y)*64;base<width;base+=splits*64) {
+        nint_prefill_load_weight_tile<true>(stream,bits,offsets,sub_scale,sub_min,scale,minimum,
+            weights,0,outputs,outputs,groups,gs,width,first_output,base,0,thread,packed_bytes);
+        for(int index=thread;index<TileM*8;index+=256) {
+            const int row=index/8,column=base+(index%8)*8;
+            auto* destination=activations+row*72+(index%8)*8;
+            if(row>=rows || column>=width)*reinterpret_cast<int4*>(destination)=make_int4(0,0,0,0);
+            else if((width&7)==0 && column+8<=width)
+                *reinterpret_cast<int4*>(destination)=*reinterpret_cast<const int4*>(input+size_t(row)*width+column);
+            else for(int j=0;j<8;++j)destination[j]=column+j<width?input[size_t(row)*width+column+j]:__float2half_rn(0.f);
+        }
+        __syncthreads();
+#if defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+        #pragma unroll
+        for(int k=0;k<64;k+=16) {
+            const H4 a=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                weights+(wave*16+(lane&15))*72+k+(lane>>4)*4));
+            #pragma unroll
+            for(int mi=0;mi<TileM/16;++mi) {
+                const H4 x=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                    activations+(mi*16+(lane&15))*72+k+(lane>>4)*4));
+                accumulators[mi]=__builtin_amdgcn_mfma_f32_16x16x16f16(a,x,accumulators[mi],0,0,0);
+            }
+        }
+#else
+        #pragma unroll
+        for(int j=0;j<TileM*64/256;++j) {
+            const int index=thread+j*256,row=index/64,column=index%64;
+            for(int k=0;k<64;++k)accumulators[j]+=__half2float(activations[row*72+k])*__half2float(weights[column*72+k]);
+        }
+#endif
+        __syncthreads();
+    }
+    const auto store=[&](int row,int column,float value) {
+        if(row<rows && column<outputs) {
+            const size_t index=size_t(row)*outputs+column;
+            if(splits==1)output[index]=__float2half_rn(value);
+            else partial[size_t(blockIdx.y)*rows*outputs+index]=value;
+        }
+    };
+#if defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+    #pragma unroll
+    for(int mi=0;mi<TileM/16;++mi) {
+        const int row=mi*16+(lane&15);
+        #pragma unroll
+        for(int j=0;j<4;++j)store(row,first_output+wave*16+(lane>>4)*4+j,accumulators[mi][j]);
+    }
+#else
+    #pragma unroll
+    for(int j=0;j<TileM*64/256;++j) {
+        const int index=thread+j*256;store(index/64,first_output+index%64,accumulators[j]);
+    }
+#endif
+}
+
+__global__ void nint_online_reduce_kernel(const float* partial,__half* output,int elements,int splits) {
+    for(int i=int(blockIdx.x)*blockDim.x+threadIdx.x;i<elements;i+=blockDim.x*gridDim.x) {
+        float sum=0.f;for(int split=0;split<splits;++split)sum+=partial[size_t(split)*elements+i];
+        output[i]=__float2half_rn(sum);
+    }
+}
 
 }  // namespace
 
@@ -2057,7 +2336,8 @@ mfq_tensor_backend::Tensor nint_cublas_gemm_nt_f32acc_cuda(
 }
 
 
-mfq_tensor_backend::Tensor nint_decode_cuda(
+template<class Output>
+mfq_tensor_backend::Tensor nint_decode_hip_impl(
         mfq_tensor_backend::Tensor bitstream,
         mfq_tensor_backend::Tensor row_q_bits,
         mfq_tensor_backend::Tensor row_q_bit_offsets,
@@ -2116,12 +2396,12 @@ mfq_tensor_backend::Tensor nint_decode_cuda(
         "NINT tensors must share one CUDA device");
     auto output = mfq_tensor_backend::empty(
         {rows, width},
-        neuron_scale.options().dtype(mfq_tensor_backend::kFloat16));
+        neuron_scale.options().dtype(std::is_same_v<Output,__half>?mfq_tensor_backend::kFloat16:mfq_tensor_backend::kFloat32));
     constexpr int threads = 256;
     const size_t total = static_cast<size_t>(rows) * width;
     const int blocks = static_cast<int>(std::min<size_t>(
         (total + threads - 1) / threads, 65535));
-   hipLaunchKernelGGL(( nint_decode_rows_kernel), 
+   hipLaunchKernelGGL(( nint_decode_rows_kernel<Output>),
         dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
             bitstream.data_ptr<uint8_t>(),
             row_q_bits.data_ptr<uint8_t>(),
@@ -2130,7 +2410,7 @@ mfq_tensor_backend::Tensor nint_decode_cuda(
             subgroup_minimum.data_ptr<uint8_t>(),
             neuron_scale.data_ptr<float>(),
             neuron_minimum.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+            reinterpret_cast<Output *>(output.data_ptr()),
             rows,
             groups,
             static_cast<int>(group_size),
@@ -2399,7 +2679,7 @@ mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         int64_t group_size,
         mfq_tensor_backend::Tensor quantized_input,
         mfq_tensor_backend::Tensor input_scale,
-        bool aligned_q8 = false) {
+        bool aligned_q8 = false,int uniform_bits = 0) {
     MFQ_RUNTIME_CHECK(
         input.is_cuda() && input.is_contiguous() &&
         (input.scalar_type() == mfq_tensor_backend::kFloat16 ||
@@ -2519,6 +2799,31 @@ mfq_tensor_backend::Tensor nint_matmul_ws_impl(
             input.scalar_type() == mfq_tensor_backend::kFloat32,
             gate != nullptr && gate->scalar_type() == mfq_tensor_backend::kFloat32,
             grouped_q8 ? input_sum.data_ptr<int>() : nullptr);
+    }
+    const char* fixed_setting=std::getenv("MFQ_HIP_NINT_FIXED_BITS");
+    if(activation_rows>1 && (!fixed_setting || fixed_setting[0]!='0') &&
+            ((uniform_bits==5 && group_size==28) || (uniform_bits==6 && (group_size==24 || group_size==28)))) {
+        const auto launch_fixed=[&](auto gs,auto bits) {
+            const auto launch_rows=[&](auto rows) {
+                hipLaunchKernelGGL((nint_fixed_group_kernel<decltype(gs)::value,decltype(bits)::value,decltype(rows)::value>),
+                    dim3((output_rows+3)/4),dim3(32,4),0,stream,
+                    bitstream.data_ptr<uint8_t>(),row_q_bits.data_ptr<uint8_t>(),row_q_bit_offsets.data_ptr<int64_t>(),
+                    subgroup_scale.data_ptr<uint8_t>(),subgroup_minimum.data_ptr<uint8_t>(),
+                    neuron_scale.data_ptr<float>(),neuron_minimum.data_ptr<float>(),
+                    quantized_input.data_ptr<int8_t>(),input_scale.data_ptr<float>(),
+                    reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),activation_rows,output_rows,groups,
+                    uint64_t(bitstream.numel()));
+            };
+            if(activation_rows==1)launch_rows(std::integral_constant<int,1>{});
+            else if(activation_rows<=2)launch_rows(std::integral_constant<int,2>{});
+            else if(activation_rows<=4)launch_rows(std::integral_constant<int,4>{});
+            else if(activation_rows<=6)launch_rows(std::integral_constant<int,6>{});
+            else launch_rows(std::integral_constant<int,8>{});
+        };
+        if(uniform_bits==5)launch_fixed(std::integral_constant<int,28>{},std::integral_constant<int,5>{});
+        else if(group_size==24)launch_fixed(std::integral_constant<int,24>{},std::integral_constant<int,6>{});
+        else launch_fixed(std::integral_constant<int,28>{},std::integral_constant<int,6>{});
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
     }
     if (grouped_q8) {
         hipLaunchKernelGGL((nint_q8_grouped_decode_kernel),
@@ -2838,7 +3143,8 @@ mfq_tensor_backend::Tensor nint_backward_input_cuda(
 }
 
 
-mfq_tensor_backend::Tensor nint8_zero_dequant_cuda(
+template<class Output>
+mfq_tensor_backend::Tensor nint8_zero_dequant_hip_impl(
         mfq_tensor_backend::Tensor quantized,
         mfq_tensor_backend::Tensor scale,
         int64_t width) {
@@ -2850,17 +3156,17 @@ mfq_tensor_backend::Tensor nint8_zero_dequant_cuda(
     const int groups = static_cast<int>(quantized.size(1));
     auto output = mfq_tensor_backend::empty(
         {rows, width},
-        quantized.options().dtype(mfq_tensor_backend::kFloat16));
+        quantized.options().dtype(std::is_same_v<Output,__half>?mfq_tensor_backend::kFloat16:mfq_tensor_backend::kFloat32));
     constexpr int threads = 256;
     const size_t total = static_cast<size_t>(rows) * width;
     const int blocks = static_cast<int>(std::min<size_t>(
         (total + threads - 1) / threads, 65535));
-   hipLaunchKernelGGL(( nint8_zero_decode_rows_kernel), 
+   hipLaunchKernelGGL(( nint8_zero_decode_rows_kernel<Output>),
         dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
             reinterpret_cast<const int8_t *>(
                 quantized.data_ptr<uint8_t>()),
             reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
-            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+            reinterpret_cast<Output *>(output.data_ptr()),
             rows,
             groups,
             static_cast<int>(width));
@@ -3011,4 +3317,100 @@ mfq_tensor_backend::Tensor nint8_zero_backward_input_cuda(
         mfq_current_cuda_stream());
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
+}
+
+mfq_tensor_backend::Tensor nint_decode_cuda(mfq_tensor_backend::Tensor bitstream,mfq_tensor_backend::Tensor bits,mfq_tensor_backend::Tensor offsets,
+    mfq_tensor_backend::Tensor sub_scale,mfq_tensor_backend::Tensor sub_min,mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor minimum,int64_t width,int64_t group_size) {
+    return nint_decode_hip_impl<__half>(bitstream,bits,offsets,sub_scale,sub_min,scale,minimum,width,group_size);
+}
+mfq_tensor_backend::Tensor nint_decode_f32_cuda(mfq_tensor_backend::Tensor bitstream,mfq_tensor_backend::Tensor bits,mfq_tensor_backend::Tensor offsets,
+    mfq_tensor_backend::Tensor sub_scale,mfq_tensor_backend::Tensor sub_min,mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor minimum,int64_t width,int64_t group_size) {
+    return nint_decode_hip_impl<float>(bitstream,bits,offsets,sub_scale,sub_min,scale,minimum,width,group_size);
+}
+
+mfq_tensor_backend::Tensor nint8_zero_dequant_cuda(mfq_tensor_backend::Tensor quantized,mfq_tensor_backend::Tensor scale,int64_t width) {
+    return nint8_zero_dequant_hip_impl<__half>(quantized,scale,width);
+}
+mfq_tensor_backend::Tensor nint8_zero_dequant_f32_cuda(mfq_tensor_backend::Tensor quantized,mfq_tensor_backend::Tensor scale,int64_t width) {
+    return nint8_zero_dequant_hip_impl<float>(quantized,scale,width);
+}
+
+mfq_tensor_backend::Tensor nint_matmul_online_f16_cuda(
+        mfq_tensor_backend::Tensor stream,mfq_tensor_backend::Tensor bits,
+        mfq_tensor_backend::Tensor offsets,mfq_tensor_backend::Tensor sub_scale,
+        mfq_tensor_backend::Tensor sub_min,mfq_tensor_backend::Tensor scale,
+        mfq_tensor_backend::Tensor minimum,mfq_tensor_backend::Tensor input,int64_t gs) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.scalar_type()==tb::kFloat16 &&
+        input.dim()==2 && input.size(0)>8 && input.size(0)<=32,"NINT online input requires contiguous HIP FP16 rows 9..32");
+    for(const auto* value:{&stream,&bits,&offsets,&sub_scale,&sub_min,&scale,&minimum})
+        MFQ_RUNTIME_CHECK(value->is_cuda() && value->is_contiguous() && value->device()==input.device(),
+            "NINT online metadata must be contiguous on the input device");
+    MFQ_RUNTIME_CHECK(stream.scalar_type()==tb::kUInt8 && stream.dim()==1 &&
+        bits.scalar_type()==tb::kUInt8 && bits.dim()==1 && offsets.scalar_type()==tb::kInt64 && offsets.dim()==1 &&
+        sub_scale.scalar_type()==tb::kUInt8 && sub_scale.dim()==2 && sub_min.scalar_type()==tb::kUInt8 &&
+        sub_min.sizes()==sub_scale.sizes() && scale.scalar_type()==tb::kFloat32 && minimum.scalar_type()==tb::kFloat32,
+        "NINT online metadata dtypes or ranks disagree");
+    const int64_t n=sub_scale.size(0),g=sub_scale.size(1),k=input.size(1),m=input.size(0);
+    MFQ_RUNTIME_CHECK(n>0 && n<=INT_MAX/32 && g>0 && g<=INT_MAX/64 && gs>=4 && gs<=64 &&
+        k>0 && k<=g*gs && k<=INT_MAX && bits.numel()==n && offsets.numel()==n &&
+        scale.numel()==n && minimum.numel()==n && stream.numel()>0,"NINT online dimensions disagree");
+    auto output=tb::empty({m,n},input.options());
+    const int tiles=int((n+63)/64),ktiles=int((k+63)/64);
+    static thread_local int device=-1,processors=1;
+    if(device!=input.get_device()) {
+        MFQ_CUDA_CHECK(hipDeviceGetAttribute(&processors,hipDeviceAttributeMultiprocessorCount,input.get_device()));
+        device=input.get_device();
+    }
+    // Packed decoding needs several active CTAs per CU to hide metadata and
+    // LDS latency. Large output grids already supply that parallelism.
+    int splits=1;
+    if(tiles<processors) {
+        const int wanted=std::min({ktiles,32,(3*processors+tiles-1)/tiles});
+        while(splits<wanted)splits*=2;
+        splits=std::min(splits,ktiles);
+    }
+    if(const char* setting=std::getenv("MFQ_HIP_NINT_ONLINE_SPLITS")) {
+        const int requested=std::atoi(setting);
+        MFQ_RUNTIME_CHECK(requested>=1 && requested<=32,"NINT online splits must be 1..32");
+        splits=std::min(requested,ktiles);
+    }
+    auto partial=splits>1?tb::empty({splits,m,n},input.options().dtype(tb::kFloat32)):tb::Tensor{};
+    const auto launch=[&](auto tile) {
+        hipLaunchKernelGGL((nint_online_mfma_kernel<decltype(tile)::value>),dim3(tiles,splits),dim3(256),0,
+            mfq_current_cuda_stream(),stream.data_ptr<uint8_t>(),bits.data_ptr<uint8_t>(),offsets.data_ptr<int64_t>(),
+            sub_scale.data_ptr<uint8_t>(),sub_min.data_ptr<uint8_t>(),scale.data_ptr<float>(),minimum.data_ptr<float>(),
+            reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+            splits>1?partial.data_ptr<float>():nullptr,int(m),int(n),int(g),int(gs),int(k),splits,uint64_t(stream.numel()));
+    };
+    if(m<=16)launch(std::integral_constant<int,16>{});else launch(std::integral_constant<int,32>{});
+    if(splits>1)hipLaunchKernelGGL((nint_online_reduce_kernel),dim3((m*n+255)/256),dim3(256),0,
+        mfq_current_cuda_stream(),partial.data_ptr<float>(),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),int(m*n),splits);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
+}
+
+mfq_tensor_backend::Tensor nint_matmul_fixed_bits_ws_cuda(
+    mfq_tensor_backend::Tensor bitstream,mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,mfq_tensor_backend::Tensor subgroup_scale,
+    mfq_tensor_backend::Tensor subgroup_minimum,mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_minimum,mfq_tensor_backend::Tensor input,
+    int64_t group_size,mfq_tensor_backend::Tensor quantized_input,
+    mfq_tensor_backend::Tensor input_scale,int uniform_bits) {
+    MFQ_RUNTIME_CHECK(uniform_bits>=1 && uniform_bits<=8,"NINT fixed-bit hint must be 1..8");
+    return nint_matmul_ws_impl(bitstream,row_q_bits,row_q_bit_offsets,subgroup_scale,subgroup_minimum,
+        neuron_scale,neuron_minimum,input,nullptr,0,group_size,quantized_input,input_scale,false,uniform_bits);
+}
+
+mfq_tensor_backend::Tensor nint_matmul_input_mul_fixed_bits_ws_cuda(
+    mfq_tensor_backend::Tensor bitstream,mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,mfq_tensor_backend::Tensor subgroup_scale,
+    mfq_tensor_backend::Tensor subgroup_minimum,mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_minimum,mfq_tensor_backend::Tensor input,
+    mfq_tensor_backend::Tensor gate,int64_t activation_mode,int64_t group_size,
+    mfq_tensor_backend::Tensor quantized_input,mfq_tensor_backend::Tensor input_scale,int uniform_bits) {
+    MFQ_RUNTIME_CHECK(uniform_bits>=1 && uniform_bits<=8,"NINT fixed-bit hint must be 1..8");
+    return nint_matmul_ws_impl(bitstream,row_q_bits,row_q_bit_offsets,subgroup_scale,subgroup_minimum,
+        neuron_scale,neuron_minimum,input,&gate,activation_mode,group_size,quantized_input,input_scale,false,uniform_bits);
 }

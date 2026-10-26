@@ -2,12 +2,17 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include <optional>
 #include <string>
 
 namespace mfq::cuda::runtime_options {
 // Keep dynamic diagnostic/ablation options at the execution boundary. Values
 // are read on access so changing an option before graph capture remains valid.
+inline bool vision_resident() {
+    const auto* value=std::getenv("MFQ_CUDA_VISION_RESIDENT");
+    return value && value[0]=='1';
+}
 bool resident_plan_overlap();
 std::optional<bool> rotary_fusion();
 bool mhc_timings();

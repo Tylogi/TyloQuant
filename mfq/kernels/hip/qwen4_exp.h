@@ -9,6 +9,7 @@
 
 namespace mfq_qwen4_exp {
 using mfq_tensor_backend::Tensor;
+void fill_decode_positions(const Tensor& cache,const Tensor& positions,int64_t start,int64_t delta=0);
 
 Tensor grouped_rms_norm(const Tensor&, const Tensor&, int64_t group_size, double eps);
 Tensor gated_residual_bottleneck(const Tensor&, int64_t streams);
@@ -24,6 +25,11 @@ std::vector<Tensor> gated_residual_post_norm(
     const Tensor& branch, const Tensor& residual, const Tensor& injection,
     const Tensor& norm, int64_t hc_count, double eps);
 Tensor block_scores(const Tensor&, const Tensor&);
+Tensor qsa_graph_select(const Tensor& scores,const Tensor& positions,int64_t pool,int64_t budget);
+std::vector<Tensor> ple_gate_norm_hip(const Tensor&,const Tensor&,const Tensor&,const Tensor&,
+    int64_t hidden,int64_t streams,double eps);
+std::vector<Tensor> ple_conv_add_hip(const Tensor&,const Tensor&,const std::optional<Tensor>&,
+    int64_t dilation,const Tensor& gated,bool half_output);
 std::vector<Tensor> ple_dilated_conv_silu(
     const Tensor&, const Tensor&, const std::optional<Tensor>& state,
     int64_t dilation);

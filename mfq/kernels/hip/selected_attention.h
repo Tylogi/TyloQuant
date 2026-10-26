@@ -17,6 +17,8 @@ Tensor dense(const Tensor& query, const Tensor& key, const Tensor& value,
 Tensor sparse(const Tensor& query, const Tensor& key, const Tensor& value,
     const Tensor& indices, double scale, bool key_is_cache);
 Tensor gated(const Tensor& attended, const Tensor& gate, bool half_output);
+Tensor causal(const Tensor& query,const Tensor& key,const Tensor& value,
+    const Tensor& positions,int64_t columns,double scale);
 Tensor causal_gated(const Tensor& query, const Tensor& key, const Tensor& value,
     const Tensor& positions, const Tensor& gate, int64_t columns, double scale,
     bool half_output, bool fused_mma_gate = true, bool fused_mma_prepare = true);

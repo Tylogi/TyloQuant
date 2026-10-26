@@ -2,20 +2,7 @@
 #include "hip/hip_runtime.h"
 // Shared dense and index-selected attention mechanics.
 #include "../hip/selected_attention.h"
-#ifndef __HIP_PLATFORM_AMD__
-#include "../hip/mfq_sparse_attn_mma_f16.cuh"
-#else
-// Sparse MMA attention builds on NVIDIA tensor-core tile paths; fail
-// loudly if a model graph selects it on HIP until an MFMA port exists.
-namespace mfq_sparse_attn_mma {
-template <int... IntArgs, typename... Args>
-mfq_tensor_backend::Tensor launch(Args&&...) {
-    MFQ_RUNTIME_CHECK(false,
-        "sparse MMA attention is not yet available on HIP");
-    return mfq_tensor_backend::Tensor{};
-}
-}  // namespace mfq_sparse_attn_mma
-#endif
+#include "mfq_sparse_attn_mma_f16.cuh"
 
 #include <cmath>
 #include <limits>
@@ -248,9 +235,9 @@ Tensor sparse(const Tensor& q, const Tensor& k, const Tensor& v,
     }
 
     const bool use_qsa_mma = !v_is_k_view && q.size(3) == 256;
-    const bool use_mla_mma = v_is_k_view && q.size(3) == 512;
+    const bool use_mla_mma = false;
     if (use_qsa_mma || use_mla_mma) {
-        constexpr int index_tile = 32;
+        constexpr int index_tile = 64;
         const int64_t source_count = indices.size(2);
         MFQ_RUNTIME_CHECK(
             source_count <= std::numeric_limits<int>::max() - index_tile &&
@@ -284,9 +271,7 @@ Tensor sparse(const Tensor& q, const Tensor& k, const Tensor& v,
                 query, key, value, safe_indices, mask, Tensor{}, Tensor{},
                 scale, "qwen4_sparse_gqa_attention");
         }
-        return mfq_sparse_attn_mma::launch<512, 512, 1, 16, true>(
-            query, key, key, safe_indices, mask, Tensor{}, Tensor{},
-            scale, "glm5_sparse_mla_attention");
+        MFQ_RUNTIME_CHECK(false, "unsupported HIP sparse attention geometry");
     }
 
     auto output = tb::empty({q.size(0), q.size(2), q.size(1), q.size(3)},
@@ -465,6 +450,18 @@ Tensor mma_reduce_gated(const Tensor& partial,const Tensor& metadata,const Tenso
     return output;
 }
 
+Tensor causal(const Tensor& q,const Tensor& k,const Tensor& v,
+    const Tensor& positions,int64_t columns,double scale) {
+    attention_shapes(q,k,v);
+    MFQ_RUNTIME_CHECK(q.size(3)==128 && half_or_float(q) &&
+        k.scalar_type()==tb::kFloat16 && v.scalar_type()==tb::kFloat16,
+        "causal MFMA attention requires 128-wide F16/F32 queries and F16 KV");
+    MfqCudaGuard guard(q.device());
+    return mfq_sparse_attn_mma::launch<128,128,1,16,false>(
+        q,k,v,Tensor{},Tensor{},Tensor{},Tensor{},scale,"causal_gqa_mfma",
+        Tensor{},false,positions.contiguous(),columns);
+}
+
 Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
     const Tensor& positions, const Tensor& gate, int64_t columns, double scale,
     bool half_output, bool fused_mma_gate, bool fused_mma_prepare) {
@@ -495,7 +492,7 @@ Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
         }
         // Prepare the original MMA query, safe indices and validity mask together.
         MFQ_RUNTIME_CHECK(columns <= INT_MAX - 32, "causal MMA index geometry exceeds 32 bits");
-        const int64_t padded_columns = ((columns + 31) / 32) * 32;
+        const int64_t padded_columns = ((columns + 63) / 64) * 64;
         auto query = tb::empty(q.sizes(), q.options().dtype(tb::kFloat32));
         auto indices = tb::empty({q.size(0), q.size(2), padded_columns}, q.options().dtype(tb::kInt32));
         auto mask = tb::empty(indices.sizes(), q.options().dtype(tb::kFloat16));

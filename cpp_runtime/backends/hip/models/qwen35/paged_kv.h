@@ -74,7 +74,9 @@ public:
             pool.device = device;
             pool.heads = heads;
             pool.head_dim = head_dim;
-            pool.dtype = mfq_tensor_backend::kFloat16;
+            pool.key_width=block->kv_quantization.enabled()?cuda_kv_packed_width(int(head_dim),block->kv_quantization.key_bits()):head_dim;
+            pool.value_width=block->kv_quantization.enabled()?cuda_kv_packed_width(int(head_dim),block->kv_quantization.value_bits()):head_dim;
+            pool.dtype=block->kv_quantization.enabled()?mfq_tensor_backend::kInt32:mfq_tensor_backend::kFloat16;
             pool.k_chunk_ptrs = mfq_tensor_backend::zeros(
                 {maximum_chunks}, pointer_options);
             pool.v_chunk_ptrs = mfq_tensor_backend::zeros(
@@ -158,7 +160,8 @@ public:
                 layer.k_chunk_ptrs, layer.v_chunk_ptrs,
                 device_page_tables_.at(layer.device), batch,
                 layer.heads, layer.head_dim, kPageSize,
-                kPagesPerChunk, layer.dtype);
+                kPagesPerChunk, mfq_tensor_backend::kFloat16);
+            layer.block->cache.quantization=layer.block->kv_quantization;
         }
         page_table_updates_metric_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -199,6 +202,7 @@ private:
         int device = 0;
         int64_t heads = 0;
         int64_t head_dim = 0;
+        int64_t key_width=0,value_width=0;
         mfq_tensor_backend::ScalarType dtype = mfq_tensor_backend::kFloat16;
         mfq_tensor_backend::Tensor k_chunk_ptrs;
         mfq_tensor_backend::Tensor v_chunk_ptrs;
@@ -255,10 +259,10 @@ private:
                 PendingChunk chunk;
                 chunk.k = mfq_tensor_backend::empty(
                     {static_cast<int64_t>(chunk_pages), layer.heads,
-                     kPageSize, layer.head_dim}, options);
+                     kPageSize, layer.key_width}, options);
                 chunk.v = mfq_tensor_backend::empty(
                     {static_cast<int64_t>(chunk_pages), layer.heads,
-                     kPageSize, layer.head_dim}, options);
+                     kPageSize, layer.value_width}, options);
                 pending.push_back(std::move(chunk));
             }
             const size_t chunk_index = storage_pages_ / kPagesPerChunk;

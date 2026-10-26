@@ -481,6 +481,9 @@ ParsedFile parse_file(const std::filesystem::path& requested) {
         record.tensor.dtype = std::string(
             canonical_format_dtype(record.tensor.stored_dtype));
         record.tensor.nbytes = input.scalar<std::uint64_t>("record length");
+        constexpr std::string_view legacy_asset_prefix = "__tinfer_asset__/";
+        if (record.tensor.name.compare(0, legacy_asset_prefix.size(), legacy_asset_prefix) == 0)
+            record.tensor.name = std::string(kAssetPrefix) + record.tensor.name.substr(legacy_asset_prefix.size());
         record.asset = record.tensor.name.compare(
                            0, kAssetPrefix.size(), kAssetPrefix) == 0;
         record.source_path = path;
@@ -619,7 +622,9 @@ MfqModelSource::MfqModelSource(std::filesystem::path requested, FileReadMode mod
         impl_->source_paths.push_back(initial_path);
         append(std::move(initial));
     } else {
-        const auto paths = shard_paths(initial_path, split_no, split_count);
+        // A numbered entry may be a symlink to an unnumbered downloaded file.
+        // Discover siblings from the requested name before resolving each file.
+        const auto paths = shard_paths(std::filesystem::absolute(requested).lexically_normal(), split_no, split_count);
         std::uint64_t actual_records = 0;
         std::uint64_t actual_tensors = 0;
         auto expected_records = std::numeric_limits<std::uint64_t>::max();

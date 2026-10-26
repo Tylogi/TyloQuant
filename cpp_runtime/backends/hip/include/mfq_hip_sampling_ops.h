@@ -16,3 +16,6 @@ void sample_token_counts_add_cuda(mfq_tensor_backend::Tensor counts, mfq_tensor_
 mfq_tensor_backend::Tensor sample_apply_penalties_cuda(
     mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor counts,
     double presence_penalty, double frequency_penalty, double repetition_penalty);
+
+mfq_tensor_backend::Tensor sample_top_k_compact_cuda(mfq_tensor_backend::Tensor logits,int64_t top_k);
+mfq_tensor_backend::Tensor sample_top_k_compact_if_cuda(mfq_tensor_backend::Tensor logits,int64_t top_k,const volatile int32_t* enabled);

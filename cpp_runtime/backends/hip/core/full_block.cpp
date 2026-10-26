@@ -7,6 +7,7 @@
 
 #include "mfq_hip_activation_ops.h"
 #include "mfq_hip_attention_ops.h"
+#include "selected_attention.h"
 #include "mfq_hip_norm_ops.h"
 #include "mfq_hip_paged_kv.h"
 
@@ -94,8 +95,9 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
     if (!cache.defined()) {
         cache =
             KVCache(B, nkh, cache_capacity, hd, sliding, x.device(),
-                    official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16);
+                    official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16, kv_quantization);
     }
+    cache.quantization=kv_quantization;
     if (x.is_cuda()) {
         const int64_t total = B * nh;
         if (!decode_partial_o.defined() || decode_partial_o.size(0) < total ||
@@ -143,7 +145,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             const bool fused_qk_rope_kv =
                 apply_rotary && official_bf16 && x.is_cuda() &&
                 write_positions.dim() == 1 && pos.dim() == 1 &&
-                T == 1 && !cache.is_paged() && !cache.ring && !v_norm.defined() &&
+                T == 1 && !cache.is_paged() && !cache.ring && !cache.quantization.enabled() && !v_norm.defined() &&
                 q_norm.defined() && k_norm.defined() && active_rope.rotary_dim == 128 &&
                 active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 && hd == 128 &&
                 cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
@@ -399,6 +401,13 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         attention_scale > 0.0 ? attention_scale : 1.0 / std::sqrt((double)hd);
                     mfq_tensor_backend::Tensor a;
                     a = profiler.measure("full.attention", [&]() {
+                        if(cache.quantization.enabled()) {
+                            attention_token_major=true;
+                            const auto capacity=planned_kv_length>0?planned_kv_length:cache_pos+T;
+                            return mfq::cuda::cuda_kv_attention(q,cache.k,cache.v,cache.quantization,{},write_positions,
+                                cache_pos,cache.quantized_pages(),capacity,seq_len.value_or(mfq_tensor_backend::Tensor{}),
+                                attention_mask.value_or(mfq_tensor_backend::Tensor{}),attn_scale);
+                        }
                         if (!x.is_cuda()) {
                             MFQ_RUNTIME_CHECK(
                                 !sliding, "CPU dense offload does not support sliding attention");
@@ -465,6 +474,17 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         }();
                         const bool mma_attention_enabled =
                             execution.config.mma_attention && !disable_mma_attention;
+                        static const bool disable_nope_mfma=[] {
+                            const auto* value=std::getenv("MFQ_HIP_NOPE_MFMA");
+                            return value && std::atoi(value)==0;
+                        }();
+                        if(no_rope && !sliding && !official_bf16 && hd==128 && T>1 &&
+                            mma_attention_enabled && !disable_nope_mfma && !cache.is_paged() &&
+                            !seq_len.has_value() && !attention_mask.has_value() && pos.dim()==1) {
+                            attention_token_major=true;
+                            return mfq_selected_attention::causal(qh,cache.k,cache.v,pos,
+                                cache_pos+T,attn_scale).to(mfq_tensor_backend::kFloat16);
+                        }
                         if (cache_pos == 0 && T > 1) {
                             if (official_bf16) {
                                 const bool bf16_flash128 = !sliding && hd == 128 && nh == 4 * nkh &&

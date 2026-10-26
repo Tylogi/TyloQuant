@@ -69,6 +69,7 @@ struct CudaPreparedPrompt {
     mfq_tensor_backend::Tensor positions;
     int decode_position_delta = 0;
     std::string cache_key;
+    mfq_tensor_backend::Tensor image_mask;
 
     bool transformed() const noexcept {
         return embeddings.defined() || positions.defined() ||

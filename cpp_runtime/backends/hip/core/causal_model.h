@@ -45,6 +45,8 @@ namespace mfq::models::minicpmo45 {
 template <class Backend> struct TtsCausalLm;
 }
 
+namespace mfq::models::nemotron_h { template<class Backend> struct CausalLm; }
+
 namespace mfq::cuda {
 
 struct CausalResources {
@@ -106,6 +108,7 @@ struct Glm5Model;
 struct Qwen4Model;
 struct DeepseekV4Model;
 struct DeepseekV41Model;
+struct NemotronHModel;
 
 template <typename Model> struct CudaCausalOps;
 template <typename Model>
@@ -156,6 +159,12 @@ template <typename Model> struct CudaCausalOps : Model {
         return value.narrow(0, start, count);
     }
     static Tensor concat_positions(Tensor first, Tensor second) {
+        // Text after an image advances each semantic position axis equally.
+        if(first.dim()>1 && second.dim()==1) {
+            auto shape=first.sizes().vec();shape.back()=second.size(0);
+            std::vector<int64_t> view(shape.size(),1);view.back()=second.size(0);
+            second=second.reshape(view).expand(shape);
+        }
         return mfq_tensor_backend::cat({first, second}, -1);
     }
     static int64_t rank(const Tensor &value) { return value.dim(); }
@@ -349,5 +358,7 @@ using Glm5CausalLm = mfq::models::glm5_next::CausalLm<CudaCausalOps<Glm5Model>>;
 using Qwen4CausalLm = mfq::models::qwen4_exp::CausalLm<CudaCausalOps<Qwen4Model>>;
 using DeepseekV4CausalLm = mfq::models::deepseek_v4::CausalLm<CudaCausalOps<DeepseekV4Model>>;
 using DeepseekV41CausalLm = mfq::models::deepseek_v41::CausalLm<CudaCausalOps<DeepseekV41Model>>;
+
+using NemotronHCausalLm = mfq::models::nemotron_h::CausalLm<CudaCausalOps<NemotronHModel>>;
 
 } // namespace mfq::cuda

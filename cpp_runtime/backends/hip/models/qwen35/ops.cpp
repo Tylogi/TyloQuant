@@ -9,7 +9,9 @@
 namespace mfq::cuda::qwen35 {
 struct BlockLoader : TransformerWeightLoader {
     using Ffn = FFN;
-    auto full_block() const { return std::make_unique<FullBlock>(); }
+    auto full_block() const {
+        auto block=std::make_unique<FullBlock>();block->kv_quantization=cuda_kv_quantization();return block;
+    }
     auto linear_block() const { return std::make_unique<LinearAttentionBlock>(); }
     template <class T> static std::unique_ptr<::Block> finish(std::unique_ptr<T> block) {
         return block;

@@ -1,5 +1,6 @@
 #include "hip/hip_runtime.h"
 #include "mfq_native_tensor.h"
+#include "mfq_weight_memory.h"
 
 #include "mfq_hip_context.h"
 
@@ -19,6 +20,39 @@
 #include "mfq_hip_compat.h"
 
 namespace mfq::cuda {
+namespace {
+thread_local WeightMemoryLedger* loading_weight_memory=nullptr;
+thread_local bool loading_weight_allocation=false;
+}
+void WeightMemoryLedger::observe(const std::shared_ptr<TensorStorage>& storage) {
+    if(storage && storage->device.is_cuda())weights_.push_back(storage);
+}
+void WeightMemoryLedger::observe_ple(const std::shared_ptr<void>& owner,std::size_t bytes) {
+    ple_.push_back({owner,bytes});
+}
+std::size_t WeightMemoryLedger::resident_bytes(int device) const {
+    std::size_t bytes=0;
+    for(const auto& weak:weights_)if(auto storage=weak.lock())
+        if(device < 0 || storage->device.index == device)bytes+=storage->bytes;
+    return bytes;
+}
+std::size_t WeightMemoryLedger::ple_bytes() const {
+    std::size_t bytes=0;
+    for(const auto& payload:ple_)if(!payload.owner.expired())bytes+=payload.bytes;
+    return bytes;
+}
+WeightMemoryLoadScope::WeightMemoryLoadScope(WeightMemoryLedger& ledger):previous_(loading_weight_memory) {
+    loading_weight_memory=&ledger;
+}
+WeightMemoryLoadScope::~WeightMemoryLoadScope(){loading_weight_memory=previous_;}
+WeightAllocationScope::WeightAllocationScope():previous_(loading_weight_allocation){loading_weight_allocation=true;}
+WeightAllocationScope::~WeightAllocationScope(){loading_weight_allocation=previous_;}
+void observe_weight_allocation(const std::shared_ptr<TensorStorage>& storage) {
+    if(loading_weight_memory && loading_weight_allocation)loading_weight_memory->observe(storage);
+}
+void observe_streamed_ple(const std::shared_ptr<void>& owner,std::size_t bytes) {
+    if(loading_weight_memory)loading_weight_memory->observe_ple(owner,bytes);
+}
 namespace {
 
 std::shared_ptr<TensorStorage> allocate_cuda_storage(
@@ -55,6 +89,7 @@ std::shared_ptr<TensorStorage> allocate_cuda_storage(
         if (std::find(uses->streams.begin(), uses->streams.end(), usage_stream) == uses->streams.end())
             uses->streams.push_back(usage_stream);
     };
+    observe_weight_allocation(storage);
     return storage;
 }
 
@@ -416,8 +451,19 @@ void copy_cuda(Tensor& destination, const Tensor& source) {
                     peer_destination->data_ptr(), destination_device,
                     staged_source.data_ptr(), source_device,
                     peer_destination->nbytes(), stream.stream()));
-                staged_source.record_stream(
-                    reinterpret_cast<std::uintptr_t>(stream.stream()));
+                // Source storage fences streams on its allocation device.
+                // Join the peer copy back to a source-device stream before
+                // recording that use; a destination-device stream cannot be
+                // recorded with an event created on the source device.
+                Event copied;
+                copied.record(stream.stream());
+                {
+                    DeviceGuard source_guard(source_device);
+                    MFQ_NATIVE_CUDA_CHECK(hipStreamWaitEvent(
+                        source_stream.stream(), copied.get(), 0));
+                    staged_source.record_stream(
+                        reinterpret_cast<std::uintptr_t>(source_stream.stream()));
+                }
             }
         }
         if (staged_destination.defined()) {

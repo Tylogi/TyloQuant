@@ -1,3 +1,4 @@
+#include "mfq_weight_memory.h"
 #include "hip/hip_runtime.h"
 #include "mfq_hip_activation_ops.h"
 #include "mfq_hip_quant_ops.h"
@@ -154,6 +155,7 @@ mfq_tensor_backend::Tensor load_dense_gpu(
         CudaExecutionContext& execution,
         const mfq::ModelSource& mfq,
         const std::string& name) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     const bool cpu_layer = execution.loading_cpu_layer;
     MfqCudaGuard guard(active_weight_load_device(execution));
     const auto & rec = require_tensor(mfq, name);
@@ -796,6 +798,7 @@ mfq_tensor_backend::Tensor quant_embedding_lookup(
     MFQ_RUNTIME_CHECK(
         !embedding.tensor_parallel(),
         "quantized embedding does not support tensor-parallel shards");
+    if(embedding.is_tq())return embedding.tq.embedding(token_ids);
     if (embedding.is_dense()) {
         auto output_shape = token_ids.sizes().vec();
         output_shape.push_back(embedding.dense.size(1));
@@ -1058,6 +1061,7 @@ QuantLinear load_quant_linear(
         std::optional<TensorParallelAxis> axis_override,
         const std::vector<mfq::TensorParallelSlice> *
             slices_override) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     const bool cpu_layer = execution.loading_cpu_layer;
     const auto & dtype = require_tensor(mfq, name).dtype;
     QuantLinear result;
@@ -1473,6 +1477,7 @@ QuantLinearGroup make_quant_group(
         CudaExecutionContext& execution,
         std::vector<QuantLinear> layers,
         bool preserve_projection_boundaries) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     if (layers.empty()) throw std::runtime_error("empty quantized linear group");
     QuantLinearGroup result;
     result.decode_branch_parallel = !preserve_projection_boundaries;

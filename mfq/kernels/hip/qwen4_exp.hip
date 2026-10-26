@@ -14,6 +14,41 @@ namespace mfq_qwen4_exp {
 namespace tb = mfq_tensor_backend;
 
 namespace {
+template<class Position>
+__global__ void fill_decode_positions_kernel(int64_t* cache,Position* positions,
+    int64_t tokens,int64_t entries,int64_t start,int64_t delta) {
+    for(int64_t i=threadIdx.x;i<entries;i+=blockDim.x) {
+        positions[i]=static_cast<Position>(start+i%tokens+delta);
+        if(i<tokens)cache[i]=start+i;
+    }
+}
+}
+void fill_decode_positions(const Tensor& cache,const Tensor& positions,int64_t start,int64_t delta) {
+    MFQ_RUNTIME_CHECK(cache.defined() && positions.defined() && cache.is_cuda() && positions.is_cuda() &&
+        cache.device()==positions.device() && cache.is_contiguous() && positions.is_contiguous() &&
+        cache.scalar_type()==tb::kInt64 && cache.numel()>0 && positions.numel()>=cache.numel() &&
+        positions.numel()%cache.numel()==0 &&
+        (positions.scalar_type()==tb::kInt32 || positions.scalar_type()==tb::kInt64),
+        "decode position buffers have incompatible geometry");
+    const auto begin=reinterpret_cast<uintptr_t>(cache.data_ptr()),other=reinterpret_cast<uintptr_t>(positions.data_ptr());
+    MFQ_RUNTIME_CHECK(begin+cache.numel()*cache.element_size()<=other ||
+        other+positions.numel()*positions.element_size()<=begin,"decode position buffers overlap");
+    const __int128 first=__int128(start)+delta,last=first+cache.numel()-1;
+    MFQ_RUNTIME_CHECK(start>=0 && __int128(start)+cache.numel()-1<=INT64_MAX &&
+        first>=INT64_MIN && last<=INT64_MAX && (positions.scalar_type()!=tb::kInt32 ||
+        (first>=INT32_MIN && last<=INT32_MAX)),"decode position values exceed their integer dtype");
+    MfqCudaGuard guard(cache.device());
+    if(positions.scalar_type()==tb::kInt32)
+        fill_decode_positions_kernel<<<1,64,0,mfq_current_cuda_stream()>>>(cache.data_ptr<int64_t>(),positions.data_ptr<int32_t>(),
+            cache.numel(),positions.numel(),start,delta);
+    else fill_decode_positions_kernel<<<1,64,0,mfq_current_cuda_stream()>>>(cache.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),
+            cache.numel(),positions.numel(),start,delta);
+    MFQ_CUDA_CHECK(hipGetLastError());
+}
+
+
+
+namespace {
 template<class Value, bool Injection>
 __global__ void gated_residual_activation_kernel(const Value* input,Value* output,
     int64_t count,float streams) {
@@ -104,11 +139,20 @@ __global__ void gated_residual_post_norm_kernel(const Branch* branch,const Resid
         const float f=static_cast<float>(value);
         sum=__fadd_rn(sum,__fmul_rn(f,f));
     }
-    __shared__ float partial[256];partial[threadIdx.x]=sum;__syncthreads();
-    for(int stride=blockDim.x/2;stride>0;stride/=2) {
-        if(threadIdx.x<stride)partial[threadIdx.x]=__fadd_rn(partial[threadIdx.x],partial[threadIdx.x+stride]);
-        __syncthreads();
+    // CDNA reductions stay within the physical wave until the four wave sums
+    // are ready. This replaces eight block barriers at the 2560-wide shape.
+    const int lane=int(threadIdx.x)%warpSize,wave=int(threadIdx.x)/warpSize;
+    const int width=blockDim.x<warpSize?int(blockDim.x):warpSize;
+    for(int stride=width/2;stride;stride>>=1)sum=__fadd_rn(sum,__shfl_down(sum,stride,width));
+    __shared__ float partial[8];
+    if(lane==0)partial[wave]=sum;
+    __syncthreads();
+    if(threadIdx.x==0) {
+        float total=0.f;
+        for(int w=0;w<(int(blockDim.x)+warpSize-1)/warpSize;++w)total=__fadd_rn(total,partial[w]);
+        partial[0]=total;
     }
+    __syncthreads();
     const float mean=__fdiv_rn(partial[0],static_cast<float>(hidden));
     const float inverse=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(mean,eps)));
     for(int column=threadIdx.x;column<hidden;column+=blockDim.x) {
@@ -276,11 +320,253 @@ std::vector<Tensor> gated_residual_post_norm(const Tensor& branch,const Tensor& 
     return {updated,normalized};
 }
 
+namespace {
+// Eight independent pooled keys per CTA reuse the four short index queries.
+// Convert cached FP16 keys in registers, retaining FP32 scoring arithmetic.
+template<class Query,class Key>
+__global__ __launch_bounds__(256) void qsa_decode_scores_kernel(const Query* query,const Key* pooled,
+    float* scores,int pools,int tokens,int64_t qb,int64_t qt,int64_t qh,int64_t pb,int64_t pp) {
+    const int lane=threadIdx.x&31,slot=threadIdx.x>>5;
+    const int key=blockIdx.x*8+slot,token=blockIdx.y%tokens,batch=blockIdx.y/tokens;
+    if(key>=pools)return;
+    float k[4];
+    #pragma unroll
+    for(int r=0;r<4;++r)k[r]=static_cast<float>(pooled[int64_t(batch)*pb+int64_t(key)*pp+r*32+lane]);
+    float total=0;
+    #pragma unroll
+    for(int head=0;head<4;++head) {
+        float dot=0;
+        #pragma unroll
+        for(int r=0;r<4;++r)
+            dot=__fmaf_rn(static_cast<float>(query[int64_t(batch)*qb+int64_t(token)*qt+head*qh+r*32+lane]),k[r],dot);
+        #pragma unroll
+        for(int shift=16;shift;shift>>=1)dot+=__shfl_xor(dot,shift,32);
+        total+=fmaxf(dot,0.f);
+    }
+    if(!lane)scores[(int64_t(batch)*tokens+token)*pools+key]=total*0.08838834764831845f;
+}
+}
+
 Tensor block_scores(const Tensor& query, const Tensor& pooled) {
     mfq_selected_attention::values({&query, &pooled});
     MfqCudaGuard guard(query.device());
+    if(query.dim()==4 && pooled.dim()==3 && query.size(0)==pooled.size(0) &&
+        query.size(1)>0 && query.size(1)<=6 && query.size(2)==4 && query.size(3)==128 &&
+        pooled.size(2)==128 && pooled.size(1)>0 && query.stride(3)==1 && pooled.stride(2)==1 &&
+        (query.scalar_type()==tb::kFloat32 || query.scalar_type()==tb::kFloat16) &&
+        (pooled.scalar_type()==tb::kFloat32 || pooled.scalar_type()==tb::kFloat16)) {
+        auto scores=tb::empty({query.size(0),query.size(1),pooled.size(1)},query.options().dtype(tb::kFloat32));
+        const auto launch=[&]<class Query,class Key>() {
+            hipLaunchKernelGGL((qsa_decode_scores_kernel<Query,Key>),dim3((pooled.size(1)+7)/8,query.size(0)*query.size(1)),dim3(256),0,
+                mfq_current_cuda_stream(),query.data_ptr<Query>(),pooled.data_ptr<Key>(),scores.data_ptr<float>(),
+                int(pooled.size(1)),int(query.size(1)),query.stride(0),query.stride(1),query.stride(2),pooled.stride(0),pooled.stride(1));
+        };
+        if(query.scalar_type()==tb::kFloat32) {
+            if(pooled.scalar_type()==tb::kFloat32)launch.template operator()<float,float>();
+            else launch.template operator()<float,mfq_half>();
+        } else {
+            if(pooled.scalar_type()==tb::kFloat32)launch.template operator()<mfq_half,float>();
+            else launch.template operator()<mfq_half,mfq_half>();
+        }
+        MFQ_CUDA_CHECK(hipGetLastError());
+        return scores;
+    }
     return mfq_selected_attention::dots(query, pooled).sum(-2) /
         std::sqrt(double(query.size(-1)));
+}
+
+namespace {
+__global__ void qsa_rank_kernel(const float* scores,const int64_t* positions,
+    float* ranked,int64_t total,int pools,int pool) {
+    for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<total;i+=int64_t(gridDim.x)*blockDim.x)
+        ranked[i]=(i%pools+1)*pool-1<=positions[i/pools]?scores[i]:-1e30f;
+}
+__global__ void qsa_selected_kernel(const int64_t* indices,const int64_t* positions,
+    int32_t* selected,int64_t total,int count,int pool,int budget,int columns) {
+    for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<total;i+=int64_t(gridDim.x)*blockDim.x) {
+        const int row=i/columns,slot=i%columns;
+        const int64_t end=positions[row];int64_t value=-1;
+        if(end+1<=budget) {
+            if(slot<=end)value=slot;
+        } else if(slot<count*pool) {
+            const int64_t block=indices[int64_t(row)*count+slot/pool];
+            if((block+1)*pool-1<=end)value=block*pool+slot%pool;
+        } else if(slot>=budget) {
+            const int tail=(end+1)%pool,offset=slot-budget;
+            if(offset<tail)value=end+1-tail+offset;
+        }
+        selected[i]=int32_t(value);
+    }
+}
+}
+
+Tensor qsa_graph_select(const Tensor& scores,const Tensor& positions,int64_t pool,int64_t budget) {
+    MFQ_RUNTIME_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.scalar_type()==tb::kFloat32 &&
+        scores.dim()==3 && scores.size(0)==1 && scores.size(1)>0 && scores.size(2)>0 &&
+        positions.device()==scores.device() && positions.scalar_type()==tb::kInt64 && positions.is_contiguous() &&
+        positions.dim()==1 && positions.numel()==scores.size(1) && pool>0 && budget>0 && budget%pool==0 &&
+        budget+pool-1<=std::numeric_limits<int>::max() && scores.size(2)<=std::numeric_limits<int>::max(),
+        "QSA graph selection shape/type disagrees");
+    MfqCudaGuard guard(scores.device());
+    const int pools=int(scores.size(2)),count=int(std::min(budget/pool,scores.size(2)));
+    const int columns=int(budget+pool-1);
+    auto ranked=tb::empty_like(scores);
+    hipLaunchKernelGGL(qsa_rank_kernel,dim3(std::min<int64_t>(65535,(scores.numel()+255)/256)),dim3(256),0,
+        mfq_current_cuda_stream(),scores.data_ptr<float>(),positions.data_ptr<int64_t>(),ranked.data_ptr<float>(),
+        scores.numel(),pools,int(pool));
+    auto indices=std::get<1>(tb::topk(ranked,count,-1,true,false));
+    auto selected=tb::empty({1,scores.size(1),columns},positions.options().dtype(tb::kInt32));
+    hipLaunchKernelGGL(qsa_selected_kernel,dim3(std::min<int64_t>(65535,(selected.numel()+255)/256)),dim3(256),0,
+        mfq_current_cuda_stream(),indices.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),selected.data_ptr<int32_t>(),
+        selected.numel(),count,int(pool),int(budget),columns);
+    MFQ_CUDA_CHECK(hipGetLastError());
+    return selected;
+}
+
+
+namespace {
+__device__ __forceinline__ float qwen4_wave_sum(float value) {
+    #pragma unroll
+    for(int offset=warpSize/2;offset;offset>>=1)value+=__shfl_down(value,offset,warpSize);
+    return value;
+}
+__device__ __forceinline__ float qwen4_block_sum(float value,float* waves) {
+    const int lane=threadIdx.x%warpSize,wave=threadIdx.x/warpSize;
+    value=qwen4_wave_sum(value);
+    if(lane==0)waves[wave]=value;
+    __syncthreads();
+    if(wave==0)value=qwen4_wave_sum(lane<int(blockDim.x)/warpSize?waves[lane]:0.f);
+    if(threadIdx.x==0)waves[0]=value;
+    __syncthreads();
+    return waves[0];
+}
+
+// Qwen4 PLE: per-stream signed-root dot gate, broadcast value, grouped RMSNorm.
+// Keep the normalization weight offset used by this runtime's Qwen4 tensors.
+template<class Key,class Query,class Value>
+__global__ __launch_bounds__(256) void ple_gate_norm_hip_kernel(
+    const Key* key,const Query* query,const Value* value,const float* weight,
+    float* gated,float* normalized,int hidden,int streams,float eps) {
+    __shared__ float waves[8],factor,inverse;
+    const int row=blockIdx.x,tid=threadIdx.x,stream=row%streams;
+    const size_t base=size_t(row)*hidden,vbase=size_t(row/streams)*hidden;
+    float dot=0.f;
+    for(int c=tid;c<hidden;c+=256)
+        dot=__fadd_rn(dot,__fmul_rn(float(key[base+c]),float(query[base+c])));
+    const float sum=qwen4_block_sum(dot,waves);
+    if(tid==0) {
+        const float score=float(double(sum)/sqrt(double(hidden)));
+        const float signed_root=(float(score>0.f)-float(score<0.f))*sqrtf(fmaxf(fabsf(score),1e-6f));
+        factor=1.f/(1.f+expf(-signed_root));
+    }
+    __syncthreads();
+    float square=0.f;
+    for(int c=tid;c<hidden;c+=256) {
+        const float x=__fmul_rn(factor,float(value[vbase+c]));
+        gated[base+c]=x;square=__fadd_rn(square,__fmul_rn(x,x));
+    }
+    const float norm_sum=qwen4_block_sum(square,waves);
+    if(tid==0)inverse=1.f/sqrtf(norm_sum/hidden+eps);
+    __syncthreads();
+    for(int c=tid;c<hidden;c+=256)
+        normalized[base+c]=__fmul_rn(__fmul_rn(gated[base+c],inverse),1.f+weight[stream*hidden+c]);
+}
+
+// Read the causal history directly. Each element also writes its next-state
+// counterpart; no concatenation or intermediate tensor per convolution tap.
+template<class Input,class Output,bool Add>
+__global__ void ple_conv_hip_kernel(const Input* input,const float* weight,
+    const Input* previous,const float* gated,Output* output,Input* next,
+    int64_t batch,int64_t tokens,int64_t channels,int64_t taps,int64_t dilation) {
+    const int64_t history=(taps-1)*dilation;
+    const int64_t out_count=batch*tokens*channels,next_count=batch*history*channels;
+    const int64_t count=max(out_count,next_count);
+    for(int64_t at=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;at<count;at+=int64_t(blockDim.x)*gridDim.x) {
+        if(at<out_count) {
+            const int64_t c=at%channels,t=(at/channels)%tokens,b=at/(channels*tokens);
+            float sum=0.f;
+            for(int64_t tap=0;tap<taps;++tap) {
+                const int64_t p=t+tap*dilation;
+                const float x=p<history?(previous?float(previous[(b*history+p)*channels+c]):0.f):
+                    float(input[(b*tokens+p-history)*channels+c]);
+                sum=__fadd_rn(sum,__fmul_rn(x,weight[c*taps+tap]));
+            }
+            float result=__fmul_rn(sum,1.f/(1.f+expf(-sum)));
+            if constexpr(Add)result=__fadd_rn(gated[at],result);
+            output[at]=static_cast<Output>(result);
+        }
+        if(at<next_count) {
+            const int64_t c=at%channels,p=(at/channels)%history,b=at/(channels*history);
+            const int64_t position=tokens+p;
+            next[at]=position<history?(previous?previous[(b*history+position)*channels+c]:Input{}):
+                input[(b*tokens+position-history)*channels+c];
+        }
+    }
+}
+
+template<class Input,class Output,bool Add>
+void launch_ple_conv(const Tensor& input,const Tensor& weight,const Tensor& previous,
+    const Tensor& gated,Tensor& output,Tensor& next,int64_t dilation) {
+    const int64_t count=std::max(output.numel(),next.numel());
+    if(!count)return;
+    const int blocks=int(std::min<int64_t>((count+255)/256,65535));
+    hipLaunchKernelGGL((ple_conv_hip_kernel<Input,Output,Add>),dim3(blocks),dim3(256),0,
+        mfq_current_cuda_stream(),input.data_ptr<Input>(),weight.data_ptr<float>(),
+        previous.defined()?previous.data_ptr<Input>():nullptr,Add?gated.data_ptr<float>():nullptr,
+        output.data_ptr<Output>(),next.data_ptr<Input>(),input.size(0),input.size(1),input.size(2),
+        weight.size(1),dilation);
+    MFQ_CUDA_CHECK(hipGetLastError());
+}
+}
+
+std::vector<Tensor> ple_gate_norm_hip(const Tensor& key,const Tensor& query,const Tensor& value,
+    const Tensor& weight,int64_t hidden,int64_t streams,double eps) {
+    if(key.scalar_type()==tb::kBFloat16 || query.scalar_type()==tb::kBFloat16 || value.scalar_type()==tb::kBFloat16)
+        return ple_gate_norm_hip(key.to(tb::kFloat32),query.to(tb::kFloat32),value.to(tb::kFloat32),weight,hidden,streams,eps);
+    const auto valid=[](const Tensor& x){return x.is_cuda() && x.is_contiguous() &&
+        (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32);};
+    MFQ_RUNTIME_CHECK(valid(key) && valid(query) && valid(value) && key.sizes()==query.sizes() &&
+        hidden>0 && streams>0 && key.numel()==value.numel()*streams && value.numel()%hidden==0 &&
+        key.device()==query.device() && key.device()==value.device() && weight.is_cuda() &&
+        weight.device()==key.device() && weight.numel()==hidden*streams,"invalid PLE gate geometry");
+    MfqCudaGuard guard(key.device());
+    auto norm=weight.to(tb::kFloat32).contiguous();
+    auto gated=tb::empty(key.sizes(),key.options().dtype(tb::kFloat32));
+    auto normalized=tb::empty_like(gated);
+    if(!key.numel())return {gated,normalized};
+    const auto launch=[&](auto k,auto q,auto v) {
+        using K=decltype(k);using Q=decltype(q);using V=decltype(v);
+        hipLaunchKernelGGL((ple_gate_norm_hip_kernel<K,Q,V>),dim3(key.numel()/hidden),dim3(256),0,
+            mfq_current_cuda_stream(),key.data_ptr<K>(),query.data_ptr<Q>(),value.data_ptr<V>(),
+            norm.data_ptr<float>(),gated.data_ptr<float>(),normalized.data_ptr<float>(),int(hidden),int(streams),float(eps));
+    };
+    const auto kv=[&](auto k,auto q){if(value.scalar_type()==tb::kFloat16)launch(k,q,mfq_half{});else launch(k,q,float{});};
+    const auto kq=[&](auto k){if(query.scalar_type()==tb::kFloat16)kv(k,mfq_half{});else kv(k,float{});};
+    if(key.scalar_type()==tb::kFloat16)kq(mfq_half{});else kq(float{});
+    MFQ_CUDA_CHECK(hipGetLastError());return {gated,normalized};
+}
+
+std::vector<Tensor> ple_conv_add_hip(const Tensor& input,const Tensor& source_weight,
+    const std::optional<Tensor>& previous,int64_t dilation,const Tensor& gated,bool half_output) {
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.dim()==3 &&
+        input.scalar_type()==tb::kFloat32 && gated.is_contiguous() && gated.scalar_type()==tb::kFloat32 &&
+        gated.device()==input.device() && gated.sizes()==input.sizes() && dilation>0,"invalid PLE convolution input");
+    auto weight=source_weight;
+    if(weight.dim()==3 && weight.size(1)==1)weight=weight.select(1,0);
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.device()==input.device() && weight.dim()==2 &&
+        weight.size(0)==input.size(2) && weight.size(1)>0 && weight.size(1)-1<=
+        std::numeric_limits<int64_t>::max()/dilation,"invalid PLE convolution weights");
+    const auto history=(weight.size(1)-1)*dilation;
+    const std::vector<int64_t> shape{input.size(0),history,input.size(2)};
+    if(previous)MFQ_RUNTIME_CHECK(previous->is_cuda() && previous->device()==input.device() &&
+        previous->is_contiguous() && previous->scalar_type()==tb::kFloat32 && previous->sizes().vec()==shape,
+        "invalid PLE convolution state");
+    MfqCudaGuard guard(input.device());weight=weight.to(tb::kFloat32).contiguous();
+    auto output=tb::empty(input.sizes(),input.options().dtype(half_output?tb::kFloat16:tb::kFloat32));
+    auto next=tb::empty(shape,input.options());
+    if(half_output)launch_ple_conv<float,mfq_half,true>(input,weight,previous?*previous:Tensor{},gated,output,next,dilation);
+    else launch_ple_conv<float,float,true>(input,weight,previous?*previous:Tensor{},gated,output,next,dilation);
+    return {output,next};
 }
 
 std::vector<Tensor> ple_dilated_conv_silu(const Tensor& input,
@@ -304,6 +590,15 @@ std::vector<Tensor> ple_dilated_conv_silu(const Tensor& input,
         MFQ_RUNTIME_CHECK(state->sizes().vec() == state_shape, "Qwen4 PLE state shape disagrees");
     }
     MfqCudaGuard guard(input.device());
+    if(input.is_contiguous() && (input.scalar_type()==tb::kFloat16 || input.scalar_type()==tb::kFloat32)) {
+        auto previous=state?state->to(input.scalar_type()).contiguous():Tensor{};
+        auto weight=w.to(tb::kFloat32).contiguous();
+        auto output=tb::empty_like(input),next=tb::empty(state_shape,input.options());
+        if(input.scalar_type()==tb::kFloat16)
+            launch_ple_conv<mfq_half,mfq_half,false>(input,weight,previous,{},output,next,dilation);
+        else launch_ple_conv<float,float,false>(input,weight,previous,{},output,next,dilation);
+        return {output,next};
+    }
     auto previous = state ? state->to(input.scalar_type()) : tb::zeros(state_shape, input.options());
     auto combined = tb::cat({previous, input}, 1);
     auto output = tb::zeros(input.sizes(), input.options().dtype(tb::kFloat32));

@@ -1,3 +1,4 @@
+#include "models/nemotron_h/mtp.h"
 #include "hip/hip_runtime.h"
 #include "storage/weight_loader.h"
 #include "storage/model_loader.h"
@@ -151,6 +152,7 @@ MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Glm5CausalLm);
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Qwen4CausalLm);
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::DeepseekV4CausalLm);
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::DeepseekV41CausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::NemotronHCausalLm);
 
 #undef MFQ_INSTANTIATE_CAUSAL_LM
 
@@ -227,10 +229,46 @@ RuntimeComponents<mfq::cuda::Qwen4CausalLm> load_runtime_components(
         bool load_optional_components) {
     RuntimeComponents<mfq::cuda::Qwen4CausalLm> result{model.graph, model.plan};
     if (!load_optional_components) return result;
-    if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none ||
-            (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
+    if (result.plan.vision == mfq::cuda::CudaVisionAdapter::grid_vit) {
+        const auto document = nlohmann::json::parse(model.source->model_config_json());
+        const auto& vision = document.at("vision_config");
+        if (vision.value("hidden_act", std::string("gelu_pytorch_tanh")) != "gelu_pytorch_tanh" ||
+                !vision.value("deepstack_visual_indexes", std::vector<int>{}).empty())
+            throw std::runtime_error("unsupported Qwen4 grid-ViT activation or deepstack");
+        mfq::GridVisionConfig config;
+        config.hidden_size = vision.at("hidden_size").get<int64_t>();
+        config.intermediate_size = vision.at("intermediate_size").get<int64_t>();
+        config.depth = vision.at("depth").get<int64_t>();
+        config.num_heads = vision.at("num_heads").get<int64_t>();
+        config.in_channels = vision.value("in_channels", int64_t{3});
+        config.patch_size = vision.at("patch_size").get<int64_t>();
+        config.temporal_patch_size = vision.at("temporal_patch_size").get<int64_t>();
+        config.spatial_merge_size = vision.value("spatial_merge_size", int64_t{2});
+        config.out_hidden_size = vision.at("out_hidden_size").get<int64_t>();
+        config.num_position_embeddings = vision.at("num_position_embeddings").get<int64_t>();
+        config.rope_theta = vision.value("rope_theta", 10000.0);
+        if (vision.contains("rope_parameters"))
+            config.rope_theta = vision.at("rope_parameters").value("rope_theta", config.rope_theta);
+        config.layer_norm_eps = vision.value("layer_norm_eps", 1e-6);
+        config.validate();
+        const auto image = document.at("image_token_id").get<int64_t>();
+        const auto video = document.at("video_token_id").get<int64_t>();
+        if (config.out_hidden_size != model.config.hidden || model.config.sections.size() != 3 ||
+                image < 0 || video < 0 || image >= model.config.vocab || video >= model.config.vocab || image == video)
+            throw std::runtime_error("invalid Qwen4 grid-ViT text geometry or placeholder IDs");
+        const auto* component = result.graph.component("vision");
+        if(!component)throw std::runtime_error("Qwen4 grid-ViT component is missing");
+        result.grid_vision.emplace(
+            mfq::cuda::grid_vision_runtime::CudaGridVisionPromptComponent::load(
+                *model.execution, *model.source, config, image, video,
+                component->input_contract, component->position_policy));
+        result.vision_available = true;
+    } else if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none) {
+        throw std::runtime_error("unsupported Qwen4 CUDA vision adapter");
+    }
+    if (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
              result.plan.predictor !=
-                 mfq::cuda::CudaPredictorAdapter::flash_next)) {
+                 mfq::cuda::CudaPredictorAdapter::flash_next) {
         throw std::runtime_error(
             "unsupported Qwen4 CUDA component adapter");
     }
@@ -285,12 +323,17 @@ RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> load_runtime_components(
         bool load_optional_components) {
     RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> result{model.graph, model.plan};
     if (!load_optional_components) return result;
-    if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none ||
+    if ((result.plan.vision != mfq::cuda::CudaVisionAdapter::none &&
+         result.plan.vision != mfq::cuda::CudaVisionAdapter::deepseek_v41) ||
             (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
              result.plan.predictor !=
                  mfq::cuda::CudaPredictorAdapter::deepseek_v41_dspark)) {
         throw std::runtime_error(
             "unsupported DeepSeek-V4.1 CUDA component adapter");
+    }
+    if(result.plan.vision==mfq::cuda::CudaVisionAdapter::deepseek_v41) {
+        result.deepseek_vision.emplace(mfq::cuda::deepseek_v41_runtime::Vision::load(model.source,model.shared->config));
+        result.vision_available=true;
     }
     if (result.plan.predictor ==
             mfq::cuda::CudaPredictorAdapter::none) return result;
@@ -344,3 +387,44 @@ MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::DeepseekV4CausalLm);
 
 
 #undef MFQ_INSTANTIATE_COMPONENTS
+
+template <>
+RuntimeComponents<mfq::cuda::NemotronHCausalLm> load_runtime_components(
+        mfq::cuda::NemotronHCausalLm& model,
+        bool load_optional_components) {
+    RuntimeComponents<mfq::cuda::NemotronHCausalLm> result{model.graph, model.plan};
+    if (!load_optional_components) return result;
+    if ((result.plan.vision != mfq::cuda::CudaVisionAdapter::none &&
+         result.plan.vision != mfq::cuda::CudaVisionAdapter::radio) ||
+            (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
+             result.plan.predictor != mfq::cuda::CudaPredictorAdapter::nemotron_h)) {
+        throw std::runtime_error(
+            "unsupported Nemotron-H CUDA component adapter");
+    }
+    if (result.plan.vision == mfq::cuda::CudaVisionAdapter::radio) {
+        const auto* component = result.graph.component("vision");
+        MFQ_RUNTIME_CHECK(component != nullptr,
+            "Nemotron-H graph declares a RADIO adapter without a vision component");
+        const auto vision = mfq::models::nemotron_h::RadioVisionConfig::from_json(
+            model.source->model_config_json());
+        result.radio_vision.emplace(
+            mfq::cuda::nemotron_h::CudaRadioPromptComponent::load(
+                *model.execution, *model.source, vision, component->input_contract,
+                component->position_policy));
+        result.vision_available = true;
+    }
+    if (result.plan.predictor ==
+            mfq::cuda::CudaPredictorAdapter::none) return result;
+    MFQ_RUNTIME_CHECK(model.supports_speculation(),
+        "invalid Nemotron-H predictor model");
+    auto predictor = mfq::cuda::nemotron_h::NemotronHMtp::load_if_present(
+        *model.execution, *model.source, model.config);
+    // The graph declares the component, so missing weights are a broken
+    // container rather than a text-only model.
+    MFQ_RUNTIME_CHECK(predictor,
+        "Nemotron-H graph declares the predictor component but the source has no MTP weights");
+    result.mtp = std::make_unique<mfq::cuda::nemotron_h::NemotronHMtp>(
+        std::move(*predictor));
+    result.mtp_available = true;
+    return result;
+}

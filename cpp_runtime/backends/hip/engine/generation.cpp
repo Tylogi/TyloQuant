@@ -1,3 +1,4 @@
+#include "models/nemotron_h/ops.h"
 #include "generation.h"
 #include "generation_flow.h"
 #include "models/deepseek_v4/ops.h"
@@ -12,6 +13,7 @@
 #include "hip_sampling.h"
 #include "storage/text_session_cache.h"
 #include "mfq_hip_sampling_ops.h"
+#include "mfq_hip_context.h"
 
 #include <algorithm>
 #include <iostream>
@@ -19,6 +21,36 @@
 namespace mfq::cuda::internal {
 using mfq::engine::Generation;
 namespace {
+class EagerDecodePool {
+    std::vector<std::pair<std::shared_ptr<Context>, hipStream_t>> pools_;
+public:
+    EagerDecodePool() {
+        int devices = 0;
+        MFQ_CUDA_CHECK(hipGetDeviceCount(&devices));
+        pools_.reserve(devices);
+        try {
+            for (int device = 0; device < devices; ++device) {
+                auto context = default_context(device);
+                const auto stream = mfq_get_current_cuda_stream(device).stream();
+                context->begin_graph_pool(stream);
+                pools_.emplace_back(std::move(context), stream);
+                pools_.back().first->begin_graph_warmup(stream);
+            }
+        } catch (...) {
+            clear();
+            throw;
+        }
+    }
+    void clear() noexcept {
+        for (auto it = pools_.rbegin(); it != pools_.rend(); ++it) {
+            it->first->end_graph_warmup(it->second);
+            it->first->end_graph_pool(it->second);
+        }
+        pools_.clear();
+    }
+    ~EagerDecodePool() { clear(); }
+};
+
 template <typename Model>
 static mfq_tensor_backend::Tensor sample_token(Model &model, mfq_tensor_backend::Tensor ids,
     mfq::cuda::Sampler &sampler, mfq_tensor_backend::Tensor counts,
@@ -44,6 +76,9 @@ template <typename Model> struct CudaGenerationOps {
     std::int32_t generation_limit = 0;
     bool graph_active = false;
     bool graph_prepared = false;
+    int64_t prefill_compute_chunk = 0;
+    mfq::engine::InferenceOutput* output = nullptr;
+    std::unique_ptr<EagerDecodePool> eager_decode_pool;
 
     CudaGenerationOps(Model &model, DecodeGraphCache &graph,
         const mfq::engine::InferenceRequest &request, const CudaPreparedPrompt *prepared,
@@ -70,10 +105,31 @@ template <typename Model> struct CudaGenerationOps {
         PrefillCudaTimer timer;
         auto ids = full_ids.narrow(1, chunk.offset, chunk.count).contiguous();
         Tensor hidden;
-        if (prepared && prepared->transformed()) {
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
+            if(!prepared || !prepared->transformed())
+                hidden=deepseek_v41_prefill_hidden(model,ids,prefill_compute_chunk,
+                    [&] {return output && output->stopped();});
+        }
+        if(output && output->stopped()) {
+            MFQ_CUDA_CHECK(hipEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+            return timer.elapsed_ms();
+        }
+        if(hidden.defined()) {
+        } else if (prepared && prepared->transformed()) {
+            struct ImageMaskScope {
+                Model& model;
+                ImageMaskScope(Model& m,const Tensor& mask):model(m) {
+                    if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)model.adapter_set_image_mask(mask);
+                }
+                ~ImageMaskScope() {
+                    if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)model.adapter_set_image_mask({});
+                }
+            } participation(model,prepared->image_mask.defined()?
+                prepared->image_mask.narrow(1,chunk.offset,chunk.count).contiguous():Tensor{});
             hidden = model.hidden_forward_inputs(ids,
                 prepared->embeddings.narrow(1, chunk.offset, chunk.count).contiguous(),
-                prepared->positions.narrow(-1, chunk.offset, chunk.count).contiguous(),
+                prepared->positions.defined()?MfqOptional<Tensor>(
+                    prepared->positions.narrow(-1, chunk.offset, chunk.count).contiguous()):mfq_nullopt,
                 mfq_nullopt,
                 nullptr,
                 mfq_nullopt,
@@ -100,6 +156,9 @@ template <typename Model> struct CudaGenerationOps {
     std::int64_t first_token() { return pending.template item<int64_t>(); }
 
     bool graph_eligible() const {
+        // Engram hashes and demand-paged rows are published by the CPU for
+        // each token; they are outside the generic whole-model graph contract.
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)return false;
         const auto &execution = *model.execution;
         return graph_config.enabled && (!prepared || !prepared->transformed()) && !constraint &&
                !model.metadata.flash_next && mfq_hip_graph_capture_supported() &&
@@ -205,6 +264,14 @@ template <typename Model> struct CudaGenerationOps {
     }
     std::int64_t advance() {
         if (!graph_active) {
+            if constexpr (std::is_same_v<Model, DeepseekV41CausalLm>) {
+                static const bool enabled = [] {
+                    const char* value = std::getenv("MFQ_HIP_EAGER_DECODE_POOL");
+                    return !value || value[0] != '0';
+                }();
+                if (enabled && !eager_decode_pool)
+                    eager_decode_pool = std::make_unique<EagerDecodePool>();
+            }
             pending = sample_token(model, pending.reshape({1, 1}), sampler, counts, constraint);
             return pending.template item<int64_t>();
         }
@@ -268,9 +335,12 @@ template <class Model> struct CudaGenerationContext {
     Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
                      size_t reused, size_t stable) {
         if (batching) return batching->generate(request_id, input, output);
-        return mfq::engine::generate_sequence(
-            CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr, config.decode_graph),
-            output, input.prompt.size(), reused, stable, config.generation.prefill_chunk_size);
+        auto operations=CudaGenerationOps<Model>(model,graph,input,prepared?&*prepared:nullptr,config.decode_graph);
+        operations.prefill_compute_chunk=config.generation.prefill_chunk_size;operations.output=&output;
+        auto logical_chunk=config.generation.prefill_chunk_size;
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)
+            if(!prepared || !prepared->transformed())logical_chunk=input.prompt.size();
+        return mfq::engine::generate_sequence(std::move(operations),output,input.prompt.size(),reused,stable,logical_chunk);
     }
     Generation speculate(mfq::engine::InferenceRequest &input, mfq::engine::InferenceOutput &output,
         size_t reused, Hidden restored, Hidden *committed) {
@@ -318,6 +388,7 @@ MFQ_INSTANTIATE_FLOW(mfq::cuda::Glm5CausalLm)
 MFQ_INSTANTIATE_FLOW(mfq::cuda::Qwen4CausalLm)
 MFQ_INSTANTIATE_FLOW(mfq::cuda::DeepseekV4CausalLm)
 MFQ_INSTANTIATE_FLOW(mfq::cuda::DeepseekV41CausalLm)
+MFQ_INSTANTIATE_FLOW(mfq::cuda::NemotronHCausalLm)
 
 #undef MFQ_INSTANTIATE_FLOW
 } // namespace mfq::cuda::internal

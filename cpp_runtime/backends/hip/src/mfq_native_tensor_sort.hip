@@ -255,6 +255,7 @@ __global__ void topk_tile_kernel(
 
 __global__ void initialize_sort_indices_kernel(
     std::int64_t* indices,
+    std::int32_t* segment_offsets,
     std::int64_t elements,
     std::int64_t columns) {
     for (std::int64_t index =
@@ -262,6 +263,12 @@ __global__ void initialize_sort_indices_kernel(
          index < elements;
          index += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
         indices[index] = index % columns;
+    }
+    for (std::int64_t row =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         row <= elements / columns;
+         row += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
+        segment_offsets[row] = static_cast<std::int32_t>(row * columns);
     }
 }
 
@@ -468,14 +475,13 @@ std::tuple<Tensor, Tensor> sort(
     auto output_indices = empty(keys.sizes(), keys.options().dtype(kInt64));
     const auto [blocks, threads] = launch_geometry(keys.numel());
     const auto stream = current_stream(keys.get_device()).stream();
+    auto segment_offsets = empty({rows + 1}, keys.options().dtype(kInt32));
+    // Offsets are a fixed arithmetic progression. Generate them in the
+    // existing initialization launch, avoiding a pinned host allocation,
+    // host-to-device transfer and synchronizing hipHostFree on every sort.
     initialize_sort_indices_kernel<<<blocks, threads, 0, stream>>>(
-        input_indices.data_ptr<std::int64_t>(), keys.numel(), columns);
-    std::vector<std::int32_t> offsets(static_cast<std::size_t>(rows + 1));
-    for (std::int64_t row = 0; row <= rows; ++row) {
-        offsets[static_cast<std::size_t>(row)] = static_cast<std::int32_t>(row * columns);
-    }
-    auto segment_offsets = tensor(
-        offsets, TensorOptions{}.dtype(kInt32).device(keys.device()));
+        input_indices.data_ptr<std::int64_t>(), segment_offsets.data_ptr<std::int32_t>(),
+        keys.numel(), columns);
     auto context = default_context(keys.get_device());
     auto launch = [&]<typename Value>() {
         std::size_t bytes = 0;

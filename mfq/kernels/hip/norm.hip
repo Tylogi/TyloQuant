@@ -304,7 +304,9 @@ __global__ void rms_norm_f16_kernel(const mfq_half* __restrict__ x,
 
     float rinv = rsqrtf(ssq / (float)D + eps);
     for (int i = tid; i < D; i += BD) {
-        or_[i] = (mfq_half)((float)xr[i] * rinv * (w[i] + weight_offset));
+        float value=(float)xr[i] * rinv * (w[i] + weight_offset);
+        asm volatile("" : "+v"(value));
+        or_[i] = (mfq_half)value;
     }
 }
 
@@ -776,3 +778,115 @@ mfq_tensor_backend::Tensor gdn_rms_silu_decode_cuda(mfq_tensor_backend::Tensor x
 }
 
 #include "l2_norm_pair.h"
+
+template <class Value>
+__device__ __forceinline__ float gated_norm_value_as_float(Value value)
+{
+    if constexpr (std::is_same_v<Value, float>) {
+        return value;
+    } else if constexpr (std::is_same_v<Value, __half>) {
+        return __half2float(value);
+    } else {
+        return __bfloat162float(value);
+    }
+}
+
+template <class Value>
+__device__ __forceinline__ Value gated_norm_value_from_float(float value)
+{
+    if constexpr (std::is_same_v<Value, float>) {
+        return value;
+    } else if constexpr (std::is_same_v<Value, __half>) {
+        return __float2half_rn(value);
+    } else {
+        return __float2bfloat16_rn(value);
+    }
+}
+
+template <class Value, class Gate>
+__device__ __forceinline__ float gated_norm_gated_value(
+    Value input, Gate gate)
+{
+    const float value = gated_norm_value_as_float(input);
+    const float z = gated_norm_value_as_float(gate);
+    return __fmul_rn(value, __fdiv_rn(z, __fadd_rn(1.0f, expf(-z))));
+}
+
+// One block normalizes one (row, group) pair; `width` is group_size and
+// `groups_per_row` locates the weight slice of that group.
+template <class Value, class Gate, int Threads>
+__global__ void grouped_gated_rms_norm_kernel(
+    const Value* __restrict__ input,
+    const Gate* __restrict__ gate,
+    const float* __restrict__ weight,
+    Value* __restrict__ output,
+    int width,
+    int groups_per_row,
+    float eps)
+{
+    const int64_t base = int64_t(blockIdx.x) * width;
+    const float* scale = weight + int64_t(blockIdx.x % groups_per_row) * width;
+    float square_sum = 0.0f;
+    for (int column = threadIdx.x; column < width; column += Threads) {
+        const float value =
+            gated_norm_gated_value(input[base + column], gate[base + column]);
+        square_sum = __fadd_rn(square_sum, __fmul_rn(value, value));
+    }
+    square_sum = block_sum<Threads / 32>(square_sum);
+    const float mean = __fdiv_rn(square_sum, static_cast<float>(width));
+    const float inverse = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(mean, eps)));
+    for (int column = threadIdx.x; column < width; column += Threads) {
+        const float value =
+            gated_norm_gated_value(input[base + column], gate[base + column]);
+        output[base + column] = gated_norm_value_from_float<Value>(
+            __fmul_rn(__fmul_rn(value, inverse), scale[column]));
+    }
+}
+
+mfq_tensor_backend::Tensor grouped_gated_rms_norm_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
+    mfq_tensor_backend::Tensor weight, int64_t group_size, double eps)
+{
+    namespace tb = mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() > 0 &&
+        gate.is_cuda() && gate.is_contiguous() && gate.device() == x.device() &&
+        gate.sizes() == x.sizes(),
+        "grouped_gated_rms_norm: x and gate must be matching contiguous CUDA tensors");
+    MFQ_RUNTIME_CHECK((x.scalar_type() == tb::kFloat32 || x.scalar_type() == tb::kFloat16 ||
+        x.scalar_type() == tb::kBFloat16) &&
+        (gate.scalar_type() == tb::kFloat32 || gate.scalar_type() == tb::kFloat16 ||
+        gate.scalar_type() == tb::kBFloat16),
+        "grouped_gated_rms_norm: x and gate dtypes must be f32, f16 or bf16");
+    const int64_t total_width = x.size(-1);
+    MFQ_RUNTIME_CHECK(group_size > 0 && total_width % group_size == 0,
+        "grouped_gated_rms_norm: group_size must divide the last dimension");
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() &&
+        weight.device() == x.device() && weight.scalar_type() == tb::kFloat32 &&
+        weight.dim() == 1 && weight.numel() == total_width,
+        "grouped_gated_rms_norm: weight must be contiguous CUDA f32 of the input width");
+    auto output = tb::empty_like(x);
+    const int64_t blocks = x.numel() / group_size;
+    if (blocks == 0) return output;
+    const auto launch = [&]<class Value, class Gate>() {
+        grouped_gated_rms_norm_kernel<Value, Gate, NORM_BD><<<
+            blocks, NORM_BD, 0, mfq_current_cuda_stream()>>>(
+            static_cast<const Value*>(x.data_ptr()),
+            static_cast<const Gate*>(gate.data_ptr()), weight.data_ptr<float>(),
+            static_cast<Value*>(output.data_ptr()), (int)group_size,
+            (int)(total_width / group_size), (float)eps);
+    };
+    const auto dispatch_gate = [&]<class Value>() {
+        switch (gate.scalar_type()) {
+        case tb::kFloat32: launch.template operator()<Value, float>(); break;
+        case tb::kFloat16: launch.template operator()<Value, __half>(); break;
+        default: launch.template operator()<Value, __hip_bfloat16>(); break;
+        }
+    };
+    switch (x.scalar_type()) {
+    case tb::kFloat32: dispatch_gate.template operator()<float>(); break;
+    case tb::kFloat16: dispatch_gate.template operator()<__half>(); break;
+    default: dispatch_gate.template operator()<__hip_bfloat16>(); break;
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}

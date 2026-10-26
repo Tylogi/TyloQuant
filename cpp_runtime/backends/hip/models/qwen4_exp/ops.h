@@ -19,6 +19,8 @@ void qwen4_set_rotary_fusion(Qwen4CausalLm&, bool enabled);
 void qwen4_set_attention_grouping(Qwen4CausalLm&, bool enabled);
 std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_logits(
     Qwen4CausalLm&,mfq_tensor_backend::Tensor,int);
+std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
+    Qwen4CausalLm&,mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor*,int64_t confirmed=0,bool* initialized=nullptr);
 
 struct Qwen4Model : CausalResources {
     Qwen4Model();
@@ -32,6 +34,8 @@ struct Qwen4Model : CausalResources {
     int64_t batch = 0;
     std::optional<bool> router_lookahead;
     std::unique_ptr<Qwen4DecodeGraph> graph_registry;
+    bool reuse_decode_graphs=false;
+    int64_t graph_captures=0,graph_retained_resets=0,graph_cross_request_replays=0,graph_binding_invalidations=0;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model& model,mfq_tensor_backend::Tensor ids,int kind) {
         return qwen4_decode_graph_logits(model,std::move(ids),kind);
@@ -62,7 +66,12 @@ struct Qwen4Model : CausalResources {
     void adapter_rollback_speculative(int64_t keep);
 };
 
-extern template struct CudaSessionCodec<Qwen4Model>;
+template<> struct CudaSessionCodec<Qwen4Model> {
+    static TextSessionStateKind kind(const Qwen4CausalLm&);
+    static bool supports_paged(const Qwen4CausalLm&);
+    static TextSessionState capture(const Qwen4CausalLm&,const std::vector<int64_t>&);
+    static void restore(Qwen4CausalLm&,const TextSessionState&);
+};
 
 } // namespace mfq::cuda
 
