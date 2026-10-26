@@ -205,7 +205,11 @@ extern "C" int mfq_tq_prefill_f32(ProjectionView view,const float* input,float* 
  auto* high=static_cast<half*>(workspace);auto* low=high+values;
  auto* scales=reinterpret_cast<float*>(low+values);
  mfq_hip_tq_prefill::pack<2><<<tokens,256,0,stream>>>(input,high,low,scales,view.input_columns);
- mfq_hip_tq_prefill::two_phase<256,32><<<dim3((view.rows+63)/64,(tokens+255)/256),256,0,stream>>>(view,output,tokens,high,low,scales);
+ // Twelve M fragments reduce accumulator pressure on the admitted PP shapes.
+ if(tokens==2048 && view.input_columns==2560 &&
+    (view.rows==6144 || view.rows==10240 || view.rows==12288))
+  mfq_hip_tq_prefill::two_phase<192,32><<<dim3((view.rows+63)/64,11),256,0,stream>>>(view,output,tokens,high,low,scales);
+ else mfq_hip_tq_prefill::two_phase<256,32><<<dim3((view.rows+63)/64,(tokens+255)/256),256,0,stream>>>(view,output,tokens,high,low,scales);
  mfq_hip_tq_prefill::exceptional_rows<<<tokens,64,0,stream>>>(view,input,output,scales);
  return int(hipGetLastError());
 }
