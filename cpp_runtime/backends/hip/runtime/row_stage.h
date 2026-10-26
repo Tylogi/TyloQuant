@@ -10,6 +10,9 @@ public:
     virtual ~RowStage()=default;
     virtual mfq_tensor_backend::Tensor output()const=0;
     virtual bool mapped_rows()const=0;
+    // Return true only when the host packet is reusable and its device-side
+    // consumers remain ordered before the next upload on the current stream.
+    virtual bool wait_upload_reuse(){return false;}
     virtual void upload(const std::vector<std::int64_t>& ids,const std::vector<std::int64_t>& shape)=0;
     virtual void decode()=0;
 };

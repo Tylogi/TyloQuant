@@ -460,9 +460,10 @@ class NgramEmbedding {
                 prefill_stage_=stage_factory_(shape,ids.device());
                 prefill_shape_=shape;prefill_stream_=stream;
             } else {
-                // The reused host packet and output belong to this stream.
-                // Finish its previous consumers before publishing new rows.
-                MFQ_CUDA_CHECK(hipStreamSynchronize(prefill_stream_));
+                // A staged DMA fence can release the host packet early while
+                // device packet reuse stays ordered on this same stream.
+                if(!prefill_stage_->wait_upload_reuse())
+                    MFQ_CUDA_CHECK(hipStreamSynchronize(prefill_stream_));
             }
             prefill_stage_->upload(global,shape);prefill_stage_->decode();
             auto result=prefill_stage_->output().clone();

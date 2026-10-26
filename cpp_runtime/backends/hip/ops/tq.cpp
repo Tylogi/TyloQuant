@@ -906,6 +906,7 @@ class TqRowStage final:public RowStage {
     std::size_t image_stride_=0,images_offset_=0,bytes_=0;
     tb::Device device_;
     std::unique_ptr<mfq::cuda::HostBuffer> host_;
+    std::unique_ptr<mfq::cuda::Event> upload_done_;
     tb::Tensor packet_,output_;
     std::uint8_t* packet_address_=nullptr;
     bool mapped_=false,charged_=false;
@@ -968,6 +969,7 @@ public:
         if(!mapped_) {
             packet_=tb::empty({static_cast<std::int64_t>(bytes_)},options.dtype(tb::kUInt8));
             packet_address_=packet_.data_ptr<std::uint8_t>();
+            upload_done_=std::make_unique<mfq::cuda::Event>();
         }
         auto output_shape=shape_;output_shape.push_back(columns_);
         output_=tb::zeros(output_shape,options);
@@ -986,7 +988,10 @@ public:
         const auto view=pack_row(zero,0);
         auto* views=static_cast<ProjectionView*>(host_->data());
         std::fill_n(views,count_,view);
-        if(!mapped_)MFQ_CUDA_CHECK(hipMemcpyAsync(packet_address_,host_->data(),bytes_,hipMemcpyHostToDevice,mfq_current_cuda_stream()));
+        if(!mapped_) {
+            MFQ_CUDA_CHECK(hipMemcpyAsync(packet_address_,host_->data(),bytes_,hipMemcpyHostToDevice,mfq_current_cuda_stream()));
+            upload_done_->record(mfq_current_cuda_stream());
+        }
         MFQ_CUDA_CHECK(hipStreamSynchronize(mfq_current_cuda_stream()));
         mfq::cuda::charge_tensor_host_bytes(bytes_);charged_=true;
     }
@@ -1002,6 +1007,13 @@ public:
     }
     tb::Tensor output()const override{return output_;}
     bool mapped_rows()const override{return mapped_;}
+    bool wait_upload_reuse()override {
+        if(mapped_ || streams_.size()!=1 || streams_.front().stream()!=mfq_current_cuda_stream())return false;
+        // CPU writes need only wait for their preceding DMA source read.
+        // Old decodes and the next device upload are ordered on this stream.
+        upload_done_->synchronize();
+        return true;
+    }
     void upload(const std::vector<std::int64_t>& ids,const std::vector<std::int64_t>& shape)override {
         if(shape!=shape_ || ids.size()!=std::size_t(count_))throw std::invalid_argument("TQ stage upload shape changed");
         const MfqCudaGuard guard(device_);
@@ -1032,6 +1044,7 @@ public:
             mfq_hip_record_stream(packet_,mfq_get_current_cuda_stream(device_.index));
             const auto used=images_offset_+selected.size()*image_stride_;
             MFQ_CUDA_CHECK(hipMemcpyAsync(packet_address_,host_->data(),used,hipMemcpyHostToDevice,mfq_current_cuda_stream()));
+            upload_done_->record(mfq_current_cuda_stream());
         }
     }
     void decode()override {
