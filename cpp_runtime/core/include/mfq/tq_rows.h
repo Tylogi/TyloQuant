@@ -6,6 +6,32 @@
 #include <limits>
 
 namespace mfq {
+struct TqRowSelection {
+    std::vector<std::int64_t> selected;
+    std::vector<std::uint32_t> inverse;
+};
+
+// Preserve first-occurrence order without allocating a hash node per row.
+inline TqRowSelection select_tq_rows(const std::vector<std::int64_t>& ids,
+        std::int64_t rows_per_shard,std::size_t shards) {
+    if(rows_per_shard<1 || !shards || ids.size()>std::uint64_t(INT32_MAX))
+        throw std::invalid_argument("invalid TQ row selection geometry");
+    TqRowSelection result;result.selected.reserve(ids.size());result.inverse.reserve(ids.size());
+    std::size_t capacity=1;while(capacity<ids.size()*2)capacity*=2;
+    constexpr auto empty=std::numeric_limits<std::uint32_t>::max();
+    std::vector<std::uint32_t> slots(capacity,empty);
+    for(const auto id:ids) {
+        if(id<0 || std::uint64_t(id/rows_per_shard)>=shards)
+            throw std::out_of_range("TQ stage shard ID is out of bounds");
+        auto key=std::uint64_t(id);key^=key>>33;key*=0xff51afd7ed558ccdULL;key^=key>>33;
+        auto at=std::size_t(key)&(capacity-1);
+        while(slots[at]!=empty && result.selected[slots[at]]!=id)at=(at+1)&(capacity-1);
+        if(slots[at]==empty){slots[at]=std::uint32_t(result.selected.size());result.selected.push_back(id);}
+        result.inverse.push_back(slots[at]);
+    }
+    return result;
+}
+
 struct TqLayout {
     std::uint32_t rows=0,width=0,gs=0,packed_bytes=0;
     bool columns=false;

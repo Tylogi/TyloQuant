@@ -10,6 +10,7 @@ extern "C" uint64_t mfq_tq_prefill_f32_workspace(ProjectionView,int);
 #include "tq_input_gate.h"
 #include "tq_residual.h"
 #include "mfq/tq_rows.h"
+#include "mfq/host_parallel.h"
 #include "nlohmann/json.hpp"
 #include <algorithm>
 #include <climits>
@@ -1005,18 +1006,10 @@ public:
         if(shape!=shape_ || ids.size()!=std::size_t(count_))throw std::invalid_argument("TQ stage upload shape changed");
         const MfqCudaGuard guard(device_);
         retain_stream();
-        std::unordered_map<std::int64_t,std::size_t> unique;
-        unique.reserve(ids.size());
-        std::vector<std::int64_t> selected;selected.reserve(ids.size());
-        std::vector<std::size_t> inverse;inverse.reserve(ids.size());
+        auto selection=mfq::select_tq_rows(ids,rows_per_shard_,tables_.size());
+        const auto& selected=selection.selected;
+        const auto& inverse=selection.inverse;
         auto* views=static_cast<ProjectionView*>(host_->data());
-        for(const auto id:ids) {
-            if(id<0 || std::uint64_t(id/rows_per_shard_)>=tables_.size())
-                throw std::out_of_range("TQ stage shard ID is out of bounds");
-            const auto [position,inserted]=unique.try_emplace(id,selected.size());
-            if(inserted)selected.push_back(id);
-            inverse.push_back(position->second);
-        }
         std::vector<ProjectionView> prepared(selected.size());
         const auto gather=[&](std::size_t begin,std::size_t end) {
             for(auto index=begin;index<end;++index) {
@@ -1029,21 +1022,15 @@ public:
         if(selected.size()>=4096 && std::all_of(tables_.begin(),tables_.end(),[](const auto& table){return table->parallel_reads();})) {
             // Mapped readers copy independent ranges. Keep all HIP calls on
             // the caller thread and parallelize only CPU row preparation.
-            std::vector<std::future<void>> workers;
-            const auto grain=(selected.size()+3)/4;
-            for(std::size_t worker=1;worker<4;++worker) {
-                const auto begin=worker*grain,end=std::min(selected.size(),begin+grain);
-                workers.push_back(std::async(std::launch::async,gather,begin,end));
-            }
-            gather(0,std::min(grain,selected.size()));
-            for(auto& worker:workers)worker.get();
+            static thread_local mfq::HostParallelPool readers;
+            readers.run(0,std::int64_t(selected.size()),1,4,gather);
         } else gather(0,selected.size());
         for(std::size_t index=0;index<ids.size();++index) {
             views[index]=prepared[inverse[index]];
         }
         if(!mapped_) {
             mfq_hip_record_stream(packet_,mfq_get_current_cuda_stream(device_.index));
-            const auto used=images_offset_+unique.size()*image_stride_;
+            const auto used=images_offset_+selected.size()*image_stride_;
             MFQ_CUDA_CHECK(hipMemcpyAsync(packet_address_,host_->data(),used,hipMemcpyHostToDevice,mfq_current_cuda_stream()));
         }
     }
