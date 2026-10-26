@@ -22,6 +22,7 @@
 #include "mfe_cached_dispatch_test.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <numeric>
 #include <chrono>
@@ -29,6 +30,7 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 using namespace mfq::cuda;
 using namespace mfq::cuda::internal;
@@ -1319,6 +1321,42 @@ static void check_graph_workspace_reuse() {
     check(context->memory_stats().allocated==before,"oversized graph block was not fully released");
 }
 
+// A drained graph pool may still have a free that the driver has not
+// finished. Destroying it made the driver fault inside a later
+// cudaStreamSynchronize (an access violation), so drained graph pools are
+// recycled instead. Hold the stream on the host so a retired pool's last free
+// stays queued while further graph pools are prepared; the pool must be
+// reused rather than destroyed, and repeated graphs must not add handles.
+static void check_graph_pool_recycling() {
+    namespace tb=mfq_tensor_backend;
+    auto context=default_context();const auto stream=mfq_current_cuda_stream();
+    context->begin_graph_pool(stream);
+    tb::Tensor retained;
+    {
+        GraphWarmupScope warmup(context,stream);
+        retained=tb::empty({1<<20},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+    }
+    context->end_graph_pool(stream);
+    const auto handles=context->graph_memory_pool_count();
+    std::atomic<bool> resume{false};
+    MFQ_CUDA_CHECK(cudaLaunchHostFunc(stream,[](void* flag) {
+        while(!static_cast<std::atomic<bool>*>(flag)->load())std::this_thread::yield();
+    },&resume));
+    retained={};
+    const auto other=mfq_get_stream_from_pool();
+    bool recycled=true;
+    for(int graph=0;graph<4;++graph) {
+        context->begin_graph_pool(other.stream());
+        context->end_graph_pool(other.stream());
+        recycled&=context->graph_memory_pool_count()==handles;
+    }
+    resume=true;
+    MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));
+    check(recycled,"a drained graph pool was destroyed or replaced instead of recycled");
+    context->reclaim_idle_memory();
+    check(context->graph_memory_pool_count()==handles,"trimming dropped a recycled graph pool");
+}
+
 static void check_streamed_graph_segments() {
     namespace tb=mfq_tensor_backend;
     auto context=default_context();const auto stream=mfq_current_cuda_stream();
@@ -1440,6 +1478,10 @@ void check_dma_copy_buckets() {
 int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    if(argc==2 && std::string(argv[1])=="--graph-pool-recycling-check") {
+        check_graph_pool_recycling();
+        std::cout<<"graph pool recycling check passed\n";return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--workspace-loan-check") {
         check_workspace_loan();check_graph_workspace_reuse();
         std::cout<<"CUDA workspace loan ranges and graph reuse checks passed\n";return 0;
@@ -1502,6 +1544,7 @@ int main(int argc, char** argv) try {
     check_kv_projection_loan();
     check_reused_projection_observer();
     check_graph_workspace_reuse();
+    check_graph_pool_recycling();
     check_gelu_approximations();
     check_streamed_graph_segments();
     check_retained_recurrent_storage();
