@@ -65,6 +65,10 @@ public:
         const mfq_tensor_backend::Tensor& raw,const mfq_tensor_backend::Tensor& weight,
         const mfq_tensor_backend::Tensor& positions,const mfq_tensor_backend::Tensor& cache_positions,
         const mfq_tensor_backend::Tensor& pooled,double eps,int64_t pool) const;
+    // Optional pool4 FP16 prefill; an undefined result preserves the caller's path.
+    mfq_tensor_backend::Tensor forward_pooled(
+        const mfq_tensor_backend::Tensor& raw,const mfq_tensor_backend::Tensor& weight,
+        const mfq_tensor_backend::Tensor& positions,double eps,int64_t pool) const;
     mfq_tensor_backend::Tensor forward_normalized(
         const mfq_tensor_backend::Tensor& value, const mfq_tensor_backend::Tensor& weight,
         const mfq_tensor_backend::Tensor& positions, double eps,

@@ -15,6 +15,10 @@ void rotary_pooled_cache_update_cuda(
     const mfq_tensor_backend::Tensor& positions,const mfq_tensor_backend::Tensor& cache_positions,
     const mfq_tensor_backend::Tensor& pooled,const mfq_tensor_backend::Tensor& frequencies,
     const mfq_tensor_backend::Tensor& axes,int64_t maximum,double eps);
+mfq_tensor_backend::Tensor rotary_pooled_prefill_cuda(
+    const mfq_tensor_backend::Tensor& raw,const mfq_tensor_backend::Tensor& weight,
+    const mfq_tensor_backend::Tensor& positions,const mfq_tensor_backend::Tensor& frequencies,
+    const mfq_tensor_backend::Tensor& axes,int64_t maximum,double eps);
 mfq_tensor_backend::Tensor rotary_normalized_cached_cuda(
     mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor weight,
     mfq_tensor_backend::Tensor positions, mfq_tensor_backend::Tensor frequencies,

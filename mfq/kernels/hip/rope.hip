@@ -311,6 +311,69 @@ __global__ void rotary_embedding_cached_kernel(
     }
 }
 
+// Preserve the FP16 pooled mean and the existing normalized-RoPE arithmetic.
+template<class Position>__global__ __launch_bounds__(128) void rotary_pooled_prefill_kernel(const __half* raw,__half* destination,
+ const float* weight,const Position* positions,const float* frequencies,const int32_t* axes,
+ int capacity,int pairs,int position_axes,int maximum,float eps){
+ const int tid=threadIdx.x;const int64_t block=blockIdx.x;
+ __shared__ float pooled[128],squares[128],normalized[128];
+ float value=0;
+ if(tid<128){float sum=0;for(int row=0;row<4;++row){const int64_t at=block*4+row;sum=__fadd_rn(sum,float(raw[at*128+tid]));}
+  value=float(__half(__fmul_rn(sum,.25f)));pooled[tid]=value;}
+ squares[tid]=__fmul_rn(value,value);__syncthreads();
+ for(int stride=64;stride;stride/=2){if(tid<stride)squares[tid]=__fadd_rn(squares[tid],squares[tid+stride]);__syncthreads();}
+ const float mean=__fdiv_rn(squares[0],128.f),shifted=__fadd_rn(mean,float(eps)),inverse=__fdiv_rn(1.f,__fsqrt_rn(shifted));
+ if(tid<128)normalized[tid]=float(__half(__fmul_rn(__fmul_rn(pooled[tid],inverse),__fadd_rn(weight[tid],1.f))));
+ __syncthreads();
+ if(tid>=128-pairs)return;
+ const int64_t out=block*128;
+ if(tid>=pairs){destination[out+tid+pairs]=__half(normalized[tid+pairs]);return;}
+ int axis=axes[tid];if(axis>=position_axes)axis=0;
+ const int64_t raw_position=int64_t(positions[int64_t(axis)*capacity+block*4]);
+ #ifdef MFQ_NATIVE_CUDA_RUNTIME
+ int position=__double2int_rz(double(raw_position));
+#else
+ int position=static_cast<int32_t>(raw_position);
+#endif
+ position=max(0,min(maximum-1,position));
+ const float angle=__fmul_rn(float(position),frequencies[tid]);
+ const float cosine=float(::cos(double(angle))),sine=float(::sin(double(angle)));
+ const float first=normalized[tid],second=normalized[tid+pairs];
+ destination[out+tid]=__half(__fsub_rn(__fmul_rn(first,cosine),__fmul_rn(second,sine)));
+ destination[out+tid+pairs]=__half(__fadd_rn(__fmul_rn(second,cosine),__fmul_rn(first,sine)));
+}
+
+mfq_tensor_backend::Tensor rotary_pooled_prefill_cuda(
+    const mfq_tensor_backend::Tensor& raw,const mfq_tensor_backend::Tensor& weight,
+    const mfq_tensor_backend::Tensor& positions,const mfq_tensor_backend::Tensor& frequencies,
+    const mfq_tensor_backend::Tensor& axes,int64_t maximum,double eps) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(raw.is_cuda() && raw.dim()==3 && raw.size(0)==1 && raw.size(1)>=4 && raw.size(1)<=INT_MAX &&
+        raw.size(2)==128 && raw.is_contiguous() && raw.scalar_type()==tb::kFloat16 &&
+        weight.device()==raw.device() && weight.is_contiguous() && weight.scalar_type()==tb::kFloat32 && weight.numel()==128 &&
+        positions.device()==raw.device() && positions.is_contiguous() && positions.dim()>=1 && positions.dim()<=3 &&
+        positions.size(-1)==raw.size(1) && (positions.dim()<3 || positions.size(1)==1) &&
+        (positions.scalar_type()==tb::kInt32 || positions.scalar_type()==tb::kInt64) &&
+        frequencies.device()==raw.device() && frequencies.is_contiguous() && frequencies.scalar_type()==tb::kFloat32 &&
+        frequencies.dim()==1 && frequencies.numel()>0 && frequencies.numel()<=64 &&
+        axes.device()==raw.device() && axes.is_contiguous() && axes.scalar_type()==tb::kInt32 && axes.sizes()==frequencies.sizes() &&
+        maximum>0 && maximum<=INT_MAX && std::isfinite(eps) && eps>=0,
+        "pooled rotary prefill geometry/type mismatch");
+    MfqCudaGuard guard(raw.device());
+    const int position_axes=positions.dim()==1?1:int(positions.size(0));
+    MFQ_RUNTIME_CHECK(position_axes>0,"pooled rotary prefill needs a position axis");
+    auto output=tb::empty({1,raw.size(1)/4,128},raw.options());
+    const auto launch=[&]<class Position>() {
+        rotary_pooled_prefill_kernel<Position><<<unsigned(raw.size(1)/4),128,0,mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const __half*>(raw.data_ptr()),reinterpret_cast<__half*>(output.data_ptr()),
+            weight.data_ptr<float>(),positions.data_ptr<Position>(),frequencies.data_ptr<float>(),axes.data_ptr<int32_t>(),
+            int(raw.size(1)),int(frequencies.numel()),position_axes,int(maximum),float(eps));
+    };
+    if(positions.scalar_type()==tb::kInt64)launch.template operator()<int64_t>();
+    else launch.template operator()<int32_t>();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
+}
+
 template<class Position>
 __global__ __launch_bounds__(256) void rotary_pooled_cache_kernel(
     const __half* raw,__half* destination,const float* weight,const Position* positions,

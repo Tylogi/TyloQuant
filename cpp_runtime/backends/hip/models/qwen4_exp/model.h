@@ -907,6 +907,10 @@ class Qsa {
             },
             [&](const Projection &p) {
                 const auto &raw = p.raw;
+                if(fused_projection_) {
+                    auto pooled=rotary_->forward_pooled(raw,w_.index_key_norm,full_positions,c_.eps,c_.pool);
+                    if(pooled.defined())return pooled;
+                }
                 const auto pools = (offset + t) / c_.pool;
                 auto pooled = raw.narrow(1, 0, pools * c_.pool)
                                   .reshape({b, pools, c_.pool, c_.index_width})
