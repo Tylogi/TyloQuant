@@ -566,7 +566,12 @@ struct TqMoePeer {
         return output;
     }
 };
-tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,tb::Tensor weights,float limit)const {
+tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,tb::Tensor weights,float limit,
+        const TqWeight* shared_down,tb::Tensor shared_hidden,tb::Tensor shared_coefficient)const {
+    if(shared_down && (!gate || !down || !gate->shards.empty() ||
+        input_value.scalar_type()!=tb::kFloat16 || input_value.dim()!=2 || input_value.size(0)!=1 ||
+        ids.dim()!=2 || ids.size(1)<1 || shared_down->image.device()!=input_value.device()))
+        throw std::invalid_argument("fused TQ shared finish requires one local FP16 request");
     if(gate && !gate->shards.empty()) {
         if(!up || !down || gate->shards.size()!=up->shards.size() || gate->shards.size()!=down->shards.size())
             throw std::invalid_argument("TQ expert shard banks differ");
@@ -604,7 +609,7 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,tb::Tensor 
         throw std::invalid_argument("invalid TQ three-bank MoE geometry");
     MfqCudaGuard guard(input_value.device());const auto x=input_value.contiguous();
     if(!ids.numel())return tb::zeros({x.size(0),down->out},x.options());
-    auto output=tb::empty({x.size(0),down->out},x.options());
+    auto output=shared_down?tb::Tensor{}:tb::empty({x.size(0),down->out},x.options());
     auto coefficients=weights.to(tb::kFloat32).contiguous();TqHipRoutes route(ids,int(gate->experts),x);
     auto hidden=tb::empty({ids.size(0),ids.size(1),gate->out},x.options());
     // SIMT writes every pair, including invalid routes. Grouped tiles visit valid pairs only.
@@ -613,6 +618,7 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,tb::Tensor 
     const auto stream=mfq_current_cuda_stream();const int type=dtype(x.scalar_type());
     status(mfq_tq_moe_swiglu(gate->weight.view,up->weight.view,x.data_ptr(),hidden.data_ptr(),int(gate->out),route.plan,type,limit,stream));
     status(mfq_tq_moe_projection(down->weight.view,hidden.data_ptr(),pairs.data_ptr(),int(down->out),route.plan,type,true,stream));
+    if(shared_down)return tq_shared_finish_cuda(shared_down->view,shared_hidden,pairs,coefficients,shared_coefficient);
     status(mfq_tq_moe_reduce(pairs.data_ptr(),coefficients.data_ptr<float>(),output.data_ptr(),int(ids.size(0)),int(ids.size(1)),int(down->out),type,stream));
     return output;
 }

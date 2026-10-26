@@ -39,7 +39,10 @@ mfq_tensor_backend::Tensor tq_shared_swiglu_cuda(ProjectionView,ProjectionView,
 std::vector<mfq_tensor_backend::Tensor> tq_router_gate_cuda(ProjectionView,
     const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&);
 mfq_tensor_backend::Tensor tq_shared_add_cuda(const mfq_tensor_backend::Tensor&,
-    const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&);
+        const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&);
+mfq_tensor_backend::Tensor tq_shared_finish_cuda(ProjectionView,
+        const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&,
+        const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&);
 
 // The same three ordinary TQ banks used by CUDA. Compressed rows retain their
 // standard layout and independent bit widths, without an MFE wrapper.
@@ -61,7 +64,9 @@ struct TqMoeBanks {
     std::shared_ptr<TqRoutedWeight> gate,up,down;
     mutable std::shared_ptr<TqMoePeer> peer;
     mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor,
-        mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor,float limit=0.f)const;
+        mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor,float limit=0.f,
+        const TqWeight* shared_down=nullptr,mfq_tensor_backend::Tensor shared_hidden={},
+        mfq_tensor_backend::Tensor shared_coefficient={})const;
 };
 
 // Table rows remain in their source. Only requested rows enter device memory.

@@ -102,6 +102,7 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
                        Linear router, Linear shared_gate, Linear sg, Linear su, Linear sd,
                        const Config &c, MoeFfnPrefetch* prefetch=nullptr) {
     auto sg_weight=weight_loader::linear_weight(sg),su_weight=weight_loader::linear_weight(su);
+    auto sd_weight=weight_loader::linear_weight(sd);
     auto router_weight=weight_loader::linear_weight(router),shared_gate_weight=weight_loader::linear_weight(shared_gate);
     auto shared=[sg,su,sd,shared_gate,sg_weight,su_weight](CudaExecutionContext& execution,const Tensor& source) {
         if(sg_weight && su_weight && sg_weight->is_tq() && su_weight->is_tq() &&
@@ -128,7 +129,7 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
         tq->up=gate_up.tq_projections[1];tq->down=down.tq_projections[0];
     }
     auto pipeline=tq?MoeFfnForward{}:make_moe_ffn_pipeline(gate_up.projections,down.projections,shared,{},std::move(shared_weights),prefetch);
-    return [gate_up, down, router, shared, pipeline, tq, c,router_weight,shared_gate_weight,sg_weight,su_weight,sd](CudaExecutionContext &execution,
+    return [gate_up, down, router, shared, pipeline, tq, c,router_weight,shared_gate_weight,sg_weight,su_weight,sd,sd_weight](CudaExecutionContext &execution,
                                                                const Tensor &x) {
         auto source = x.reshape({-1, c.hidden}).to(tb::kFloat16);
         const auto routing = c.routing();
@@ -143,6 +144,9 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
                 routing.activation==mfq::models::RouterActivation::sqrt_softplus,
                 routing.normalize,routing.delayed_softmax,mfq_nullopt,1e-20,routing.scale);
             auto hidden=tq_shared_swiglu_cuda(sg_weight->tq.view,su_weight->tq.view,source);
+            if(sd_weight && sd_weight->is_tq() && tq->gate->shards.empty() &&
+               sd_weight->tq.out>=sd_weight->tq.neuron_len && sd_weight->tq.neuron_len%8==0)
+                return tq->forward(source,selected[0],selected[1],0.f,&sd_weight->tq,hidden,projected[1]).reshape(x.sizes());
             auto shared_output=sd(execution,hidden);
             auto routed=tq->forward(source,selected[0],selected[1]);
             return tq_shared_add_cuda(routed,shared_output,projected[1]).reshape(x.sizes());
