@@ -82,6 +82,23 @@ struct MoeActivationWorkspace {
     mfq_tensor_backend::Tensor xscale;
 };
 
+// Eager prefill scratch (key rows 0) is shared only by the expert pools of
+// one projection call. Drop it on return; otherwise every MoE layer keeps a
+// buffer sized for the longest prompt seen. Later layers reuse the freed
+// pages in stream order.
+template <class Workspaces>
+struct EagerActivationScratch {
+    Workspaces & workspaces;
+    bool active;
+    ~EagerActivationScratch() {
+        if (!active) return;
+        for (auto it = workspaces.begin(); it != workspaces.end();) {
+            if (it->first.input_rows == 0) it = workspaces.erase(it);
+            else ++it;
+        }
+    }
+};
+
 struct MoeActivationGeometry {
     int groups = 0;
     int gs = 0;

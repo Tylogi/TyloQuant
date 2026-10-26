@@ -2599,6 +2599,8 @@ void release_moe_prefill_buffers(MoeExpertCache* cache) {
     if(!cache)return;
     if(!cache->pipeline_prefill_copy_pending_ && cache->pipeline_prefill_release_.empty() &&
             !cache->pipeline_prefill_layer_buffer_.defined() && !cache->pipeline_prefill_pool_ &&
+            !cache->pipeline_prefill_activations_ && cache->pipeline_prefill_host_workspaces_.empty() &&
+            !cache->pipeline_prefill_route_publication_ &&
             !cache->pipeline_prefill_host_ring_.defined() && !cache->pipeline_prefill_metadata_host_.defined())return;
     cudaStreamCaptureStatus capture;
     const auto stream=mfq_current_cuda_stream();
@@ -2613,6 +2615,7 @@ void release_moe_prefill_buffers(MoeExpertCache* cache) {
     for(auto i=cache->pipeline_stages_.begin();i!=cache->pipeline_stages_.end();)
         if(i->first.starts_with("prefill:"))i=cache->pipeline_stages_.erase(i);else ++i;
     cache->pipeline_prefill_activations_.reset();
+    cache->pipeline_prefill_host_workspaces_.clear();
     cache->pipeline_prefill_host_ring_={};cache->pipeline_prefill_host_stride_=0;
     cache->pipeline_prefill_metadata_host_={};cache->pipeline_prefill_metadata_stride_=0;
     cache->pipeline_prefill_ring_={};
