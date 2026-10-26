@@ -452,22 +452,29 @@ __global__ void mma_reduce_gate_kernel(const float* partial, const float2* metad
     }
 }
 
+template<bool Tail33>
 __global__ void mma_reduce_gate_parallel_kernel(const float* partial,const float2* metadata,const void* gate,void* output,
  int64_t gate_batch,int64_t gate_head,int64_t gate_column,int total_blocks,int parts,bool float_gate,bool half_output,bool double_sigmoid){
  const int tid=threadIdx.x,head=blockIdx.x%24,batch=blockIdx.x/24;
  const int tile_id=batch*2+head/12,local=head%12,first=tile_id*parts;
  const size_t output_base=size_t(batch*24+head)*256;
  const float* contributions=reinterpret_cast<const float*>(metadata)+size_t(total_blocks)*64;
- __shared__ float factors[32],denominator,values[4096],merged[256];
+ __shared__ float factors[32+(Tail33?1:0)],denominator,values[4096],merged[256];
  if(tid<32){
   float2 stats=make_float2(-INFINITY,0.f);
   if(tid<parts){const int index=first+tid;stats=metadata[(size_t(index)+(tid==parts-1?0:total_blocks))*16+local];}
-  float peak=stats.x;
+  float2 extra=make_float2(-INFINITY,0.f);
+  if constexpr(Tail33)extra=metadata[size_t(first+parts-1)*16+local];
+  float peak=stats.x;if constexpr(Tail33)peak=fmaxf(peak,extra.x);
   #pragma unroll
   for(int shift=16;shift;shift/=2)peak=fmaxf(peak,__shfl_xor(peak,shift,32));
   const float difference=stats.x-peak;
   const float factor=stats.y>0.f && difference>=-20.f?expf(difference):0.f;
   factors[tid]=factor;float sum=factor*stats.y;
+  if constexpr(Tail33)if(tid==0){const float difference=extra.x-peak;
+   const float tail_factor=extra.y>0.f && difference>=-20.f?expf(difference):0.f;
+   factors[32]=tail_factor;sum+=tail_factor*extra.y;
+  }
   #pragma unroll
   for(int shift=16;shift;shift/=2){const float other=__shfl_down(sum,shift,32);if(tid<shift)sum+=other;}
   if(!tid)denominator=sum;
@@ -478,10 +485,15 @@ __global__ void mma_reduce_gate_parallel_kernel(const float* partial,const float
  for(int base=0;base<256;base+=128){
   float4 data=make_float4(0.f,0.f,0.f,0.f);
   if(part<parts){const float* source=part==parts-1?partial+output_base:contributions+(size_t(first+part)*16+local)*256;data=*reinterpret_cast<const float4*>(source+base+column_group);}
-  values[part*128+(column_group^part)]=data.x*factor;
-  values[part*128+((column_group+1)^part)]=data.y*factor;
-  values[part*128+((column_group+2)^part)]=data.z*factor;
-  values[part*128+((column_group+3)^part)]=data.w*factor;
+  float4 weighted=make_float4(data.x*factor,data.y*factor,data.z*factor,data.w*factor);
+  if constexpr(Tail33)if(part==0){const float4 tail=*reinterpret_cast<const float4*>(partial+output_base+base+column_group);
+   weighted.x+=tail.x*factors[32];weighted.y+=tail.y*factors[32];
+   weighted.z+=tail.z*factors[32];weighted.w+=tail.w*factors[32];
+  }
+  values[part*128+(column_group^part)]=weighted.x;
+  values[part*128+((column_group+1)^part)]=weighted.y;
+  values[part*128+((column_group+2)^part)]=weighted.z;
+  values[part*128+((column_group+3)^part)]=weighted.w;
   __syncthreads();
   const int lane=tid&31,warp=tid>>5;
   #pragma unroll
@@ -522,11 +534,14 @@ Tensor mma_reduce_gated(const Tensor& partial,const Tensor& metadata,const Tenso
     MfqCudaGuard guard(partial.device());
     auto output=tb::empty(partial.sizes(),partial.options().dtype(half_output?tb::kFloat16:tb::kFloat32));
     if(tokens==1 && heads==24 && kv_heads==2 && width==256 && query_columns==1 && head_columns==16 &&
-        parts>1 && parts<=32 && qsa_gated_gfx942(partial.get_device())) {
-        mma_reduce_gate_parallel_kernel<<<unsigned(output.numel()/width),1024,0,mfq_current_cuda_stream()>>>(
+        parts>1 && parts<=33 && qsa_gated_gfx942(partial.get_device())) {
+        const auto launch=[&]<bool Tail33>() {
+        mma_reduce_gate_parallel_kernel<Tail33><<<unsigned(output.numel()/width),1024,0,mfq_current_cuda_stream()>>>(
             partial.data_ptr<float>(),reinterpret_cast<const float2*>(metadata.data_ptr<float>()),gate.data_ptr(),output.data_ptr(),
             gate.stride(0),gate.stride(2),gate.stride(3),total_blocks,parts,gate.scalar_type()==tb::kFloat32,
             half_output,gate.scalar_type()==tb::kFloat32&&!gate.is_contiguous());
+        };
+        if(parts==33)launch.template operator()<true>();else launch.template operator()<false>();
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
     }
     hipLaunchKernelGGL(( mma_reduce_gate_kernel), dim3(unsigned(output.numel()/width)),dim3(256),shared,mfq_current_cuda_stream(),
