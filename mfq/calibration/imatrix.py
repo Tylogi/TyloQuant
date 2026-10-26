@@ -1210,10 +1210,6 @@ def collect_imatrix(
     target_device = torch.device(device)
     if target_device.type not in {"cuda", "mps"}:
         raise ValueError("imatrix device must be CUDA or MPS")
-    if target_device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA imatrix requested but CUDA is unavailable")
-    if target_device.type == "mps" and not torch.backends.mps.is_available():
-        raise RuntimeError("Metal imatrix requested but MPS is unavailable")
     if min(window_length, batch_size, train_tokens) <= 0:
         raise ValueError("imatrix window, batch, and train token counts must be positive")
     if objective not in {"naq", "linear"}:
@@ -1241,11 +1237,28 @@ def collect_imatrix(
         raise ValueError("training corpus produced no imatrix batches")
     selected_tokens = sum(int(batch.attention_mask.sum()) for batch in batches)
     storage_tokens = sum(int(batch.input_ids.size) for batch in batches)
-    work = (
-        Path(work_dir).resolve()
-        if work_dir is not None
-        else output_path.parent / f"{output_path.stem}.work"
+    work = Path(work_dir).resolve() if work_dir is not None else output_path.parent / f"{output_path.stem}.work"
+    from mfq.architectures.hf_config import load_hf_model_config, text_section
+    from mfq.tools.quantize_hf_to_mfq import _hf_source_inventory
+    from mfq.disk_space import DiskSpaceRequirement, check_disk_space
+    config = text_section(load_hf_model_config(root))
+    hidden_size = int(config['hidden_size'])
+    inventory = _hf_source_inventory(root)
+    # Price all source matrices, including unobserved targets. The selected
+    # corpus layout gives the exact padded hidden-state token count.
+    imatrix_bytes = sum(
+        (int(np.prod(item.shape[:-2])) if len(item.shape) > 2 else 1)
+        * (item.shape[-1]*4 + item.shape[-2]*8 + 8) + 2048
+        for item in inventory.values() if len(item.shape) >= 2
     )
+    check_disk_space([
+        DiskSpaceRequirement(work, storage_tokens*hidden_size*2, 'imatrix BF16 hidden-state workspace'),
+        DiskSpaceRequirement(output_path, imatrix_bytes, 'imatrix moments, NAQ rows and metadata'),
+    ], stage='imatrix model loading and calibration')
+    if target_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA imatrix requested but CUDA is unavailable")
+    if target_device.type == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("Metal imatrix requested but MPS is unavailable")
     work.mkdir(parents=True, exist_ok=True)
     hidden_path = work / "hidden.bf16"
     if hidden_path.exists():
@@ -1417,6 +1430,12 @@ def collect_imatrix(
             "routed_expert_entries": sum(entry.matrices > 1 for entry in entries.values()),
             "elapsed_seconds": time.time() - started,
         }
+        final_bytes = sum(entry.values.nbytes + entry.counts.nbytes
+            + (0 if entry.row_importance is None else entry.row_importance.nbytes)
+            + (0 if entry.allocation_groups is None else entry.allocation_groups.nbytes)
+            + 2048 for entry in entries.values())
+        check_disk_space([DiskSpaceRequirement(output_path, final_bytes, 'final imatrix arrays and metadata')],
+                         stage='imatrix serialization')
         result = save_importance_matrix(
             output_path,
             entries,

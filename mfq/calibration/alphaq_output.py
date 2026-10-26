@@ -90,6 +90,7 @@ class AlphaQOutput:
     maximum_file_bytes: int
     payload_cache: object | None = None
     excluded_components: tuple[str, ...] = ()
+    consume_fitted: bool = False
 
     def validate_plan(self, plans):
         if tuple(plans) != self.plans:
@@ -119,15 +120,55 @@ class AlphaQOutput:
         from mfq.calibration.alphaq_payloads import EncodedRecord
         from mfq.formats.assets import ASSET_DTYPE
         from mfq.formats.shards import write_blob_record_shards
+        from mfq.disk_space import DiskSpaceRequirement, check_disk_space, filesystem
+        from mfq.formats.nint import NintSpec
+        from mfq.tools import quantize_hf_to_mfq as q
+        consumer = getattr(self.payload_cache, 'consume', None) if self.consume_fitted else None
+        if self.consume_fitted and not callable(consumer):
+            raise ValueError('--alphaq-consume-fitted requires a fitted payload cache')
+        sizes = [q._plan_blob_nbytes(p, NintSpec(), getattr(self.payload_cache, 'artifact_root', None))
+                 for p in self.plans]
+        pending = getattr(self.payload_cache, 'pending_bytes', None)
+        if callable(pending):
+            cache_bytes = pending(self.plans, sizes)
+            file_bytes = sum(sizes) + sum(len(a.data) for a in self.assets)
+            same_disk = filesystem(self.payload_cache.directory)[0] == filesystem(Path(output))[0]
+            output_bytes = file_bytes
+            if self.consume_fitted and same_disk:
+                output_bytes = file_bytes-sum(sizes) + max(sizes, default=0)
+            check_disk_space([
+                DiskSpaceRequirement(self.payload_cache.directory, cache_bytes, 'remaining fitted payloads'),
+                DiskSpaceRequirement(Path(output), output_bytes, 'final AlphaQ output and copy overlap'),
+            ], stage='AlphaQ payload fitting')
         records = [self.payload_cache.require(p) for p in self.plans]
         records.extend(EncodedRecord(a.name, ASSET_DTYPE, len(a.data),
                        lambda target, data=a.data: target.write(data)) for a in self.assets)
         expected = self.validate_records(records)
+        # Every payload now exists. For consume mode, simulate copy/delete in
+        # writer order, crediting only payloads on the output filesystem.
+        additional, peak = expected, expected
+        if self.consume_fitted:
+            additional = expected-sum(r.nbytes for r in records)
+            peak = additional
+            output_device = filesystem(Path(output))[0]
+            for record in records[:len(self.plans)]:
+                additional += record.nbytes
+                peak = max(peak, additional)
+                if filesystem(record.path)[0] == output_device:
+                    additional -= record.nbytes
+            peak = max(peak, additional + sum(len(a.data) for a in self.assets))
+        check_disk_space([DiskSpaceRequirement(Path(output), peak, 'final AlphaQ output and copy overlap')],
+                         stage='final AlphaQ assembly')
         def validate(paths):
             self.payload_cache.validate()
             self.validate_plan(self.plans)
             if len(paths) != 1 or paths[0].stat().st_size != expected:
                 raise ValueError('cached AlphaQ file size differs from validated records')
+        tensor_names = {p.name for p in self.plans}
         write_blob_record_shards(output, self.header, records, overwrite=overwrite,
-                                 before_publish=validate)
+                                 before_publish=validate,
+                                 after_record=(lambda record: consumer(record)
+                                     if record.name in tensor_names else None)
+                                     if self.consume_fitted else None,
+                                 preflight=not self.consume_fitted)
         return True

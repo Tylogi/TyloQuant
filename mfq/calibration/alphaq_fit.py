@@ -42,6 +42,36 @@ class FittedPayloadCache:
         self.checked = []
         self.verified = {}
 
+    def pending_bytes(self, plans, sizes):
+        """Credit only completed payloads with the exact selected fitting policy."""
+        pending = 0
+        for item, size in zip(plans, sizes, strict=True):
+            signature = self.signature(item)
+            key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
+            directory = self.directory/key
+            marker = directory/'complete.json'
+            if marker.exists():
+                saved = json.loads(marker.read_text())
+                if (saved.get('signature') == signature and saved.get('complete') is True
+                        and Path(saved['file']['path']) == directory/'tensor.blob'):
+                    checked_file(saved['file'])
+                    continue
+            pending += size
+        return pending
+
+    def consume(self, record):
+        """Release a verified fitted blob only after the writer has copied it."""
+        matches = [part for part in self.checked if Path(part['path']) == record.path]
+        if len(matches) != 1:
+            raise ValueError(f'cannot consume an unverified fitted payload: {record.name}')
+        checked_file(matches[0])
+        # Remove completion evidence first so an interruption cannot leave a
+        # completion marker pointing at a deleted payload.
+        (record.path.parent/'complete.json').unlink()
+        record.path.unlink()
+        self.checked.remove(matches[0])
+        self.verified.pop(record.name, None)
+
     def accept_verified(self, item, record, signature, info):
         """Consume a just-verified worker result without hashing its payload twice."""
         if signature != self.signature(item) or record.name != item.name:

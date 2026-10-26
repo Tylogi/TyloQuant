@@ -2405,8 +2405,20 @@ def convert(args: argparse.Namespace) -> None:
         target_bytes[item.target_dtype] = target_bytes.get(item.target_dtype, 0) + nbytes
         recipe_counts[item.recipe_type] = recipe_counts.get(item.recipe_type, 0) + 1
 
+    from mfq.disk_space import DiskSpaceRequirement, check_disk_space, disk_space_headroom
+    tokenizer_reader = (GGUFReader(str(Path(args.tokenizer_gguf).resolve()), 'r')
+                        if getattr(args, 'tokenizer_gguf', '') else source_reader.readers[0])
+    asset_bytes = len(gguf_metadata_asset(tokenizer_reader).data)
+    config_path = discover_model_config(source_path, getattr(args, 'model_config', '') or None)
+    if config_path is not None:
+        asset_bytes += config_path.stat().st_size
     free_bytes = shutil.disk_usage(output.parent).free
-    required_peak = 2 * estimated_bytes + 1024**3
+    required_peak = 2 * (estimated_bytes + asset_bytes)
+    following_in_bytes = int(getattr(args, '_following_in_output_bytes', 0))
+    workflow_extra_bytes = max(0, 2*following_in_bytes
+                               - (0 if args.keep_temp else estimated_bytes + asset_bytes))
+    required_peak += workflow_extra_bytes
+    required_peak += disk_space_headroom(required_peak)
     contract = {
         "input_bf16_gguf": str(source_path),
         "input_bf16_gguf_shards": [str(path) for path in source_reader.paths],
@@ -2506,11 +2518,11 @@ def convert(args: argparse.Namespace) -> None:
     print(json.dumps(contract, ensure_ascii=False), flush=True)
     if args.dry_run:
         return
-    if free_bytes < required_peak:
-        raise OSError(
-            f"insufficient free space under {output.parent}: "
-            f"need about {required_peak / 1e9:.1f} GB, have {free_bytes / 1e9:.1f} GB"
-        )
+    check_disk_space([
+        DiskSpaceRequirement(output, estimated_bytes + asset_bytes, 'final MFQ including vision/MTP and assets'),
+        DiskSpaceRequirement(output, estimated_bytes + asset_bytes, 'staged GGUF tensor blobs and assets'),
+        DiskSpaceRequirement(output, workflow_extra_bytes, 'following important-neuron output and scratch'),
+    ], stage='GGUF quantization')
 
     tmp_root = output.parent / f".{output.name}.tmp_blobs"
     resume_completed = int(getattr(args, "resume_completed", 0))
