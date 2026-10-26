@@ -17,6 +17,50 @@
 #include <cstdlib>
 #include <cstdio>
 #include <atomic>
+#include <cstring>
+
+namespace {
+// A tiered FFN needs range-readable projections throughout. Native cohorts
+// remain resident together with their paired projections.
+bool supports_ffn_range_cache(const mfq::ModelSource& source, const std::string& name, std::string& reason) {
+    const auto boundary = name.find(".experts.");
+    if (boundary == std::string::npos) return true;
+    const auto prefix = name.substr(0, boundary) + ".experts.";
+    for (const auto* role : {"gate", "up", "gate_up", "down"}) {
+        const auto sibling = prefix + role + ".weight";
+        const auto* record = source.find_tensor(sibling);
+        if (!record || record->dtype == "NINT") continue;
+        if (record->dtype != "MFE") {
+            reason = sibling + " dtype=" + record->dtype;
+            return false;
+        }
+        try {
+            auto reader = source.tensor_reader(sibling);
+            std::uint8_t magic[4]{};
+            if (record->nbytes < sizeof(magic)) {
+                reason = sibling + " has no complete MFE header";
+                return false;
+            }
+            reader(0, reinterpret_cast<std::byte*>(magic), sizeof(magic));
+            if (std::memcmp(magic, "MFE1", 4) && std::memcmp(magic, "NIM2", 4)) {
+                reason = sibling + " uses a resident MFE layout";
+                return false;
+            }
+            mfq::MfeQuantExpertStore probe(record->nbytes,
+                [reader](std::size_t offset, std::uint8_t* output, std::size_t bytes) {
+                    reader(offset, reinterpret_cast<std::byte*>(output), bytes);
+                });
+        } catch (const mfq::MfeQuantRangeUnsupported& error) {
+            reason = sibling + " " + error.what();
+            return false;
+        } catch (const mfq::TensorReaderUnsupported&) {
+            reason = sibling + " has no retained range reader";
+            return false;
+        }
+    }
+    return true;
+}
+}
 
 std::shared_ptr<mfq::NintRows> load_nint_row_table(
         const mfq::ModelSource& source, const std::string& name, bool prefer_mapping) {
@@ -58,7 +102,17 @@ MfeWeight load_mfe_gpu(
         const std::string & projection_role) {
     const mfq::cuda::WeightAllocationScope weight_memory;
     auto& cache = execution.moe_expert_cache;
+    const auto& dtype = require_tensor(mfq, name).dtype;
+    if (cache && cacheable && execution.config.moe_pipeline) {
+        std::string reason;
+        if (!supports_ffn_range_cache(mfq, name, reason)) {
+            cacheable = false;
+            std::fprintf(stderr, "moe_resident_ffn tensor=%s reason=%s tiered_cache=unsupported\n",
+                name.c_str(), reason.c_str());
+        }
+    }
     if (cache && cacheable &&
+            (dtype == "MFE" || dtype == "NINT") &&
             !moe_parallel_config(execution).enabled() &&
             execution.config.moe_ssd_ranges) {
         const auto & record = require_tensor(mfq, name);
@@ -124,6 +178,12 @@ MfeWeight load_mfe_gpu(
             return pool.dtype == "MXFP4-SQ" ||
                 mfq::fp8sq::is_dtype(pool.dtype);
         });
+    const bool has_native = std::any_of(cpu.pools.begin(), cpu.pools.end(),
+        [](const MfeCpuPool& pool) { return pool.dense.defined(); });
+    if (has_native && cache && cacheable) {
+        std::fprintf(stderr, "moe_native_cohort_resident tensor=%s dtype=%s packed_cache=unsupported\n",
+            name.c_str(), dtype.c_str());
+    }
     if (moe_parallel_config(execution).enabled()) {
         auto slices = plan_moe_expert_parallel_slices(
             moe_parallel_config(execution), cpu.n_experts, name);
@@ -150,7 +210,7 @@ MfeWeight load_mfe_gpu(
         }
         return result;
     }
-    if (cache && cacheable && !has_matrix_local_sq) {
+    if (cache && cacheable && !has_matrix_local_sq && !has_native) {
         auto runtime =
             make_mixed_moe_runtime(cpu, false);
         return cache_moe_weight(
@@ -369,7 +429,7 @@ Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, con
     if (dtype=="F32" || dtype=="F16" || dtype=="BF16") {
         MFQ_RUNTIME_CHECK(!moe_parallel_config(execution).enabled(),
             "expert parallelism requires packed routed tensors: ",name);
-        auto w=dense(execution,file,name);
+        auto w=load_dense_native_gpu(execution,file,name);
         MFQ_RUNTIME_CHECK(w.sizes().vec()==std::vector<int64_t>({experts,output,input}),
             "dense expert tensor shape mismatch: ",name);
         return [w,output,input](CudaExecutionContext&, const Tensor& x,const Tensor& ids) {
@@ -388,7 +448,7 @@ Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, con
         "routed tensor shape mismatch: ",name);
     Routed result=[w,experts](CudaExecutionContext& execution, const Tensor& x,const Tensor& ids) {
         auto route=build_moe_route_plan(ids.to(tb::kInt32).contiguous(),int(experts));
-        return w->forward(execution,x.contiguous(),route);
+        return w->forward(execution,x.to(tb::kFloat16).contiguous(),route);
     };
     result.projections.push_back(w);
     return result;
@@ -406,7 +466,8 @@ Routed routed_gate_up(CudaExecutionContext& execution, const mfq::ModelSource& f
     auto projections=gate.projections;
     projections.insert(projections.end(),up.projections.begin(),up.projections.end());
     Routed result=[gate=std::move(gate),up=std::move(up)](CudaExecutionContext& execution, const Tensor& x,const Tensor& ids) {
-        return tb::cat({gate(execution,x,ids),up(execution,x,ids)},-1);
+        return tb::cat({gate(execution,x,ids).to(tb::kFloat16),
+            up(execution,x,ids).to(tb::kFloat16)},-1);
     };
     result.projections=std::move(projections);
     return result;
@@ -425,9 +486,8 @@ void validate_load_options(
 
 } // namespace mfq::cuda::weight_loader
 
-mfq_tensor_backend::Tensor load_dense_cpu(const CudaExecutionContext &execution,
-                                          const mfq::ModelSource &source,
-                                          const std::string &name) {
+mfq_tensor_backend::Tensor load_dense_cpu(const mfq::ModelSource &source,
+                                          const std::string &name, bool drop_file_cache) {
     namespace tb = mfq_tensor_backend;
     const auto &record = require_tensor(source, name);
     tb::ScalarType dtype;
@@ -437,10 +497,11 @@ mfq_tensor_backend::Tensor load_dense_cpu(const CudaExecutionContext &execution,
     else if (record.dtype == "F32") { dtype = tb::kFloat32; item_size = 4; }
     else if (record.dtype == "I64") { dtype = tb::kInt64; item_size = 8; }
     else if (record.dtype == "I32") { dtype = tb::kInt32; item_size = 4; }
-    else throw std::runtime_error("unsupported dense dtype: " + record.dtype + " tensor " + name);
+    else throw std::runtime_error("unsupported CUDA dense tensor " + name + " dtype=" + record.dtype +
+        "; use --dense-dtype f16/bf16/f32 for this parameter");
 
     auto blob = read_tensor(source, name);
-    if (execution.drop_file_cache) source.drop_file_cache();
+    if (drop_file_cache) source.drop_file_cache();
     MFQ_RUNTIME_CHECK(blob.size() >= sizeof(uint32_t), "truncated dense tensor header: ", name);
     size_t offset = 0;
     const auto rank = read_u32_from(blob, offset);
@@ -461,6 +522,12 @@ mfq_tensor_backend::Tensor load_dense_cpu(const CudaExecutionContext &execution,
     MFQ_RUNTIME_CHECK(payload % item_size == 0 && uint64_t(numel) == payload / item_size,
                       "dense tensor payload size mismatch: ", name);
     return tb::from_blob(blob.data() + offset, shape, tb::TensorOptions().dtype(dtype)).clone();
+}
+
+mfq_tensor_backend::Tensor load_dense_cpu(const CudaExecutionContext &execution,
+                                          const mfq::ModelSource &source,
+                                          const std::string &name) {
+    return load_dense_cpu(source, name, execution.drop_file_cache);
 }
 
 mfq_tensor_backend::Tensor load_dense_native_gpu(CudaExecutionContext &execution,

@@ -7,6 +7,7 @@
 #include "moe.h"
 
 #include "quant_linear.h"
+#include "dense_moe.h"
 #include "format.h"
 #include "mfq_format_compat.h"
 #include "mfe_expert_store.h"
@@ -21,6 +22,23 @@
 
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;
+
+static mfq_tensor_backend::Tensor unpack_native_mfe_pool(
+        const std::vector<uint8_t>& blob, const std::string& dtype,
+        int64_t rows, int64_t width) {
+    size_t offset = 0;
+    MFQ_RUNTIME_CHECK(blob.size() >= 20, "truncated native MFE pool: ", dtype);
+    const auto rank = read_u32_from(blob, offset);
+    MFQ_RUNTIME_CHECK(rank == 2, "native MFE pool must be rank 2: ", dtype);
+    const auto stored_rows = read_i64_from(blob, offset);
+    const auto stored_width = read_i64_from(blob, offset);
+    MFQ_RUNTIME_CHECK(stored_rows == rows && stored_width == width &&
+        uint64_t(rows) * uint64_t(width) == (blob.size() - offset) / 2 &&
+        (blob.size() - offset) % 2 == 0, "native MFE pool shape/payload mismatch: ", dtype);
+    const auto type = dtype == "F16" ? mfq_tensor_backend::kFloat16 : mfq_tensor_backend::kBFloat16;
+    return mfq_tensor_backend::from_blob(const_cast<uint8_t*>(blob.data()) + offset,
+        {rows, width}, mfq_tensor_backend::TensorOptions().dtype(type)).clone();
+}
 
 static MfeCpu unpack_mfe_impl(
         const std::vector<uint8_t> & blob,
@@ -159,6 +177,14 @@ static MfeCpu unpack_mfe_impl(
                 throw std::runtime_error(
                     "MFE NINT8-0 pool weight shape mismatch");
             }
+        } else if (!version1 && (pool.dtype == "F16" || pool.dtype == "BF16")) {
+            MFQ_RUNTIME_CHECK(pool.runtime_payload.empty(), "native MFE pool cannot have runtime fields");
+            pool.dense = unpack_native_mfe_pool(pool.payload, pool.dtype,
+                int64_t(expert_count) * result.out_per_expert, result.neuron_len);
+        } else if (!version1 && pool.dtype == "MXFP8") {
+            throw std::runtime_error(
+                "MFE cohort dtype=MXFP8 is not supported by CUDA; quantize experts with F16/BF16, "
+                "MXFP4 or NINT/NVQ");
         } else if (version1 || pool.dtype == "NINT") {
             pool.weight = unpack_nint(pool.payload);
             if (version1) pool.dtype = "NINT";
@@ -170,6 +196,9 @@ static MfeCpu unpack_mfe_impl(
                 pool.weight.shape[1] != result.neuron_len) {
                 throw std::runtime_error("MFE pool weight shape mismatch");
             }
+        } else if (pool.dtype != "NVQ" && pool.dtype != "NPQ" && pool.dtype != "NEPQ") {
+            throw std::runtime_error("unsupported CUDA MFE cohort dtype=" + pool.dtype +
+                "; quantize experts with F16/BF16, MXFP4 or NINT/NVQ");
         }
         result.pools.push_back(std::move(pool));
     }
@@ -719,7 +748,9 @@ int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
     }
     for (const auto & pool : runtime.pools) {
         bytes += tensor_storage_bytes(pool.expert_local);
-        if (pool.family == MixedMoeFamily::Nint) {
+        if (pool.family == MixedMoeFamily::Dense) {
+            bytes += tensor_storage_bytes(pool.dense);
+        } else if (pool.family == MixedMoeFamily::Nint) {
             bytes += tensor_storage_bytes(pool.nint.q_packed);
             bytes += tensor_storage_bytes(pool.nint.row_q_bits);
             bytes += tensor_storage_bytes(pool.nint.row_q_bit_offsets);
@@ -798,7 +829,11 @@ std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
                 pool.expert_local.to(target).contiguous();
         }
         const int expected_rows = pool.local_experts * cpu.out_per_expert;
-        if (source.dtype == "NINT8-0") {
+        if (source.dense.defined()) {
+            pool.family = MixedMoeFamily::Dense;
+            pool.dense = source.dense.reshape({pool.local_experts, cpu.out_per_expert, cpu.neuron_len});
+            if (cuda) pool.dense = copy_cpu_weight_to_cuda(pool.dense);
+        } else if (source.dtype == "NINT8-0") {
             pool.family = MixedMoeFamily::Nint8Zero;
             pool.q8_zero = cuda
                 ? to_gpu_nint8_zero(source.q8_zero)
@@ -855,7 +890,7 @@ std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
             pool.nepq = cuda
                 ? to_gpu_nepq(parsed)
                 : to_cpu_nepq(parsed);
-        } else {
+        } else if (source.dtype == "NVQ" || source.dtype == "NPQ") {
             pool.family = MixedMoeFamily::Nvq;
             auto parsed = unpack_nvq(source.payload, source.dtype);
             if (parsed.out != expected_rows || parsed.neuron_len != cpu.neuron_len) {
@@ -864,6 +899,9 @@ std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
             pool.nvq = cuda
                 ? to_gpu_nvq(parsed, config)
                 : to_cpu_nvq(parsed);
+        } else {
+            throw std::runtime_error("unsupported CUDA MFE cohort dtype=" + source.dtype +
+                "; quantize experts with F16/BF16, MXFP4 or NINT/NVQ");
         }
         runtime->pools.push_back(std::move(pool));
     }
@@ -1012,7 +1050,13 @@ MfeWeight to_cuda_device_moe_expert_slice(
             .clone().to(mfq_tensor_backend::Device(
                 mfq_tensor_backend::kCUDA,
                 mfq_current_cuda_device())).contiguous();
-        if (source.dtype == "NINT8-0") {
+        if (source.dense.defined()) {
+            pool.family = MixedMoeFamily::Dense;
+            const auto indices = mfq_tensor_backend::tensor(rows,
+                mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64));
+            pool.dense = copy_cpu_weight_to_cuda(source.dense.index_select(0, indices)
+                .reshape({pool.local_experts, cpu.out_per_expert, cpu.neuron_len}));
+        } else if (source.dtype == "NINT8-0") {
             pool.family = MixedMoeFamily::Nint8Zero;
             pool.q8_zero = to_gpu_nint8_zero(
                 select_nint8_zero_cpu_rows(source.q8_zero, rows));
@@ -1175,7 +1219,9 @@ MfeWeight stage_cpu_mixed_moe(
         pool.local_experts = source.local_experts;
         pool.expert_local =
             copy_cpu_weight_to_cuda(source.expert_local);
-        if (pool.family == MixedMoeFamily::Nint) {
+        if (pool.family == MixedMoeFamily::Dense) {
+            pool.dense = copy_cpu_weight_to_cuda(source.dense);
+        } else if (pool.family == MixedMoeFamily::Nint) {
             pool.nint = copy_cpu_nint_to_cuda(source.nint);
         } else if (pool.family == MixedMoeFamily::Nint8Zero) {
             pool.q8_zero = copy_cpu_nint_to_cuda(source.q8_zero);
@@ -1234,10 +1280,30 @@ MfeCpu load_mfe_cpu(
         result.pools.push_back(std::move(pool));
         return result;
     }
-    if (dtype != "MFE") {
-        throw std::runtime_error("expert tensor must use MFE: " + name);
+    if (dtype == "F32" || dtype == "F16" || dtype == "BF16") {
+        auto bank = load_dense_cpu(mfq, name);
+        MFQ_RUNTIME_CHECK(bank.dim() == 3, "dense expert bank must be [experts,out,in]: ", name);
+        MfeCpu result;
+        result.n_experts = static_cast<int>(bank.size(0));
+        result.out_per_expert = static_cast<int>(bank.size(1));
+        result.neuron_len = static_cast<int>(bank.size(2));
+        MfeCpuPool pool;
+        pool.dtype = dtype;
+        pool.dense = bank.reshape({bank.size(0) * bank.size(1), bank.size(2)});
+        pool.expert_ids.resize(result.n_experts);
+        std::iota(pool.expert_ids.begin(), pool.expert_ids.end(), 0);
+        result.pools.push_back(std::move(pool));
+        return result;
     }
-    return unpack_mfe(read_tensor(mfq, name));
+    if (dtype != "MFE") {
+        throw std::runtime_error("unsupported CUDA expert tensor " + name + " dtype=" + dtype +
+            "; quantize experts with F16/BF16, MXFP4 or NINT/NVQ in MFE");
+    }
+    try {
+        return unpack_mfe(read_tensor(mfq, name));
+    } catch (const std::exception& error) {
+        throw std::runtime_error("CUDA expert tensor " + name + " dtype=MFE: " + error.what());
+    }
 }
 
 std::shared_ptr<MixedMoeRuntime> make_mxfp4_range_runtime(
@@ -1278,7 +1344,9 @@ mfq_tensor_backend::Tensor mfe_dense_reference(
         mfq_tensor_backend::Tensor dense_flat;
         int rotation_block = 0;
         mfq_tensor_backend::Tensor rotation_signs;
-        if (pool.dtype == "NINT8-0") {
+        if (pool.dense.defined()) {
+            dense_flat = copy_cpu_weight_to_cuda(pool.dense).to(mfq_tensor_backend::kFloat16);
+        } else if (pool.dtype == "NINT8-0") {
             auto packed = to_gpu_nint8_zero(pool.q8_zero);
             dense_flat = nint8_zero_dequant_cuda(
                 packed.q_packed, packed.q8_zero_scale,
@@ -1375,7 +1443,9 @@ mfq_tensor_backend::Tensor materialize_mfe_dense(
             .dtype(mfq_tensor_backend::kFloat16));
     for (const auto& pool : cpu.pools) {
         mfq_tensor_backend::Tensor local_flat;
-        if (pool.dtype == "NINT8-0") {
+        if (pool.dense.defined()) {
+            local_flat = copy_cpu_weight_to_cuda(pool.dense).to(mfq_tensor_backend::kFloat16);
+        } else if (pool.dtype == "NINT8-0") {
             auto packed = to_gpu_nint8_zero(pool.q8_zero);
             local_flat = nint8_zero_dequant_cuda(
                 packed.q_packed, packed.q8_zero_scale,
@@ -1468,7 +1538,7 @@ std::vector<MoeActivationGeometry> MixedMoeRuntime::activation_geometry() const 
         } else if (pool.family == MixedMoeFamily::Nvq) {
             groups = static_cast<int>(pool.nvq.ng);
             gs = static_cast<int>(pool.nvq.gs);
-        } else if (pool.family == MixedMoeFamily::Mxfp4 ||
+        } else if (pool.family == MixedMoeFamily::Dense || pool.family == MixedMoeFamily::Mxfp4 ||
                 pool.family == MixedMoeFamily::Mxfp4Sq ||
                 pool.family == MixedMoeFamily::Fp8Sq) {
             continue;
@@ -1518,7 +1588,9 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
     const int result_width = epilogue_mode == 0
         ? out_per_expert
         : out_per_expert / 2;
-    auto output = partial_experts
+    const bool zero_output = partial_experts || std::any_of(pools.begin(), pools.end(),
+        [](const MixedMoePool& pool) { return pool.family == MixedMoeFamily::Dense; });
+    auto output = zero_output
         ? mfq_tensor_backend::zeros(
             {tokens, routes, result_width},
             x.options().dtype(mfq_tensor_backend::kFloat16))
@@ -1725,6 +1797,15 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
     }
 
     for (const auto & pool : pools) {
+        if (pool.family == MixedMoeFamily::Dense) {
+            auto ids = pool.expert_local.index_select(0,
+                route.ids.reshape({-1}).clamp_min(0).to(mfq_tensor_backend::kInt64))
+                .reshape({tokens, routes}).masked_fill(route.ids < 0, -1);
+            auto projected = dense_routed_projection(pool.dense, x, ids.clamp_min(0))
+                .to(output.scalar_type());
+            output.copy_(mfq_tensor_backend::where((ids >= 0).unsqueeze(-1), projected, output));
+            continue;
+        }
         if(pool.family==MixedMoeFamily::Nint && use_nint_decode)continue;
         if (pool.family == MixedMoeFamily::Nvq &&
                 (use_nvq_prefill || use_nvq_decode)) {

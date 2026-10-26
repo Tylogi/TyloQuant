@@ -4644,6 +4644,15 @@ public:
 MoeFfnForward make_moe_ffn_pipeline(const std::vector<std::shared_ptr<MfeWeight>>& gate_up,
         const std::vector<std::shared_ptr<MfeWeight>>& down,MoeFfnShared shared,MoeFfnDispatchObserver observer,
         MoeFfnSharedWeights shared_weights,MoeFfnPrefetch* prefetch,double swiglu_limit) {
+    const auto resident = [](const auto& projections) {
+        return std::all_of(projections.begin(), projections.end(),
+            [](const auto& weight) { return weight && !weight->cached_source; });
+    };
+    if (resident(gate_up) && resident(down)) {
+        // Resident projections have no cold expert images to prefetch.
+        if (prefetch) *prefetch = [](const tb::Tensor&) { return mfq::cuda::DecodeWindow::Task{}; };
+        return {};
+    }
     if((gate_up.size()!=1 && gate_up.size()!=2) || down.size()!=1)return {};
     const auto& up=gate_up.back();
     for(const auto& w:{gate_up[0],up,down[0]})if(!w || !w->cached_source)return {};

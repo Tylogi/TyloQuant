@@ -23,6 +23,7 @@ struct QuantLinear;
 struct QuantLinearGroup;
 struct DenseLinearGroup;
 
+// Preserve the activation dtype while computing in the stored weight dtype.
 mfq_tensor_backend::Tensor dense_projection(
     mfq_tensor_backend::Tensor input, const mfq_tensor_backend::Tensor& weight);
 
@@ -102,6 +103,7 @@ struct QuantLinearShard {
     Fp8SqLinear fp8_sq;
     Mxfp8Weight mxfp8;
     mfq_tensor_backend::Tensor dense;
+    bool native_output = false;
 };
 
 struct QuantLinear {
@@ -113,6 +115,8 @@ struct QuantLinear {
     Fp8SqLinear fp8_sq;
     Mxfp8Linear mxfp8;
     mfq_tensor_backend::Tensor dense;
+    // Output heads retain native floating logits; internal linears follow activations.
+    bool native_output = false;
     TensorParallelAxis tensor_parallel_axis =
         TensorParallelAxis::Mirrored;
     std::vector<QuantLinearShard> tensor_parallel_shards;

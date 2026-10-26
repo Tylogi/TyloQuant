@@ -207,7 +207,7 @@ int run_mfe_tensor_check(
     const auto& mfq = *model_source;
     auto weight = load_mfe_gpu(execution,
         mfq, tensor_name, true, 0, "diagnostic");
-    if (execution.moe_expert_cache &&
+    if (moe_expert_cache_has_sources(execution.moe_expert_cache) &&
             !moe_expert_cache_finalized(execution.moe_expert_cache)) {
         finalize_moe_expert_cache(execution.moe_expert_cache);
     }

@@ -61,6 +61,10 @@ template <class Model> struct CudaWeightLoader {
         const bool use_mapped=mapped ? *mapped==1 || mapped_control :
             model.execution->config.moe_pipeline && model.execution->config.moe_ram_pcie;
         const auto& dtype=require_tensor(source,name).dtype;
+        if (dtype == "MXFP4-SQ" || mfq::fp8sq::is_dtype(dtype)) {
+            throw std::runtime_error("CUDA embedding tensor " + name + " dtype=" + dtype +
+                " does not support lookup; use --dense-dtype f16/bf16/f32 or NINT/MXFP4/MXFP8 embeddings");
+        }
         const bool nint=dtype=="NINT";
         if(use_mapped && model.has_independent_output_weights(*this) &&
                 !model.execution->tensor_parallel.enabled() && !model.execution->loading_cpu_layer &&
@@ -99,10 +103,16 @@ template <class Model> struct CudaWeightLoader {
         return load_quant_linear(*model.execution, source, name);
     }
     auto output(const std::string &name) {
-        return load_quant_linear(*model.execution, source, name, TensorParallelAxis::Output);
+        auto result = load_quant_linear(*model.execution, source, name, TensorParallelAxis::Output);
+        result.native_output = true;
+        for (auto& shard : result.tensor_parallel_shards) shard.native_output = true;
+        return result;
     }
     auto tied_output(const QuantLinear &embedding, const std::string &name) {
-        return model.execution->tensor_parallel.enabled() ? output(name) : embedding;
+        if (model.execution->tensor_parallel.enabled()) return output(name);
+        auto result = embedding;
+        result.native_output = true;
+        return result;
     }
     bool has_weight(const std::string &name) { return has_tensor(source, name); }
     void final_state(mfq_tensor_backend::Tensor &norm) {

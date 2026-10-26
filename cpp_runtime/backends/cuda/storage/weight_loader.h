@@ -51,6 +51,11 @@ mfq_tensor_backend::Tensor load_dense_gpu(
 
 // Preserve the stored dtype; load_dense_gpu promotes half-precision floats to F32.
 mfq_tensor_backend::Tensor load_dense_cpu(
+    const mfq::ModelSource& source,
+    const std::string& name,
+    bool drop_file_cache = false);
+
+mfq_tensor_backend::Tensor load_dense_cpu(
     const CudaExecutionContext& execution,
     const mfq::ModelSource& source,
     const std::string& name);

@@ -2799,7 +2799,7 @@ void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
 }
 
 bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache) {
-    if (!cache || !moe_expert_cache_has_sources(cache)) return false;
+    if (!cache) return false;
     const auto stream = mfq_current_cuda_stream();
     if (!cache->pipeline_pool_context_) {
         cache->pipeline_pool_context_ = mfq::cuda::default_context(mfq_current_cuda_device());

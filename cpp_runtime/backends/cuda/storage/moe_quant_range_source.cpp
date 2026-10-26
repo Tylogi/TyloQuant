@@ -431,7 +431,7 @@ MixedMoePool MoeQuantRangeSource::decode_expert(int expert,const mfq::MfeQuantEx
     } else if(encoded.dtype=="MXFP4") {
         pool.family=MixedMoeFamily::Mxfp4;
         pool.mxfp4=to_device_mxfp4(unpack_mxfp4(encoded.payload),false);
-    } else {
+    } else if (encoded.dtype == "NVQ" || encoded.dtype == "NPQ") {
         pool.family=MixedMoeFamily::Nvq;
         pool.nvq=to_cpu_nvq(unpack_nvq(encoded.payload,encoded.dtype));
         if(dense_groups_ && prepare_nvq_dense_groups(pool.nvq))++dense_materializations_;
@@ -439,6 +439,9 @@ MixedMoePool MoeQuantRangeSource::decode_expert(int expert,const mfq::MfeQuantEx
             pool.nvq.codebook=metadata_->pools[index].nvq.codebook;
             pool.nvq.bank_map=metadata_->pools[index].nvq.bank_map;
         }
+    } else {
+        throw std::runtime_error("unsupported CUDA expert range dtype=" + encoded.dtype +
+            "; use the full MFE reader for native cohorts, or quantize experts with NINT/NVQ or MXFP4");
     }
     ++materializations_;
     return pool;
