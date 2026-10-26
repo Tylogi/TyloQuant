@@ -167,6 +167,7 @@ def test_cli_prepares_raw_records_before_imatrix_collection(tmp_path, monkeypatc
     from mfq.cli import _build_parser, _calibrate_imatrix
     path = tmp_path / 'input.txt'
     path.write_text('hello world')
+    (tmp_path / 'config.json').write_text(json.dumps({'model_type': 'qwen3_5'}), encoding='utf-8')
     monkeypatch.setattr(transformers.AutoTokenizer, 'from_pretrained', lambda *args, **kwargs: TokenizerFixture())
     seen = []
     def collect(model, corpus, output, **kwargs):
