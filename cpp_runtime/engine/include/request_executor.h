@@ -134,10 +134,11 @@ class RequestExecutor {
                 if (backend_failure || std::find(eligible.begin(), eligible.end(), id) != eligible.end())
                     request->complete(std::current_exception());
         } catch (...) {
+            // Unknown failures leave the device state unknown: fail every request.
             mfq::log_runtime_error("execution", "unknown execution failure");
+            healthy_ = false;
             for (auto& [id, request] : requests_)
-                if (std::find(eligible.begin(), eligible.end(), id) != eligible.end())
-                    request->complete(std::current_exception());
+                request->complete(std::current_exception());
         }
         EngineStepResult result;
         for (auto it = requests_.begin(); it != requests_.end();) {

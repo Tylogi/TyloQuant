@@ -516,7 +516,7 @@ int main() {
         executor.cancel("b");
         executor.step({}, ops);
     }
-    // Request errors are recoverable; device or cleanup failures stop admission.
+    // Request errors are recoverable; device, cleanup or unknown failures stop admission.
     for (int failure : {1, 2, 3, 4}) {
         TestOps ops;
         ops.failure = failure == 3 ? 1 : failure;
@@ -527,7 +527,7 @@ int main() {
         const auto &error = std::get<Failed>(terminal_event(result));
         assert(error.code == (failure == 1 ? "invalid_request" : "backend_failure"));
         assert(ops.live == 0 && ops.resets == 1 && executor.empty());
-        const bool recoverable = failure == 1 || failure == 4;
+        const bool recoverable = failure == 1;
         assert(result.status.healthy == recoverable);
         ops.failure = 0;
         assert(executor.admit(request(), nullptr, info(), ops) ==

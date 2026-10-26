@@ -399,11 +399,11 @@ void MfqScheduler::loop() noexcept {
                 if (!request.finished)
                     try { publish(request, {id, Failed{"backend_failure", error.what()}}); } catch (...) {}
         } catch (...) {
+            // Structured exceptions (for example an access violation inside the
+            // CUDA driver) can arrive here through coroutine handlers. Do not
+            // run the engine again; report unhealthy so the runtime is replaced.
             mfq::log_runtime_error("scheduler", "unknown backend error");
-            healthy &= engine_.status().healthy;
-            for (auto& [id, request] : requests_)
-                try { engine_.cancel(id); } catch (...) {}
-            try { healthy &= engine_.step({}).status.healthy; } catch (...) { healthy = false; }
+            healthy = false;
             for (auto& [id, request] : requests_)
                 if (!request.finished)
                     try { publish(request, {id, Failed{"backend_failure", "unknown backend error"}}); } catch (...) {}

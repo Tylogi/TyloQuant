@@ -40,7 +40,11 @@ void RequestExecutor::finish(
         mfq::log_runtime_error("request", error.what());
         result.events.push_back({id, Failed{"backend_failure", error.what()}});
     } catch (...) {
+        // A non-standard exception can be a structured exception (an access
+        // violation in the driver) that reached a coroutine handler; the
+        // process state is unknown, so stop admitting work.
         mfq::log_runtime_error("request", "unknown execution failure");
+        healthy_ = false;
         result.events.push_back({id, Failed{"backend_failure", "unknown execution failure"}});
     }
 }
