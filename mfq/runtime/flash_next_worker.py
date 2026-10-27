@@ -335,7 +335,7 @@ def _sampling_log_probs(
     if values.ndim == 1:
         values = values[None]
     values = mx.where(mx.isnan(values), -mx.inf, values)
-    if temperature <= 0.0 or int(top_k) == 1:
+    if temperature <= 0.0 or int(top_k) == 1 or top_p == 0.0:
         return values - mx.logsumexp(values, axis=-1, keepdims=True)
     scores = values / float(temperature)
     vocab = int(scores.shape[-1])
@@ -1149,7 +1149,7 @@ class FlashNextTextWorker:
         finish_reason = "stop"
         first_token_at: float | None = None
         stats = _MtpDecodeStats()
-        greedy = prepared.temperature <= 0.0 or prepared.top_k == 1
+        greedy = prepared.temperature <= 0.0 or prepared.top_k == 1 or prepared.top_p == 0.0
         counts = self._initial_penalty_counts(
             prepared,
             int(initial_logits.shape[-1]),
@@ -1474,8 +1474,8 @@ class FlashNextTextWorker:
             raise FlashNextWorkerError("temperature must be finite and non-negative")
         if not 0 <= top_k <= 1024:
             raise FlashNextWorkerError("top_k must be in [0,1024]")
-        if not math.isfinite(top_p) or not 0.0 < top_p <= 1.0:
-            raise FlashNextWorkerError("top_p must be in (0,1]")
+        if not math.isfinite(top_p) or not 0.0 <= top_p <= 1.0:
+            raise FlashNextWorkerError("top_p must be in [0,1]")
         presence_penalty = _request_float(
             request.get("presence_penalty", 0.0),
             "presence_penalty",

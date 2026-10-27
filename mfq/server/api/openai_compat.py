@@ -68,6 +68,19 @@ class OpenAIChatRequest:
 
 _TOOL_CHOICE = TypeAdapter(ToolChoice)
 _RESPONSE_FORMAT = TypeAdapter(ResponseFormat)
+_MESSAGE_ROLES = ("system", "developer", "user", "assistant", "tool")
+
+
+def require_json_content_type(content_type: str) -> None:
+    """Reject an explicit non-JSON media type; a missing header is parsed as JSON."""
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if not media_type or media_type == "application/json" or (
+        media_type.startswith("application/") and media_type.endswith("+json")
+    ):
+        return
+    raise OpenAIRequestError(
+        "Content-Type must be application/json", param="Content-Type", status_code=415,
+    )
 
 
 def _value(body: dict[str, Any], name: str, default: Any) -> Any:
@@ -141,9 +154,9 @@ def parse_chat_request(body: Any) -> OpenAIChatRequest:
                 param=f"messages[{index}]",
             )
         role = message.get("role")
-        if not isinstance(role, str) or not role:
+        if not isinstance(role, str) or role not in _MESSAGE_ROLES:
             raise OpenAIRequestError(
-                f"messages[{index}].role must be a non-empty string",
+                f"messages[{index}].role must be one of: {', '.join(_MESSAGE_ROLES)}",
                 param=f"messages[{index}].role",
             )
         messages.append(dict(message))
@@ -217,13 +230,18 @@ def parse_chat_request(body: Any) -> OpenAIChatRequest:
     if "reasoning_effort" not in body and "reasoning_effort" in template_kwargs:
         explicit_sampling_fields.add("reasoning_effort")
     try:
-        validated_sampling = SamplingParams.model_validate(sampling_values)
+        validated_sampling = SamplingParams.model_validate(sampling_values, strict=True)
+        if validated_sampling.temperature > 2.0:
+            raise OpenAIRequestError("temperature must be between 0 and 2", param="temperature")
         sampling = SamplingParams.model_construct(
             _fields_set=explicit_sampling_fields,
             **validated_sampling.model_dump(),
         )
     except ValidationError as error:
-        raise OpenAIRequestError(str(error)) from error
+        param = str(error.errors()[0]["loc"][0])
+        if param == "max_tokens" and body.get("max_completion_tokens") is not None:
+            param = "max_completion_tokens"
+        raise OpenAIRequestError(str(error), param=param) from error
 
     raw_tools = body.get("tools") or []
     if not isinstance(raw_tools, list):

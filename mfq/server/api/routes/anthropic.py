@@ -11,7 +11,7 @@ from mfq.server.api.anthropic_compat import (
     stream_message,
 )
 from mfq.server.api.dependencies import ServiceDependency
-from mfq.server.api.openai_compat import OpenAIRequestError, backend_error_status
+from mfq.server.api.openai_compat import OpenAIRequestError, backend_error_status, require_json_content_type
 from mfq.server.runtime.backend import BackendError, preflight_backend_request
 
 router = APIRouter()
@@ -35,6 +35,7 @@ async def model_info(service: ServiceDependency, model_id: str) -> Response:
 @router.post("/v1/messages", include_in_schema=False)
 async def messages(service: ServiceDependency, request: Request) -> Response:
     try:
+        require_json_content_type(request.headers.get("content-type", ""))
         parsed = parse_messages_request(await request.json())
     except (ValueError, OpenAIRequestError) as error:
         status = error.status_code if isinstance(error, OpenAIRequestError) else 400
