@@ -33,7 +33,8 @@ def is_anthropic_request(request: Any) -> bool:
 
 def error_type(status: int) -> str:
     return {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
-            404: "not_found_error", 413: "request_too_large", 422: "invalid_request_error",
+            404: "not_found_error", 413: "request_too_large",
+            415: "invalid_request_error", 422: "invalid_request_error",
             429: "rate_limit_error", 503: "overloaded_error", 529: "overloaded_error"}.get(status, "api_error")
 
 
@@ -94,9 +95,14 @@ def parse_messages_request(body: Any) -> MessagesRequest:
             raise OpenAIRequestError("system accepts only text blocks")
         messages.append({"role": "system", "content": "\n".join(
             _string(block.get("text"), "system.text", empty=True) for block in system)})
-    for message in raw_messages:
-        if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
-            raise OpenAIRequestError("messages must have a user or assistant role; use top-level system")
+    for index, message in enumerate(raw_messages):
+        if not isinstance(message, dict):
+            raise OpenAIRequestError(f"messages[{index}] must be an object", param=f"messages[{index}]")
+        if message.get("role") not in ("user", "assistant"):
+            raise OpenAIRequestError(
+                f"messages[{index}].role must be one of: user, assistant; use top-level system",
+                param=f"messages[{index}].role",
+            )
         role = message["role"]
         content: list[dict[str, Any]] = []
         calls: list[dict[str, Any]] = []

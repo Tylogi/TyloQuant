@@ -8,6 +8,7 @@ namespace {
 struct FakeParams {
     double temperature = 1.0;
     int top_k = 0;
+    double top_p = 1.0;
     double presence_penalty = 0.0;
     double frequency_penalty = 0.0;
     double repetition_penalty = 1.0;
@@ -60,5 +61,18 @@ int main() {
     greedy.seed = 7;
     mfq::engine::Sampler<FakeOps> greedy_sampler(greedy);
     assert(greedy_sampler.sample(FakeTensor{9.0}).value == 9.0);
+    for (int top_k : {0, 1, 20}) {
+        greedy.top_k = top_k;
+        greedy.top_p = 0.0;
+        mfq::engine::Sampler<FakeOps> zero_nucleus(greedy);
+        mfq::engine::Sampler<FakeOps> fresh_greedy(greedy);
+        assert(zero_nucleus.greedy());
+        assert(zero_nucleus.sample(FakeTensor{9.0}).value == 9.0);
+        assert(zero_nucleus.next_uniform_float() == fresh_greedy.next_uniform_float());
+    }
+    std::mt19937 rng(42);
+    const float scores[]{0, 1, 5, -1};
+    for (int minimum : {0, 1, 3})
+        assert(mfq::engine::sample_top_k_top_p(scores, 3, 0.0, minimum, rng) == 2);
     return 0;
 }

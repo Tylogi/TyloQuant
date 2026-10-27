@@ -457,12 +457,14 @@ def sample_top_k_top_p(
 
     if not math.isfinite(temperature) or temperature <= 0.0:
         raise ValueError("temperature must be finite and positive")
-    if not 0.0 < float(top_p) <= 1.0:
-        raise ValueError("top_p must be in (0,1]")
+    if not 0.0 <= float(top_p) <= 1.0:
+        raise ValueError("top_p must be in [0,1]")
     values, prefix, rows, vocab = _logits(logits)
     selected = int(top_k)
     if not 1 <= selected <= min(vocab, 1024):
         raise ValueError("top_k must be in [1,min(vocab,1024)]")
+    if top_p == 0.0:
+        return sample_greedy(logits)
     uniforms = _random_values(random, rows)
     if selected > 64:
         result = _sample_sorted(
@@ -505,7 +507,7 @@ def sample(
 
     if int(top_k) < 0:
         raise ValueError("top_k must be non-negative")
-    if temperature <= 0.0 or int(top_k) == 1:
+    if temperature <= 0.0 or int(top_k) == 1 or top_p == 0.0:
         return sample_greedy(logits)
     if not 0.0 < float(top_p) <= 1.0:
         raise ValueError("top_p must be in (0,1]")

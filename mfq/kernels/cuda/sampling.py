@@ -25,12 +25,12 @@ def sample(
 ) -> torch.Tensor:
     """Sample token ids from logits on GPU.
 
-    ``temperature <= 0`` or ``top_k == 1`` uses greedy. ``top_p`` is applied within
+    ``temperature <= 0``, ``top_k == 1`` or ``top_p == 0`` uses greedy. ``top_p`` is applied within
     ``top_k`` when ``top_k > 0``.
     """
 
     flat = logits.contiguous().view(-1, logits.shape[-1])
-    if temperature <= 0.0 or top_k == 1:
+    if temperature <= 0.0 or top_k == 1 or top_p == 0.0:
         out = ext().sample_greedy_cuda(flat)
         return out.view(logits.shape[:-1])
     if random is None:

@@ -9596,8 +9596,8 @@
           },
           "top_p": {
             "default": 0.95,
-            "exclusiveMinimum": 0.0,
             "maximum": 1.0,
+            "minimum": 0.0,
             "title": "Top P",
             "type": "number"
           }

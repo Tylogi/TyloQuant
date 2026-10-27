@@ -82,6 +82,115 @@ def _request(**updates: Any):
     return parse_chat_request(body)
 
 
+@pytest.mark.parametrize("endpoint,roles", [
+    ("/v1/chat/completions", ("system", "developer", "user", "assistant", "tool")),
+    ("/v1/messages", ("user", "assistant")),
+])
+def test_message_role_validation(endpoint, roles):
+    async def run():
+        backend = _Backend()
+        app = create_app(_Service(backend))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            for role in roles:
+                body = {"model": "model", "max_tokens": 8, "messages": [{"role": role, "content": "hello"}]}
+                if endpoint == "/v1/messages":
+                    body["system"] = "Top-level system prompt"
+                response = await client.post(endpoint, json=body)
+                assert response.status_code == 200, response.text
+                assert backend.requests[-1]["messages"][-1]["role"] == role
+            count = len(backend.requests)
+            invalid_roles = ("wizard", "", None, 3, [], {}) + tuple(
+                role for role in ("system", "tool") if role not in roles)
+            for role in invalid_roles:
+                response = await client.post(endpoint, json={"model": "model", "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hello"}, {"role": role, "content": "bad"}]})
+                assert response.status_code == 400
+                error = response.json()["error"]
+                assert error["type"] == "invalid_request_error"
+                assert "messages[1].role" in error["message"]
+                assert all(role in error["message"] for role in roles)
+                if endpoint == "/v1/chat/completions":
+                    assert error["param"] == "messages[1].role"
+            assert len(backend.requests) == count
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/messages"])
+@pytest.mark.parametrize("content_type,status", [
+    ("application/json", 200), ("application/json; charset=utf-8", 200),
+    ("Application/JSON", 200), ("application/vnd.client+json", 200),
+    ("text/plain", 415), ("text/json", 415), ("application/octet-stream", 415),
+    ("application/x-www-form-urlencoded", 415), (None, 200),
+])
+def test_json_content_type_validation(endpoint, content_type, status):
+    async def run():
+        backend = _Backend()
+        app = create_app(_Service(backend))
+        headers = {"Content-Type": content_type} if content_type else {}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(endpoint, headers=headers, content=json.dumps({
+                "model": "model", "max_tokens": 8, "messages": [{"role": "user", "content": "hello"}]}))
+        assert response.status_code == status, response.text
+        assert len(backend.requests) == (1 if status == 200 else 0)
+        if status != 200:
+            assert response.json()["error"]["type"] == "invalid_request_error"
+            assert "Content-Type" in response.json()["error"]["message"]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("endpoint,temperature_max", [("/v1/chat/completions", 2), ("/v1/messages", 1)])
+def test_sampling_ranges_and_json_types(endpoint, temperature_max):
+    async def run():
+        backend = _Backend()
+        app = create_app(_Service(backend))
+        cases = [(name, value, 200) for name, values in (
+            ("temperature", (0, temperature_max)), ("top_p", (0, 1)), ("top_k", (0, 1)),
+            ("max_tokens", (1,)), ("seed", (0, 42)),
+        ) for value in values]
+        cases += [(name, value, 400) for name, values in (
+            ("temperature", (-0.1, temperature_max + 0.1, 3, True, "1")),
+            ("top_p", (-0.1, 1.1, True, "0.5")), ("top_k", (-1, 1.5, True, "1")),
+            ("max_tokens", (0, -1, 1.5, True, "8")), ("seed", (True, 1.5, "42")),
+        ) for value in values]
+        if endpoint == "/v1/chat/completions":
+            for name in ("presence_penalty", "frequency_penalty"):
+                cases += [(name, value, 200) for value in (-2, 0, 2)]
+                cases += [(name, value, 400) for value in (-2.1, 2.1, True, "0")]
+            cases += [("max_completion_tokens", value, 400) for value in (0, True, "8")]
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            for name, value, status in cases:
+                count = len(backend.requests)
+                response = await client.post(endpoint, json={"model": "model", "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hello"}], name: value})
+                assert response.status_code == status, (name, value, response.text)
+                assert len(backend.requests) == count + (1 if status == 200 else 0)
+                if status == 200:
+                    assert getattr(backend.requests[-1]["sampling"], name) == value
+                else:
+                    assert response.json()["error"]["type"] == "invalid_request_error"
+                    if endpoint == "/v1/chat/completions":
+                        assert response.json()["error"]["param"] == name
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("with_web_root", [False, True])
+def test_legacy_completions_returns_actionable_openai_error(tmp_path, with_web_root):
+    async def run():
+        backend = _Backend()
+        if with_web_root:
+            (tmp_path / "index.html").write_text("<html>Studio</html>", encoding="utf-8")
+        app = create_app(_Service(backend), web_root=tmp_path if with_web_root else None)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/v1/completions", json={"model": "model", "prompt": "hello"})
+        assert response.status_code == 404
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["code"] == "unsupported_endpoint"
+        assert "/v1/chat/completions" in error["message"]
+        assert not backend.requests
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_missing_model_returns_not_found_for_both_transports(tmp_path, stream) -> None:
     from mfq.server.runtime.runtime_pool import RuntimePool
