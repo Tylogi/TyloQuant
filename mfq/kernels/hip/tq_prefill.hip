@@ -216,11 +216,11 @@ extern "C" int mfq_tq_prefill_f32(ProjectionView view,const float* input,float* 
  auto* scales=reinterpret_cast<float*>(low+values);
  mfq_hip_tq_prefill::pack<2><<<tokens,256,0,stream>>>(input,high,low,scales,view.input_columns);
  // Twelve M fragments reduce accumulator pressure on the admitted PP shapes.
- if(tokens==2048 && view.input_columns==2560 &&
+ if((tokens==2048 || tokens==4096) && view.input_columns==2560 &&
     (view.rows==6144 || view.rows==10240 || view.rows==12288))
   // Eight N waves share the M192 activation tile; VGPR accumulators
   // retain the preceding per-output K/high-low accumulation order.
-  mfq_hip_tq_prefill::two_phase<192,32,128><<<dim3((view.rows+127)/128,11),512,0,stream>>>(view,output,tokens,high,low,scales);
+  mfq_hip_tq_prefill::two_phase<192,32,128><<<dim3((view.rows+127)/128,(tokens+191)/192),512,0,stream>>>(view,output,tokens,high,low,scales);
  else mfq_hip_tq_prefill::two_phase<256,32><<<dim3((view.rows+63)/64,(tokens+255)/256),256,0,stream>>>(view,output,tokens,high,low,scales);
  mfq_hip_tq_prefill::exceptional_rows<<<tokens,64,0,stream>>>(view,input,output,scales);
  return int(hipGetLastError());
