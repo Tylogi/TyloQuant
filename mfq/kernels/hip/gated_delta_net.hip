@@ -14,6 +14,7 @@
 #include "../../hip/include/mfq_tensor_backend.h"
 #include <vector>
 #include <cstdlib>
+#include <cstring>
 
 #include "../hip/reduce.cuh"
 #include "mfq_hip_compat.h"
@@ -318,6 +319,22 @@ __global__ void gdn_warp_column_kernel(
         }                                                                              \
     } while (0)
 
+static bool gdn_dot_chain_supported(int device) {
+#if defined(__HIP_PLATFORM_AMD__)
+    static thread_local int cached_device=-1;
+    static thread_local bool supported=false;
+    if(cached_device!=device) {
+        hipDeviceProp_t properties{};
+        supported=hipGetDeviceProperties(&properties,device)==hipSuccess &&
+            std::strncmp(properties.gcnArchName,"gfx942",6)==0;
+        cached_device=device;
+    }
+    return supported;
+#else
+    return false;
+#endif
+}
+
 static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
     mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, MfqOptional<mfq_tensor_backend::Tensor> state,
@@ -380,7 +397,11 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
             hipDeviceGetAttribute(&sms,hipDeviceAttributeMultiprocessorCount,device)==hipSuccess,
             "GDN: device occupancy unavailable");
         if(T>=128 && B*Hv*8>=sms) {
-            if(transposed_state)hipLaunchKernelGGL((mfq_hip_gdn_prefill::recurrent<true,16>),
+            if(transposed_state && !tiled_heads && B==1 && Hq==16 && Hv==48 &&
+               (T==2048 || T==4096) && gdn_dot_chain_supported(device))
+                hipLaunchKernelGGL((mfq_hip_gdn_prefill::recurrent_dot_chains<true,16,2,4>),
+                    dim3(B*Hv,8),dim3(256),0,stream,qd,kd,vd,gd,bd,sd,od,sod,Hq,Hv,T,tiled_heads);
+            else if(transposed_state)hipLaunchKernelGGL((mfq_hip_gdn_prefill::recurrent<true,16>),
                 dim3(B*Hv,8),dim3(256),0,stream,qd,kd,vd,gd,bd,sd,od,sod,Hq,Hv,T,tiled_heads);
             else hipLaunchKernelGGL((mfq_hip_gdn_prefill::recurrent<false,16>),
                 dim3(B*Hv,8),dim3(256),0,stream,qd,kd,vd,gd,bd,sd,od,sod,Hq,Hv,T,tiled_heads);
