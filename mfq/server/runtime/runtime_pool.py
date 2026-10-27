@@ -11,7 +11,7 @@ import socket
 import subprocess
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -95,6 +95,7 @@ from mfq.server.services.hardware import (
     memory_topology,
 )
 from mfq.server.services.metrics import RequestMetrics, RuntimeMetricsSnapshot
+from mfq.server.services.model_memory import checkpoint_attention_kv_bytes_per_token
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,14 @@ _WINDOWS_COMMIT_RESERVE_FRACTION = 8
 # CUDA contexts, KV staging, and kernels are committed but absent from the
 # weight estimate; price them before deciding how many experts stay in RAM.
 _WINDOWS_GPU_WORKSPACE_BYTES = 4 << 30
+# Match the native expert cache's 1-GiB graph/driver allowance plus its
+# 256-MiB allocator/graph construction guard, outside prompt workspace.
+_CUDA_RUNTIME_OVERHEAD_BYTES = 1280 << 20
+# Missing KV geometry: FP16 K/V for 64 layers, 8 KV heads, head dim 128.
+_CUDA_FALLBACK_KV_BYTES_PER_TOKEN = 64 * 8 * 128 * 4
+# Packed expert slots round up per arena; a cache meant to hold every expert
+# asks for 1% of the routed bytes on top, at least this much.
+_CUDA_CACHE_ALL_MIN_MARGIN_BYTES = 64 << 20
 # Deadline failures keep their own result label so retries stay distinguishable
 # from requests that failed for another reason.
 _TIMEOUT_ERROR_CODES = frozenset({
@@ -170,6 +179,32 @@ class _ExpertHostBudget:
     @property
     def commit_limited(self) -> bool:
         return self.commit_bytes is not None and self.commit_bytes < self.physical_bytes
+
+
+@dataclass(frozen=True)
+class _CudaResidencyReserve:
+    """Runtime headroom needed before choosing irrevocable GPU expert residency."""
+
+    context: int
+    kv_bytes: int
+    kv_source: str
+    workspace_bytes: int
+    overhead_bytes: int = _CUDA_RUNTIME_OVERHEAD_BYTES
+
+    @property
+    def total_bytes(self) -> int:
+        return self.kv_bytes + self.workspace_bytes + self.overhead_bytes
+
+
+@dataclass(frozen=True)
+class _CudaExpertCacheHostPlan:
+    """How the host serves the routed experts behind a CUDA expert cache."""
+
+    budget: _ExpertHostBudget
+    pipeline: bool
+    streaming: bool
+    allow_ssd: bool
+    failure: str | None
 
 
 def _job_error(code: str, message: str, *, retryable: bool = False) -> JobExecutionError:
@@ -4185,9 +4220,6 @@ class RuntimePool:
         if self.backend == "cuda" and request.moe_gpu_cache_gb is None:
             device_ceiling = self._cuda_device_vram_limit(request)
             if device_ceiling is not None:
-                # The native worker prices concrete dense/KV allocations and
-                # decode scratch after load; prefill borrows expert storage.
-                # Do not reserve another third before that calculation.
                 ceiling = min(ceiling, device_ceiling) if ceiling is not None else device_ceiling
         if (
             request.moe_gpu_cache_gb is not None
@@ -4200,7 +4232,65 @@ class RuntimePool:
             0,
             artifact.resource.total_bytes - artifact.always_streamed_bytes,
         )
-        if resident_total_bytes <= ceiling:
+        reserve = (
+            self._cuda_residency_runtime_reserve(artifact, request, ceiling=ceiling)
+            if self.backend == "cuda" and artifact.resource.format == "mfq"
+            else None
+        )
+        runtime_reserve = reserve.total_bytes if reserve is not None else 0
+        fits = resident_total_bytes + runtime_reserve <= ceiling
+        dense_bytes = max(0, resident_total_bytes - artifact.routed_expert_bytes)
+        runtime_headroom = 0 if self.backend == "cuda" else min(
+            4 << 30, max(1 << 30, ceiling // 20))
+        # Native cache admission subtracts concrete KV/workspace requirements
+        # and can lend expert storage to prefill; do not charge them twice.
+        resident_expert_bytes = min(
+            artifact.routed_expert_bytes,
+            max(0, ceiling - runtime_headroom - dense_bytes),
+        )
+        environment = {**os.environ, **self.runtime_environment}
+        # CUDA expert banks that the RAM-expert pipeline can serve decode (and
+        # verify MTP drafts) as CUDA graphs only through the expert cache; plain
+        # residency falls back to eager per-expert dispatch, measured 3-10x
+        # slower with MTP on Qwen3.8-Flash-Next and Agnes V4-XS. When every
+        # expert fits a discrete GPU, cache all of them rather than leaving
+        # them resident, unless the pipeline was explicitly disabled.
+        if (fits and reserve is not None and environment.get("MFQ_MOE_PIPELINE") != "0"
+                and self._cuda_discrete_device_capacity(request) is not None
+                and supports_cuda_ram_expert_pipeline(artifact.path)):
+            # The native cache deducts its GPU KV charge from the requested
+            # budget; ask for it on top so every expert still gets a slot.
+            margin = max(_CUDA_CACHE_ALL_MIN_MARGIN_BYTES, artifact.routed_expert_bytes // 100)
+            decision, cache_bytes = "cache_all", artifact.routed_expert_bytes + reserve.kv_bytes + margin
+        elif fits:
+            decision, cache_bytes = "resident", 0
+        elif resident_expert_bytes > 0:
+            decision, cache_bytes = "cache", resident_expert_bytes
+        else:
+            decision, cache_bytes = "no_cache_capacity", 0
+        unavailable = None
+        if reserve is not None and cache_bytes > 0:
+            candidate = request.model_copy(update={"moe_gpu_cache_gb": cache_bytes / float(1 << 30)})
+            try:
+                unavailable = self._cuda_expert_cache_host_plan(artifact, candidate, environment).failure
+            except (JobExecutionError, OSError) as error:
+                unavailable = str(error)
+            if unavailable is not None and resident_total_bytes <= ceiling:
+                # Runtime headroom must not turn a load that launched resident
+                # into a host-RAM launch failure.
+                decision, cache_bytes = "resident", 0
+        if reserve is not None:
+            logger.info(
+                "cuda_auto_expert_residency model=%s total_bytes=%d resident_total_bytes=%d "
+                "context=%d kv_reserve_bytes=%d kv_source=%s workspace_reserve_bytes=%d "
+                "overhead_reserve_bytes=%d runtime_reserve_bytes=%d ceiling_bytes=%d "
+                "decision=%s cache_bytes=%d cache_gib=%.6f cache_unavailable=%r",
+                artifact.resource.name, artifact.resource.total_bytes, resident_total_bytes,
+                reserve.context, reserve.kv_bytes, reserve.kv_source, reserve.workspace_bytes,
+                reserve.overhead_bytes, runtime_reserve, ceiling,
+                decision, cache_bytes, cache_bytes / float(1 << 30), unavailable,
+            )
+        if decision == "resident":
             if artifact.resource.format == "hf":
                 # Native-HF workers interpret an omitted cache budget as
                 # "stream experts".  Make the opposite decision explicit
@@ -4208,23 +4298,63 @@ class RuntimePool:
                 # host needlessly starts a cold SSD LRU for a ~160-GiB MoE.
                 return request.model_copy(update={"moe_gpu_cache_gb": 0.0})
             return request
-        dense_bytes = max(
-            0,
-            resident_total_bytes - artifact.routed_expert_bytes,
-        )
-        runtime_headroom = 0 if self.backend == "cuda" else min(
-            4 << 30, max(1 << 30, ceiling // 20))
-        resident_expert_bytes = min(
-            artifact.routed_expert_bytes,
-            max(0, ceiling - runtime_headroom - dense_bytes),
-        )
-        if resident_expert_bytes <= 0:
+        if cache_bytes <= 0:
             return request
         return request.model_copy(
             update={
-                "moe_gpu_cache_gb": resident_expert_bytes / float(1 << 30),
+                "moe_gpu_cache_gb": cache_bytes / float(1 << 30),
             }
         )
+
+    def _cuda_residency_runtime_reserve(
+        self, artifact: DiscoveredModel, request: ModelLoadRequest, *, ceiling: int | None = None
+    ) -> _CudaResidencyReserve:
+        """Estimate target GPU KV capacity, workspace headroom and fixed CUDA costs."""
+        context = self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled)
+        try:
+            plan = checkpoint_kv_budget(artifact, context, request.kv_memory, request.kv_quantization)
+        except (OSError, ValueError):
+            plan = None
+        if plan is None:
+            # Unsupported/absent metadata must not turn into zero KV reserve.
+            # One GiB minimum also covers small contexts and unknown fixed state.
+            per_token = checkpoint_attention_kv_bytes_per_token(artifact)
+            if per_token is not None:
+                kv_bytes = max(1 << 30, context * per_token)
+                source = "config_attention_fp16_min_1gib"
+            else:
+                # Without geometry this is only a conservative guess. Capped at
+                # the ceiling it still rules out full residency, but a long
+                # default context no longer reports more KV than the GPU holds.
+                kv_bytes = max(1 << 30, context * _CUDA_FALLBACK_KV_BYTES_PER_TOKEN)
+                kv_bytes = min(kv_bytes, ceiling) if ceiling is not None else kv_bytes
+                source = "fallback_256kib_per_token_min_1gib_max_ceiling"
+            kv_bytes = max(kv_bytes, request.kv_memory.gpu_budget_bytes or 0)
+        elif (request.kv_memory.gpu_budget_bytes is not None
+                or artifact.resource.architecture.casefold().startswith("qwen4_exp")):
+            # Only qwen4_exp's tiered KvMemoryManager keeps a context-dependent
+            # fraction of KV on the GPU (validated by _validate_kv_memory_budget).
+            kv_bytes = plan.gpu_budget_bytes
+            source = "checkpoint_kv_budget"
+        else:
+            # Other architectures preallocate full-context KV on the GPU.
+            kv_bytes = plan.indexer_bytes + plan.raw_bytes
+            source = "checkpoint_kv_full_context"
+        configured = self.runtime_environment.get(
+            "MFQ_CUDA_WORKSPACE_RESERVE_GIB", os.environ.get("MFQ_CUDA_WORKSPACE_RESERVE_GIB", "4")
+        )
+        try:
+            gib = float(configured)
+            workspace_bytes = int(gib * (1 << 30))
+            if not math.isfinite(gib) or gib < 0 or workspace_bytes > (1 << 64) - 1:
+                raise ValueError
+        except (ValueError, OverflowError):
+            raise _job_error(
+                "runtime_workspace_budget_invalid", "CUDA workspace reserve must be a finite non-negative GiB value"
+            ) from None
+        # KvMemoryManager::finalize requires this free headroom even without an
+        # expert cache; it is not a separate preallocated 4-GiB device buffer.
+        return _CudaResidencyReserve(context, kv_bytes, source, workspace_bytes)
 
     @staticmethod
     def _observed_runtime_bytes(
@@ -5024,6 +5154,25 @@ class RuntimePool:
             budget, physical_budget, commit_bytes, commit_available, footprint
         )
 
+    def _cuda_expert_cache_host_plan(
+        self, artifact: DiscoveredModel, request: ModelLoadRequest, environment: Mapping[str, str]
+    ) -> _CudaExpertCacheHostPlan:
+        """Price the host side of a CUDA expert cache; residency and launch share this verdict."""
+        budget = self._cuda_expert_host_budget_plan(artifact, request)
+        # Preload needs room for the complete routed set, not only for the
+        # experts missing from the GPU cache; otherwise Windows commit (and
+        # physical RAM on Linux) is exhausted after load.
+        complete = budget.bytes >= self._cuda_expert_preload_bytes(artifact)
+        allow_ssd = environment.get("MFQ_MOE_SSD_EXPERTS", "1") != "0"
+        if supports_cuda_ram_expert_pipeline(artifact.path):
+            streaming = not complete or environment.get("MFQ_MOE_PRELOAD_ALL") == "0"
+            failure = None if allow_ssd or not streaming else (
+                "remaining experts do not fit in RAM; enable SSD expert streaming or reduce the model size")
+            return _CudaExpertCacheHostPlan(budget, True, streaming, allow_ssd, failure)
+        failure = None if complete else (
+            "this expert container requires complete RAM residency; use a canonical MFQ checkpoint for SSD streaming")
+        return _CudaExpertCacheHostPlan(budget, False, False, allow_ssd, failure)
+
     def _kv_ram_limit(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int | None:
         _, available = host_memory_capacity()
         limit = request.kv_memory.ram_budget_bytes
@@ -5113,7 +5262,8 @@ class RuntimePool:
             process_environment.setdefault("MFQ_MEMORY_ARCHITECTURE", memory_topology()["memory_architecture"])
         if (self.backend == "cuda" and artifact.resource.format == "mfq"
                 and request.moe_gpu_cache_gb is not None and request.moe_gpu_cache_gb > 0):
-            budget = self._cuda_expert_host_budget_plan(artifact, request)
+            plan = self._cuda_expert_cache_host_plan(artifact, request, process_environment)
+            budget = plan.budget
             host_budget = budget.bytes
             if budget.commit_limited:
                 logger.info(
@@ -5123,19 +5273,9 @@ class RuntimePool:
                     host_budget, budget.physical_bytes, budget.commit_bytes,
                     budget.commit_available_bytes, budget.commit_footprint_bytes,
                 )
-            preload_bytes = self._cuda_expert_preload_bytes(artifact)
-            if supports_cuda_ram_expert_pipeline(artifact.path):
-                # Preload needs room for the complete routed set, not only for
-                # the experts missing from the GPU cache; otherwise Windows
-                # commit (and physical RAM on Linux) is exhausted after load.
-                streaming = (
-                    host_budget < preload_bytes
-                    or process_environment.get("MFQ_MOE_PRELOAD_ALL") == "0"
-                )
-                allow_ssd = process_environment.get("MFQ_MOE_SSD_EXPERTS", "1") != "0"
-                if streaming and not allow_ssd:
-                    raise _job_error("runtime_ram_expert_budget_exceeded",
-                        "remaining experts do not fit in RAM; enable SSD expert streaming or reduce the model size")
+            if plan.failure is not None:
+                raise _job_error("runtime_ram_expert_budget_exceeded", plan.failure)
+            if plan.pipeline:
                 defaults = {
                     "MFQ_MOE_HOST_CACHE_BYTES": str(host_budget),
                     "MFQ_MOE_PIPELINE": "1",
@@ -5160,8 +5300,8 @@ class RuntimePool:
                 for name, value in defaults.items():
                     process_environment.setdefault(name, value)
                 process_environment["MFQ_MOE_HOST_CACHE_BYTES"] = str(host_budget)
-                process_environment["MFQ_MOE_SSD_EXPERTS"] = "1" if allow_ssd else "0"
-                if streaming:
+                process_environment["MFQ_MOE_SSD_EXPERTS"] = "1" if plan.allow_ssd else "0"
+                if plan.streaming:
                     process_environment["MFQ_MOE_PRELOAD_ALL"] = "0"
                     process_environment["MFQ_MOE_ASSERT_RESIDENT"] = "0"
                     process_environment["MFQ_MOE_NVQ_DENSE"] = "0"
@@ -5170,9 +5310,6 @@ class RuntimePool:
                     if process_environment.setdefault("MFQ_MODEL_FILE_IO", "direct") == "direct":
                         process_environment.setdefault("MFQ_PLE_FILE_MAP", "1")
             else:
-                if host_budget < preload_bytes:
-                    raise _job_error("runtime_ram_expert_budget_exceeded",
-                        "this expert container requires complete RAM residency; use a canonical MFQ checkpoint for SSD streaming")
                 # Older expert containers use the resident CPU loader, followed
                 # by the same bounded GPU cache; they must not read SSD per step.
                 process_environment.setdefault("MFQ_DISABLE_MOE_SSD_RANGES", "1")

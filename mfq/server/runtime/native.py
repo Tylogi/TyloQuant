@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
@@ -42,6 +43,19 @@ _RESIDENT_DENSE_EXPERT_DTYPES = frozenset({"BF16", "F16", "F32"})
 
 def supports_cuda_ram_expert_pipeline(model: Path) -> bool:
     """Inspect expert headers without decoding or copying their weight payloads."""
+    try:
+        path = Path(model).resolve()
+        stat = path.stat()
+        # Residency planning and launch configuration ask about the same
+        # checkpoint several times per load; probe each file version once.
+        return _cuda_ram_expert_pipeline_probe(str(path), stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        # Not cached: an unreadable file may become readable again.
+        return False
+
+
+@functools.lru_cache(maxsize=16)
+def _cuda_ram_expert_pipeline_probe(model: str, size: int, modified_ns: int) -> bool:
     found = False
     try:
         with open_mmap(model) as store:
@@ -69,7 +83,7 @@ def supports_cuda_ram_expert_pipeline(model: Path) -> bool:
                 finally:
                     view.release()
                 found = True
-    except (OSError, ValueError):
+    except ValueError:
         return False
     return found
 
