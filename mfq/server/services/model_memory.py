@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from mfq.architectures.hf_config import text_section
 from mfq.formats.assets import MODEL_CONFIG_ASSET
 from mfq.formats.io import open_mmap
+from mfq.formats.shards import ShardFileVersions, shard_file_versions
 from mfq.server.protocol.models import (
     ModelCacheComponent,
     ModelCacheFixedComponent,
@@ -20,8 +21,8 @@ if TYPE_CHECKING:
 
 
 @functools.lru_cache(maxsize=16)
-def _mfq_config(path: str, size: int, modified_ns: int) -> tuple[Any, bool]:
-    # Load planning prices KV several times per load; read each file version
+def _mfq_config(path: str, versions: ShardFileVersions) -> tuple[Any, bool]:
+    # Load planning prices KV several times per load; read each shard set version
     # once. Callers only read the returned config.
     with open_mmap(path) as store:
         record = store.records.get(MODEL_CONFIG_ASSET)
@@ -39,8 +40,7 @@ def _checkpoint_config(artifact: DiscoveredModel) -> tuple[Any, bool]:
     """Return the checkpoint's model config and whether it stores a predictor."""
     if artifact.resource.format == 'mfq':
         path = Path(artifact.path).resolve()
-        stat = path.stat()
-        return _mfq_config(str(path), stat.st_size, stat.st_mtime_ns)
+        return _mfq_config(str(path), shard_file_versions(path))
     path = artifact.path / 'config.json'
     if path.stat().st_size > 4 << 20:
         raise ValueError('model configuration exceeds 4 MiB')

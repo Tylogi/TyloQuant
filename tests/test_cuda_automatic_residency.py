@@ -9,6 +9,7 @@ from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.nint import NintSpec
+from mfq.formats.shards import format_shard_path, shard_header
 from mfq.quantize.nint_quant import quantize
 from mfq.server.protocol.models import ModelArtifactResource, ModelLoadRequest
 from mfq.server.runtime.native import supports_cuda_ram_expert_pipeline
@@ -727,16 +728,18 @@ def test_cuda_residency_fallback_without_geometry_is_capped_at_ceiling(tmp_path,
     assert "decision=cache" in caplog.text.split() and selected.moe_gpu_cache_gb > 0
 
 
-def test_cuda_unified_memory_keeps_resident_experts(tmp_path, monkeypatch, caplog):
-    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=40)
+@pytest.mark.parametrize("total_gib,ceiling_gib", [(40, 100), (86, 90)])
+def test_cuda_unified_memory_keeps_resident_experts(tmp_path, monkeypatch, caplog, total_gib, ceiling_gib):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=total_gib)
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
-        "cpu", 8, gpu_memory=(GpuMemory("NVIDIA GB10", 128 * GIB, unified=True),)))
+        "cpu", 8, gpu_memory=(GpuMemory("Unified CUDA GPU", 128 * GIB, unified=True),)))
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "unified"})
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (128 * GIB, 120 * GIB))
     assert supports_cuda_ram_expert_pipeline(model.path)
     request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
     with caplog.at_level("INFO", logger="mfq.server.runtime.runtime_pool"):
-        assert pool._apply_automatic_expert_residency(model, request, memory_ceiling=100 * GIB) is request
-    assert "decision=resident" in caplog.text.split()
+        assert pool._apply_automatic_expert_residency(model, request, memory_ceiling=ceiling_gib * GIB) is request
+    assert "cuda_auto_expert_residency" not in caplog.text
 
 
 @pytest.mark.parametrize("inherited", [False, True])
@@ -774,3 +777,30 @@ def test_cuda_residency_and_launch_probe_checkpoint_once(tmp_path, monkeypatch):
     os.utime(model.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
     assert supports_cuda_ram_expert_pipeline(model.path)
     assert len(probes) == 2
+
+
+@pytest.mark.parametrize("initially_supported", [False, True])
+def test_cuda_pipeline_probe_invalidates_when_another_shard_changes(tmp_path, initially_supported):
+    header = FileHeader(version=2, model_arch="qwen4_exp")
+    first, second = [format_shard_path(tmp_path / "model.mfq", index, 2) for index in (1, 2)]
+    save(first, shard_header(header, split_no=0, split_count=2, tensor_count=2, record_count=2),
+         {"model.embed_tokens.weight": np.zeros((2, 2), dtype=np.float16)})
+    companion = shard_header(header, split_no=1, split_count=2, tensor_count=2, record_count=2)
+    name = "model.block.0.mlp.experts.gate.weight"
+    dense = np.zeros((2, 3, 96), dtype=np.float16)
+    quantized = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), make_nvq_fixture()),))
+    save(second, companion, {name: quantized if initially_supported else dense})
+    assert supports_cuda_ram_expert_pipeline(first) is initially_supported
+    primary = first.stat()
+
+    save(second, companion, {name: dense if initially_supported else quantized})
+    assert first.stat().st_size == primary.st_size
+    assert first.stat().st_mtime_ns == primary.st_mtime_ns
+    assert supports_cuda_ram_expert_pipeline(first) is not initially_supported
+
+    # Removing a companion must not reuse a cached positive or negative answer.
+    payload = second.read_bytes()
+    second.unlink()
+    assert supports_cuda_ram_expert_pipeline(first) is False
+    second.write_bytes(payload)
+    assert supports_cuda_ram_expert_pipeline(first) is not initially_supported

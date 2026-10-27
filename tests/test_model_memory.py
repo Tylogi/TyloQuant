@@ -1,4 +1,13 @@
-from mfq.server.services.model_memory import cache_profile
+from dataclasses import replace
+
+import numpy as np
+import pytest
+
+from mfq.formats.header import FileHeader
+from mfq.formats.io import save
+from mfq.formats.shards import format_shard_path, shard_header
+from mfq.server.services.model_memory import cache_profile, checkpoint_cache_profile
+from mfq.server.state.catalog import ModelCatalog
 
 
 def test_flash_next_profile_includes_gdn_ple_and_qsa_index_caches():
@@ -66,3 +75,38 @@ def test_kv_profile_does_not_require_gdn_geometry_or_count_recurrent_state():
     assert profile.fixed_bytes == 0 and profile.fixed_components == []
     assert len(profile.components) == 1
     assert profile.components[0].group == 'GQA' and profile.components[0].layers == 1
+
+
+@pytest.mark.parametrize('changed', ['config', 'predictor'])
+def test_checkpoint_profile_invalidates_when_another_shard_changes(tmp_path, changed):
+    config = dict(model_type='qwen4_exp', max_position_embeddings=4096,
+        num_hidden_layers=4, full_attention_interval=4, num_key_value_heads=2,
+        head_dim=128, indexer_head_dim=128, indexer_compress_ratio=8)
+    header = FileHeader(version=2, model_arch='qwen4_exp', extra={'hf_config': config})
+    first, second = [format_shard_path(tmp_path / 'model.mfq', index, 2) for index in (1, 2)]
+    primary = shard_header(header, split_no=0, split_count=2, tensor_count=2, record_count=2)
+    companion = shard_header(header, split_no=1, split_count=2, tensor_count=2, record_count=2)
+    weight = np.zeros((2, 2), dtype=np.float16)
+    save(first, primary, {'model.embed_tokens.weight': weight})
+    save(second, companion, {'model.norm.weight': weight})
+    # Configuration lives in the primary shard; the predictor can be anywhere.
+    entry = second if changed == 'config' else first
+    model = replace(ModelCatalog._inspect(tmp_path, first), path=entry)
+    before = checkpoint_cache_profile(model, cuda=True)
+    assert before is not None and before.components[0].layers == 1
+    entry_stat = entry.stat()
+
+    if changed == 'config':
+        primary.extra['hf_config'] = {**config, 'num_key_value_heads': 4}
+        save(first, primary, {'model.embed_tokens.weight': weight})
+    else:
+        save(second, companion, {'mtp.block.0.norm.weight': weight})
+
+    assert entry.stat().st_size == entry_stat.st_size
+    assert entry.stat().st_mtime_ns == entry_stat.st_mtime_ns
+    after = checkpoint_cache_profile(model, cuda=True)
+    assert after is not None
+    if changed == 'config':
+        assert after.components[0].bytes_per_row == 2 * before.components[0].bytes_per_row
+    else:
+        assert after.components[0].layers == 2

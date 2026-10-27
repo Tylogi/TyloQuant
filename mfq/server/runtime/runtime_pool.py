@@ -4235,6 +4235,7 @@ class RuntimePool:
         reserve = (
             self._cuda_residency_runtime_reserve(artifact, request, ceiling=ceiling)
             if self.backend == "cuda" and artifact.resource.format == "mfq"
+            and self._cuda_discrete_device_capacity(request) is not None
             else None
         )
         runtime_reserve = reserve.total_bytes if reserve is not None else 0
@@ -4256,7 +4257,6 @@ class RuntimePool:
         # expert fits a discrete GPU, cache all of them rather than leaving
         # them resident, unless the pipeline was explicitly disabled.
         if (fits and reserve is not None and environment.get("MFQ_MOE_PIPELINE") != "0"
-                and self._cuda_discrete_device_capacity(request) is not None
                 and supports_cuda_ram_expert_pipeline(artifact.path)):
             # The native cache deducts its GPU KV charge from the requested
             # budget; ask for it on top so every expert still gets a slot.

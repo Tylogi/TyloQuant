@@ -23,6 +23,7 @@ from mfq.formats.assets import (
     TOKENIZER_GGUF_ASSET,
 )
 from mfq.formats.io import inspect_mfe_header, open_mmap
+from mfq.formats.shards import ShardFileVersions, shard_file_versions
 from mfq.server.state.model_weights import weight_role
 from mfq.server.runtime.hf_tokenizer import (
     ensure_hf_tokenizer_gguf,
@@ -45,17 +46,16 @@ def supports_cuda_ram_expert_pipeline(model: Path) -> bool:
     """Inspect expert headers without decoding or copying their weight payloads."""
     try:
         path = Path(model).resolve()
-        stat = path.stat()
         # Residency planning and launch configuration ask about the same
-        # checkpoint several times per load; probe each file version once.
-        return _cuda_ram_expert_pipeline_probe(str(path), stat.st_size, stat.st_mtime_ns)
-    except OSError:
-        # Not cached: an unreadable file may become readable again.
+        # checkpoint several times per load; probe each shard set version once.
+        return _cuda_ram_expert_pipeline_probe(str(path), shard_file_versions(path))
+    except (OSError, ValueError):
+        # Not cached: unreadable or inconsistent shard sets may be repaired.
         return False
 
 
 @functools.lru_cache(maxsize=16)
-def _cuda_ram_expert_pipeline_probe(model: str, size: int, modified_ns: int) -> bool:
+def _cuda_ram_expert_pipeline_probe(model: str, versions: ShardFileVersions) -> bool:
     found = False
     try:
         with open_mmap(model) as store:
