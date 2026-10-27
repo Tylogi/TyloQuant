@@ -97,33 +97,33 @@ __global__ __launch_bounds__(64) void exceptional_rows(ProjectionView m,const fl
   output[size_t(token)*m.rows+row]=dot.value+(m.bias?m.bias[row]:0.f);
  }
 }
-template<int BM,int BK>__global__ __launch_bounds__(256) void two_phase(
+template<int BM,int BK,int BN=64>__global__ __launch_bounds__(BN*4) void two_phase(
  ProjectionView m,float* output,int tokens,const half* high,const half* low,const float* scales) {
  using F4=float __attribute__((ext_vector_type(4)));
  using H4=_Float16 __attribute__((ext_vector_type(4)));
- __shared__ half w[64*BK],x[BM*BK];
+ __shared__ half w[BN*BK],x[BM*BK];
 #if defined(__gfx942__)
- const int tid=threadIdx.x,lane=tid&63,wave=tid/64,n0=blockIdx.x*64,t0=blockIdx.y*BM;
- constexpr int Vectors=64*(BK/8),Count=(Vectors+255)/256;
+ const int tid=threadIdx.x,lane=tid&63,wave=tid/64,n0=blockIdx.x*BN,t0=blockIdx.y*BM;
+ constexpr int Threads=BN*4,Vectors=BN*(BK/8),Count=(Vectors+Threads-1)/Threads;
  uint64_t descriptors[Count];
  #pragma unroll
  for(int i=0;i<Count;++i) {
-  const int row=n0+(tid+i*256)/(BK/8);
+  const int row=n0+(tid+i*Threads)/(BK/8);
   descriptors[i]=row<m.rows?m.descriptors[row]:0;
  }
  F4 accum[BM/16]{};
  PreparedWeight prepared[Count];
  #pragma unroll
- for(int i=0;i<Count;++i)prepared[i]=prefetch_weight(m,descriptors[i],n0+(tid+i*256)/(BK/8),(tid%(BK/8))*8);
+ for(int i=0;i<Count;++i)prepared[i]=prefetch_weight(m,descriptors[i],n0+(tid+i*Threads)/(BK/8),(tid%(BK/8))*8);
  for(int kb=0;kb<m.input_columns;kb+=BK) {
   #pragma unroll
-  for(int i=tid;i<Vectors;i+=256) {
+  for(int i=tid;i<Vectors;i+=Threads) {
    const int local_row=i/(BK/8),column=kb+(i%(BK/8))*8,row=n0+local_row;
    PackedStore store{w+local_row*BK,(i%(BK/8))*8,((local_row>>1)&(BK/4-1))*4};
    if(row<m.rows && column<m.stored_columns) {
-    const auto& data=prepared[i/256];
-    if(m.columns)mfq_tq_vector::visit_values<8,true,true,0,PackedStore,false,2,true>(m.words,descriptors[i/256],m.scales,static_cast<const half*>(m.relative),nullptr,nullptr,row,column,m.stored_columns,m.gslog,store,data.raw,data.columns);
-    else mfq_tq_vector::visit_values<8,true,false,0,PackedStore,false,2,true>(m.words,descriptors[i/256],m.scales,static_cast<const half*>(m.relative),nullptr,nullptr,row,column,m.stored_columns,m.gslog,store,data.raw,data.columns);
+    const auto& data=prepared[i/Threads];
+    if(m.columns)mfq_tq_vector::visit_values<8,true,true,0,PackedStore,false,2,true>(m.words,descriptors[i/Threads],m.scales,static_cast<const half*>(m.relative),nullptr,nullptr,row,column,m.stored_columns,m.gslog,store,data.raw,data.columns);
+    else mfq_tq_vector::visit_values<8,true,false,0,PackedStore,false,2,true>(m.words,descriptors[i/Threads],m.scales,static_cast<const half*>(m.relative),nullptr,nullptr,row,column,m.stored_columns,m.gslog,store,data.raw,data.columns);
    }else {
     #pragma unroll
     for(int j=0;j<8;j+=2)store(j,half{},half{});
@@ -133,7 +133,7 @@ template<int BM,int BK>__global__ __launch_bounds__(256) void two_phase(
   for(int phase=0;phase<2;++phase) {
    const half* input=phase?low:high;
    #pragma unroll
-   for(int i=tid;i<BM*(BK/8);i+=256) {
+   for(int i=tid;i<BM*(BK/8);i+=Threads) {
     const int row=i/(BK/8),column=(i%(BK/8))*8,mask=((row>>1)&(BK/4-1))*4;
     const uint4 packed=t0+row<tokens && kb+column<m.input_columns?
      *reinterpret_cast<const uint4*>(input+size_t(t0+row)*m.input_columns+kb+column):uint4{};
@@ -143,7 +143,7 @@ template<int BM,int BK>__global__ __launch_bounds__(256) void two_phase(
    __syncthreads();
    if(phase==0 && kb+BK<m.input_columns) {
     #pragma unroll
-    for(int i=0;i<Count;++i)prepared[i]=prefetch_weight(m,descriptors[i],n0+(tid+i*256)/(BK/8),kb+BK+(tid%(BK/8))*8);
+    for(int i=0;i<Count;++i)prepared[i]=prefetch_weight(m,descriptors[i],n0+(tid+i*Threads)/(BK/8),kb+BK+(tid%(BK/8))*8);
    }
    #pragma unroll
    for(int k=0;k<BK;k+=16) {
@@ -154,6 +154,15 @@ template<int BM,int BK>__global__ __launch_bounds__(256) void two_phase(
      H4 b[4];
      #pragma unroll
      for(int j=0;j<4;++j)b[j]=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(x+((mt+j)*16+(lane&15))*BK+wc));
+     if constexpr(BN==128) {
+     asm volatile(
+      "v_mfma_f32_16x16x16_f16 %0, %4, %5, %0\n\t"
+      "v_mfma_f32_16x16x16_f16 %1, %4, %6, %1\n\t"
+      "v_mfma_f32_16x16x16_f16 %2, %4, %7, %2\n\t"
+      "v_mfma_f32_16x16x16_f16 %3, %4, %8, %3"
+      : "+v"(accum[mt]),"+v"(accum[mt+1]),"+v"(accum[mt+2]),"+v"(accum[mt+3])
+      : "v"(a),"v"(b[0]),"v"(b[1]),"v"(b[2]),"v"(b[3]));
+     }else {
      asm volatile(
       "v_mfma_f32_16x16x16_f16 %0, %4, %5, %0\n\t"
       "v_mfma_f32_16x16x16_f16 %1, %4, %6, %1\n\t"
@@ -161,6 +170,7 @@ template<int BM,int BK>__global__ __launch_bounds__(256) void two_phase(
       "v_mfma_f32_16x16x16_f16 %3, %4, %8, %3"
       : "+a"(accum[mt]),"+a"(accum[mt+1]),"+a"(accum[mt+2]),"+a"(accum[mt+3])
       : "v"(a),"v"(b[0]),"v"(b[1]),"v"(b[2]),"v"(b[3]));
+     }
     }
    }
    __syncthreads();
@@ -208,7 +218,9 @@ extern "C" int mfq_tq_prefill_f32(ProjectionView view,const float* input,float* 
  // Twelve M fragments reduce accumulator pressure on the admitted PP shapes.
  if(tokens==2048 && view.input_columns==2560 &&
     (view.rows==6144 || view.rows==10240 || view.rows==12288))
-  mfq_hip_tq_prefill::two_phase<192,32><<<dim3((view.rows+63)/64,11),256,0,stream>>>(view,output,tokens,high,low,scales);
+  // Eight N waves share the M192 activation tile; VGPR accumulators
+  // retain the preceding per-output K/high-low accumulation order.
+  mfq_hip_tq_prefill::two_phase<192,32,128><<<dim3((view.rows+127)/128,11),512,0,stream>>>(view,output,tokens,high,low,scales);
  else mfq_hip_tq_prefill::two_phase<256,32><<<dim3((view.rows+63)/64,(tokens+255)/256),256,0,stream>>>(view,output,tokens,high,low,scales);
  mfq_hip_tq_prefill::exceptional_rows<<<tokens,64,0,stream>>>(view,input,output,scales);
  return int(hipGetLastError());
