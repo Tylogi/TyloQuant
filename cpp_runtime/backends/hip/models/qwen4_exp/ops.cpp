@@ -43,7 +43,10 @@ struct Gr {
             down.weight->tq.out==320 && down.weight->tq.neuron_len==10240 &&
             injection.weight->dense.is_contiguous() && injection.weight->dense.scalar_type()==tb::kBFloat16 &&
             injection.weight->dense.sizes().vec()==std::vector<int64_t>({streams,hidden*streams}) &&
-            x.is_cuda() && x.is_contiguous() && x.scalar_type()==tb::kFloat32 && x.numel()==hidden*streams;
+            x.is_cuda() && x.is_contiguous() && x.scalar_type()==tb::kFloat32 &&
+            (x.numel()==hidden*streams ||
+             (x.dim()==3 && x.size(1)==1 && x.size(0)>=2 && x.size(0)<=6 &&
+              x.size(2)==hidden*streams && mfq_tq_prefill_f32_supported(x.get_device())));
     }
     std::vector<Tensor> fused_tq(const Tensor& input,const Tensor& normalized)const {
         auto projected=tq_gr_down_injection_cuda(down.weight->tq.view,injection.weight->dense,normalized,streams);
