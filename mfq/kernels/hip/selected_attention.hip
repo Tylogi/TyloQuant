@@ -594,9 +594,9 @@ Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
                     if(q.size(0)==1 && q.size(2)==4096 && q.scalar_type()==tb::kFloat32 &&
                             gate.scalar_type()==tb::kFloat32 && q.stride(3)==1 && gate.stride(3)==1 &&
                             fused_mma_gate && !half_output){
-                        return mfq_sparse_attn_mma::launch<256,256,8,4,false>(
+                        return mfq_sparse_attn_mma::launch<256,256,12,4,false>(
                             q,key,value,Tensor{},Tensor{},Tensor{},Tensor{},scale,
-                            "causal_gqa_query8_np4",gate,false,cache_positions,columns);
+                            "causal_gqa_query12_np4",gate,false,cache_positions,columns);
                     }
                     auto attended=mfq_sparse_attn_mma::launch<256,256,4,4,false>(
                         q,key,value,Tensor{},Tensor{},Tensor{},Tensor{},scale,

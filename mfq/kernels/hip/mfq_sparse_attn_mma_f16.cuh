@@ -384,6 +384,12 @@ Tensor launch(
     MFQ_RUNTIME_CHECK(!Compact || (arch==0x942 && !causal && M>=128 && heads==24 && kv_heads==2),
         name,": compact LDS requires the measured gfx942 sparse PP geometry");
     auto config = ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc);
+    if constexpr(ncols==48){
+        static_assert(DKQ==256 && DV==256 && ncols1==12 && ncols2==4 && !V_is_K_view,
+            "48-column tiles are reserved for measured causal QSA");
+        MFQ_RUNTIME_CHECK(arch==0x942 && causal && M==4096 && B==1 && heads==24 && kv_heads==2,
+            name,": twelve-query tile requires the measured gfx942 causal PP geometry");
+    }
     if constexpr(DKQ==256 && DV==256 && ncols1==8 && ncols2==4 && !V_is_K_view){
         MFQ_RUNTIME_CHECK(arch==0x942 && causal && M==4096 && B==1 && heads==24 && kv_heads==2,
             name,": wide query tile requires the measured gfx942 causal PP geometry");
