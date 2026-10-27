@@ -336,6 +336,13 @@ target_link_libraries(mfq-metal-runtime PUBLIC
     ${MFQ_ACCELERATE_FRAMEWORK}
 )
 target_link_libraries(mfq-metal-runtime PRIVATE mfq-json)
+# MTP LoRA sessions and the Qwen4 MTP cache key use block_hash_hex from the
+# paged prefix cache; without it, targets linking only this library fail.
+if(TARGET mfq-paged-prefix-cache)
+    target_link_libraries(mfq-metal-runtime PUBLIC mfq-paged-prefix-cache)
+else()
+    target_sources(mfq-metal-runtime PRIVATE ${PROJECT_SOURCE_DIR}/core/mfq_paged_prefix_cache.cpp)
+endif()
 target_compile_features(mfq-metal-runtime PUBLIC cxx_std_20)
 target_compile_definitions(mfq-metal-runtime PUBLIC
     MFQ_NATIVE_MLX_RUNTIME=1
