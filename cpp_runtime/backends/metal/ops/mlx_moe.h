@@ -268,7 +268,7 @@ public:
         bool shared_gate_is_logits = false,
         const mlx::core::array* route_groups = nullptr,
         const mlx::core::array* softmax_router_logits = nullptr) const;
-    // Decode/small-M MXFP4 fast path. For one through six tokens, project
+    // Decode/small-M fast path. For one through six tokens, project
     // every selected expert and apply its routing weight in one Metal
     // dispatch, avoiding the transient [M,routes,hidden] down-projection
     // tensor. Unsupported shapes and representations transparently use the
