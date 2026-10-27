@@ -1353,7 +1353,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols);
     constexpr int  nbatch_K2       = (Compact ? 64 : ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols));
     constexpr int  nbatch_V2       = (Compact ? 64 : ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols));
-    constexpr int  nbatch_combine  = (Compact ? 64 : ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols));
+#if defined(AMD_MFMA_AVAILABLE) && defined(__gfx942__)
+    constexpr bool wide_causal_qsa=DKQ==256 && DV==256 && ncols1==8 && ncols2==4 &&
+        nwarps==8 && use_indirect && !V_is_K_view;
+#else
+    constexpr bool wide_causal_qsa=false;
+#endif
+    constexpr int nbatch_combine=(Compact || wide_causal_qsa) ? 64 :
+        ggml_cuda_fattn_mma_get_nbatch_combine(DKQ,DV,ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr int  configured_nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
     constexpr int  nstages         = use_indirect && !V_is_K_view ? 0 : configured_nstages;

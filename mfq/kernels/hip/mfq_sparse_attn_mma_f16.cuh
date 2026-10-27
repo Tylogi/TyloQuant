@@ -50,6 +50,14 @@ inline uint3 sparse_fastdiv_values(uint32_t divisor) {
     return make_uint3(multiplier, shift, divisor);
 }
 
+// Keep the existing four-way KV reduction while sharing a causal tile
+// across eight queries. Runtime admission below restricts this to gfx942.
+template<int DKQ,int DV,int Queries,int Heads,bool SharedKV>
+static constexpr __device__ int sparse_attention_threads(){
+    if constexpr(DKQ==256 && DV==256 && Queries==8 && Heads==4 && !SharedKV)return 512;
+    return ggml_cuda_fattn_mma_get_nthreads(DKQ,DV,Queries*Heads);
+}
+
 // Shared selected-token attention kernel. Model-specific indexers own the
 // selection order and optional validity mask; this kernel owns KV gathering,
 // MMA, online softmax and stream-K reduction.
@@ -81,7 +89,7 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
     RuntimeInput input) {
     constexpr int ncols = ncols1 * ncols2;
     constexpr int nthreads =
-        ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols);
+        sparse_attention_threads<DKQ,DV,ncols1,ncols2,V_is_K_view>();
     constexpr int nwarps = nthreads / ggml_cuda_get_physical_warp_size();
     constexpr bool use_logit_softcap = false;
     constexpr bool use_indirect = true;
@@ -184,7 +192,7 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view,bool SplitKV=false,bool Unsplit=false,bool Compact=false>
 __launch_bounds__(
-    ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1 * ncols2),
+    (sparse_attention_threads<DKQ,DV,ncols1,ncols2,V_is_K_view>()),
     ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1 * ncols2))
 __global__ void sparse_attention_kernel(
     const void * __restrict__ q,
@@ -376,6 +384,13 @@ Tensor launch(
     MFQ_RUNTIME_CHECK(!Compact || (arch==0x942 && !causal && M>=128 && heads==24 && kv_heads==2),
         name,": compact LDS requires the measured gfx942 sparse PP geometry");
     auto config = ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc);
+    if constexpr(DKQ==256 && DV==256 && ncols1==8 && ncols2==4 && !V_is_K_view){
+        MFQ_RUNTIME_CHECK(arch==0x942 && causal && M==4096 && B==1 && heads==24 && kv_heads==2,
+            name,": wide query tile requires the measured gfx942 causal PP geometry");
+        config.nthreads=512;
+        // Limit the combine scratch while retaining the original KV tile.
+        config.nbatch_combine=64;
+    }
     // Keep64 KV rows per softmax step. Halving feature/combine tiles permits
     // more resident blocks without changing the causal or MLA configuration.
     if constexpr(Compact)config.nbatch_K2=config.nbatch_V2=config.nbatch_combine=64;
