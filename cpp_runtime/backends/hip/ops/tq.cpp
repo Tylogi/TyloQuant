@@ -621,7 +621,14 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,tb::Tensor 
     const std::vector<int64_t> pair_shape{ids.size(0),ids.size(1),down->out};
     auto pairs=route.plan.pairs?tb::zeros(pair_shape,x.options()):tb::empty(pair_shape,x.options());
     const auto stream=mfq_current_cuda_stream();const int type=dtype(x.scalar_type());
+    const auto wide_bytes=type==0&&route.plan.tokens==4096?
+        mfq_tq_moe_wide128_workspace(gate->weight.view,up->weight.view,int(gate->out),route.plan,type,limit):0;
+    if(wide_bytes){
+        auto workspace=tb::empty({static_cast<int64_t>(wide_bytes)},x.options().dtype(tb::kUInt8));
+        status(mfq_tq_moe_swiglu_wide128(gate->weight.view,up->weight.view,x.data_ptr(),hidden.data_ptr(),int(gate->out),route.plan,type,limit,workspace.data_ptr(),wide_bytes,stream));
+    }else{
     status(mfq_tq_moe_swiglu(gate->weight.view,up->weight.view,x.data_ptr(),hidden.data_ptr(),int(gate->out),route.plan,type,limit,stream));
+    }
     status(mfq_tq_moe_projection(down->weight.view,hidden.data_ptr(),pairs.data_ptr(),int(down->out),route.plan,type,true,stream));
     if(shared_down)return tq_shared_finish_cuda(shared_down->view,shared_hidden,pairs,coefficients,shared_coefficient);
     status(mfq_tq_moe_reduce(pairs.data_ptr(),coefficients.data_ptr<float>(),output.data_ptr(),int(ids.size(0)),int(ids.size(1)),int(down->out),type,stream));

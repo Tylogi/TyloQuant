@@ -704,6 +704,160 @@ template<int BM,bool Async=false,bool Full=false,bool Pipeline=true>__global__ _
 }
 
 
+template<bool Columns,bool Uniform=false,bool ExpertColumns=false,bool Swizzle=false,bool Full=false,bool Prepared=false,bool Packed=false>
+__device__ __forceinline__ void load_weight_wide128(ProjectionView m,half* tile,int expert,
+    int rows,int n0,int k0,int tid,int choice,const uint64_t* descriptors,const PreparedTile& prepared={}) {
+    constexpr int BK=64,BN=64,Stride=Swizzle?64:72,V=8;
+    using Store=std::conditional_t<Swizzle && Packed,PackedSwizzledTileStore,
+        std::conditional_t<Swizzle,SwizzledCachedTileStore,CachedTileStore>>;
+    if constexpr(ExpertColumns)m.scales=static_cast<const half*>(m.scales)+size_t(expert)*m.stored_columns;
+    else if(m.columns==2)m.scales=static_cast<const half*>(m.scales)+size_t(expert)*m.stored_columns;
+    #pragma unroll 1
+    for(int i=tid;i<BN*(BK/V);i+=256) {
+        const int local_row=i/(BK/V),local_col=(i%(BK/V))*V;
+        const int row=expert*rows+n0+local_row,col=k0+local_col;
+        auto* destination=tile+local_row*Stride+local_col;
+        if(Full || (n0+local_row<rows && col<m.input_columns)) {
+            Store store{Swizzle?tile+local_row*Stride:destination,Full?V:min(V,m.input_columns-col)};
+            if constexpr(Swizzle){store.column=local_col;store.mask=(local_row&15)*4;}
+            const auto descriptor=descriptors[i/256];
+            U4 raw{};
+            if constexpr(Prepared)raw=i<256?prepared.first:prepared.second;
+            switch(choice) {
+                case 2:mfq_tq_vector::visit_values<V,true,Columns,2,Store,false,2,Prepared>(m.words,descriptor,m.scales,static_cast<const half*>(m.relative),nullptr,nullptr,row,col,m.stored_columns,m.gslog,store,raw,prepared.columns);break;
+                case 3:mfq_tq_vector::visit_values<V,true,Columns,3,Store,false,2,Prepared>(m.words,descriptor,m.scales,static_cast<const half*>(m.relative),nullptr,nullptr,row,col,m.stored_columns,m.gslog,store,raw,prepared.columns);break;
+                default:mfq_tq_vector::visit_values<V,true,Columns,0,Store,false,2,Prepared>(m.words,descriptor,m.scales,static_cast<const half*>(m.relative),nullptr,nullptr,row,col,m.stored_columns,m.gslog,store,raw,prepared.columns);break;
+            }
+        } else {
+            if constexpr(Swizzle) {
+                Store store{tile+local_row*Stride,0,local_col,(local_row&15)*4};
+                #pragma unroll
+                for(int j=0;j<V;j+=2)store(j,half{},half{});
+            } else *reinterpret_cast<uint4*>(destination)=uint4{};
+        }
+    }
+}
+
+
+template<int BM,bool Async=false,bool Full=false,bool Pipeline=true,bool Hybrid=false>__global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(4))) void grouped_pair_wide128(
+        ProjectionView g,ProjectionView u,const uint16_t* input,uint16_t* output,
+        int rows,TqMoeRoutePlan plan,float limit) {
+    static_assert(Async && Full,"Prepared projections require complete column-scale tiles");
+    constexpr int BN=64,BK=64,Stride=72;
+#if defined(__gfx942__)
+    constexpr bool Direct=Async;
+#else
+    constexpr bool Direct=false;
+#endif
+    using F4=float __attribute__((ext_vector_type(4)));
+    using H4=_Float16 __attribute__((ext_vector_type(4)));
+    __shared__ half weights[2][BN*(Direct?64:Stride)];
+    __shared__ __align__(16) half x[BM*(Direct?64:Stride)];
+    const int full=threadIdx.x,tid=full&255,role=__builtin_amdgcn_readfirstlane(full>>8),lane=tid&63,wave=tid>>6;
+    const auto m=role?u:g;
+    const int ntiles=(rows+BN-1)/BN,total=plan.tiles[plan.expert_count]*ntiles;
+    for(int task=blockIdx.x;task<total;task+=gridDim.x) {
+        const int tile=task/ntiles,n0=(task%ntiles)*BN,expert=plan.experts[tile];
+        if constexpr(Hybrid){
+            const int count=plan.bounds[expert+1]-plan.bounds[expert];
+            const int small=(count+63)/64,wide=(count+95)/96;
+            const bool use_wide=wide<small && wide*96<=small*64;
+            if(use_wide!=(BM==96))continue;
+        }
+        const int first=plan.bounds[expert]+(tile-plan.tiles[expert])*BM,last=min(first+BM,plan.bounds[expert+1]);
+        uint64_t descriptors[2];
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            const int row=n0+tid/8+i*32;
+            descriptors[i]=(Full || row<rows)?__ldg(m.descriptors+expert*rows+row):0;
+        }
+        const int code0=int((descriptors[0]>>32)&7),code1=int((descriptors[1]>>32)&7),leader=__shfl(code0,0,64);
+        const int choice=__builtin_amdgcn_readfirstlane(__all(code0==leader && code1==leader)?leader+1:0);
+        using Cache=std::conditional_t<Direct,DirectInputCache<BM,512>,InputCache<BM,512,true>>;
+        Cache input_cache(input,x,g.input_columns,plan,first,last,false);
+        PreparedTile prepared;
+        if constexpr(Pipeline)prefetch_tile(m,expert,0,tid,choice,descriptors,prepared);
+        F4 acc[BM/16]{};
+        for(int kb=0;kb<g.input_columns;kb+=BK) {
+            if constexpr(!Pipeline)prefetch_tile(m,expert,kb,tid,choice,descriptors,prepared);
+            if constexpr(Direct)input_cache.load(kb);
+            else if((g.input_columns&7)==0)input_cache.load(kb);
+            else {
+            for(int i=full;i<BM*BK;i+=512) {
+                const int token=i/BK,k=i%BK,compact=first+token;
+                const int pair=compact<last?plan.pairs[compact]:-1;
+                x[token*Stride+k]=pair>=0 && kb+k<g.input_columns?__ushort_as_half(input[size_t(pair/plan.routes)*g.input_columns+kb+k]):half{};
+            }
+            }
+            // This cached entry is dispatched only for expert column-scale banks.
+            load_weight_wide128<true,true,true,Direct,Full,true,BM>=64 && Direct && Full>(m,weights[role],expert,rows,n0,kb,tid,choice,descriptors,prepared);
+            if constexpr(Direct)input_cache.wait();
+            __syncthreads();
+            if constexpr(Pipeline)if(kb+BK<g.input_columns)prefetch_tile(m,expert,kb+BK,tid,choice,descriptors,prepared);
+            #pragma unroll
+            for(int k=0;k<BK;k+=16) {
+                const half* weight_source=Direct?
+                    weights[role]+(wave*16+(lane&15))*64+((k+(lane>>4)*4)^((lane&15)*4)):
+                    weights[role]+(wave*16+(lane&15))*Stride+k+(lane>>4)*4;
+                const auto a=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(weight_source));
+                if constexpr(BM>=64 && Direct && Full) {
+                    #pragma unroll
+                    for(int group=0;group<BM/16;group+=4) {
+                        H4 b[4];
+                        #pragma unroll
+                        for(int j=0;j<4;++j)b[j]=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                            x+((group+j)*16+(lane&15))*64+((k+(lane>>4)*4)^((lane&15)*4))));
+                        #pragma unroll
+                        for(int j=0;j<4;++j)acc[group+j]=__builtin_amdgcn_mfma_f32_16x16x16f16(a,b[j],acc[group+j],0,0,0);
+                        asm volatile("" ::: "memory");
+                    }
+                } else {
+                #pragma unroll
+                for(int mt=0;mt<BM/16;++mt) {
+                    const half* source=Direct?
+                        x+(mt*16+(lane&15))*64+((k+(lane>>4)*4)^((lane&15)*4)):
+                        x+(mt*16+(lane&15))*Stride+k+(lane>>4)*4;
+                    const auto b=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(source));
+                    if(mt==0 || first+mt*16<last)acc[mt]=__builtin_amdgcn_mfma_f32_16x16x16f16(a,b,acc[mt],0,0,0);
+                    if constexpr(BM>=64)asm volatile("" ::: "memory");
+                }
+                }
+            }
+            __syncthreads();
+        }
+        static_assert(BM==128 && Async && Full);
+        // Reuse the64-row weight tiles for two successive output stripes.
+        // Keep all128-row FP32 accumulators and the original K order.
+        #pragma unroll
+        for(int stripe=0;stripe<128;stripe+=64) {
+            #pragma unroll
+            for(int mt=0;mt<4;++mt) {
+                const int token=stripe+mt*16+(lane&15),row=wave*16+(lane>>4)*4;
+                if(first+token<last) {
+                    H4 packed;
+                    #pragma unroll
+                    for(int j=0;j<4;++j)packed[j]=__builtin_bit_cast(_Float16,__float2half_rn(
+                        acc[stripe/16+mt][j]+(m.bias?m.bias[expert*rows+n0+row+j]:0.f)));
+                    const int store_row=row^((token&15)*4);
+                    *reinterpret_cast<uint2*>(weights[role]+(token-stripe)*BN+store_row)=__builtin_bit_cast(uint2,packed);
+                }
+            }
+            __syncthreads();
+            for(int i=full;i<64*BN;i+=512) {
+                const int token=stripe+i/BN,row=i%BN;
+                if(first+token<last && n0+row<rows) {
+                    const int pair=plan.pairs[first+token],physical=(token-stripe)*BN+(row^((token&15)*4));
+                    float a=__half2float(weights[0][physical]),b=__half2float(weights[1][physical]);
+                    if(limit>0){a=fminf(a,limit);b=fmaxf(-limit,fminf(b,limit));}
+                    output[size_t(pair)*rows+n0+row]=rounded<0>(b*(a/(1.f+expf(-a))));
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+
 template<int DT,bool Pair,int BM=16,bool Uniform=false,bool Async=false,bool Full=false,bool Prepared=false>
 __global__ __launch_bounds__(256) void grouped_down_cached(ProjectionView weight,ProjectionView up,
     const S<DT>* input,S<DT>* output,int rows,TqMoeRoutePlan plan,bool routed,float limit) {
@@ -1027,6 +1181,25 @@ __global__ void reduce_vector16(const half* pairs,const float* weights,half* out
  }
 }
 
+// Split only experts whose128-row tiles reduce task count without padding
+// more rows than the original64-row map. Down retains the original map.
+__global__ void wide128_plans(TqMoeRoutePlan original,TqMoeRoutePlan small,TqMoeRoutePlan wide){
+ const int tid=threadIdx.x,lane=tid&63,wave=tid>>6;
+ const int count=original.bounds[tid+1]-original.bounds[tid];
+ const int t64=(count+63)/64,t128=(count+127)/128;
+ const bool use=t128<t64&&t128*128<=t64*64;
+ const int own0=use?0:t64,own1=use?t128:0;
+ int p0=own0,p1=own1;
+ #pragma unroll
+ for(int step=1;step<64;step*=2){int a=__shfl_up(p0,step,64),b=__shfl_up(p1,step,64);if(lane>=step){p0+=a;p1+=b;}}
+ __shared__ int totals[8][2];if(lane==63){totals[wave][0]=p0;totals[wave][1]=p1;}__syncthreads();
+ for(int previous=0;previous<wave;++previous){p0+=totals[previous][0];p1+=totals[previous][1];}
+ const_cast<int32_t*>(small.tiles)[tid+1]=p0;const_cast<int32_t*>(wide.tiles)[tid+1]=p1;
+ if(!tid){const_cast<int32_t*>(small.tiles)[0]=0;const_cast<int32_t*>(wide.tiles)[0]=0;}
+ for(int i=p0-own0;i<p0;++i)const_cast<int32_t*>(small.experts)[i]=tid;
+ for(int i=p1-own1;i<p1;++i)const_cast<int32_t*>(wide.experts)[i]=tid;
+}
+
 template<int DT>struct EmbeddingStore {
     S<DT>* output;int valid;
     __device__ __forceinline__ void operator()(int j,float a,float b) {
@@ -1250,4 +1423,29 @@ extern "C" int mfq_tq_embedding_hip(ProjectionView weight,const int64_t* ids,int
 }
 extern "C" int mfq_tq_embedding_rows_hip(const ProjectionView* views,int count,int columns,void* output,int dtype,hipStream_t stream) {
     return launch_embedding<true>({},views,nullptr,count,columns,output,dtype,stream);
+}
+
+extern "C" uint64_t mfq_tq_moe_wide128_workspace(ProjectionView g,ProjectionView u,int rows,
+ TqMoeRoutePlan plan,int dtype,float limit){
+ static const bool enabled=[] {
+  const char*a=std::getenv("MFQ_HIP_TQ_PREFILL_DESCRIPTORS"),*b=std::getenv("MFQ_HIP_TQ_GROUPED_PAIR_PARALLEL");
+  return (!a||a[0]!='0')&&(!b||b[0]!='0');
+ }();
+ if(!enabled||dtype!=0||limit!=0.f||rows!=640||plan.tokens!=4096||plan.routes!=10||plan.expert_count!=512||
+  plan.tile_rows!=64||plan.expert_offset||!plan.pairs||!plan.bounds||!plan.tiles||!plan.experts||
+  g.columns!=2||u.columns!=2||g.input_columns!=2560||u.input_columns!=2560||g.rows!=512*640||u.rows!=g.rows)return 0;
+ int device=0;if(hipGetDevice(&device)!=hipSuccess||!mfq_tq_prefill_f32_supported(device))return 0;
+ return uint64_t(2)*(plan.expert_count+1+plan.tokens*plan.routes)*sizeof(int32_t);
+}
+extern "C" int mfq_tq_moe_swiglu_wide128(ProjectionView g,ProjectionView u,const void*input,void*output,int rows,
+ TqMoeRoutePlan original,int dtype,float limit,void*workspace,uint64_t bytes,hipStream_t stream){
+ const auto required=mfq_tq_moe_wide128_workspace(g,u,rows,original,dtype,limit);
+ if(!required||!workspace||bytes<required||!input||!output||input==output)return int(hipErrorInvalidValue);
+ auto* p=static_cast<int32_t*>(workspace);auto small=original,wide=original;
+ small.tiles=p;p+=original.expert_count+1;small.experts=p;p+=original.tokens*original.routes;
+ wide.tiles=p;p+=original.expert_count+1;wide.experts=p;wide.tile_rows=128;
+ mfq_tq_moe::wide128_plans<<<1,512,0,stream>>>(original,small,wide);
+ mfq_tq_moe::grouped_parallel_pair_prepared<64,true,true,true><<<4096,512,0,stream>>>(g,u,static_cast<const uint16_t*>(input),static_cast<uint16_t*>(output),rows,small,limit);
+ mfq_tq_moe::grouped_pair_wide128<128,true,true,true,false><<<4096,512,0,stream>>>(g,u,static_cast<const uint16_t*>(input),static_cast<uint16_t*>(output),rows,wide,limit);
+ return int(hipGetLastError());
 }
