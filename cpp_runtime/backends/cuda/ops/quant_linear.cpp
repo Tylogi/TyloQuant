@@ -1023,6 +1023,12 @@ plan_moe_expert_parallel_slices(
     return plan_parallel_slices(extent, 1, parallel, name);
 }
 
+static bool is_routed_expert_router(const std::string& name) {
+    static const std::string suffix = ".mlp.router.weight";
+    return name.size() >= suffix.size() &&
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 QuantLinear load_quant_linear(
         CudaExecutionContext& execution,
         const mfq::ModelSource & mfq,
@@ -1422,6 +1428,12 @@ QuantLinear load_quant_linear(
         throw std::runtime_error(
             "linear tensor must be NINT/NVQ/MXFP4-SQ/MXFP8-SQ/FP8-128SQ/MXFP4/MXFP8/BF16/F16/F32: " +
             name + " dtype=" + dtype + "; use --dense-dtype f16/bf16/f32 or quantize this projection");
+    }
+    // A float router keeps float logits: rounding them to the FP16 activation
+    // can reorder near-tied experts of a router kept unquantized on purpose.
+    if (dtype == "F32" && is_routed_expert_router(name)) {
+        result.native_output = true;
+        for (auto& shard : result.tensor_parallel_shards) shard.native_output = true;
     }
     return result;
 }
