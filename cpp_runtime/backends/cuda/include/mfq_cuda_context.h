@@ -193,6 +193,8 @@ public:
     bool supports_async_allocations() const noexcept { return async_allocations_; }
     DeviceMemoryStats memory_stats() const noexcept;
     std::pair<std::uint64_t,std::uint64_t> pool_memory_stats() const;
+    // Graph memory pool handles held by this device, live or kept for reuse.
+    std::size_t graph_memory_pool_count() const;
     std::size_t local_memory_usage() const;
     // Process-owned pages, including idle allocator pages and CUDA libraries.
     std::size_t resident_memory_usage() const;
