@@ -69,6 +69,12 @@ jobs:
           tests/test_server_concurrency.py tests/test_server_protocol.py
           tests/test_server_prometheus_metrics.py tests/test_serving_statistics.py
 
+      - name: Check automatic residency and sharded load metadata
+        run: >-
+          uv run python -m pytest -q
+          tests/test_cuda_automatic_residency.py tests/test_model_memory.py
+          tests/test_formats/test_shards.py tests/test_engram_companions.py
+
   macos-metal:
     name: macOS Metal
     runs-on: macos-14

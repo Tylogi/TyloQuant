@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import functools
 import json
+from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from mfq.architectures.hf_config import text_section
 from mfq.formats.assets import MODEL_CONFIG_ASSET
 from mfq.formats.io import open_mmap
+from mfq.formats.shards import ShardFileVersions, shard_file_versions
 from mfq.server.protocol.models import (
     ModelCacheComponent,
     ModelCacheFixedComponent,
@@ -15,32 +20,46 @@ if TYPE_CHECKING:
     from mfq.server.state.catalog import DiscoveredModel
 
 
+@functools.lru_cache(maxsize=16)
+def _mfq_config(path: str, versions: ShardFileVersions) -> tuple[Any, bool]:
+    # Load planning prices KV several times per load; read each shard set version
+    # once. Callers only read the returned config.
+    with open_mmap(path) as store:
+        record = store.records.get(MODEL_CONFIG_ASSET)
+        if record is not None:
+            if record.nbytes > 4 << 20:
+                raise ValueError('model configuration exceeds 4 MiB')
+            config = json.loads(store.read_blob(MODEL_CONFIG_ASSET))
+        else:
+            config = store.header.extra.get('hf_config', {})
+        has_predictor = any(name.startswith(('predictor.block.', 'mtp.')) for name in store.records)
+    return config, has_predictor
+
+
+def _checkpoint_config(artifact: DiscoveredModel) -> tuple[Any, bool]:
+    """Return the checkpoint's model config and whether it stores a predictor."""
+    if artifact.resource.format == 'mfq':
+        path = Path(artifact.path).resolve()
+        return _mfq_config(str(path), shard_file_versions(path))
+    path = artifact.path / 'config.json'
+    if path.stat().st_size > 4 << 20:
+        raise ValueError('model configuration exceeds 4 MiB')
+    config = json.loads(path.read_text(encoding='utf-8'))
+    index = artifact.path / 'model.safetensors.index.json'
+    if index.is_file():
+        names = json.loads(index.read_text(encoding='utf-8')).get('weight_map', {})
+    else:
+        from mfq.server.state.catalog import ModelCatalog
+        names = {name for shard in artifact.path.glob('*.safetensors')
+            for name in ModelCatalog._safetensors_header(shard)}
+    return config, any(name.startswith(('predictor.block.', 'mtp.')) for name in names)
+
+
 def checkpoint_cache_profile(artifact: DiscoveredModel, *, cuda: bool = False,
     include_recurrent: bool = False) -> ModelCacheProfile | None:
     if not artifact.resource.complete:
         raise ValueError('checkpoint shards are incomplete')
-    if artifact.resource.format == 'mfq':
-        with open_mmap(artifact.path) as store:
-            record = store.records.get(MODEL_CONFIG_ASSET)
-            if record is not None:
-                if record.nbytes > 4 << 20:
-                    raise ValueError('model configuration exceeds 4 MiB')
-                config = json.loads(store.read_blob(MODEL_CONFIG_ASSET))
-            else:
-                config = store.header.extra.get('hf_config', {})
-            has_predictor = any(name.startswith(('predictor.block.', 'mtp.')) for name in store.records)
-    else:
-        path = artifact.path / 'config.json'
-        if path.stat().st_size > 4 << 20:
-            raise ValueError('model configuration exceeds 4 MiB')
-        config = json.loads(path.read_text(encoding='utf-8'))
-        index = artifact.path / 'model.safetensors.index.json'
-        if index.is_file():
-            names = json.loads(index.read_text(encoding='utf-8')).get('weight_map', {})
-        else:
-            from mfq.server.state.catalog import ModelCatalog
-            names = {name for shard in artifact.path.glob('*.safetensors') for name in ModelCatalog._safetensors_header(shard)}
-        has_predictor = any(name.startswith(('predictor.block.', 'mtp.')) for name in names)
+    config, has_predictor = _checkpoint_config(artifact)
     if not isinstance(config, dict):
         return None
     text = config.get('text_config', config)
@@ -48,6 +67,48 @@ def checkpoint_cache_profile(artifact: DiscoveredModel, *, cuda: bool = False,
     if type(predictor_layers) is not int or predictor_layers < 0:
         return None
     return cache_profile(config, include_recurrent=include_recurrent, predictor_layers=predictor_layers, cuda=cuda)
+
+
+def checkpoint_attention_kv_bytes_per_token(artifact: DiscoveredModel) -> int | None:
+    """FP16 K/V bytes per token of the backbone attention layers, from config fields alone.
+
+    A coarse estimate for checkpoints without a cache profile; None when the
+    config does not state the attention geometry.
+    """
+    try:
+        config, _ = _checkpoint_config(artifact)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(config, Mapping):
+        return None
+    text = text_section(config)
+
+    def positive(key: str) -> int | None:
+        value = text.get(key)
+        return value if type(value) is int and value > 0 else None
+
+    # Hybrid models keep per-token K/V only in their attention mixers; sliding
+    # windows are priced at full context.
+    schedule = text.get('layers_block_type') or text.get('layer_types')
+    pattern = text.get('hybrid_override_pattern')
+    if isinstance(schedule, list) and schedule:
+        layers = sum(isinstance(kind, str) and 'attention' in kind and 'linear' not in kind for kind in schedule)
+    elif isinstance(pattern, str) and pattern:
+        layers = pattern.count('*')
+    else:
+        layers = positive('num_hidden_layers')
+        interval = positive('full_attention_interval')
+        if layers is not None and interval is not None:
+            layers //= interval
+    if layers == 0:
+        return 0
+    heads = positive('num_attention_heads')
+    kv_heads = positive('num_key_value_heads') or heads
+    hidden = positive('hidden_size')
+    head_dim = positive('head_dim') or (hidden // heads if hidden and heads else None)
+    if layers is None or kv_heads is None or not head_dim:
+        return None
+    return layers * kv_heads * head_dim * 2 * 2
 
 
 def cache_profile(config: dict[str, Any], *, include_recurrent: bool = True, predictor_layers: int = 0,

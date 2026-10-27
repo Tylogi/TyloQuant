@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timezone
 from dataclasses import replace
 
@@ -8,6 +9,7 @@ from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.formats.mfe import MfePool, MfeTensor
 from mfq.formats.nint import NintSpec
+from mfq.formats.shards import format_shard_path, shard_header
 from mfq.quantize.nint_quant import quantize
 from mfq.server.protocol.models import ModelArtifactResource, ModelLoadRequest
 from mfq.server.runtime.native import supports_cuda_ram_expert_pipeline
@@ -15,6 +17,7 @@ from mfq.server.runtime.runtime_pool import RuntimePool
 from mfq.server.services.hardware import GpuMemory, HardwareIdentity
 from mfq.server.state.catalog import DiscoveredModel, ModelCatalog
 from mfq.server.services.jobs import JobExecutionError
+from mfq.server.services.model_memory import cache_profile, checkpoint_cache_profile
 from mfq.formats.nvq import E8_256, NVQ2_E8, NvqJscTensor
 
 
@@ -35,6 +38,7 @@ def _no_host_commit_accounting(monkeypatch):
     )
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.gpu_memory_status", lambda: [])
     monkeypatch.delenv("MFQ_CUDA_VRAM_LIMIT_GIB", raising=False)
+    monkeypatch.delenv("MFQ_CUDA_WORKSPACE_RESERVE_GIB", raising=False)
 
 
 def artifact(tmp_path):
@@ -99,6 +103,249 @@ def test_cuda_vram_limit_rejects_invalid_explicit_values(tmp_path, monkeypatch, 
     with pytest.raises(JobExecutionError) as error:
         pool._cuda_device_vram_limit(ModelLoadRequest(model="model", device_ids=["0"]))
     assert error.value.detail.code == "runtime_vram_budget_invalid"
+
+
+def _headroom_pool(tmp_path, monkeypatch, *, total_gib=89.5, always_streamed_gib=0, pipeline=None):
+    # Nominal 96-GB card: reported capacity yields the observed ~89.6-GiB ceiling.
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
+        "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", int(95.6 * GIB)),)))
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "discrete"})
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (256 * GIB, 200 * GIB))
+    profile = cache_profile(dict(model_type="qwen4_exp", max_position_embeddings=1048576,
+        num_hidden_layers=64, full_attention_interval=4, num_key_value_heads=8, head_dim=128,
+        indexer_head_dim=128, indexer_compress_ratio=8), include_recurrent=False, cuda=True)
+    assert profile is not None
+    monkeypatch.setattr("mfq.server.services.model_memory.checkpoint_cache_profile", lambda *args, **kwargs: profile)
+    if pipeline is not None:
+        # The fixture bank is pipeline-capable; reserve tests also cover banks
+        # the RAM-expert pipeline cannot serve, which stay resident when they fit.
+        monkeypatch.setattr("mfq.server.runtime.runtime_pool.supports_cuda_ram_expert_pipeline",
+            lambda path: pipeline)
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda", automatic_memory_budget=False)
+    pool.memory_policy.prefix_directory = str(tmp_path / "prefix")
+    model = artifact(tmp_path)
+    model = replace(model, resource=model.resource.model_copy(update={
+        "total_bytes": int(total_gib * GIB), "context_capacity": 1048576,
+    }), routed_expert_bytes=int((total_gib - always_streamed_gib - 4) * GIB),
+        always_streamed_bytes=int(always_streamed_gib * GIB))
+    return pool, model
+
+
+def test_cuda_borderline_residency_selects_cache_and_fast_launch(tmp_path, monkeypatch, caplog):
+    pool, model = _headroom_pool(tmp_path, monkeypatch)
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    assert model.resource.total_bytes <= pool._cuda_device_vram_limit(request)
+    with caplog.at_level("INFO", logger="mfq.server.runtime.runtime_pool"):
+        selected = pool._apply_automatic_expert_residency(model, request)
+    assert selected.moe_gpu_cache_gb > 0
+    command, environment = pool._launch_configuration(model, selected, port=1234)
+    assert "--moe-gpu-cache-gb" in command
+    for name in ("MFQ_MOE_PIPELINE", "MFQ_MOE_TWO_STAGE_FFN", "MFQ_MOE_PREFILL_LAYER",
+                 "MFQ_MOE_DECODE_HOST_PIN", "MFQ_MOE_TRANSFER_CACHE"):
+        assert environment[name] == "1"
+    assert float(environment["MFQ_CUDA_VRAM_LIMIT_GIB"]) * GIB == pool._cuda_device_vram_limit(request)
+    assert "decision=cache" in caplog.text.split()
+    assert f"total_bytes={model.resource.total_bytes}" in caplog.text
+    reserve = pool._cuda_residency_runtime_reserve(model, request)
+    for field, value in (("kv_reserve_bytes", reserve.kv_bytes), ("workspace_reserve_bytes", 4 * GIB),
+                         ("overhead_reserve_bytes", 1280 << 20), ("runtime_reserve_bytes", reserve.total_bytes),
+                         ("ceiling_bytes", pool._cuda_device_vram_limit(request)),
+                         ("cache_bytes", int(selected.moe_gpu_cache_gb * GIB))):
+        assert f"{field}={value}" in caplog.text
+
+
+@pytest.mark.parametrize("resident_gib,streamed_gib", [(40, 0), (66, 0), (40, 60)])
+def test_cuda_roomy_residency_launches_without_pipeline_or_vram_limit(
+    tmp_path, monkeypatch, caplog, resident_gib, streamed_gib,
+):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, pipeline=False,
+        total_gib=resident_gib + streamed_gib, always_streamed_gib=streamed_gib)
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    with caplog.at_level("INFO", logger="mfq.server.runtime.runtime_pool"):
+        selected = pool._apply_automatic_expert_residency(model, request)
+    assert selected is request and selected.moe_gpu_cache_gb is None
+    command, environment = pool._launch_configuration(model, selected, port=1234)
+    assert "--moe-gpu-cache-gb" not in command
+    # Resident workers keep the whole device: the limit belongs to the expert
+    # cache fast path (TCC GPUs have no WDDM adapter to enforce it).
+    assert "MFQ_CUDA_VRAM_LIMIT_GIB" not in environment
+    assert "MFQ_MOE_PIPELINE" not in environment
+    assert "MFQ_MOE_HOST_CACHE_BYTES" not in environment
+    assert {"decision=resident", "cache_bytes=0"} <= set(caplog.text.split())
+
+
+@pytest.mark.parametrize("cache_gib", [0, 7])
+def test_cuda_explicit_cache_budget_bypasses_automatic_reserve(tmp_path, monkeypatch, cache_gib):
+    pool, model = _headroom_pool(tmp_path, monkeypatch)
+    def unexpected_reserve(*args):
+        pytest.fail("explicit expert residency must bypass automatic reserve estimation")
+    monkeypatch.setattr(pool, "_cuda_residency_runtime_reserve", unexpected_reserve)
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=cache_gib, device_ids=["0"])
+    assert pool._apply_automatic_expert_residency(model, request) is request
+    command, environment = pool._launch_configuration(model, request, port=1234)
+    assert float(command[command.index("--moe-gpu-cache-gb") + 1]) == cache_gib
+    assert (environment.get("MFQ_MOE_PIPELINE") == "1") == (cache_gib > 0)
+
+
+def test_cuda_residency_reserve_grows_with_resolved_context(tmp_path, monkeypatch):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, pipeline=False, total_gib=80)
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    short = pool._cuda_residency_runtime_reserve(model, request)
+    assert pool._apply_automatic_expert_residency(model, request) is request
+    pool.context_policy.model_overrides["model"] = 262144
+    long_request = request.model_copy(update={"context_size": None})
+    long = pool._cuda_residency_runtime_reserve(model, long_request)
+    assert long.context == 262144 and long.kv_bytes > short.kv_bytes
+    assert pool._apply_automatic_expert_residency(model, long_request).moe_gpu_cache_gb > 0
+    assert pool.resolve_context_size(model, long_request.context_size) == 262144
+
+
+def test_cuda_residency_includes_runtime_reserve_at_exact_ceiling(tmp_path, monkeypatch):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, pipeline=False, total_gib=40)
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    required = model.resource.total_bytes + pool._cuda_residency_runtime_reserve(model, request).total_bytes
+    assert pool._apply_automatic_expert_residency(model, request, memory_ceiling=required) is request
+    assert pool._apply_automatic_expert_residency(model, request,
+        memory_ceiling=required - 1).moe_gpu_cache_gb > 0
+
+
+@pytest.mark.parametrize("architecture,total_gib,kv_source", [
+    ("nemotron_h", 66, "config_attention_fp16_min_1gib"), ("qwen3_next", 40, "checkpoint_kv_full_context"),
+])
+def test_cuda_roomy_checkpoint_metadata_keeps_resident_launch(
+    tmp_path, monkeypatch, architecture, total_gib, kv_source,
+):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=total_gib)
+    monkeypatch.setattr("mfq.server.services.model_memory.checkpoint_cache_profile", checkpoint_cache_profile)
+    config = dict(model_type=architecture, num_hidden_layers=64, max_position_embeddings=262144,
+        full_attention_interval=4, num_key_value_heads=8, head_dim=128)
+    save(model.path, FileHeader(version=2, model_arch=architecture, extra={"hf_config": config}),
+        {"weight": np.zeros((2, 2), dtype=np.float16)})
+    model = replace(model, resource=model.resource.model_copy(update={"architecture": architecture}))
+    request = ModelLoadRequest(model="model", context_size=32768, device_ids=["0"])
+    reserve = pool._cuda_residency_runtime_reserve(model, request)
+    # 16 attention layers x 8 KV heads x 128 x FP16 K/V for 32K tokens.
+    assert reserve.kv_source == kv_source and reserve.kv_bytes == 2 * GIB
+    assert model.resource.total_bytes + reserve.total_bytes < pool._cuda_device_vram_limit(request)
+    assert pool._apply_automatic_expert_residency(model, request) is request
+    _, environment = pool._launch_configuration(model, request, port=1234)
+    assert "MFQ_CUDA_VRAM_LIMIT_GIB" not in environment
+    assert "MFQ_MOE_PIPELINE" not in environment
+
+
+@pytest.mark.parametrize("placement,quantized", [("auto", False), ("auto_ssd", False),
+    ("ram", False), ("vram", False), ("auto", True), ("vram", True)])
+def test_cuda_residency_reserve_honors_kv_policy(tmp_path, monkeypatch, placement, quantized):
+    from mfq.server.runtime.kv_budget import checkpoint_kv_budget
+
+    pool, model = _headroom_pool(tmp_path, monkeypatch, pipeline=False, total_gib=80)
+    request = ModelLoadRequest(model="model", context_size=262144, device_ids=["0"],
+        kv_memory={"placement": placement}, kv_quantization={"enabled": quantized, "bits": 4})
+    reserve = pool._cuda_residency_runtime_reserve(model, request)
+    plan = checkpoint_kv_budget(model, 262144, request.kv_memory, request.kv_quantization)
+    assert reserve.kv_bytes == plan.gpu_budget_bytes
+    assert reserve.kv_source == "checkpoint_kv_budget"
+    selected = pool._apply_automatic_expert_residency(model, request)
+    assert (selected.moe_gpu_cache_gb is None) == (placement == "ram" or (placement == "auto" and quantized))
+
+
+@pytest.mark.parametrize("allocation", ["preallocated", "dynamic"])
+def test_cuda_residency_reserve_honors_explicit_kv_budget(tmp_path, monkeypatch, allocation):
+    pool, model = _headroom_pool(tmp_path, monkeypatch)
+    request = ModelLoadRequest(model="model", context_size=4096,
+        kv_memory={"allocation": allocation, "gpu_budget_bytes": 8 * GIB})
+    assert pool._cuda_residency_runtime_reserve(model, request).kv_bytes == 8 * GIB
+
+
+@pytest.mark.parametrize("configured", ["0", "1.5", "8"])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_cuda_residency_reserve_honors_workspace_environment(tmp_path, monkeypatch, configured, inherited):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=80)
+    if inherited:
+        monkeypatch.setenv("MFQ_CUDA_WORKSPACE_RESERVE_GIB", configured)
+    else:
+        monkeypatch.setenv("MFQ_CUDA_WORKSPACE_RESERVE_GIB", "16")
+        pool.runtime_environment["MFQ_CUDA_WORKSPACE_RESERVE_GIB"] = configured
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    assert pool._cuda_residency_runtime_reserve(model, request).workspace_bytes == int(float(configured) * GIB)
+
+
+def test_cuda_workspace_override_can_require_expert_cache(tmp_path, monkeypatch):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, pipeline=False, total_gib=80)
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    assert pool._apply_automatic_expert_residency(model, request) is request
+    pool.runtime_environment["MFQ_CUDA_WORKSPACE_RESERVE_GIB"] = "16"
+    assert pool._apply_automatic_expert_residency(model, request).moe_gpu_cache_gb > 0
+
+
+@pytest.mark.parametrize("configured", ["-1", "nan", "inf", "invalid", ""])
+def test_cuda_residency_rejects_invalid_workspace_environment(tmp_path, monkeypatch, configured):
+    pool, model = _headroom_pool(tmp_path, monkeypatch)
+    pool.runtime_environment["MFQ_CUDA_WORKSPACE_RESERVE_GIB"] = configured
+    with pytest.raises(JobExecutionError) as error:
+        pool._apply_automatic_expert_residency(model, ModelLoadRequest(model="model", device_ids=["0"]))
+    assert error.value.detail.code == "runtime_workspace_budget_invalid"
+
+
+def test_cuda_residency_missing_profile_uses_context_dependent_fallback(tmp_path, monkeypatch, caplog):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, pipeline=False, total_gib=66)
+    monkeypatch.setattr("mfq.server.services.model_memory.checkpoint_cache_profile", lambda *args, **kwargs: None)
+    request = ModelLoadRequest(model="model", context_size=32768, device_ids=["0"])
+    reserve = pool._cuda_residency_runtime_reserve(model, request)
+    assert reserve.kv_bytes == 8 * GIB
+    assert pool._apply_automatic_expert_residency(model, request) is request
+    long_request = request.model_copy(update={"context_size": 262144})
+    with caplog.at_level("INFO", logger="mfq.server.runtime.runtime_pool"):
+        assert pool._apply_automatic_expert_residency(model, long_request).moe_gpu_cache_gb > 0
+    assert "kv_source=fallback_256kib_per_token_min_1gib_max_ceiling" in caplog.text.split()
+    assert pool._cuda_residency_runtime_reserve(model, long_request).kv_bytes == 64 * GIB
+
+
+@pytest.mark.parametrize("backend,format", [("metal", "mfq"), ("metal", "hf"), ("cuda", "hf")])
+def test_runtime_headroom_does_not_change_hf_or_metal_residency(tmp_path, monkeypatch, backend, format):
+    pool, model = _headroom_pool(tmp_path, monkeypatch)
+    pool.backend = backend
+    model = replace(model, resource=model.resource.model_copy(update={"format": format}))
+    pool.max_runtime_memory_bytes = 90 * GIB
+    def unexpected_reserve(*args):
+        pytest.fail("CUDA MFQ runtime reserve must not affect HF or Metal residency")
+    monkeypatch.setattr(pool, "_cuda_residency_runtime_reserve", unexpected_reserve)
+    request = ModelLoadRequest(model="model", device_ids=["0"])
+    selected = pool._apply_automatic_expert_residency(model, request)
+    assert selected.moe_gpu_cache_gb == (0 if format == "hf" else None)
+
+
+@pytest.mark.parametrize("inherited", [False, True])
+def test_cuda_resident_launch_preserves_explicit_vram_limit(tmp_path, monkeypatch, inherited):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=40)
+    if inherited:
+        monkeypatch.setenv("MFQ_CUDA_VRAM_LIMIT_GIB", "76")
+    else:
+        monkeypatch.setenv("MFQ_CUDA_VRAM_LIMIT_GIB", "70")
+        pool.runtime_environment["MFQ_CUDA_VRAM_LIMIT_GIB"] = "76"
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    _, environment = pool._launch_configuration(model, request, port=1234)
+    assert environment["MFQ_CUDA_VRAM_LIMIT_GIB"] == "76"
+
+
+@pytest.mark.parametrize("configured", ["0", "nan"])
+def test_cuda_explicit_cache_launch_keeps_vram_limit_validation(tmp_path, monkeypatch, configured):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=40)
+    pool.runtime_environment["MFQ_CUDA_VRAM_LIMIT_GIB"] = configured
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=7, device_ids=["0"])
+    with pytest.raises(JobExecutionError) as error:
+        pool._launch_configuration(model, request, port=1234)
+    assert error.value.detail.code == "runtime_vram_budget_invalid"
+
+
+def test_cuda_unified_launch_does_not_add_discrete_vram_limit(tmp_path, monkeypatch):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=40)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
+        "cpu", 8, gpu_memory=(GpuMemory("NVIDIA GB10", 128 * GIB, unified=True),)))
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "unified"})
+    request = ModelLoadRequest(model="model", device_ids=["0"])
+    _, environment = pool._launch_configuration(model, request, port=1234)
+    assert "MFQ_CUDA_VRAM_LIMIT_GIB" not in environment
 
 
 @pytest.mark.parametrize("available,enabled", [(52 * GIB, True), (8 * GIB, False)])
@@ -338,3 +585,222 @@ def test_cuda_ram_pipeline_accepts_mxfp4_predictor_with_quantized_target(tmp_pat
         "predictor.stage.0.mlp.experts.down.weight": predictor,
     })
     assert supports_cuda_ram_expert_pipeline(model.path)
+
+
+@pytest.mark.parametrize("resident_gib,streamed_gib", [(40, 0), (66, 0), (60, 30)])
+def test_cuda_pipeline_capable_experts_use_full_cache_when_they_fit(
+    tmp_path, monkeypatch, caplog, resident_gib, streamed_gib,
+):
+    # Decode and MTP verification run as CUDA graphs only through the expert
+    # cache, so a pipeline-capable bank caches every expert instead of staying
+    # resident on the eager per-expert path.
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=resident_gib + streamed_gib,
+        always_streamed_gib=streamed_gib, pipeline=True)
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    with caplog.at_level("INFO", logger="mfq.server.runtime.runtime_pool"):
+        selected = pool._apply_automatic_expert_residency(model, request)
+    assert selected.moe_gpu_cache_gb * GIB > model.routed_expert_bytes
+    # Admission still prices the complete checkpoint, not the KV/padding allowance.
+    assert pool._estimated_load_bytes(model, selected) == resident_gib * GIB
+    command, environment = pool._launch_configuration(model, selected, port=1234)
+    assert float(command[command.index("--moe-gpu-cache-gb") + 1]) == selected.moe_gpu_cache_gb
+    assert environment["MFQ_MOE_PIPELINE"] == "1" and environment["MFQ_MOE_TWO_STAGE_FFN"] == "1"
+    assert float(environment["MFQ_CUDA_VRAM_LIMIT_GIB"]) * GIB == pool._cuda_device_vram_limit(request)
+    assert "decision=cache_all" in caplog.text.split()
+
+
+@pytest.mark.parametrize("context", [4096, 262144])
+def test_cuda_cache_all_requests_kv_charge_and_slot_margin(tmp_path, monkeypatch, context):
+    # The native cache deducts its GPU KV charge from the requested budget, so
+    # a cache that must hold every expert asks for that charge on top.
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=40)
+    request = ModelLoadRequest(model="model", context_size=context, device_ids=["0"])
+    reserve = pool._cuda_residency_runtime_reserve(model, request)
+    selected = pool._apply_automatic_expert_residency(model, request)
+    margin = max(64 << 20, model.routed_expert_bytes // 100)
+    assert selected.moe_gpu_cache_gb * GIB == pytest.approx(model.routed_expert_bytes + reserve.kv_bytes + margin)
+    assert pool._estimated_load_bytes(model, selected) == model.resource.total_bytes
+
+
+@pytest.mark.parametrize("pipeline", [True, False])
+@pytest.mark.parametrize("total_gib,cached", [(40, False), (86, False), (100, True)])
+def test_cuda_unservable_expert_cache_keeps_previous_residency(
+    tmp_path, monkeypatch, caplog, pipeline, total_gib, cached,
+):
+    # 40 GiB fits with headroom (cache_all candidate), 86 GiB only without the
+    # runtime reserve (bounded cache candidate), 100 GiB never fit.
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=total_gib, pipeline=pipeline)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (32 * GIB, 8 * GIB))
+    if pipeline:
+        pool.runtime_environment["MFQ_MOE_SSD_EXPERTS"] = "0"
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    with caplog.at_level("INFO", logger="mfq.server.runtime.runtime_pool"):
+        selected = pool._apply_automatic_expert_residency(model, request)
+    # A roomy bank the pipeline cannot serve stays resident without a cache candidate.
+    if pipeline or total_gib != 40:
+        reason = "remaining experts do not fit in RAM" if pipeline else "this expert container requires complete RAM"
+        assert f"cache_unavailable='{reason}" in caplog.text
+    if not cached:
+        # Resident launches never needed host RAM for experts.
+        assert selected is request and "decision=resident" in caplog.text.split()
+        command, _ = pool._launch_configuration(model, selected, port=1234)
+        assert "--moe-gpu-cache-gb" not in command
+        return
+    # A checkpoint that never fit keeps the bounded cache it requested before.
+    assert selected.moe_gpu_cache_gb * GIB == pytest.approx(pool._cuda_device_vram_limit(request) - 4 * GIB)
+    with pytest.raises(JobExecutionError) as error:
+        pool._launch_configuration(model, selected, port=1234)
+    assert error.value.detail.code == "runtime_ram_expert_budget_exceeded"
+
+
+@pytest.mark.parametrize("architecture,tiered", [
+    ("qwen4_exp-hf-mfq-alphaq-ud", True), ("Qwen4_Exp", True), ("qwen3_next", False), ("nemotron_h", False),
+])
+def test_cuda_residency_reserve_uses_full_kv_outside_qwen4_exp(tmp_path, monkeypatch, architecture, tiered):
+    from mfq.server.runtime.kv_budget import checkpoint_kv_budget
+
+    pool, model = _headroom_pool(tmp_path, monkeypatch)
+    model = replace(model, resource=model.resource.model_copy(update={"architecture": architecture}))
+    request = ModelLoadRequest(model="model", context_size=262144, device_ids=["0"])
+    plan = checkpoint_kv_budget(model, 262144, request.kv_memory, request.kv_quantization)
+    assert plan.gpu_budget_bytes < plan.indexer_bytes + plan.raw_bytes
+    reserve = pool._cuda_residency_runtime_reserve(model, request)
+    assert reserve.kv_bytes == (plan.gpu_budget_bytes if tiered else plan.indexer_bytes + plan.raw_bytes)
+    explicit = ModelLoadRequest(model="model", context_size=262144, device_ids=["0"],
+        kv_memory={"gpu_budget_bytes": 8 * GIB})
+    assert pool._cuda_residency_runtime_reserve(model, explicit).kv_bytes == 8 * GIB
+
+
+def _save_config(path, config):
+    save(path, FileHeader(version=2, model_arch=str(config.get("model_type", "unknown")),
+        extra={"hf_config": config}), {"weight": np.zeros((2, 2), dtype=np.float16)})
+
+
+@pytest.mark.parametrize("config,expected", [
+    # Nemotron-H block list (legacy mixer names): 4 attention layers.
+    (dict(model_type="nemotron_h", num_hidden_layers=99, num_key_value_heads=2, head_dim=128,
+          layers_block_type=["mamba", "moe", "attention", "moe"] * 4), 4 * 2 * 128 * 4),
+    # Omni wrapper nests the language model under llm_config.
+    (dict(model_type="nemotron_h_omni", llm_config=dict(num_key_value_heads=2, head_dim=128,
+          layers_block_type=["linear_attention", "full_attention"] * 3)), 3 * 2 * 128 * 4),
+    (dict(num_hidden_layers=8, num_key_value_heads=4, head_dim=64, hybrid_override_pattern="M-M*M-M*"),
+     2 * 4 * 64 * 4),
+    (dict(num_hidden_layers=48, full_attention_interval=4, num_key_value_heads=2, head_dim=256), 12 * 2 * 256 * 4),
+    # head_dim derived from hidden_size and KV heads from attention heads.
+    (dict(num_hidden_layers=10, hidden_size=1024, num_attention_heads=8), 10 * 8 * 128 * 4),
+    (dict(layers_block_type=["mamba", "moe"] * 4), 0),
+    (dict(num_hidden_layers=10), None),
+    ({}, None),
+])
+def test_attention_kv_estimate_reads_checkpoint_config(tmp_path, config, expected):
+    from mfq.server.services.model_memory import checkpoint_attention_kv_bytes_per_token
+
+    model = artifact(tmp_path)
+    _save_config(model.path, config)
+    assert checkpoint_attention_kv_bytes_per_token(model) == expected
+
+
+def test_cuda_residency_fallback_derives_kv_from_config(tmp_path, monkeypatch):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=40)
+    monkeypatch.setattr("mfq.server.services.model_memory.checkpoint_cache_profile", lambda *args, **kwargs: None)
+    _save_config(model.path, dict(model_type="nemotron_h", num_key_value_heads=2, head_dim=128,
+        layers_block_type=["mamba", "moe", "attention", "moe"] * 4))
+    request = ModelLoadRequest(model="model", context_size=1048576, device_ids=["0"])
+    reserve = pool._cuda_residency_runtime_reserve(model, request)
+    assert reserve.kv_source == "config_attention_fp16_min_1gib"
+    assert reserve.kv_bytes == 1048576 * 4 * 2 * 128 * 4
+    short = pool._cuda_residency_runtime_reserve(model, request.model_copy(update={"context_size": 4096}))
+    assert short.kv_bytes == GIB
+
+
+def test_cuda_residency_fallback_without_geometry_is_capped_at_ceiling(tmp_path, monkeypatch, caplog):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=40)
+    monkeypatch.setattr("mfq.server.services.model_memory.checkpoint_cache_profile", lambda *args, **kwargs: None)
+    request = ModelLoadRequest(model="model", device_ids=["0"])
+    ceiling = pool._cuda_device_vram_limit(request)
+    assert pool.resolve_context_size(model, None) == 1048576
+    # 256 KiB/token at the 1M default context would claim 256 GiB.
+    assert pool._cuda_residency_runtime_reserve(model, request).kv_bytes == 256 * GIB
+    assert pool._cuda_residency_runtime_reserve(model, request, ceiling=ceiling).kv_bytes == ceiling
+    with caplog.at_level("INFO", logger="mfq.server.runtime.runtime_pool"):
+        selected = pool._apply_automatic_expert_residency(model, request)
+    assert f"kv_reserve_bytes={ceiling}" in caplog.text.split()
+    assert "decision=cache" in caplog.text.split() and selected.moe_gpu_cache_gb > 0
+
+
+@pytest.mark.parametrize("total_gib,ceiling_gib", [(40, 100), (86, 90)])
+def test_cuda_unified_memory_keeps_resident_experts(tmp_path, monkeypatch, caplog, total_gib, ceiling_gib):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=total_gib)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
+        "cpu", 8, gpu_memory=(GpuMemory("Unified CUDA GPU", 128 * GIB, unified=True),)))
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "unified"})
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (128 * GIB, 120 * GIB))
+    assert supports_cuda_ram_expert_pipeline(model.path)
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    with caplog.at_level("INFO", logger="mfq.server.runtime.runtime_pool"):
+        assert pool._apply_automatic_expert_residency(model, request, memory_ceiling=ceiling_gib * GIB) is request
+    assert "cuda_auto_expert_residency" not in caplog.text
+
+
+@pytest.mark.parametrize("inherited", [False, True])
+def test_cuda_disabled_pipeline_keeps_resident_experts(tmp_path, monkeypatch, inherited):
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=40)
+    if inherited:
+        monkeypatch.setenv("MFQ_MOE_PIPELINE", "0")
+    else:
+        pool.runtime_environment["MFQ_MOE_PIPELINE"] = "0"
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    assert pool._apply_automatic_expert_residency(model, request) is request
+
+
+def test_cuda_residency_and_launch_probe_checkpoint_once(tmp_path, monkeypatch):
+    import mfq.server.runtime.native as native
+    import mfq.server.services.model_memory as model_memory
+
+    pool, model = _headroom_pool(tmp_path, monkeypatch, total_gib=40)
+    # Real metadata path: the fixture has no KV geometry, so the reserve also
+    # falls back to the config estimate after the profile lookup.
+    monkeypatch.setattr("mfq.server.services.model_memory.checkpoint_cache_profile", checkpoint_cache_profile)
+    probes, reads = [], []
+    inspect, open_store = native.inspect_mfe_header, model_memory.open_mmap
+    monkeypatch.setattr(native, "inspect_mfe_header", lambda *args: probes.append(1) or inspect(*args))
+    monkeypatch.setattr(model_memory, "open_mmap",
+        lambda *args, **kwargs: reads.append(1) or open_store(*args, **kwargs))
+    request = ModelLoadRequest(model="model", context_size=4096, device_ids=["0"])
+    selected = pool._apply_automatic_expert_residency(model, request)
+    assert selected.moe_gpu_cache_gb > 0
+    pool._launch_configuration(model, selected, port=1234)
+    assert supports_cuda_ram_expert_pipeline(model.path)
+    assert len(probes) == 1 and len(reads) == 1
+    # A rewritten checkpoint is probed again.
+    stat = model.path.stat()
+    os.utime(model.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    assert supports_cuda_ram_expert_pipeline(model.path)
+    assert len(probes) == 2
+
+
+@pytest.mark.parametrize("initially_supported", [False, True])
+def test_cuda_pipeline_probe_invalidates_when_another_shard_changes(tmp_path, initially_supported):
+    header = FileHeader(version=2, model_arch="qwen4_exp")
+    first, second = [format_shard_path(tmp_path / "model.mfq", index, 2) for index in (1, 2)]
+    save(first, shard_header(header, split_no=0, split_count=2, tensor_count=2, record_count=2),
+         {"model.embed_tokens.weight": np.zeros((2, 2), dtype=np.float16)})
+    companion = shard_header(header, split_no=1, split_count=2, tensor_count=2, record_count=2)
+    name = "model.block.0.mlp.experts.gate.weight"
+    dense = np.zeros((2, 3, 96), dtype=np.float16)
+    quantized = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), make_nvq_fixture()),))
+    save(second, companion, {name: quantized if initially_supported else dense})
+    assert supports_cuda_ram_expert_pipeline(first) is initially_supported
+    primary = first.stat()
+
+    save(second, companion, {name: dense if initially_supported else quantized})
+    assert first.stat().st_size == primary.st_size
+    assert first.stat().st_mtime_ns == primary.st_mtime_ns
+    assert supports_cuda_ram_expert_pipeline(first) is not initially_supported
+
+    # Removing a companion must not reuse a cached positive or negative answer.
+    payload = second.read_bytes()
+    second.unlink()
+    assert supports_cuda_ram_expert_pipeline(first) is False
+    second.write_bytes(payload)
+    assert supports_cuda_ram_expert_pipeline(first) is not initially_supported

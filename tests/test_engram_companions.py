@@ -10,6 +10,7 @@ import pytest
 from mfq.formats.companions import with_engram_shards
 from mfq.formats.header import FileHeader
 from mfq.formats.io import open_mmap, save
+from mfq.formats.shards import shard_file_versions
 from mfq.server.protocol.models import CreateJobRequest, HubModelFile, HubModelInfo, HubSystemProfile
 from mfq.server.services.hub import HubCatalog, _model_variants
 from mfq.server.services.service import ServerService
@@ -55,6 +56,21 @@ def test_two_precision_tiers_read_one_shared_table_without_copies(tmp_path):
         assert str(table) not in model_deletion_plan(artifact).files
     assert len(list(tmp_path.rglob('*Engram*.mfq'))) == 1
     assert len(list(tmp_path.rglob('*.mfq'))) == 5
+
+
+def test_checkpoint_versions_track_shared_table_changes(tmp_path):
+    paths, table = checkpoint(tmp_path)
+    before = shard_file_versions(paths[0])
+    assert len(before) == 3
+    assert before == shard_file_versions(paths[-1])
+    assert before[1][0] == str(table.resolve())
+    table.write_bytes(table.read_bytes() + b'changed')
+    after = shard_file_versions(paths[0])
+    assert after[0] == before[0] and after[2] == before[2]
+    assert after[1] != before[1]
+    table.unlink()
+    with pytest.raises(FileNotFoundError):
+        shard_file_versions(paths[0])
 
 
 def test_missing_or_ambiguous_shared_table_is_rejected(tmp_path):

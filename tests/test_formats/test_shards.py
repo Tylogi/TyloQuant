@@ -20,6 +20,7 @@ from mfq.formats.shards import (
     format_shard_path,
     parse_shard_path,
     parse_size,
+    shard_file_versions,
     write_blob_record_shards,
 )
 from mfq.tools.split_mfq import split_mfq
@@ -81,6 +82,20 @@ def test_shard_name_round_trip(tmp_path: Path) -> None:
     assert parse_shard_path(shard) == (base, 2, 17)
     assert parse_size("4G") == 4_000_000_000
     assert parse_size("512m") == 512_000_000
+
+
+def test_file_version_tracks_replacement_with_same_size_and_mtime(tmp_path: Path) -> None:
+    path = tmp_path / "model.mfq"
+    path.write_bytes(b"old")
+    before = shard_file_versions(path)
+    stat = path.stat()
+    replacement = tmp_path / "replacement.mfq"
+    replacement.write_bytes(b"new")
+    os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    os.replace(replacement, path)
+    assert path.stat().st_size == stat.st_size
+    assert path.stat().st_mtime_ns == stat.st_mtime_ns
+    assert shard_file_versions(path) != before
 
 
 def test_offline_split_loads_from_any_shard_without_changing_records(

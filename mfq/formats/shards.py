@@ -33,6 +33,8 @@ SPLIT_KEYS = frozenset(
 
 _SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})\.[mM][fF][qQ]$")
 
+ShardFileVersions = tuple[tuple[str, int, int, int, int, int], ...]
+
 
 class BlobRecordLike(Protocol):
     name: str
@@ -103,6 +105,25 @@ def shard_paths_from_any(path: str | Path, count: int) -> list[Path]:
         if entry is not None and entry[1] not in available:
             available[entry[1]] = candidate
     return [available.get(index, candidate) for index, candidate in enumerate(expected, 1)]
+
+
+def shard_file_versions(path: str | Path) -> ShardFileVersions:
+    """Stat every backing file, including shared Engram shards, for cache keys.
+
+    File identity also catches replacements that retain size and mtime. Missing
+    shards raise OSError so an earlier complete checkpoint cannot stay cached.
+    """
+
+    source = Path(path)
+    parsed = parse_shard_path(source)
+    paths = shard_paths_from_any(source, parsed[2]) if parsed is not None else [source]
+    versions = []
+    for candidate in paths:
+        resolved = candidate.resolve()
+        stat = resolved.stat()
+        versions.append((str(resolved), stat.st_dev, stat.st_ino, stat.st_size,
+                         stat.st_mtime_ns, stat.st_ctime_ns))
+    return tuple(versions)
 
 
 def matching_shard_paths(path: str | Path) -> list[Path]:
