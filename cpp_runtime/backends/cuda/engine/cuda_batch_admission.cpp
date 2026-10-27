@@ -287,8 +287,14 @@ void FlashNextBatchOperations::retract(const std::shared_ptr<Request>& request) 
         mtp->history_ids.clear();
         mtp->candidates.clear();
     }
+    // Replay continues the same generation: keep its sampler RNG and penalty
+    // counts, which discarding a failed prefill resets.
+    auto sampler = std::move(request->sampler);
+    auto counts = std::move(request->counts);
     discard_prefill(request);
     request->mtp = std::move(mtp);
+    request->sampler = std::move(sampler);
+    request->counts = std::move(counts);
     default_context(execution_.layer_placement.primary_device())->reclaim_idle_memory();
 }
 
