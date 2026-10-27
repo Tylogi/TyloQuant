@@ -55,6 +55,7 @@ struct CausalResources {
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model&,mfq_tensor_backend::Tensor,int) {return {};}
 
+    bool adapter_needs_host_token_ids() const noexcept { return false; }
     void adapter_validate_load_options() const;
     bool adapter_uses_common_rope() const noexcept;
     void adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;
@@ -236,12 +237,12 @@ template <typename Model> struct CudaCausalOps : Model {
             return positions + delta;
         }
         Tensor prepare_hidden(int64_t B, int64_t T) {
-            if(model.execution->config.moe_pipeline) {
+            if(model.execution->config.moe_pipeline || model.adapter_needs_host_token_ids())
                 cpu_ids=ids.to(mfq_tensor_backend::kCPU,mfq_tensor_backend::kInt64).contiguous();
+            if(model.execution->config.moe_pipeline)
                 for(const auto& block:model.blocks)block->prefetch_token_ids(cpu_ids);
-            }
             if (model.execution->dense_cpu_layer_count > 0) {
-                cpu_ids = ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
+                if(!cpu_ids.defined())cpu_ids = ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
                 cpu_pos = pos.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
                 cpu_cache_positions =
                     cache_positions.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64)

@@ -41,6 +41,7 @@ struct Qwen4Model : CausalResources {
         return qwen4_decode_graph_logits(model,std::move(ids),kind);
     }
 
+    bool adapter_needs_host_token_ids() const noexcept { return !config.ple_layers.empty(); }
     void adapter_validate_load_options() const;
     void adapter_load_final_state(const mfq::ModelSource &source,
                                   mfq_tensor_backend::Tensor &output_norm);
