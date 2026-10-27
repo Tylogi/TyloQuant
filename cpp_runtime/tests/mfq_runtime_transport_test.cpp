@@ -51,7 +51,8 @@ struct FakeEngine final : Engine {
                 blocked = true;
                 while (!resume) std::this_thread::sleep_for(1ms);
             }
-            if (work.request.token_ids == std::vector<int64_t>{63}) throw std::runtime_error("device failure");
+            if (work.request.token_ids == std::vector<int64_t>{63}) throw MfqBackendFailure("device failure");
+            if (work.request.token_ids == std::vector<int64_t>{58}) throw std::runtime_error("request failure");
             ++advances.at(std::stoi(id));
             ++work.steps;
             result.advanced.push_back(id);
@@ -349,6 +350,16 @@ int main() {
         auto second = scheduler.submit(bad);
         drain(first, false, true); drain(second, false, true);
         assert(!scheduler.status().healthy);
+        assert(engine.active.empty());
+    }
+    {
+        // An ordinary engine error fails the pending requests but keeps serving.
+        FakeEngine engine;
+        MfqScheduler scheduler(engine);
+        auto bad = request(1); bad.token_ids = {58};
+        drain(scheduler.submit(bad), false, true);
+        assert(scheduler.status().healthy);
+        drain(scheduler.submit(request(2, 100)));
         assert(engine.active.empty());
     }
     {

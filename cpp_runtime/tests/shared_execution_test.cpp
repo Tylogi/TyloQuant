@@ -350,12 +350,14 @@ void isolated_context_growth_test() {
 
 void batch_failure_test() {
     enum Stage { suspend, prefill, activate, resume };
-    struct Fault { Stage stage; bool armed = false; size_t recovered = 0; };
+    struct Fault { Stage stage; bool backend = false; bool armed = false; size_t recovered = 0; };
     struct FailingOps : BatchOps {
         Fault& fault;
         explicit FailingOps(Fault& state) : fault(state) {}
         void check(Stage stage) {
-            if (fault.armed && fault.stage == stage) throw std::runtime_error("device failure");
+            if (!fault.armed || fault.stage != stage) return;
+            if (fault.backend) throw MfqBackendFailure("device failure");
+            throw std::runtime_error("batch step failure");
         }
         void suspend_decode() { check(suspend); }
         Sample prefill(const std::shared_ptr<Request>& request, PrefillChunk chunk) {
@@ -365,8 +367,8 @@ void batch_failure_test() {
         void resume_decode(int64_t) { check(resume); }
         void recover(State& state) { fault.recovered = state.prefilling.size(); }
     };
-    for (auto stage : {suspend, prefill, activate, resume}) {
-        Fault fault{stage};
+    for (auto stage : {suspend, prefill, activate, resume}) for (bool backend : {false, true}) {
+        Fault fault{stage, backend};
         BatchExecution<FailingOps> ops(fault);
         RequestExecutor executor(2);
         executor.admit(batch_request("a", 2, 20), nullptr, batch_info(), ops);
@@ -374,10 +376,19 @@ void batch_failure_test() {
         // Register both physical rows before the device fault.
         executor.step({"a", "b"}, ops);
         fault.armed = true;
-        const auto result = executor.step({"a"}, ops); // Paused peers must also fail and release.
-        assert(!result.status.healthy && executor.empty() && fault.recovered == 2);
-        assert(result.events.size() == 2);
-        for (const auto& event : result.events) assert(std::holds_alternative<Failed>(event.data));
+        const auto result = executor.step({"a"}, ops);
+        // The batch recovered both rows. A lost backend fails them now and
+        // closes admission; otherwise the paused row fails on its next step.
+        assert(result.status.healthy == !backend && fault.recovered == 2);
+        auto events = result.events;
+        fault.armed = false;
+        if (!backend) {
+            assert(events.size() == 1 && events.front().id == "a");
+            const auto paused = executor.step({"b"}, ops);
+            events.insert(events.end(), paused.events.begin(), paused.events.end());
+        }
+        assert(executor.empty() && events.size() == 2);
+        for (const auto& event : events) assert(std::holds_alternative<Failed>(event.data));
         for (const auto& [key, value] : ops.batch.metrics())
             if (key == "continuous_batching_active" || key == "continuous_batching_prefilling") assert(value == 0);
     }
