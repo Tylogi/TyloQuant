@@ -512,12 +512,6 @@ function Stage-WindowsRuntime {
     param([Parameter(Mandatory)][hashtable] $Context)
 
     Reset-Directory $Context.WindowsRuntimeDirectory
-    if ($IncludeNativeSymbols) {
-        foreach ($name in @("mfq-runtime.pdb", "mfq-diagnostics.pdb")) {
-            Copy-Item -LiteralPath (Join-Path $Context.NativeOutput.DirectoryName $name) `
-                -Destination $Context.WindowsRuntimeDirectory -Force
-        }
-    }
     Copy-RuntimeDlls $Context.NativeOutput.DirectoryName $Context.WindowsRuntimeDirectory
     $cudaRuntimeDirectory = Find-CudaRuntimeDirectory $Context.CudaRoot
     foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
@@ -666,6 +660,30 @@ function Build-PortableArchive {
     )
 }
 
+# PDBs record every object path of the build machine, so they never enter the
+# installer or portable package; -IncludeNativeSymbols writes them separately.
+function Write-NativeSymbolArchive {
+    param([Parameter(Mandatory)][hashtable] $Context)
+
+    $staging = Join-Path $Context.ScriptDirectory "build\native-symbols"
+    Reset-Directory $staging
+    foreach ($name in @("mfq-runtime.pdb", "mfq-diagnostics.pdb")) {
+        $symbols = Join-Path $Context.NativeOutput.DirectoryName $name
+        if (-not (Test-Path -LiteralPath $symbols -PathType Leaf)) {
+            Fail "native build did not create $name"
+        }
+        Copy-Item -LiteralPath $symbols -Destination $staging -Force
+    }
+    Set-Content -LiteralPath (Join-Path $staging "README.txt") -Encoding utf8 -Value @(
+        "Debug symbols for mfq-runtime.exe and mfq-diagnostics.exe from this build.",
+        "Place the .pdb files next to mfq-runtime.exe to get function names and source lines in fatal reports.",
+        "They contain build-machine paths and are not part of the installer or portable package."
+    )
+    $archive = Join-Path $Context.OutputDirectory "mfq-native-symbols-x64.zip"
+    Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $archive -Force
+    Write-Host "wrote $archive (contains build-machine paths; not for redistribution)"
+}
+
 if (-not [System.OperatingSystem]::IsWindows() -or -not [Environment]::Is64BitOperatingSystem) {
     Fail "this release target must be built on 64-bit Windows"
 }
@@ -717,6 +735,9 @@ try {
     Remove-PyInstallerCache $context
     Build-NsisInstaller $context
     Build-PortableArchive $context
+    if ($IncludeNativeSymbols) {
+        Write-NativeSymbolArchive $context
+    }
 }
 finally {
     Pop-Location
