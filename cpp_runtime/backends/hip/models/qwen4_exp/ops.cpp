@@ -152,6 +152,22 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
             auto routed=tq->forward(source,selected[0],selected[1]);
             return tq_shared_add_cuda(routed,shared_output,projected[1]).reshape(x.sizes());
         }
+        if(tq && tq->gate->shards.empty() && c.hidden==2560 && source.size(0)>=2 && source.size(0)<=6 &&
+           router_weight && router_weight->is_tq() && router_weight->tq.out==512 &&
+           shared_gate_weight && shared_gate_weight->is_dense() && shared_gate_weight->dense.is_contiguous() &&
+           shared_gate_weight->dense.scalar_type()==tb::kBFloat16 &&
+           shared_gate_weight->dense.sizes().vec()==std::vector<int64_t>({1,c.hidden}) &&
+           sg_weight && su_weight && sd_weight && sg_weight->is_tq() && su_weight->is_tq() && sd_weight->is_tq() &&
+           sg_weight->tq.out==640 && su_weight->tq.out==640 &&
+           sd_weight->tq.out>=sd_weight->tq.neuron_len && sd_weight->tq.neuron_len%8==0 && !tq_q8_enabled()) {
+            auto projected=tq_moe_inputs_batch_cuda(router_weight->tq.view,shared_gate_weight->dense,
+                sg_weight->tq.view,su_weight->tq.view,source);
+            auto selected=moe_topk_cuda(projected[0].contiguous(),c.topk,
+                routing.activation==mfq::models::RouterActivation::sigmoid,
+                routing.activation==mfq::models::RouterActivation::sqrt_softplus,
+                routing.normalize,routing.delayed_softmax,mfq_nullopt,1e-20,routing.scale);
+            return tq->forward(source,selected[0],selected[1],0.f,&sd_weight->tq,projected[2],projected[1]).reshape(x.sizes());
+        }
         // fused TQ concurrent ending: preserve the native shared coefficient dtype.
         if(tq && tq->gate->shards.empty() && c.hidden==2560 && source.size(0)>=2 && source.size(0)<=6 &&
            router_weight && router_weight->is_tq() && shared_gate_weight && shared_gate_weight->is_dense() &&

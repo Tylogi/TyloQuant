@@ -40,6 +40,8 @@ std::vector<mfq_tensor_backend::Tensor> tq_router_gate_cuda(ProjectionView,
     const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&);
 std::vector<mfq_tensor_backend::Tensor> tq_moe_inputs_cuda(ProjectionView,
     const mfq_tensor_backend::Tensor&,ProjectionView,ProjectionView,const mfq_tensor_backend::Tensor&);
+std::vector<mfq_tensor_backend::Tensor> tq_moe_inputs_batch_cuda(ProjectionView,
+    const mfq_tensor_backend::Tensor&,ProjectionView,ProjectionView,const mfq_tensor_backend::Tensor&);
 mfq_tensor_backend::Tensor tq_shared_add_cuda(const mfq_tensor_backend::Tensor&,
         const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&);
 mfq_tensor_backend::Tensor tq_shared_finish_cuda(ProjectionView,
