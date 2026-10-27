@@ -557,8 +557,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                 if (dense_routed) {
                     if (moe_ungated_experts &&
                         (moe_dense_gate.defined() || moe_dense_gate_up.defined() || moe_gate_up.n_experts > 0 ||
-                         moe_gate.n_experts > 0 || moe_up.n_experts > 0 ||
-                         moe_gate_up.cached_source || moe_up.cached_source))
+                         moe_gate.n_experts > 0 || moe_gate_up.cached_source))
                         throw std::runtime_error(
                             "ungated routed MoE cannot mix a gate with a dense expert bank");
                     MFQ_RUNTIME_CHECK((moe_dense_up.defined() || moe_dense_gate_up.defined()) &&
@@ -609,7 +608,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                         });
                     record_moe_route_stats(execution, moe_layer, selected.at(0), selected.at(1),
                                            down_pair, route.n_experts);
-                    return {reduced, true};
+                    return {reduced.to(xh.scalar_type()).contiguous(), true};
                 }
                 if (moe_ungated_experts && !use_pipeline) {
                     // relu-squared experts store Up and Down only: one Up matmul,

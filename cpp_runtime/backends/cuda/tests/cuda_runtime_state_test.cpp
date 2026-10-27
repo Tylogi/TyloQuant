@@ -163,7 +163,7 @@ static void check_dense_loading() {
         const std::unordered_map<std::string, std::string>& metadata() const noexcept override { return meta; }
         const std::vector<mfq::TensorMetadata>& tensors() const noexcept override { return records; }
         const mfq::TensorMetadata* find_tensor(std::string_view name) const noexcept override {
-            return name == "weight" ? &records[0] : nullptr;
+            return name == records[0].name ? &records[0] : nullptr;
         }
         void read_range_into(std::string_view, uint64_t offset, std::byte* output, size_t size) const override {
             check(offset <= bytes.size() && size <= bytes.size() - offset, "dense fixture range");
@@ -202,6 +202,21 @@ static void check_dense_loading() {
                       same(value, expected.to(promoted)), "dense load placement/promotion changed");
         }
     }
+    // Float routers keep float logits; other dense projections return the
+    // activation dtype.
+    const auto weights = tensor(std::vector<float>{0.5f, -0.25f, 0.125f, 2.0f}).reshape({2, 2});
+    std::memcpy(source.bytes.data() + header, weights.data_ptr(), weights.nbytes());
+    source.records[0].dtype = "F32";
+    const auto input = tensor(std::vector<float>{1.0f, 3.0f}).reshape({1, 2}).to(kFloat16).to(kCUDA);
+    for (const auto &[name, expected] : std::vector<std::pair<std::string, ScalarType>>{
+             {"model.block.0.mlp.router.weight", kFloat32}, {"model.block.0.mlp.up.weight", kFloat16},
+             {"model.block.0.mlp.shared_expert.router.weight", kFloat16}}) {
+        source.records[0].name = name;
+        execution.loading_cpu_layer = false;
+        const auto linear = load_quant_linear(execution, source, name);
+        check(linear.forward(execution, input).scalar_type() == expected, "dense projection output dtype changed");
+    }
+    source.records[0].name = "weight";
     const auto valid = source.bytes;
     auto rejects = [&] {
         source.records[0].nbytes = source.bytes.size();

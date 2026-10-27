@@ -83,21 +83,46 @@ void TransformerWeightLoader::experts(FFN& ffn, mfq::models::ExpertProjection pr
                                      const std::string& name, int layer) const {
     using Role = mfq::models::ExpertProjection;
     const auto& record = require_tensor(source, name);
-    if (record.dtype == "F32" || record.dtype == "F16" || record.dtype == "BF16") {
+    bool homogeneous_dense = record.dtype == "F32" || record.dtype == "F16" || record.dtype == "BF16";
+    const auto boundary = name.find(".experts.");
+    if (homogeneous_dense && boundary != std::string::npos) {
+        const auto prefix = name.substr(0, boundary) + ".experts.";
+        for (const auto* role : {"gate", "up", "gate_up", "down"}) {
+            const auto* sibling = source.find_tensor(prefix + role + ".weight");
+            if (sibling && sibling->dtype != record.dtype) homogeneous_dense = false;
+        }
+    }
+    if (homogeneous_dense) {
         // Source-precision banks stay dense instead of entering an MFE cohort.
         if (cpu_offloaded)
             throw std::runtime_error(
-                "CPU-offloaded MoE cannot materialize a dense expert bank at layer " +
-                std::to_string(layer));
+                "CPU-offloaded MoE cannot materialize dense expert tensor " + name + " dtype=" + record.dtype +
+                "; quantize experts with NINT/NVQ in MFE");
         auto bank = load_dense_native_gpu(execution, source, name);
         if (bank.dim() != 3)
             throw std::runtime_error(
                 "dense routed expert tensor must be [experts,out,in]: " + name);
+        auto metadata = MfeWeight{};
+        metadata.n_experts = static_cast<int>(bank.size(0));
+        metadata.out_per_expert = static_cast<int>(bank.size(1));
+        metadata.neuron_len = static_cast<int>(bank.size(2));
         switch (projection) {
-            case Role::gate: ffn.moe_dense_gate = std::move(bank); break;
-            case Role::up: ffn.moe_dense_up = std::move(bank); break;
-            case Role::down: ffn.moe_dense_down = std::move(bank); break;
-            case Role::gate_up: ffn.moe_dense_gate_up = std::move(bank); break;
+            case Role::gate:
+                ffn.moe_gate = metadata;
+                ffn.moe_dense_gate = std::move(bank);
+                break;
+            case Role::up:
+                ffn.moe_up = metadata;
+                ffn.moe_dense_up = std::move(bank);
+                break;
+            case Role::down:
+                ffn.moe_down = metadata;
+                ffn.moe_dense_down = std::move(bank);
+                break;
+            case Role::gate_up:
+                ffn.moe_gate_up = metadata;
+                ffn.moe_dense_gate_up = std::move(bank);
+                break;
         }
         return;
     }

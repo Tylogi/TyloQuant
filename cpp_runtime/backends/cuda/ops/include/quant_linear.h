@@ -23,8 +23,15 @@ struct QuantLinear;
 struct QuantLinearGroup;
 struct DenseLinearGroup;
 
+// Preserve the activation dtype while computing in the stored weight dtype.
 mfq_tensor_backend::Tensor dense_projection(
     mfq_tensor_backend::Tensor input, const mfq_tensor_backend::Tensor& weight);
+
+// Output dtype of a dense projection: the activation dtype, except that an FP32
+// activation (such as an FP32 norm output) keeps a half-precision weight's
+// dtype. Widening it to FP32 would bypass kernels fused on the store dtype.
+mfq_tensor_backend::ScalarType dense_output_dtype(
+    mfq_tensor_backend::ScalarType activation, mfq_tensor_backend::ScalarType weight);
 
 bool decode_branch_parallel_enabled(
     const CudaExecutionConfig& config,
@@ -102,6 +109,7 @@ struct QuantLinearShard {
     Fp8SqLinear fp8_sq;
     Mxfp8Weight mxfp8;
     mfq_tensor_backend::Tensor dense;
+    bool native_output = false;
 };
 
 struct QuantLinear {
@@ -113,6 +121,8 @@ struct QuantLinear {
     Fp8SqLinear fp8_sq;
     Mxfp8Linear mxfp8;
     mfq_tensor_backend::Tensor dense;
+    // Output heads retain native floating logits; internal linears follow activations.
+    bool native_output = false;
     TensorParallelAxis tensor_parallel_axis =
         TensorParallelAxis::Mirrored;
     std::vector<QuantLinearShard> tensor_parallel_shards;

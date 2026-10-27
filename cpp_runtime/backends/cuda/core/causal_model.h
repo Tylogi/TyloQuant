@@ -197,7 +197,7 @@ template <typename Model> struct CudaCausalOps : Model {
     }
     Tensor scale_hidden(Tensor hidden, double scale) const {
         return this->execution->profiler.measure("model.embed_scale",
-                                                 [&] { return hidden * scale; });
+            [&] { return (hidden * scale).to(mfq_tensor_backend::kFloat16); });
     }
     static Tensor repeat_hidden(Tensor hidden, int64_t streams) {
         return hidden.to(mfq_tensor_backend::kFloat16).repeat({1, 1, streams});

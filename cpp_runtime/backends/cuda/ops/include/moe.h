@@ -10,6 +10,7 @@ struct MfeCpuPool {
     NintCpu weight;
     Nint8ZeroCpu q8_zero;
     Mxfp4Cpu mxfp4;
+    mfq_tensor_backend::Tensor dense;
 };
 
 struct MfeCpu {
@@ -27,6 +28,7 @@ enum class MixedMoeFamily {
     Fp8Sq,
     Nvq,
     Nepq,
+    Dense,
 };
 
 struct MixedMoePool {
@@ -38,6 +40,7 @@ struct MixedMoePool {
     Fp8SqWeight fp8_sq;
     NvqWeight nvq;
     NepqWeight nepq;
+    mfq_tensor_backend::Tensor dense;
     mfq_tensor_backend::Tensor expert_local;
     int local_experts = 0;
 };

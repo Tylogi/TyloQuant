@@ -494,7 +494,9 @@ mfq_tensor_backend::Tensor run_quant_linear_shard(
                 ? local * mfq_tensor_backend::sigmoid(local_gate)
                 : local * mfq_tensor_backend::silu(local_gate);
         }
-        return dense_projection(std::move(local), shard.dense);
+        return dense_projection(std::move(local), shard.dense)
+            .to(shard.native_output ? shard.dense.scalar_type()
+                                    : dense_output_dtype(x.scalar_type(), shard.dense.scalar_type()));
     }
     MFQ_RUNTIME_CHECK(
         !gate.has_value(),
@@ -1021,6 +1023,12 @@ plan_moe_expert_parallel_slices(
     return plan_parallel_slices(extent, 1, parallel, name);
 }
 
+static bool is_routed_expert_router(const std::string& name) {
+    static const std::string suffix = ".mlp.router.weight";
+    return name.size() >= suffix.size() &&
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 QuantLinear load_quant_linear(
         CudaExecutionContext& execution,
         const mfq::ModelSource & mfq,
@@ -1419,7 +1427,13 @@ QuantLinear load_quant_linear(
     } else {
         throw std::runtime_error(
             "linear tensor must be NINT/NVQ/MXFP4-SQ/MXFP8-SQ/FP8-128SQ/MXFP4/MXFP8/BF16/F16/F32: " +
-            name + " dtype=" + dtype);
+            name + " dtype=" + dtype + "; use --dense-dtype f16/bf16/f32 or quantize this projection");
+    }
+    // A float router keeps float logits: rounding them to the FP16 activation
+    // can reorder near-tied experts of a router kept unquantized on purpose.
+    if (dtype == "F32" && is_routed_expert_router(name)) {
+        result.native_output = true;
+        for (auto& shard : result.tensor_parallel_shards) shard.native_output = true;
     }
     return result;
 }
@@ -1901,8 +1915,14 @@ mfq_tensor_backend::Tensor QuantLinear::forward_tensor_parallel_flat(
         : reduced;
 }
 
+mfq_tensor_backend::ScalarType dense_output_dtype(
+        mfq_tensor_backend::ScalarType activation, mfq_tensor_backend::ScalarType weight) {
+    return activation == mfq_tensor_backend::kFloat32 ? weight : activation;
+}
+
 mfq_tensor_backend::Tensor dense_projection(
         mfq_tensor_backend::Tensor input, const mfq_tensor_backend::Tensor& weight) {
+    const auto output_dtype = dense_output_dtype(input.scalar_type(), weight.scalar_type());
     input = input.to(weight.scalar_type());
     const int64_t rows = input.numel() / input.size(-1);
     if (rows > 1 && rows <= 6) {
@@ -1916,12 +1936,13 @@ mfq_tensor_backend::Tensor dense_projection(
         // ponytail: at most six launches; fuse only with decode-equivalent accumulation.
         for (int64_t row = 0; row < rows; ++row)
             outputs.push_back(mfq_tensor_backend::matmul(flat.narrow(0, row, 1), weight.transpose(0, 1)));
-        return mfq_tensor_backend::cat(outputs, 0).reshape(shape);
+        return mfq_tensor_backend::cat(outputs, 0).reshape(shape).to(output_dtype);
     }
-    return mfq_tensor_backend::matmul(input, weight.transpose(0, 1));
+    return mfq_tensor_backend::matmul(input, weight.transpose(0, 1)).to(output_dtype);
 }
 
 mfq_tensor_backend::Tensor QuantLinear::forward_dense(mfq_tensor_backend::Tensor x) const {
+    if (native_output) x = x.to(dense.scalar_type());
     return dense_projection(std::move(x), dense);
 }
 
@@ -2017,7 +2038,8 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul(
         auto gated = mode == 1
             ? local * mfq_tensor_backend::sigmoid(local_gate)
             : local * mfq_tensor_backend::silu(local_gate);
-        return forward_dense(gated);
+        return forward_dense(gated).to(native_output ? dense.scalar_type()
+                                                     : dense_output_dtype(x.scalar_type(), dense.scalar_type()));
     }
     MFQ_RUNTIME_CHECK(mode == 1 || mode == 2,
         "input gate mode must be sigmoid or SiLU");
