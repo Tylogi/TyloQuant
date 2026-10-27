@@ -18,6 +18,7 @@ struct TqProjectionJob {
 };
 struct TqProjectionPlan { TqProjectionJob jobs[4]; int count; };
 extern "C" int mfq_tq_group(TqProjectionPlan, const void*, int, hipStream_t);
+extern "C" int mfq_tq_group_f32_batch(TqProjectionPlan,const float*,int,hipStream_t);
 extern "C" int mfq_tq_swiglu(ProjectionView, ProjectionView, const void*, void*, int, hipStream_t);
 
 extern "C" int mfq_tq_forward(ProjectionView, const void*, void*, int, int, hipStream_t);

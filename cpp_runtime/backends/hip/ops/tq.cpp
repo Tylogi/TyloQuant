@@ -73,8 +73,12 @@ std::vector<tb::Tensor> tq_forward_group(
     if(weights.empty() || weights.size()>4 || !input.is_cuda())
         throw std::invalid_argument("TQ projection group requires 1..4 GPU weights");
     const auto x=input.contiguous();
-    if(x.numel()!=weights[0]->neuron_len || x.size(-1)!=weights[0]->neuron_len)
-        throw std::invalid_argument("TQ fused group requires one input token");
+    const bool concurrent=x.scalar_type()==tb::kFloat32 && x.dim()==3 && x.size(1)==1 &&
+        x.size(0)>=2 && x.size(0)<=6 && weights.size()==4 &&
+        weights[0]->neuron_len==2560 && weights[0]->out==12288 &&
+        weights[1]->out==512 && weights[2]->out==512 && weights[3]->out==640;
+    if((x.numel()!=weights[0]->neuron_len && !concurrent) || x.size(-1)!=weights[0]->neuron_len)
+        throw std::invalid_argument("TQ fused group input geometry is unsupported");
     const MfqCudaGuard guard(x.get_device());
     trace(1,"group",x);
     std::vector<tb::Tensor> result;
@@ -92,7 +96,8 @@ std::vector<tb::Tensor> tq_forward_group(
     for(int i=0;i<plan.count;++i) {
         const int j=order[i];plan.jobs[i]={weights[j]->view,result[j].data_ptr(),0};
     }
-    status(mfq_tq_group(plan,x.data_ptr(),dtype(x.scalar_type()),mfq_current_cuda_stream()));
+    if(concurrent)status(mfq_tq_group_f32_batch(plan,x.data_ptr<float>(),int(x.size(0)),mfq_current_cuda_stream()));
+    else status(mfq_tq_group(plan,x.data_ptr(),dtype(x.scalar_type()),mfq_current_cuda_stream()));
     return result;
 }
 

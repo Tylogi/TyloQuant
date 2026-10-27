@@ -195,10 +195,15 @@ LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>&
         }
     }
     if(tq_weights.size()>1 && tq_weights.size()<=4) {
-        return [separate=functions,tq_indices=std::move(tq_indices),tq_weights=std::move(tq_weights)](
+        const bool qsa_batch=tq_weights.size()==4 && tq_weights[0]->neuron_len()==2560 &&
+            tq_weights[0]->tq.out==12288 && tq_weights[1]->tq.out==512 &&
+            tq_weights[2]->tq.out==512 && tq_weights[3]->tq.out==640;
+        return [separate=functions,tq_indices=std::move(tq_indices),tq_weights=std::move(tq_weights),qsa_batch](
             CudaExecutionContext& context,const Tensor& input) {
             std::vector<Tensor> outputs(separate.size());
-            if(!tq_q8_enabled() && input.is_cuda() && input.numel()==input.size(-1)) {
+            const bool concurrent=qsa_batch && input.scalar_type()==tb::kFloat32 &&
+                input.dim()==3 && input.size(1)==1 && input.size(0)>=2 && input.size(0)<=6;
+            if(!tq_q8_enabled() && input.is_cuda() && (input.numel()==input.size(-1) || concurrent)) {
                 std::vector<const TqWeight*> weights;
                 for(const auto& weight:tq_weights)weights.push_back(&weight->tq);
                 auto fused=tq_forward_group(weights,input);
