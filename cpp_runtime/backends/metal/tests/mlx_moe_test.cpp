@@ -2275,8 +2275,13 @@ void test_all_families_and_projections(int tokens = 3) {
     const auto second_weight =
         mfq::metal::MlxMoeWeight::from_blob(
             second.blob);
-    require(!first_weight.supports_fused_routed_reduce(),
-            "mixed NINT fallback must not advertise fused down-reduce");
+    // The weighted-reduce kernel reuses the generic per-descriptor decoder, so
+    // mixed NINT widths take the fused Down path whenever the native primitive
+    // is enabled (checked numerically below).
+    const char* native_env = std::getenv("MFQ_METAL_MFE_NATIVE_PRIMITIVE");
+    const bool native_primitive = native_env == nullptr || std::string_view(native_env) != "0";
+    require(first_weight.supports_fused_routed_reduce() == native_primitive,
+            "mixed NINT Down fused weighted reduction capability mismatch");
     require(
         first_weight.experts()
                 == static_cast<int>(
@@ -2443,6 +2448,47 @@ void test_all_families_and_projections(int tokens = 3) {
                 - 14)
             / 96.0f;
     }
+    std::vector<float> route_weights(tokens * routes);
+    for (std::size_t index = 0; index < route_weights.size(); ++index)
+        route_weights[index] = 0.125f * static_cast<float>(index % 5 + 1);
+    const auto routed_source = mlx::core::array(
+        routed_input.begin(), mlx::core::Shape{tokens, routes, input_width});
+    const auto routed_ids = mlx::core::array(ids.begin(), mlx::core::Shape{tokens, routes});
+    const auto weight_values = mlx::core::array(
+        route_weights.begin(), mlx::core::Shape{tokens, routes});
+    const auto fused_reduce =
+        first_weight.routed_matmul_reduce(routed_source, routed_ids, weight_values);
+    if (native_primitive) {
+        const auto* kernel =
+            dynamic_cast<const mfq::metal::MlxPreparableKernel*>(&fused_reduce.primitive());
+        require(kernel != nullptr && kernel->preparation_key().find("_reduce_v1") != std::string::npos,
+                "mixed NINT Down reduction did not dispatch the fused kernel");
+    }
+    const auto reduced = evaluated_floats(fused_reduce);
+    require(reduced.size() == static_cast<std::size_t>(tokens * output_width),
+            "mixed NINT Down reduction shape mismatch");
+    for (int token = 0; token < tokens; ++token) {
+        for (int output = 0; output < output_width; ++output) {
+            float expected = 0.0f;
+            for (int route = 0; route < routes; ++route) {
+                const int index = token * routes + route;
+                if (ids[index] >= 0 && ids[index] < first.experts)
+                    expected += route_weights[index] * dot(routed_input,
+                        static_cast<std::size_t>(index) * input_width, first, ids[index], output);
+            }
+            require_close(reduced[token * output_width + output], expected);
+        }
+    }
+    // Model decode runs FP16; the fused result must track the unfused fallback.
+    const auto half_source = mlx::core::astype(routed_source, mlx::core::float16);
+    const auto fused_half = evaluated_floats(
+        first_weight.routed_matmul_reduce(half_source, routed_ids, weight_values));
+    const auto unfused_half = evaluated_floats(mfq::metal::moe_weighted_reduce(
+        first_weight.routed_matmul(half_source, routed_ids), weight_values));
+    require(fused_half.size() == unfused_half.size(),
+            "mixed NINT FP16 Down reduction shape mismatch");
+    for (std::size_t index = 0; index < fused_half.size(); ++index)
+        require_close(fused_half[index], unfused_half[index], 2e-3f);
     const auto grouped =
         mfq::metal::MlxMoeWeight::
             concatenate_projections(
