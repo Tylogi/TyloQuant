@@ -126,6 +126,7 @@ __device__ __forceinline__ void generic_dispatch(ProjectionView m,int row,const 
     #undef C
 }
 
+#ifndef MFQ_TQ_ROW_HELPERS_ONLY
 template<int DT,bool Grouped,int W,int T=2,int V=16>
 __global__ __launch_bounds__(256)
 void tq_generic_kernel(ProjectionView m,const S<DT>* x,S<DT>* output,int tokens,int groups) {
@@ -182,7 +183,7 @@ int launch_tile(ProjectionView m,const void* x,void* y,
     return int(hipGetLastError());
 }
 
-int launch(ProjectionView m,const void* x,void* y,
+inline int launch(ProjectionView m,const void* x,void* y,
         int tokens,int groups,int dtype,hipStream_t stream) {
     if(tokens==1) {
         if(m.rows<=64)return launch_tile<1,16>(m,x,y,tokens,groups,dtype,stream);
@@ -203,4 +204,5 @@ int launch(ProjectionView m,const void* x,void* y,
 }
 
 
+#endif // MFQ_TQ_ROW_HELPERS_ONLY
 } // namespace mfq_tq_cuda_exact

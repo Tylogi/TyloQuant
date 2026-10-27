@@ -49,4 +49,43 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     int64_t key_heads, int64_t value_heads, int64_t width,
     double convolution_eps, double norm_eps, bool silu_gate, bool output_half,
     bool transposed_state,
-    mfq_tensor_backend::Tensor workspace={});
+    mfq_tensor_backend::Tensor workspace={},bool inplace_state=false,
+    mfq_tensor_backend::Tensor state_addresses={},bool inplace_convolution=false);
+
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_short_cuda(
+    mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor qkv,
+    mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,
+    mfq_tensor_backend::Tensor beta,mfq_tensor_backend::Tensor dt_bias,
+    mfq_tensor_backend::Tensor a_log,int64_t nk,int64_t nv,int64_t width,double eps);
+
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_prefill_cuda(
+    mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor qkv,
+    mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,
+    mfq_tensor_backend::Tensor beta,mfq_tensor_backend::Tensor dt_bias,
+    mfq_tensor_backend::Tensor a_log,int64_t nk,int64_t nv,int64_t width,double eps);
+
+std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_checkpoint_cuda(
+    mfq_tensor_backend::Tensor qkv, mfq_tensor_backend::Tensor output_gate,
+    mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta,
+    mfq_tensor_backend::Tensor convolution_state, mfq_tensor_backend::Tensor recurrent_state,
+    mfq_tensor_backend::Tensor convolution_weight, mfq_tensor_backend::Tensor dt_bias,
+    mfq_tensor_backend::Tensor a_log, mfq_tensor_backend::Tensor norm_weight,
+    int64_t key_heads, int64_t value_heads, int64_t width,
+    double convolution_eps, double norm_eps, bool silu_gate, bool output_half,
+    bool transposed_state,
+    mfq_tensor_backend::Tensor workspace,bool inplace_state,
+    mfq_tensor_backend::Tensor checkpoint_convolution,
+    mfq_tensor_backend::Tensor checkpoint_recurrent);
+
+// Register-resident 2..8-token recurrence, FP16/FP32 QKV, width128/taps4.
+// Empty paired checkpoint entries omit prefixes the caller will not restore.
+std::vector<mfq_tensor_backend::Tensor> gdn_decode_window_cuda(
+    const mfq_tensor_backend::Tensor& qkv,const mfq_tensor_backend::Tensor& output_gate,
+    const mfq_tensor_backend::Tensor& alpha,const mfq_tensor_backend::Tensor& beta,
+    const mfq_tensor_backend::Tensor& convolution_state,const mfq_tensor_backend::Tensor& recurrent_state,
+    const mfq_tensor_backend::Tensor& convolution_weight,const mfq_tensor_backend::Tensor& dt_bias,
+    const mfq_tensor_backend::Tensor& a_log,const mfq_tensor_backend::Tensor& norm_weight,
+    int key_heads,int value_heads,int confirmed,double convolution_eps,double norm_eps,
+    bool silu_gate,bool output_half,bool transposed_state,
+    const std::vector<mfq_tensor_backend::Tensor>& checkpoint_convolution,
+    const std::vector<mfq_tensor_backend::Tensor>& checkpoint_recurrent);

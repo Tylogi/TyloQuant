@@ -2,6 +2,8 @@
 #include "mfq_native_tensor_ops_common.cuh"
 
 #include <cmath>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -12,8 +14,54 @@
 #include <vector>
 
 namespace mfq::cuda {
+bool f32_matmul_lt(const float*,const float*,float*,int,int,int,bool,bool,int,int,int,hipStream_t);
 using namespace native_ops_detail;
 namespace {
+__device__ __forceinline__ float bf16_gemv_value(uint16_t v) {return __uint_as_float(uint32_t(v)<<16);}
+template<int Lanes,int Vector,bool Cache,int Threads=256,bool Streaming=false>__global__ __launch_bounds__(Threads) void bf16_decode_gemv_kernel(
+        const uint16_t* weights,const uint16_t* input,void* output,int n,int k,bool float_output) {
+    const int tid=threadIdx.x,lane=tid%Lanes,row=blockIdx.x*(Threads/Lanes)+tid/Lanes;
+    extern __shared__ float activation[];
+    if constexpr(Cache) {
+        for(int i=tid;i<k;i+=256)activation[i+(i>>5)]=bf16_gemv_value(input[i]);
+        __syncthreads();
+    }
+    if(row>=n)return;
+    float sum[4]{};
+    for(int base=0;base<k;base+=Lanes*Vector) {
+        #pragma unroll
+        for(int part=0;part<Vector/8;++part) {
+            const int col=base+lane*Vector+part*8;
+            if(col<k) {
+                uint4 w;
+                if constexpr(Streaming) {
+                    using U4=uint32_t __attribute__((ext_vector_type(4)));
+                    const auto v=__builtin_nontemporal_load(reinterpret_cast<const U4*>(weights+size_t(row)*k+col));
+                    w=make_uint4(v[0],v[1],v[2],v[3]);
+                } else w=*reinterpret_cast<const uint4*>(weights+size_t(row)*k+col);
+                uint32_t words[4]{w.x,w.y,w.z,w.w};
+                uint32_t inputs[4]{};
+                if constexpr(!Cache) {const auto x=*reinterpret_cast<const uint4*>(input+col);inputs[0]=x.x;inputs[1]=x.y;inputs[2]=x.z;inputs[3]=x.w;}
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    const int c=col+j*2;
+                    const float x0=Cache?activation[c+(c>>5)]:bf16_gemv_value(uint16_t(inputs[j]));
+                    const float x1=Cache?activation[c+1+((c+1)>>5)]:bf16_gemv_value(uint16_t(inputs[j]>>16));
+                    sum[(j*2)&3]=fmaf(bf16_gemv_value(uint16_t(words[j])),x0,sum[(j*2)&3]);
+                    sum[(j*2+1)&3]=fmaf(bf16_gemv_value(uint16_t(words[j]>>16)),x1,sum[(j*2+1)&3]);
+                }
+            }
+        }
+    }
+    float total=(sum[0]+sum[1])+(sum[2]+sum[3]);
+    #pragma unroll
+    for(int d=Lanes/2;d;d>>=1)total+=__shfl_down(total,d,Lanes);
+    if(lane==0) {
+        asm volatile("" : "+v"(total));
+        if(float_output)static_cast<float*>(output)[row]=total;
+        else static_cast<__hip_bfloat16*>(output)[row]=__float2bfloat16(total);
+    }
+}
 hipDataType cuda_data_type(ScalarType type) {
     switch (type) {
         case kFloat16: return HIP_R_16F;
@@ -208,6 +256,66 @@ Tensor matmul(const Tensor& left_source, const Tensor& right_source) {
         return output;
     }
 
+
+    static const bool native_bf16=[] {
+        const auto* value=std::getenv("MFQ_HIP_BF16_GEMV");return !value || value[0]!='0';
+    }();
+    static const bool native_bf16_small=[] {
+        const auto* value=std::getenv("MFQ_HIP_BF16_SMALL");return !value || value[0]!='0';
+    }();
+    const bool small_bf16_shape=(contraction==5120 && (columns==512 || columns==32)) ||
+        (contraction==512 && columns==128);
+    if(native_bf16 && native_bf16_small && batches==1 && rows==1 && small_bf16_shape &&
+            left.scalar_type()==kBFloat16 && left.stride(-1)==1 &&
+            right.stride(-2)==1 && right.stride(-1)==contraction) {
+        DeviceGuard device_guard(left.get_device());
+        const auto stream=current_stream(left.get_device()).stream();
+        if(contraction==512) {
+            bf16_decode_gemv_kernel<32,16,false><<<(int(columns)+7)/8,256,0,stream>>>(
+                reinterpret_cast<const uint16_t*>(right.data_ptr()),reinterpret_cast<const uint16_t*>(left.data_ptr()),
+                output.data_ptr(),int(columns),int(contraction),false);
+        } else {
+            bf16_decode_gemv_kernel<64,16,false><<<(int(columns)+3)/4,256,0,stream>>>(
+                reinterpret_cast<const uint16_t*>(right.data_ptr()),reinterpret_cast<const uint16_t*>(left.data_ptr()),
+                output.data_ptr(),int(columns),int(contraction),false);
+        }
+        MFQ_NATIVE_CUDA_CHECK(hipGetLastError());
+        static const bool log=std::getenv("MFQ_HIP_BF16_GEMV_LOG")!=nullptr;
+        static std::atomic<unsigned> logged{0};
+        const unsigned bit=columns==512?1u:columns==32?2u:4u;
+        if(log && !(logged.fetch_or(bit,std::memory_order_relaxed)&bit))
+            std::fprintf(stderr,"native_bf16_small shape=%lldx%lld lanes=%d vector=16\n",
+                static_cast<long long>(columns),static_cast<long long>(contraction),contraction==512?32:64);
+        if(left_vector)output=output.squeeze(-2);
+        if(right_vector)output=output.squeeze(-1);
+        return output;
+    }
+    if(native_bf16 && batches==1 && rows==1 && columns==129280 && contraction==5120 &&
+            left.scalar_type()==kBFloat16 && left.stride(-1)==1 &&
+            right.stride(-2)==1 && right.stride(-1)==contraction) {
+        DeviceGuard device_guard(left.get_device());
+        const auto stream=current_stream(left.get_device()).stream();
+        static const bool streaming=[] {
+            const auto* value=std::getenv("MFQ_HIP_BF16_STREAMING");return !value || value[0]!='0';
+        }();
+        if(streaming) {
+        bf16_decode_gemv_kernel<64,8,false,512,true><<<(int(columns)+7)/8,512,0,stream>>>(
+            reinterpret_cast<const uint16_t*>(right.data_ptr()),reinterpret_cast<const uint16_t*>(left.data_ptr()),
+            output.data_ptr(),int(columns),int(contraction),false);
+        } else {
+        bf16_decode_gemv_kernel<64,8,false><<<(int(columns)+3)/4,256,0,stream>>>(
+            reinterpret_cast<const uint16_t*>(right.data_ptr()),reinterpret_cast<const uint16_t*>(left.data_ptr()),
+            output.data_ptr(),int(columns),int(contraction),false);
+        }
+        MFQ_NATIVE_CUDA_CHECK(hipGetLastError());
+        static const bool log=std::getenv("MFQ_HIP_BF16_GEMV_LOG")!=nullptr;
+        static std::atomic_flag logged=ATOMIC_FLAG_INIT;
+        if(log && !logged.test_and_set(std::memory_order_relaxed))
+            std::fprintf(stderr,"native_bf16_gemv shape=129280x5120 lanes=64 vector=8 threads=%d streaming=%d\n",streaming?512:256,int(streaming));
+        if(left_vector)output=output.squeeze(-2);
+        if(right_vector)output=output.squeeze(-1);
+        return output;
+    }
     DeviceGuard guard(left.get_device());
     auto context = default_context(left.get_device());
     const auto stream = current_stream(left.get_device()).stream();
@@ -254,6 +362,15 @@ Tensor matmul(const Tensor& left_source, const Tensor& right_source) {
             fp64 ? HIPBLAS_COMPUTE_64F : HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
         if (left_vector) output = output.squeeze(-2);
         if (right_vector) output = output.squeeze(-1);
+        return output;
+    }
+
+    if(batches==1 && left.scalar_type()==kFloat32 && f32_matmul_lt(
+        right.data_ptr<float>(),left.data_ptr<float>(),output.data_ptr<float>(),
+        int(columns),int(rows),int(contraction),!right_row_major,!left_row_major,
+        right_leading,left_leading,int(columns),stream)) {
+        if(left_vector)output=output.squeeze(-2);
+        if(right_vector)output=output.squeeze(-1);
         return output;
     }
 

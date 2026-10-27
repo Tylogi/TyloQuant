@@ -47,3 +47,5 @@ mfq_tensor_backend::Tensor gemma4_ffn_merge_f16_cuda(
     mfq_tensor_backend::Tensor final_post_weight, mfq_tensor_backend::Tensor layer_scale, double eps);
 mfq_tensor_backend::Tensor glm_dsa_indexer_layer_norm_cuda(
     mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias, double eps);
+
+mfq_tensor_backend::Tensor grouped_gated_rms_norm_cuda(mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor,int64_t,double);

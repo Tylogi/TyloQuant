@@ -17,9 +17,11 @@ struct MtpTarget {
     std::variant<mfq::cuda::Qwen35CausalLm*, mfq::cuda::MiniCPMO45CausalLm*,
         mfq::cuda::MiniCPMOTtsCausalLm*, mfq::cuda::Gemma4CausalLm*,
         mfq::cuda::GlmDsaCausalLm*, mfq::cuda::Glm5CausalLm*, mfq::cuda::Qwen4CausalLm*,
-        mfq::cuda::DeepseekV4CausalLm*, mfq::cuda::DeepseekV41CausalLm*> model;
+        mfq::cuda::DeepseekV4CausalLm*, mfq::cuda::DeepseekV41CausalLm*, mfq::cuda::NemotronHCausalLm*> model;
     const RopeCache* rope = nullptr;
-    template <class Model> explicit MtpTarget(Model& target) : model(&target), rope(&target.rope) {}
+    const void* identity = nullptr;
+    template <class Model> explicit MtpTarget(Model& target)
+        : model(&target), rope(&target.rope), identity(&target) {}
     mfq_tensor_backend::Tensor embed(mfq_tensor_backend::Tensor ids) const;
     mfq_tensor_backend::Tensor logits(mfq_tensor_backend::Tensor hidden) const;
 };
@@ -27,6 +29,8 @@ struct MtpTarget {
 struct MtpStep {
     mfq_tensor_backend::Tensor sample_hidden;
     mfq_tensor_backend::Tensor chain_hidden;
+    mfq_tensor_backend::Tensor sample_logits;
+    int32_t greedy_token=-1;
 };
 
 // Architecture-specific predictors implement device math and cache state only.
@@ -58,6 +62,8 @@ struct MtpModule {
     virtual bool teacher_forced_prompt_prime() const noexcept = 0;
     virtual bool target_bootstrap_decode() const noexcept = 0;
     virtual bool preserve_output_dtype() const noexcept = 0;
+    virtual bool take_graph_initialization() noexcept { return false; }
+    virtual uint64_t graph_replay_count() const noexcept { return 0; }
     virtual int maximum_draft_depth() const noexcept {
         return mfq::engine::mtp::kMaximumDraftDepth;
     }
@@ -77,6 +83,11 @@ struct MtpModule {
     virtual void restore_session_state(const MtpSessionState&) {
         throw std::runtime_error(
             "this CUDA MTP predictor has no session state");
+    }
+    virtual void seed_target_context(mfq_tensor_backend::Tensor hidden, std::int64_t tokens) {
+        MFQ_RUNTIME_CHECK(hidden.dim()==3 && hidden.size(1)==tokens,
+                          "this HIP MTP predictor requires complete prompt context");
+        append_target_context(std::move(hidden),0);
     }
     virtual void append_target_context(
         mfq_tensor_backend::Tensor,

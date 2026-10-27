@@ -2159,6 +2159,8 @@ def _nemotron_h_source_mapper(
 ) -> TensorNameMapping | None:
     """Map one Nemotron-H text/omni tensor into the canonical vocabulary."""
 
+    if source_name.startswith(("backbone.", "lm_head.")):
+        source_name = "language_model." + source_name
     canonical = _already_canonical(source_name)
     if canonical is not None:
         return canonical

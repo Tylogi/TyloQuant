@@ -39,6 +39,30 @@ template<int DT>__global__ __launch_bounds__(256) void group(
     } else if(m.input_columns>=8192)group_row<DT,2,16>(m,x,out,block);
     else group_row<DT,1,16>(m,x,out,block);
 }
+// Concurrent QSA retains the independent native token tile and dot-product order.
+template<int T,int V>__global__ __launch_bounds__(256) void group_batch(TqProjectionPlan plan,const float* input,int tokens){
+ TqProjectionJob job;int begin;
+ if(blockIdx.x<unsigned(plan.jobs[0].block_end)){job=plan.jobs[0];begin=0;}
+ else if(blockIdx.x<unsigned(plan.jobs[1].block_end)){job=plan.jobs[1];begin=plan.jobs[0].block_end;}
+ else if(blockIdx.x<unsigned(plan.jobs[2].block_end)){job=plan.jobs[2];begin=plan.jobs[1].block_end;}
+ else{job=plan.jobs[3];begin=plan.jobs[2].block_end;}
+ const auto m=job.weight;const int row=(int(blockIdx.x)-begin)*4+threadIdx.x/64,first=blockIdx.y*T;
+ float values[T]{};
+ if(row<m.rows){
+  if(m.columns)generic_dispatch<2,true,1,T,V>(m,row,input,first,tokens,m.input_columns,values);
+  else generic_dispatch<2,false,1,T,V>(m,row,input,first,tokens,m.input_columns,values);
+ }
+ #pragma unroll
+ for(int t=0;t<T;++t){
+  #pragma unroll
+  for(int shift=32;shift;shift>>=1)values[t]+=__shfl_down(values[t],shift,64);
+  if(!(threadIdx.x&63)&&row<m.rows&&first+t<tokens){
+   if(m.bias)values[t]+=__ldg(m.bias+row);
+   static_cast<float*>(job.output)[size_t(first+t)*m.rows+row]=values[t];
+  }
+ }
+}
+
 template<int DT,int V>__global__ __launch_bounds__(256) void swiglu(
         ProjectionView gate,ProjectionView up,const S<DT>* x,S<DT>* output) {
     const int wave=threadIdx.x/64,lane=threadIdx.x&63,slot=wave/2;
@@ -125,4 +149,14 @@ extern "C" int mfq_tq_swiglu(ProjectionView gate,ProjectionView up,const void* x
     if(dtype==0){RUN(0,8);}else if(dtype==1){RUN(1,8);}else{RUN(2,8);}
     #undef RUN
     return int(hipGetLastError());
+}
+
+extern "C" int mfq_tq_group_f32_batch(TqProjectionPlan plan,const float* input,int tokens,hipStream_t stream){
+ if(!input||plan.count!=4||tokens<2||tokens>6)return int(hipErrorInvalidValue);
+ const int expected_rows[4]={12288,512,512,640};int blocks=0;
+ for(int i=0;i<4;++i){const auto&m=plan.jobs[i].weight;if(m.input_columns!=2560||m.rows!=expected_rows[i])return int(hipErrorInvalidValue);blocks+=(m.rows+3)/4;plan.jobs[i].block_end=blocks;}
+ #define RUN(T,V) mfq_tq_fused::group_batch<T,V><<<dim3(blocks,(tokens+T-1)/T),256,0,stream>>>(plan,input,tokens)
+ if(tokens==2){RUN(2,16);}else if(tokens==3||tokens==5||tokens==6){RUN(3,8);}else{RUN(4,8);}
+ #undef RUN
+ return int(hipGetLastError());
 }

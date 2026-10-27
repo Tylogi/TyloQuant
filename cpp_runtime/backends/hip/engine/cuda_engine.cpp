@@ -1,3 +1,5 @@
+#include "mfq_weight_memory.h"
+#include "mfq_hip_kv_quantization.h"
 #include "hip/hip_runtime.h"
 #include "hip_runtime_config.h"
 #include "hip_execution.h"
@@ -21,6 +23,7 @@ using namespace mfq::cuda::internal;
 namespace {
 template <typename Model>
 struct CudaEngineState {
+    std::shared_ptr<WeightMemoryLedger> weight_memory;
     std::shared_ptr<CudaExecutionContext> execution;
     CudaRuntimeConfig config;
     Model model;
@@ -32,8 +35,8 @@ struct CudaEngineState {
     bool duplex_active = false;
 
     CudaEngineState(std::shared_ptr<CudaExecutionContext> owner, Model loaded,
-            RuntimeComponents<Model> optional, CudaRuntimeConfig runtime_config)
-        : execution(std::move(owner)), config(std::move(runtime_config)),
+            RuntimeComponents<Model> optional, CudaRuntimeConfig runtime_config,std::shared_ptr<WeightMemoryLedger> weights)
+        : weight_memory(std::move(weights)), execution(std::move(owner)), config(std::move(runtime_config)),
           model(std::move(loaded)), components(std::move(optional)),
           language(components.language(model)), graph(language.max_position_embeddings()),
           cache(config.session_cache, config.prefix_cache,
@@ -58,7 +61,10 @@ struct CudaEngineState {
     }
     using Prepared = CudaPreparedPrompt;
     mfq::StepSequence<Prepared> prepare(InferenceRequest& input) {
+        if constexpr(std::is_same_v<Model,mfq::cuda::DeepseekV41CausalLm>)
+            if(components.deepseek_vision)return components.deepseek_vision->prepare(language,input.prompt,*input.vision);
         if (components.composite) return components.composite->prepare(input.prompt, *input.vision);
+        if (components.radio_vision) return components.radio_vision->prepare(language,input.prompt,*input.vision);
         if (components.grid_vision) return components.grid_vision->prepare(language, input.prompt, *input.vision);
         throw std::invalid_argument("model has no multimodal component");
     }
@@ -88,7 +94,15 @@ struct CudaEngineState {
                 {"cuda_allocated_bytes", double(memory.allocated_bytes)}, {"cuda_reserved_bytes", double(memory.reserved_bytes)},
                 {"vision_declared", double(capabilities.vision_declared)}, {"vision_supported", double(capabilities.vision_supported)},
                 {"vision_available", double(capabilities.vision_available)}, {"mtp_declared", double(capabilities.mtp_declared)},
-                {"mtp_supported", double(capabilities.mtp_supported)}, {"mtp_available", double(capabilities.mtp_available)}};
+                {"mtp_supported", double(capabilities.mtp_supported)}, {"mtp_available", double(capabilities.mtp_available)},
+                {"kv_quantization_supported",(std::is_same_v<Model,Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)?1.0:0.0},
+                {"kv_quantization_bits",(std::is_same_v<Model,Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)?cuda_kv_quantization().bits:0.0}};
+            const auto ple_bytes=weight_memory->ple_bytes();
+            const bool complete_weights=!moe_expert_cache_has_sources(execution->moe_expert_cache);
+            metrics.insert(metrics.end(),{{"resident_observed_weight_bytes",double(weight_memory->resident_bytes())},
+                {"resident_weight_bytes_complete",complete_weights?1.0:0.0},
+                {"ssd_ple_enabled",ple_bytes>0?1.0:0.0},{"ssd_ple_payload_bytes",double(ple_bytes)}});
+            if(complete_weights)metrics.emplace_back("resident_weight_bytes",double(weight_memory->resident_bytes()));
             if (components.mtp) mtp::append_generation_metrics(metrics, components.mtp->last_stats);
             if (batching) {
                 auto batch = batching->metrics(); metrics.insert(metrics.end(), batch.begin(), batch.end());
@@ -115,7 +129,8 @@ using State = std::variant<
     std::unique_ptr<CudaEngineState<Glm5CausalLm>>,
     std::unique_ptr<CudaEngineState<Qwen4CausalLm>>,
     std::unique_ptr<CudaEngineState<DeepseekV4CausalLm>>,
-    std::unique_ptr<CudaEngineState<DeepseekV41CausalLm>>>;
+    std::unique_ptr<CudaEngineState<DeepseekV41CausalLm>>,
+    std::unique_ptr<CudaEngineState<NemotronHCausalLm>>>;
 
 struct CudaBackend {
     using Options = CudaEngineOptions;
@@ -136,10 +151,16 @@ struct CudaBackend {
         execution->profiler.enabled = false;
         mfq_tensor_backend::NoGradGuard no_grad;
         auto config = resolve_cuda_runtime_config(options);
+        auto weight_memory=std::make_shared<WeightMemoryLedger>();
+        const WeightMemoryLoadScope memory_load(*weight_memory);
         state = with_loaded_cuda_model(*execution, options, true,
             [&](auto& model, auto& components, auto, auto) -> State {
                 using Model = std::decay_t<decltype(model)>;
-                return std::make_unique<CudaEngineState<Model>>(execution, std::move(model), std::move(components), config);
+                if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                    const auto* reuse=std::getenv("MFQ_RUNTIME_REUSE_DECODE_GRAPHS");
+                    model.reuse_decode_graphs=!reuse || reuse[0]!='0';
+                }
+                return std::make_unique<CudaEngineState<Model>>(execution, std::move(model), std::move(components), config,weight_memory);
             });
         return visit([&](auto& state) {
             EngineInfo info;
@@ -147,7 +168,7 @@ struct CudaBackend {
             info.max_context = state.language.max_position_embeddings();
             info.vocab_size = static_cast<int32_t>(state.language.vocab_size());
             info.model_type = state.language.model_type();
-            info.multimodal = state.components.grid_vision.has_value() || bool(state.components.composite);
+            info.multimodal = state.components.grid_vision.has_value() || state.components.deepseek_vision.has_value() || state.components.radio_vision.has_value() || bool(state.components.composite);
             info.reload = true;
             const auto caps = cuda_runtime_capabilities(state.components.graph, state.components.plan,
                 state.components.state(), info.multimodal, bool(state.components.composite));

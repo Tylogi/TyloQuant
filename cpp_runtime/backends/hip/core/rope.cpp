@@ -9,6 +9,7 @@
 #include <array>
 #include <numeric>
 #include <cmath>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -308,6 +309,45 @@ RotaryEmbedding::Prepared RotaryEmbedding::prepare_parameters(const Tensor& valu
         cached = std::move(next);
     }
     return cached;
+}
+
+Tensor RotaryEmbedding::forward_pooled(const Tensor& raw,const Tensor& weight,
+        const Tensor& positions,double eps,int64_t pool) const {
+    if(!fused_ || pool!=4 || dimension_>128 || maximum_>INT_MAX ||
+       !raw.defined() || !raw.is_cuda() || !raw.is_contiguous() || raw.scalar_type()!=tb::kFloat16 ||
+       raw.dim()!=3 || raw.size(0)!=1 || raw.size(1)<4 || raw.size(1)>INT_MAX || raw.size(2)!=128 ||
+       !weight.defined() || weight.device()!=raw.device() || weight.numel()!=128 ||
+       !positions.defined() || positions.device()!=raw.device() || !positions.is_contiguous() ||
+       (positions.scalar_type()!=tb::kInt32 && positions.scalar_type()!=tb::kInt64) ||
+       positions.dim()<1 || positions.dim()>3 || positions.size(-1)!=raw.size(1) ||
+       (positions.dim()==3 && positions.size(1)!=1) || positions.numel()<1 ||
+       !std::isfinite(eps) || eps<0)return {};
+    const auto prepared=prepare_parameters(raw);
+    return rotary_pooled_prefill_cuda(raw,weight.to(tb::kFloat32).contiguous(),positions,
+        prepared.frequencies,prepared.axes,maximum_,eps);
+}
+
+bool RotaryEmbedding::update_pooled_cache(const Tensor& raw,const Tensor& weight,
+        const Tensor& positions,const Tensor& cache_positions,const Tensor& pooled,double eps,int64_t pool) const {
+    const char* serial_mean=std::getenv("MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN");
+    if(!fused_ || (serial_mean && serial_mean[0]=='1') || pool!=4 || dimension_>128 || maximum_>INT_MAX ||
+       !raw.defined() || !raw.is_cuda() || !raw.is_contiguous() || raw.scalar_type()!=tb::kFloat16 ||
+       raw.dim()!=3 || raw.size(0)!=1 || raw.size(1)<1 || raw.size(1)>INT_MAX || raw.size(2)!=128 ||
+       !pooled.defined() || pooled.device()!=raw.device() || !pooled.is_contiguous() ||
+       pooled.scalar_type()!=tb::kFloat16 || pooled.dim()!=3 || pooled.size(0)!=1 ||
+       pooled.size(1)!=(raw.size(1)+3)/4 || pooled.size(2)!=128 ||
+       !weight.defined() || weight.device()!=raw.device() || weight.numel()!=128 ||
+       !cache_positions.defined() || cache_positions.device()!=raw.device() || !cache_positions.is_contiguous() ||
+       cache_positions.scalar_type()!=tb::kInt64 || cache_positions.dim()!=1 || cache_positions.numel()!=1 ||
+       !positions.defined() || positions.device()!=raw.device() || !positions.is_contiguous() ||
+       (positions.scalar_type()!=tb::kInt32 && positions.scalar_type()!=tb::kInt64) ||
+       positions.dim()<1 || positions.dim()>3 || positions.size(-1)!=1 ||
+       (positions.dim()==3 && positions.size(1)!=1) || positions.numel()<1 ||
+       !std::isfinite(eps) || eps<0)return false;
+    const auto prepared=prepare_parameters(raw);
+    rotary_pooled_cache_update_cuda(raw,weight.to(tb::kFloat32).contiguous(),positions,cache_positions,
+        pooled,prepared.frequencies,prepared.axes,maximum_,eps);
+    return true;
 }
 
 Tensor RotaryEmbedding::forward_normalized(const Tensor& value, const Tensor& weight,

@@ -1,13 +1,13 @@
 #include "hip/hip_runtime.h"
+#include "mfq_hip_compat.h"
+
 #include <hip/hip_runtime.h>
-#include "mfq/kernels/cuda/deepseek_v4_attention.h"
+#include "deepseek_v4_attention.h"
 #include "mfq_tensor_backend.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#if CUDART_VERSION >= 12080
-#include <hip/hip_fp4.h>
-#endif
-#include <hip/hip_fp8.h>
+#include "mfq_fp_sim.h"
+
 
 #include <algorithm>
 #include <cmath>
@@ -17,7 +17,9 @@
 #include <vector>
 
 #include "mfq_sparse_attn_mma_f16.cuh"
-#include "mfq_hip_compat.h"
+
+void mfq_dsv4_fp4_half2_launch(
+    const half *input, half *output, int64_t count, hipStream_t stream);
 
 namespace {
 
@@ -52,8 +54,7 @@ __device__ __forceinline__ float dsv4_fp8_e4m3_dequant(
 {
     const float normalized =
         fminf(448.0f, fmaxf(-448.0f, value / scale));
-    const __hip_fp8_e4m3_fnuz quantized(normalized);
-    return static_cast<float>(quantized) * scale;
+    return mfq_round_e4m3fn(normalized) * scale;
 }
 
 __device__ __forceinline__ float dsv4_bf16_round(float value) {
@@ -75,10 +76,7 @@ __device__ __forceinline__ float dsv4_fp4_e2m1_dequant(
 {
     const float normalized =
         fminf(6.0f, fmaxf(-6.0f, value / scale));
-#if CUDART_VERSION >= 12080
-    const __hip_fp4_e2m1 quantized(normalized);
-    return static_cast<float>(quantized) * scale;
-#else
+
     const float magnitude = fabsf(normalized);
     float quantized;
     if (magnitude <= 0.25f) {
@@ -99,7 +97,7 @@ __device__ __forceinline__ float dsv4_fp4_e2m1_dequant(
         quantized = 6.0f;
     }
     return copysignf(quantized * scale, normalized);
-#endif
+
 }
 
 __device__ __forceinline__ float dsv4_warp_sum(float value) {
@@ -555,13 +553,15 @@ __global__ void dsv4_fp4_sim_kernel(
 }
 
 // One block covers 32 or 64 index heads by 64 pooled keys. Warps map the
-// 16x16 WMMA tiles and the head-weighted ReLU reduction remains on chip.
-template<int INDEXER_HEADS>
+// 16x16 MFMA tiles and the head-weighted ReLU reduction remains on chip.
+template<int INDEXER_HEADS, bool Indexed = false>
 __global__ void dsv4_indexer_scores_kernel(
     const half * __restrict__ q,
     const half * __restrict__ k,
     const half * __restrict__ weights,
     half * __restrict__ out,
+    const int64_t * __restrict__ candidates,
+    int output_keys,
     int B,
     int M,
     int K,
@@ -569,10 +569,11 @@ __global__ void dsv4_indexer_scores_kernel(
     int ratio,
     float score_scale)
 {
-#if __CUDA_ARCH__ >= 700
-    __shared__ half q_tile[INDEXER_HEADS][kIndexerDim];
-    __shared__ half k_tile[kIndexerKeysPerTile][kIndexerDim];
-    __shared__ float score_tile[INDEXER_HEADS][kIndexerKeysPerTile];
+#if defined(__HIP_DEVICE_COMPILE__)
+
+    __shared__ __align__(16) half q_tile[INDEXER_HEADS][kIndexerDim+4];
+    __shared__ __align__(16) half k_tile[kIndexerKeysPerTile][kIndexerDim+4];
+    float (*score_tile)[kIndexerKeysPerTile]=reinterpret_cast<float(*)[kIndexerKeysPerTile]>(q_tile);
 
     const int query = blockIdx.y;
     const int batch = blockIdx.z;
@@ -583,52 +584,61 @@ __global__ void dsv4_indexer_scores_kernel(
         (static_cast<int64_t>(batch) * M + query) *
             INDEXER_HEADS * kIndexerDim;
     const int threads = 32 * blockDim.y;
-    for (int i = tid; i < INDEXER_HEADS * kIndexerDim; i += threads) {
-        reinterpret_cast<half *>(q_tile)[i] = q_row[i];
+    for(int chunk=tid;chunk<(INDEXER_HEADS)*(kIndexerDim/8);chunk+=threads) {
+        const int row=chunk/(kIndexerDim/8),dim=(chunk%(kIndexerDim/8))*8;
+        const uint4 packed=*reinterpret_cast<const uint4*>(q_row+row*kIndexerDim+dim);
+        *reinterpret_cast<uint2*>(q_tile[row]+dim)=make_uint2(packed.x,packed.y);
+        *reinterpret_cast<uint2*>(q_tile[row]+dim+4)=make_uint2(packed.z,packed.w);
     }
-    for (int i = tid; i < kIndexerKeysPerTile * kIndexerDim; i += threads) {
-        const int key_local = i / kIndexerDim;
-        const int dim = i - key_local * kIndexerDim;
-        const int key = key_base + key_local;
-        reinterpret_cast<half *>(k_tile)[i] = key < K
-            ? k[(static_cast<int64_t>(batch) * K + key) * kIndexerDim + dim]
-            : __float2half(0.0f);
+    for(int chunk=tid;chunk<kIndexerKeysPerTile*(kIndexerDim/8);chunk+=threads) {
+        const int key_local=chunk/(kIndexerDim/8),dim=(chunk%(kIndexerDim/8))*8;
+        const int selected=key_base+key_local;int64_t key=selected;
+        if constexpr(Indexed)key=selected<output_keys?candidates[(static_cast<int64_t>(batch)*M+query)*output_keys+selected]:-1;
+        uint4 packed{};
+        if(selected<output_keys && key>=0 && key<K)
+            packed=*reinterpret_cast<const uint4*>(k+(static_cast<int64_t>(batch)*K+key)*kIndexerDim+dim);
+        *reinterpret_cast<uint2*>(k_tile[key_local]+dim)=make_uint2(packed.x,packed.y);
+        *reinterpret_cast<uint2*>(k_tile[key_local]+dim+4)=make_uint2(packed.z,packed.w);
     }
     __syncthreads();
 
-    const int warp = threadIdx.y;
-    const int head_base = (warp / 4) * 16;
-    const int key_local_base = (warp % 4) * 16;
-    // Direct FMA score tile (wmma tile path replaced for HIP): each lane
-    // owns eight elements, e = lane + 32*j -> (row, col).
-    float acc[8];
-#pragma unroll
-    for (int element = 0; element < 8; ++element) acc[element] = 0.0f;
-#pragma unroll
-    for (int element = 0; element < 8; ++element) {
-        const int e = (int)threadIdx.x + 32 * element;
-        const int row = e >> 4;
-        const int column = e & 15;
-        float value = 0.0f;
-#pragma unroll
-        for (int d = 0; d < kIndexerDim; ++d) {
-            value += __half2float(q_tile[head_base + row][d]) *
-                     __half2float(k_tile[key_local_base + column][d]);
+    const int lane=tid&63, wave=tid>>6;
+    const int head_base=(wave/2)*16;
+    using F4=float __attribute__((ext_vector_type(4)));
+    using H4=_Float16 __attribute__((ext_vector_type(4)));
+    F4 fragments[2];
+    // Each wave computes two 16x16 head/key tiles with FP32 accumulation.
+    #pragma unroll
+    for(int tile=0;tile<2;++tile) {
+        const int key_base=(wave%2)*32+tile*16;
+        F4 acc{};
+        #pragma unroll
+        for(int d=0;d<kIndexerDim;d+=16) {
+            const auto a=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                q_tile[head_base+(lane&15)]+d+(lane>>4)*4));
+            const auto b=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                k_tile[key_base+(lane&15)]+d+(lane>>4)*4));
+            acc=__builtin_amdgcn_mfma_f32_16x16x16f16(a,b,acc,0,0,0);
         }
-        acc[element] = value;
+        fragments[tile]=acc;
     }
-    __syncwarp();
-#pragma unroll
-    for (int element = 0; element < 8; ++element) {
-        const int e = (int)threadIdx.x + 32 * element;
-        score_tile[head_base + (e >> 4)][key_local_base + (e & 15)] =
-            acc[element];
+    // All Q/K reads finish before score storage reuses the query allocation.
+    __syncthreads();
+    #pragma unroll
+    for(int tile=0;tile<2;++tile) {
+        const int key_base=(wave%2)*32+tile*16;
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            score_tile[head_base+(lane>>4)*4+j][key_base+(lane&15)]=fragments[tile][j];
     }
     __syncthreads();
 
     if (tid < kIndexerKeysPerTile) {
-        const int key = key_base + tid;
-        if (key < K) {
+        const int selected = key_base + tid;
+        int64_t key = selected;
+        if constexpr (Indexed)
+            key = selected < output_keys ? candidates[(static_cast<int64_t>(batch) * M + query) * output_keys + selected] : -1;
+        if (selected < output_keys) {
             float sum = 0.0f;
 #pragma unroll
             for (int head = 0; head < INDEXER_HEADS; ++head) {
@@ -640,8 +650,279 @@ __global__ void dsv4_indexer_scores_kernel(
             }
             const int visible = min(
                 K, (query_offset + query + 1) / ratio);
-            out[(static_cast<int64_t>(batch) * M + query) * K + key] =
-                key < visible
+            out[(static_cast<int64_t>(batch) * M + query) * output_keys + selected] =
+                key >= 0 && key < visible
+                    ? __float2half_rn(sum * score_scale)
+                    : __float2half(-INFINITY);
+        }
+    }
+#else
+    (void)q;
+    (void)k;
+    (void)weights;
+    (void)out;
+    (void)B;
+    (void)M;
+    (void)K;
+    (void)query_offset;
+    (void)ratio;
+    (void)score_scale;
+#endif
+}
+
+// Adjacent prefill queries share one pooled-key tile.
+template<int INDEXER_HEADS, bool Indexed = false, int QueryRows = 1>
+__global__ void dsv4_indexer_grouped_scores_kernel(
+    const half * __restrict__ q,
+    const half * __restrict__ k,
+    const half * __restrict__ weights,
+    half * __restrict__ out,
+    const int64_t * __restrict__ candidates,
+    int output_keys,
+    int B,
+    int M,
+    int K,
+    int query_offset,
+    int ratio,
+    float score_scale)
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+
+    constexpr int StageDim=64, StageStride=StageDim+4;
+    constexpr int QueryHeadRows=QueryRows*INDEXER_HEADS;
+    constexpr int OperandBytes=(QueryHeadRows+kIndexerKeysPerTile)*StageStride*sizeof(half);
+    constexpr int ScoreBytes=QueryHeadRows*kIndexerKeysPerTile*sizeof(float);
+    __shared__ __align__(16) unsigned char storage[OperandBytes>ScoreBytes?OperandBytes:ScoreBytes];
+    auto q_tile=reinterpret_cast<half(*)[StageStride]>(storage);
+    auto k_tile=reinterpret_cast<half(*)[StageStride]>(storage+QueryHeadRows*StageStride*sizeof(half));
+    auto score_tile=reinterpret_cast<float(*)[kIndexerKeysPerTile]>(storage);
+
+    const int query = blockIdx.y*QueryRows;
+    const int batch = blockIdx.z;
+    const int key_base = blockIdx.x * kIndexerKeysPerTile;
+    const int tid = threadIdx.y * 32 + threadIdx.x;
+
+    const half * q_row = q +
+        (static_cast<int64_t>(batch) * M + query) *
+            INDEXER_HEADS * kIndexerDim;
+    const int threads = 32 * blockDim.y;
+    const int lane=tid&63, wave=tid>>6;
+    const int head_base=(wave/2)*16;
+    using F4=float __attribute__((ext_vector_type(4)));
+    using H4=_Float16 __attribute__((ext_vector_type(4)));
+    F4 fragments[2]{};
+    #pragma unroll
+    for(int phase=0;phase<kIndexerDim;phase+=StageDim) {
+        if(phase) __syncthreads();
+        for(int chunk=tid;chunk<QueryHeadRows*(StageDim/8);chunk+=threads) {
+            const int row=chunk/(StageDim/8),dim=(chunk%(StageDim/8))*8;
+            const uint4 packed=query+row/INDEXER_HEADS<M
+                ?*reinterpret_cast<const uint4*>(q_row+row*kIndexerDim+phase+dim):uint4{};
+            *reinterpret_cast<uint2*>(q_tile[row]+dim)=make_uint2(packed.x,packed.y);
+            *reinterpret_cast<uint2*>(q_tile[row]+dim+4)=make_uint2(packed.z,packed.w);
+        }
+        for(int chunk=tid;chunk<kIndexerKeysPerTile*(StageDim/8);chunk+=threads) {
+            const int key_local=chunk/(StageDim/8),dim=(chunk%(StageDim/8))*8;
+            const int selected=key_base+key_local;int64_t key=selected;
+            if constexpr(Indexed)key=selected<output_keys?candidates[(static_cast<int64_t>(batch)*M+query)*output_keys+selected]:-1;
+            uint4 packed{};
+            if(selected<output_keys && key>=0 && key<K)
+                packed=*reinterpret_cast<const uint4*>(k+(static_cast<int64_t>(batch)*K+key)*kIndexerDim+phase+dim);
+            *reinterpret_cast<uint2*>(k_tile[key_local]+dim)=make_uint2(packed.x,packed.y);
+            *reinterpret_cast<uint2*>(k_tile[key_local]+dim+4)=make_uint2(packed.z,packed.w);
+        }
+        __syncthreads();
+        #pragma unroll
+        for(int tile=0;tile<2;++tile) {
+            const int key_base=(wave%2)*32+tile*16;
+            F4 acc=fragments[tile];
+            #pragma unroll
+            for(int d=0;d<StageDim;d+=16) {
+                const auto a=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                    q_tile[head_base+(lane&15)]+d+(lane>>4)*4));
+                const auto b=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                    k_tile[key_base+(lane&15)]+d+(lane>>4)*4));
+                acc=__builtin_amdgcn_mfma_f32_16x16x16f16(a,b,acc,0,0,0);
+            }
+            fragments[tile]=acc;
+        }
+    }
+    // All Q/K reads finish before score storage reuses the query allocation.
+    __syncthreads();
+    #pragma unroll
+    for(int tile=0;tile<2;++tile) {
+        const int key_base=(wave%2)*32+tile*16;
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            score_tile[head_base+(lane>>4)*4+j][key_base+(lane&15)]=fragments[tile][j];
+    }
+    __syncthreads();
+
+    if (tid < QueryRows*kIndexerKeysPerTile) {
+        const int query_index=query+tid/kIndexerKeysPerTile;
+        const int key_local=tid%kIndexerKeysPerTile;
+        const int selected = key_base + key_local;
+        int64_t key = selected;
+        if constexpr (Indexed)
+            key = selected < output_keys ? candidates[(static_cast<int64_t>(batch) * M + query_index) * output_keys + selected] : -1;
+        if (query_index<M && selected < output_keys) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int head = 0; head < INDEXER_HEADS; ++head) {
+                const float dot = score_tile[(tid/kIndexerKeysPerTile)*INDEXER_HEADS+head][key_local];
+                const float weight = __half2float(
+                    weights[(static_cast<int64_t>(batch) * M + query_index) *
+                        INDEXER_HEADS + head]);
+                sum += fmaxf(dot, 0.0f) * weight;
+            }
+            const int visible = min(
+                K, (query_offset + query_index + 1) / ratio);
+            out[(static_cast<int64_t>(batch) * M + query_index) * output_keys + selected] =
+                key >= 0 && key < visible
+                    ? __float2half_rn(sum * score_scale)
+                    : __float2half(-INFINITY);
+        }
+    }
+#else
+    (void)q;
+    (void)k;
+    (void)weights;
+    (void)out;
+    (void)B;
+    (void)M;
+    (void)K;
+    (void)query_offset;
+    (void)ratio;
+    (void)score_scale;
+#endif
+}
+
+template<int INDEXER_HEADS, bool Indexed = false, int QueryRows = 1>
+__global__ void dsv4_indexer_compact_scores_kernel(
+    const half * __restrict__ q,
+    const half * __restrict__ k,
+    const half * __restrict__ weights,
+    half * __restrict__ out,
+    const int64_t * __restrict__ candidates,
+    int output_keys,
+    int B,
+    int M,
+    int K,
+    int query_offset,
+    int ratio,
+    float score_scale)
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+
+    constexpr int StageDim=64, StageStride=StageDim+4;
+    constexpr int QueryHeadRows=QueryRows*INDEXER_HEADS;
+    constexpr int OperandBytes=(QueryHeadRows+kIndexerKeysPerTile)*StageStride*sizeof(half);
+    constexpr int ScoreBytes=QueryHeadRows*kIndexerKeysPerTile*sizeof(float);
+    __shared__ __align__(16) unsigned char storage[OperandBytes>ScoreBytes?OperandBytes:ScoreBytes];
+    auto q_tile=reinterpret_cast<half(*)[StageStride]>(storage);
+    auto k_tile=reinterpret_cast<half(*)[StageStride]>(storage+QueryHeadRows*StageStride*sizeof(half));
+    auto score_tile=reinterpret_cast<float(*)[kIndexerKeysPerTile]>(storage);
+
+    const int batch=blockIdx.z;
+    const int groups=M/QueryRows;
+    const int step=ratio*kIndexerKeysPerTile/QueryRows;
+    const int first=(ratio-1)/QueryRows;
+    const int key_tiles=(K+kIndexerKeysPerTile-1)/kIndexerKeysPerTile;
+    const int64_t work=blockIdx.x;
+    int lo=0,hi=key_tiles;
+    while(lo+1<hi) {
+        const int middle=(lo+hi)/2;
+        const int64_t prefix=int64_t(middle)*(groups-first)-int64_t(step)*middle*(middle-1)/2;
+        if(prefix<=work)lo=middle;else hi=middle;
+    }
+    const int64_t prefix=int64_t(lo)*(groups-first)-int64_t(step)*lo*(lo-1)/2;
+    const int query=QueryRows*(first+lo*step+int(work-prefix));
+    const int key_base=lo*kIndexerKeysPerTile;
+    const int tid = threadIdx.y * 32 + threadIdx.x;
+
+    const half * q_row = q +
+        (static_cast<int64_t>(batch) * M + query) *
+            INDEXER_HEADS * kIndexerDim;
+    const int threads = 32 * blockDim.y;
+    const int lane=tid&63, wave=tid>>6;
+    const int head_base=(wave/2)*32;
+    using F4=float __attribute__((ext_vector_type(4)));
+    using H4=_Float16 __attribute__((ext_vector_type(4)));
+    F4 fragments[2][2]{};
+    #pragma unroll
+    for(int phase=0;phase<kIndexerDim;phase+=StageDim) {
+        if(phase) __syncthreads();
+        for(int chunk=tid;chunk<QueryHeadRows*(StageDim/8);chunk+=threads) {
+            const int row=chunk/(StageDim/8),dim=(chunk%(StageDim/8))*8;
+            const uint4 packed=query+row/INDEXER_HEADS<M
+                ?*reinterpret_cast<const uint4*>(q_row+row*kIndexerDim+phase+dim):uint4{};
+            *reinterpret_cast<uint2*>(q_tile[row]+dim)=make_uint2(packed.x,packed.y);
+            *reinterpret_cast<uint2*>(q_tile[row]+dim+4)=make_uint2(packed.z,packed.w);
+        }
+        for(int chunk=tid;chunk<kIndexerKeysPerTile*(StageDim/8);chunk+=threads) {
+            const int key_local=chunk/(StageDim/8),dim=(chunk%(StageDim/8))*8;
+            const int selected=key_base+key_local;int64_t key=selected;
+            if constexpr(Indexed)key=selected<output_keys?candidates[(static_cast<int64_t>(batch)*M+query)*output_keys+selected]:-1;
+            uint4 packed{};
+            if(selected<output_keys && key>=0 && key<K)
+                packed=*reinterpret_cast<const uint4*>(k+(static_cast<int64_t>(batch)*K+key)*kIndexerDim+phase+dim);
+            *reinterpret_cast<uint2*>(k_tile[key_local]+dim)=make_uint2(packed.x,packed.y);
+            *reinterpret_cast<uint2*>(k_tile[key_local]+dim+4)=make_uint2(packed.z,packed.w);
+        }
+        __syncthreads();
+        #pragma unroll
+        for(int d=0;d<StageDim;d+=16) {
+            H4 a[2], b[2];
+            #pragma unroll
+            for(int tile=0;tile<2;++tile) {
+                a[tile]=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                    q_tile[head_base+tile*16+(lane&15)]+d+(lane>>4)*4));
+                b[tile]=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                    k_tile[(wave%2)*32+tile*16+(lane&15)]+d+(lane>>4)*4));
+            }
+            #pragma unroll
+            for(int m=0;m<2;++m) {
+                #pragma unroll
+                for(int n=0;n<2;++n)
+                    fragments[m][n]=__builtin_amdgcn_mfma_f32_16x16x16f16(a[m],b[n],fragments[m][n],0,0,0);
+            }
+        }
+    }
+    // All Q/K reads finish before score storage reuses the query allocation.
+    __syncthreads();
+    #pragma unroll
+    for(int m=0;m<2;++m) {
+        #pragma unroll
+        for(int n=0;n<2;++n) {
+            const int key_local=(wave%2)*32+n*16;
+            #pragma unroll
+            for(int j=0;j<4;++j)
+                score_tile[head_base+m*16+(lane>>4)*4+j][key_local+(lane&15)]=fragments[m][n][j];
+        }
+    }
+    __syncthreads();
+
+    if (tid < QueryRows*kIndexerKeysPerTile) {
+        const int query_index=query+tid/kIndexerKeysPerTile;
+        const int key_local=tid%kIndexerKeysPerTile;
+        const int selected = key_base + key_local;
+        int64_t key = selected;
+        if constexpr (Indexed)
+            key = selected < output_keys ? candidates[(static_cast<int64_t>(batch) * M + query_index) * output_keys + selected] : -1;
+        if (query_index<M && selected < output_keys) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int head = 0; head < INDEXER_HEADS; ++head) {
+                const float dot = score_tile[(tid/kIndexerKeysPerTile)*INDEXER_HEADS+head][key_local];
+                const float weight = __half2float(
+                    weights[(static_cast<int64_t>(batch) * M + query_index) *
+                        INDEXER_HEADS + head]);
+                sum += fmaxf(dot, 0.0f) * weight;
+            }
+            const int visible = min(
+                K, (query_offset + query_index + 1) / ratio);
+            out[(static_cast<int64_t>(batch) * M + query_index) * output_keys + selected] =
+                key >= 0 && key < visible
                     ? __float2half_rn(sum * score_scale)
                     : __float2half(-INFINITY);
         }
@@ -864,11 +1145,19 @@ mfq_tensor_backend::Tensor dsv4_fp4_sim_cuda(mfq_tensor_backend::Tensor input) {
     MFQ_RUNTIME_CHECK(
         groups > 0 && groups <= std::numeric_limits<int>::max(),
         "dsv4_fp4_sim: invalid group count");
-    dsv4_fp4_sim_kernel<<<
-        static_cast<int>(groups), 32, 0,
-        mfq_current_cuda_stream()>>>(
-        reinterpret_cast<const half *>(input.data_ptr<mfq_half>()),
-        reinterpret_cast<half *>(output.data_ptr<mfq_half>()));
+    // Below 1Mi values, launch overhead dominates and the original path wins.
+    if (input.numel() >= 1024 * 1024) {
+        mfq_dsv4_fp4_half2_launch(
+            reinterpret_cast<const half *>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<half *>(output.data_ptr<mfq_half>()),
+            input.numel(), mfq_current_cuda_stream());
+    } else {
+        dsv4_fp4_sim_kernel<<<
+            static_cast<int>(groups), 32, 0,
+            mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const half *>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<half *>(output.data_ptr<mfq_half>()));
+    }
     const hipError_t status = hipGetLastError();
     MFQ_RUNTIME_CHECK(
         status == hipSuccess,
@@ -1124,12 +1413,33 @@ mfq_tensor_backend::Tensor dsv4_decode_pool_update_cuda(
     return pool;
 }
 
-mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
+template<bool EvenN>
+__global__ void dsv4_indexer_gather_scores_kernel(
+    const half* __restrict__ dense,const int64_t* __restrict__ ids,
+    half* __restrict__ out,int M,int K,int N) {
+    const int col=2*(int(blockIdx.x)*blockDim.x+threadIdx.x);
+    if(col>=N)return;
+    const int64_t row=int64_t(blockIdx.z)*M+blockIdx.y;
+    int64_t key0,key1=-1;
+    if constexpr(EvenN) {
+        const longlong2 chosen=*reinterpret_cast<const longlong2*>(ids+row*N+col);
+        key0=chosen.x;key1=chosen.y;
+    } else {
+        key0=ids[row*N+col];if(col+1<N)key1=ids[row*N+col+1];
+    }
+    const half a=key0>=0 && key0<K?dense[row*K+key0]:__float2half(-INFINITY);
+    const half b=key1>=0 && key1<K?dense[row*K+key1]:__float2half(-INFINITY);
+    if constexpr(EvenN)*reinterpret_cast<half2*>(out+row*N+col)=__halves2half2(a,b);
+    else {out[row*N+col]=a;if(col+1<N)out[row*N+col+1]=b;}
+}
+
+static mfq_tensor_backend::Tensor dsv4_indexer_scores_impl(
     mfq_tensor_backend::Tensor q,
     mfq_tensor_backend::Tensor k,
     mfq_tensor_backend::Tensor weights,
     int64_t query_offset,
-    int64_t ratio)
+    int64_t ratio,
+    mfq_tensor_backend::Tensor candidates)
 {
     MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
@@ -1150,33 +1460,99 @@ mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
             weights.size(2) == q.size(2) &&
             query_offset >= 0 && ratio > 0,
         "dsv4_indexer_scores: shape mismatch");
+    const bool indexed = candidates.defined();
+    if (indexed) MFQ_RUNTIME_CHECK(candidates.is_cuda() && candidates.is_contiguous() &&
+        candidates.device() == q.device() && candidates.scalar_type() == mfq_tensor_backend::kInt64 &&
+        candidates.dim() == 3 && candidates.size(0) == q.size(0) && candidates.size(1) == q.size(1),
+        "dsv4_indexer_scores: invalid candidate positions");
     const int B = static_cast<int>(q.size(0));
     const int M = static_cast<int>(q.size(1));
     const int K = static_cast<int>(k.size(1));
-    auto out = mfq_tensor_backend::empty({B, M, K}, q.options());
+    const int N = indexed ? static_cast<int>(candidates.size(2)) : K;
+    auto out = mfq_tensor_backend::empty({B, M, N}, q.options());
+    if (!N) return out;
+    // Dense scores are temporary F16 activations; candidate selection is unchanged.
+    if(indexed && q.size(2)==32 && M>=128 && K>512 &&
+       int64_t(M)*N>=2*1024*1024 && int64_t(N)*9>=int64_t(K)*4) {
+        auto dense=dsv4_indexer_scores_impl(q,k,weights,query_offset,ratio,{});
+        const dim3 gather_grid((N+511)/512,M,B);
+        const auto gather=[&](auto even_tag) {
+            dsv4_indexer_gather_scores_kernel<decltype(even_tag)::value><<<gather_grid,256,0,mfq_current_cuda_stream()>>>(
+                reinterpret_cast<const half*>(dense.data_ptr<mfq_half>()),
+                candidates.data_ptr<int64_t>(),reinterpret_cast<half*>(out.data_ptr<mfq_half>()),M,K,N);
+        };
+        if(N%2==0)gather(std::true_type{});else gather(std::false_type{});
+        const hipError_t gather_status=hipGetLastError();
+        MFQ_RUNTIME_CHECK(gather_status==hipSuccess,"dsv4_indexer_scores: candidate gather failed: ",hipGetErrorString(gather_status));
+        return out;
+    }
     const dim3 grid(
-        (K + kIndexerKeysPerTile - 1) / kIndexerKeysPerTile, M, B);
+        (N + kIndexerKeysPerTile - 1) / kIndexerKeysPerTile, M, B);
     const int indexer_heads = static_cast<int>(q.size(2));
-    const auto launch = [&](auto heads_tag) {
+    const auto launch = [&](auto heads_tag, auto indexed_tag) {
         constexpr int indexer_heads_static = decltype(heads_tag)::value;
-        dsv4_indexer_scores_kernel<indexer_heads_static><<<
+        if constexpr(indexer_heads_static==32 && !decltype(indexed_tag)::value) {
+            if(M>=128) {
+                if(query_offset==0 && M%4==0 && K==M/ratio && N==K && K>512) {
+                    const int64_t groups=M/4, first=(ratio-1)/4, step=ratio*kIndexerKeysPerTile/4;
+                    const int64_t key_tiles=(K+kIndexerKeysPerTile-1)/kIndexerKeysPerTile;
+                    const int64_t blocks=key_tiles*(groups-first)-step*key_tiles*(key_tiles-1)/2;
+                    MFQ_RUNTIME_CHECK(blocks>0 && blocks<=2147483647,"dsv4_indexer_scores: compact grid exceeds supported range");
+                    const hipError_t fill=hipMemsetD16Async(reinterpret_cast<hipDeviceptr_t>(out.data_ptr<mfq_half>()),0xfc00,static_cast<size_t>(out.numel()),mfq_current_cuda_stream());
+                    MFQ_RUNTIME_CHECK(fill==hipSuccess,"dsv4_indexer_scores: score fill failed: ",hipGetErrorString(fill));
+                    const dim3 compact_grid(static_cast<unsigned int>(blocks),1,B);
+        dsv4_indexer_compact_scores_kernel<indexer_heads_static, false, 4><<<
+            compact_grid, dim3(32, indexer_heads_static*4 / 8, 1), 0,
+            mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const half *>(q.data_ptr<mfq_half>()),
+            reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),
+            reinterpret_cast<const half *>(weights.data_ptr<mfq_half>()),
+            reinterpret_cast<half *>(out.data_ptr<mfq_half>()),
+            indexed ? candidates.data_ptr<int64_t>() : nullptr, N,
+            B, M, K, static_cast<int>(query_offset),
+            static_cast<int>(ratio),
+            1.0f / std::sqrt(
+                static_cast<float>(
+                    kIndexerDim * indexer_heads_static)));
+                    return;
+                }
+                const dim3 grouped_grid(grid.x,(M+3)/4,grid.z);
+        dsv4_indexer_grouped_scores_kernel<indexer_heads_static, false, 4><<<
+            grouped_grid, dim3(32, indexer_heads_static*4 / 4, 1), 0,
+            mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const half *>(q.data_ptr<mfq_half>()),
+            reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),
+            reinterpret_cast<const half *>(weights.data_ptr<mfq_half>()),
+            reinterpret_cast<half *>(out.data_ptr<mfq_half>()),
+            indexed ? candidates.data_ptr<int64_t>() : nullptr, N,
+            B, M, K, static_cast<int>(query_offset),
+            static_cast<int>(ratio),
+            1.0f / std::sqrt(
+                static_cast<float>(
+                    kIndexerDim * indexer_heads_static)));
+                return;
+            }
+        }
+        dsv4_indexer_scores_kernel<indexer_heads_static, decltype(indexed_tag)::value><<<
             grid, dim3(32, indexer_heads_static / 4, 1), 0,
             mfq_current_cuda_stream()>>>(
             reinterpret_cast<const half *>(q.data_ptr<mfq_half>()),
             reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),
             reinterpret_cast<const half *>(weights.data_ptr<mfq_half>()),
             reinterpret_cast<half *>(out.data_ptr<mfq_half>()),
+            indexed ? candidates.data_ptr<int64_t>() : nullptr, N,
             B, M, K, static_cast<int>(query_offset),
             static_cast<int>(ratio),
             1.0f / std::sqrt(
                 static_cast<float>(
                     kIndexerDim * indexer_heads_static)));
     };
-    if (indexer_heads == 32) {
-        launch(std::integral_constant<int, 32>{});
-    } else {
-        launch(std::integral_constant<int, 64>{});
-    }
+    const auto select_heads = [&](auto indexed_tag) {
+        if (indexer_heads == 32) launch(std::integral_constant<int, 32>{}, indexed_tag);
+        else launch(std::integral_constant<int, 64>{}, indexed_tag);
+    };
+    if (indexed) select_heads(std::true_type{});
+    else select_heads(std::false_type{});
     const hipError_t status = hipGetLastError();
     MFQ_RUNTIME_CHECK(
         status == hipSuccess,
@@ -1184,6 +1560,20 @@ mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
         hipGetErrorString(status));
     return out;
 }
+
+mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k,
+    mfq_tensor_backend::Tensor weights, int64_t query_offset, int64_t ratio) {
+    return dsv4_indexer_scores_impl(q, k, weights, query_offset, ratio, {});
+}
+
+mfq_tensor_backend::Tensor dsv4_indexer_candidate_scores_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k,
+    mfq_tensor_backend::Tensor weights, mfq_tensor_backend::Tensor candidates,
+    int64_t query_offset, int64_t ratio) {
+    return dsv4_indexer_scores_impl(q, k, weights, query_offset, ratio, candidates);
+}
+
 
 mfq_tensor_backend::Tensor dsv4_topk512_cuda(mfq_tensor_backend::Tensor scores) {
     MFQ_RUNTIME_CHECK(
@@ -1304,14 +1694,14 @@ std::vector<mfq_tensor_backend::Tensor> dsv4_build_decode_plan_cuda(
     return {indices, mask};
 }
 
-mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda(
+static mfq_tensor_backend::Tensor attention_dsv4_sparse_impl(
     mfq_tensor_backend::Tensor q,
     mfq_tensor_backend::Tensor kv,
     mfq_tensor_backend::Tensor indices,
     mfq_tensor_backend::Tensor mask,
     mfq_tensor_backend::Tensor sinks,
     mfq_tensor_backend::Tensor meta,
-    double scale)
+    double scale,mfq_tensor_backend::Tensor compressed)
 {
     MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
@@ -1339,8 +1729,47 @@ mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda(
             sinks.numel() == kHeads,
         "dsv4_sparse_attention: shape mismatch");
     auto cache = kv.unsqueeze(1);
+    auto secondary=compressed.defined()?compressed.unsqueeze(1):mfq_tensor_backend::Tensor{};
+    if (q.size(2) >= 256 && indices.size(2) >= 128 && !secondary.defined()) {
+        hipDeviceProp_t properties{};
+        MFQ_RUNTIME_CHECK(hipGetDeviceProperties(&properties, q.get_device()) == hipSuccess,
+            "dsv4_sparse_attention: device properties unavailable");
+        if (properties.warpSize == 64) {
+            return mfq_sparse_attn_mma::launch<
+                kHeadDim, kHeadDim, 1, 64, true>(
+                q, cache, cache, indices, mask, sinks, meta, scale,
+                "dsv4_sparse_attention_prefill_wide");
+        }
+    }
+    // Reuse each gathered KV tile across more heads on larger prompt batches.
+    // Keep the smaller head group for decode and short prompt batches.
+    if (q.size(2) >= 128 && !secondary.defined()) {
+        return mfq_sparse_attn_mma::launch<
+            kHeadDim, kHeadDim, 1, 32, true>(
+            q, cache, cache, indices, mask, sinks, meta, scale,
+            "dsv4_sparse_attention_prefill");
+    }
+    if(secondary.defined())return mfq_sparse_attn_mma::launch<
+        kHeadDim,kHeadDim,1,kHeadsPerTile,true,true>(
+        q,cache,cache,indices,mask,sinks,meta,scale,"dsv4_sparse_attention_split",
+        mfq_tensor_backend::Tensor{},false,mfq_tensor_backend::Tensor{},0,secondary);
     return mfq_sparse_attn_mma::launch<
         kHeadDim, kHeadDim, 1, kHeadsPerTile, true>(
         q, cache, cache, indices, mask, sinks, meta, scale,
         "dsv4_sparse_attention");
+}
+
+mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda(
+        mfq_tensor_backend::Tensor q,mfq_tensor_backend::Tensor kv,mfq_tensor_backend::Tensor indices,
+        mfq_tensor_backend::Tensor mask,mfq_tensor_backend::Tensor sinks,mfq_tensor_backend::Tensor meta,double scale) {
+    return attention_dsv4_sparse_impl(q,kv,indices,mask,sinks,meta,scale,{});
+}
+
+mfq_tensor_backend::Tensor attention_dsv4_sparse_split_cuda(
+        mfq_tensor_backend::Tensor q,mfq_tensor_backend::Tensor local,mfq_tensor_backend::Tensor compressed,
+        mfq_tensor_backend::Tensor indices,mfq_tensor_backend::Tensor mask,mfq_tensor_backend::Tensor sinks,
+        mfq_tensor_backend::Tensor meta,double scale) {
+    MFQ_RUNTIME_CHECK(compressed.is_cuda() && compressed.dim()==3 && compressed.size(0)==1 &&
+        compressed.size(1)>0 && compressed.size(2)==kHeadDim,"invalid compressed KV split");
+    return attention_dsv4_sparse_impl(q,local,indices,mask,sinks,meta,scale,compressed);
 }

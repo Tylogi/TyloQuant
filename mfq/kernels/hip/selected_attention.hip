@@ -2,20 +2,7 @@
 #include "hip/hip_runtime.h"
 // Shared dense and index-selected attention mechanics.
 #include "../hip/selected_attention.h"
-#ifndef __HIP_PLATFORM_AMD__
-#include "../hip/mfq_sparse_attn_mma_f16.cuh"
-#else
-// Sparse MMA attention builds on NVIDIA tensor-core tile paths; fail
-// loudly if a model graph selects it on HIP until an MFMA port exists.
-namespace mfq_sparse_attn_mma {
-template <int... IntArgs, typename... Args>
-mfq_tensor_backend::Tensor launch(Args&&...) {
-    MFQ_RUNTIME_CHECK(false,
-        "sparse MMA attention is not yet available on HIP");
-    return mfq_tensor_backend::Tensor{};
-}
-}  // namespace mfq_sparse_attn_mma
-#endif
+#include "mfq_sparse_attn_mma_f16.cuh"
 
 #include <cmath>
 #include <limits>
@@ -222,9 +209,8 @@ __global__ void sparse_attention_kernel(
     }
 }
 
-Tensor sparse(const Tensor& q, const Tensor& k, const Tensor& v,
-                        const Tensor& selected, double scale,
-                        bool v_is_k_view = false) {
+static Tensor sparse_impl(const Tensor& q,const Tensor& k,const Tensor& v,
+    const Tensor& selected,double scale,bool v_is_k_view,const Tensor& gate,bool half_output) {
     attention_shapes(q, k, v);
     MFQ_RUNTIME_CHECK(selected.defined() && selected.is_cuda() &&
         selected.device() == q.device() && selected.dim() == 3 &&
@@ -248,9 +234,9 @@ Tensor sparse(const Tensor& q, const Tensor& k, const Tensor& v,
     }
 
     const bool use_qsa_mma = !v_is_k_view && q.size(3) == 256;
-    const bool use_mla_mma = v_is_k_view && q.size(3) == 512;
+    const bool use_mla_mma = false;
     if (use_qsa_mma || use_mla_mma) {
-        constexpr int index_tile = 32;
+        constexpr int index_tile = 64;
         const int64_t source_count = indices.size(2);
         MFQ_RUNTIME_CHECK(
             source_count <= std::numeric_limits<int>::max() - index_tile &&
@@ -280,13 +266,18 @@ Tensor sparse(const Tensor& q, const Tensor& k, const Tensor& v,
             static_cast<int>(key.size(2)));
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         if (use_qsa_mma) {
+            if(query.size(2)>=128 && query.size(1)==24 && key.size(1)==2) {
+                hipDeviceProp_t properties{};
+                MFQ_CUDA_CHECK(hipGetDeviceProperties(&properties,query.get_device()));
+                if(std::strncmp(properties.gcnArchName,"gfx942",6)==0)
+                    return mfq_sparse_attn_mma::launch<256,256,1,16,false,false,true>(
+                        query,key,value,safe_indices,mask,Tensor{},Tensor{},scale,"qwen4_sparse_compact_lds",gate,half_output);
+            }
             return mfq_sparse_attn_mma::launch<256, 256, 1, 16, false>(
                 query, key, value, safe_indices, mask, Tensor{}, Tensor{},
-                scale, "qwen4_sparse_gqa_attention");
+                scale, "qwen4_sparse_gqa_attention",gate,half_output);
         }
-        return mfq_sparse_attn_mma::launch<512, 512, 1, 16, true>(
-            query, key, key, safe_indices, mask, Tensor{}, Tensor{},
-            scale, "glm5_sparse_mla_attention");
+        MFQ_RUNTIME_CHECK(false, "unsupported HIP sparse attention geometry");
     }
 
     auto output = tb::empty({q.size(0), q.size(2), q.size(1), q.size(3)},
@@ -308,6 +299,31 @@ Tensor sparse(const Tensor& q, const Tensor& k, const Tensor& v,
     #undef MFQ_LAUNCH_SPARSE
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+// Retain the existing sparse ABI; only the explicit gated entry fuses fixup.
+Tensor sparse(const Tensor& q,const Tensor& k,const Tensor& v,
+    const Tensor& selected,double scale,bool v_is_k_view=false) {
+    return sparse_impl(q,k,v,selected,scale,v_is_k_view,Tensor{},false);
+}
+
+static bool qsa_gated_gfx942(int device) {
+    static thread_local int previous=-1;static thread_local bool supported=false;
+    if(previous!=device){hipDeviceProp_t properties{};MFQ_CUDA_CHECK(hipGetDeviceProperties(&properties,device));
+        supported=std::strncmp(properties.gcnArchName,"gfx942",6)==0;previous=device;}
+    return supported;
+}
+
+Tensor sparse_gated(const Tensor& q,const Tensor& k,const Tensor& v,
+    const Tensor& selected,double scale,const Tensor& gate,bool half_output) {
+    attention_shapes(q,k,v);values({&q,&gate});
+    MFQ_RUNTIME_CHECK(gate.sizes().vec()==std::vector<int64_t>({q.size(0),q.size(2),q.size(1),q.size(3)}),
+        "sparse attention gate shape disagrees");
+    if(q.size(2)!=1 || q.size(1)!=24 || k.size(1)!=2 || q.size(3)!=256 ||
+        !q.size(0) || !k.size(2) ||
+        !(gate.scalar_type()==tb::kFloat16 || gate.scalar_type()==tb::kFloat32) || !qsa_gated_gfx942(q.get_device()))
+        return gated(sparse(q,k,v,selected,scale,false),gate,half_output);
+    return sparse_impl(q,k,v,selected,scale,false,gate,half_output);
 }
 
 __global__ void attention_gated_kernel(const void* attended, bool half_input,
@@ -436,6 +452,67 @@ __global__ void mma_reduce_gate_kernel(const float* partial, const float2* metad
     }
 }
 
+template<bool Tail33>
+__global__ void mma_reduce_gate_parallel_kernel(const float* partial,const float2* metadata,const void* gate,void* output,
+ int64_t gate_batch,int64_t gate_head,int64_t gate_column,int total_blocks,int parts,bool float_gate,bool half_output,bool double_sigmoid){
+ const int tid=threadIdx.x,head=blockIdx.x%24,batch=blockIdx.x/24;
+ const int tile_id=batch*2+head/12,local=head%12,first=tile_id*parts;
+ const size_t output_base=size_t(batch*24+head)*256;
+ const float* contributions=reinterpret_cast<const float*>(metadata)+size_t(total_blocks)*64;
+ __shared__ float factors[32+(Tail33?1:0)],denominator,values[4096],merged[256];
+ if(tid<32){
+  float2 stats=make_float2(-INFINITY,0.f);
+  if(tid<parts){const int index=first+tid;stats=metadata[(size_t(index)+(tid==parts-1?0:total_blocks))*16+local];}
+  float2 extra=make_float2(-INFINITY,0.f);
+  if constexpr(Tail33)extra=metadata[size_t(first+parts-1)*16+local];
+  float peak=stats.x;if constexpr(Tail33)peak=fmaxf(peak,extra.x);
+  #pragma unroll
+  for(int shift=16;shift;shift/=2)peak=fmaxf(peak,__shfl_xor(peak,shift,32));
+  const float difference=stats.x-peak;
+  const float factor=stats.y>0.f && difference>=-20.f?expf(difference):0.f;
+  factors[tid]=factor;float sum=factor*stats.y;
+  if constexpr(Tail33)if(tid==0){const float difference=extra.x-peak;
+   const float tail_factor=extra.y>0.f && difference>=-20.f?expf(difference):0.f;
+   factors[32]=tail_factor;sum+=tail_factor*extra.y;
+  }
+  #pragma unroll
+  for(int shift=16;shift;shift/=2){const float other=__shfl_down(sum,shift,32);if(tid<shift)sum+=other;}
+  if(!tid)denominator=sum;
+ }
+ __syncthreads();
+ const int part=tid/32,column_group=(tid&31)*4;const float factor=factors[part];
+ #pragma unroll
+ for(int base=0;base<256;base+=128){
+  float4 data=make_float4(0.f,0.f,0.f,0.f);
+  if(part<parts){const float* source=part==parts-1?partial+output_base:contributions+(size_t(first+part)*16+local)*256;data=*reinterpret_cast<const float4*>(source+base+column_group);}
+  float4 weighted=make_float4(data.x*factor,data.y*factor,data.z*factor,data.w*factor);
+  if constexpr(Tail33)if(part==0){const float4 tail=*reinterpret_cast<const float4*>(partial+output_base+base+column_group);
+   weighted.x+=tail.x*factors[32];weighted.y+=tail.y*factors[32];
+   weighted.z+=tail.z*factors[32];weighted.w+=tail.w*factors[32];
+  }
+  values[part*128+(column_group^part)]=weighted.x;
+  values[part*128+((column_group+1)^part)]=weighted.y;
+  values[part*128+((column_group+2)^part)]=weighted.z;
+  values[part*128+((column_group+3)^part)]=weighted.w;
+  __syncthreads();
+  const int lane=tid&31,warp=tid>>5;
+  #pragma unroll
+  for(int j=0;j<4;++j){const int column=warp*4+j;float sum=values[lane*128+(column^lane)];
+   #pragma unroll
+   for(int shift=16;shift;shift/=2){const float other=__shfl_down(sum,shift,32);if(lane<shift)sum+=other;}
+   if(!lane)merged[base+column]=sum;
+  }
+  __syncthreads();
+ }
+ if(tid<256){
+  const float result=denominator!=0.f?merged[tid]/denominator:0.f;
+  const auto gi=int64_t(batch)*gate_batch+int64_t(head)*gate_head+int64_t(tid)*gate_column;
+  const float g=float_gate?static_cast<const float*>(gate)[gi]:__half2float(static_cast<const half*>(gate)[gi]);
+  const float value=apply_attention_gate(result,g,double_sigmoid);
+  if(half_output)static_cast<half*>(output)[output_base+tid]=__float2half_rn(value);else static_cast<float*>(output)[output_base+tid]=value;
+ }
+}
+
 Tensor mma_reduce_gated(const Tensor& partial,const Tensor& metadata,const Tensor& gate,
     bool half_output,int kv_heads,int total_blocks,int parts,int query_columns,int head_columns) {
     values({&partial,&metadata,&gate});
@@ -456,6 +533,17 @@ Tensor mma_reduce_gated(const Tensor& partial,const Tensor& metadata,const Tenso
     MFQ_RUNTIME_CHECK(shared+sizeof(float)<=48*1024,"MMA gate reduction shared memory exceeded");
     MfqCudaGuard guard(partial.device());
     auto output=tb::empty(partial.sizes(),partial.options().dtype(half_output?tb::kFloat16:tb::kFloat32));
+    if(tokens==1 && heads==24 && kv_heads==2 && width==256 && query_columns==1 && head_columns==16 &&
+        parts>1 && parts<=33 && qsa_gated_gfx942(partial.get_device())) {
+        const auto launch=[&]<bool Tail33>() {
+        mma_reduce_gate_parallel_kernel<Tail33><<<unsigned(output.numel()/width),1024,0,mfq_current_cuda_stream()>>>(
+            partial.data_ptr<float>(),reinterpret_cast<const float2*>(metadata.data_ptr<float>()),gate.data_ptr(),output.data_ptr(),
+            gate.stride(0),gate.stride(2),gate.stride(3),total_blocks,parts,gate.scalar_type()==tb::kFloat32,
+            half_output,gate.scalar_type()==tb::kFloat32&&!gate.is_contiguous());
+        };
+        if(parts==33)launch.template operator()<true>();else launch.template operator()<false>();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
+    }
     hipLaunchKernelGGL(( mma_reduce_gate_kernel), dim3(unsigned(output.numel()/width)),dim3(256),shared,mfq_current_cuda_stream(),
         partial.data_ptr<float>(),reinterpret_cast<const float2*>(metadata.data_ptr<float>()),
         gate.data_ptr(),output.data_ptr(),attention_layout(gate),int(tokens),int(heads),kv_heads,
@@ -465,9 +553,21 @@ Tensor mma_reduce_gated(const Tensor& partial,const Tensor& metadata,const Tenso
     return output;
 }
 
+Tensor causal(const Tensor& q,const Tensor& k,const Tensor& v,
+    const Tensor& positions,int64_t columns,double scale) {
+    attention_shapes(q,k,v);
+    MFQ_RUNTIME_CHECK(q.size(3)==128 && half_or_float(q) &&
+        k.scalar_type()==tb::kFloat16 && v.scalar_type()==tb::kFloat16,
+        "causal MFMA attention requires 128-wide F16/F32 queries and F16 KV");
+    MfqCudaGuard guard(q.device());
+    return mfq_sparse_attn_mma::launch<128,128,1,16,false>(
+        q,k,v,Tensor{},Tensor{},Tensor{},Tensor{},scale,"causal_gqa_mfma",
+        Tensor{},false,positions.contiguous(),columns);
+}
+
 Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
     const Tensor& positions, const Tensor& gate, int64_t columns, double scale,
-    bool half_output, bool fused_mma_gate, bool fused_mma_prepare) {
+    bool half_output, bool fused_mma_gate, bool fused_mma_prepare, bool consecutive_positions) {
     attention_shapes(q, k, v);
     values({&q, &gate});
     MFQ_RUNTIME_CHECK(gate.dim() == 4 && gate.size(0) == q.size(0) && gate.size(1) == q.size(2) &&
@@ -487,6 +587,23 @@ Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
     if (q.size(3) == 256) {
         auto key = k.to(tb::kFloat16).contiguous(), value = v.to(tb::kFloat16).contiguous();
         if (fused_mma_prepare && q.numel()) {
+            if(consecutive_positions && q.size(2)>=128 && q.size(1)==24 && key.size(1)==2) {
+                hipDeviceProp_t properties{};
+                MFQ_CUDA_CHECK(hipGetDeviceProperties(&properties,q.get_device()));
+                if(std::strncmp(properties.gcnArchName,"gfx942",6)==0) {
+                    if(q.size(0)==1 && q.size(2)==4096 && q.scalar_type()==tb::kFloat32 &&
+                            gate.scalar_type()==tb::kFloat32 && q.stride(3)==1 && gate.stride(3)==1 &&
+                            fused_mma_gate && !half_output){
+                        return mfq_sparse_attn_mma::launch<256,256,12,4,false>(
+                            q,key,value,Tensor{},Tensor{},Tensor{},Tensor{},scale,
+                            "causal_gqa_query12_np4",gate,false,cache_positions,columns);
+                    }
+                    auto attended=mfq_sparse_attn_mma::launch<256,256,4,4,false>(
+                        q,key,value,Tensor{},Tensor{},Tensor{},Tensor{},scale,
+                        "causal_gqa_query_tiles",fused_mma_gate?gate:Tensor{},half_output,cache_positions,columns);
+                    return fused_mma_gate?attended:gated(attended,gate,half_output);
+                }
+            }
             auto attended = mfq_sparse_attn_mma::launch<256, 256, 1, 16, false>(
                 q, key, value, Tensor{}, Tensor{}, Tensor{}, Tensor{}, scale,
                 "causal_gqa_attention_gate", fused_mma_gate ? gate : Tensor{}, half_output,
@@ -495,7 +612,7 @@ Tensor causal_gated(const Tensor& q, const Tensor& k, const Tensor& v,
         }
         // Prepare the original MMA query, safe indices and validity mask together.
         MFQ_RUNTIME_CHECK(columns <= INT_MAX - 32, "causal MMA index geometry exceeds 32 bits");
-        const int64_t padded_columns = ((columns + 31) / 32) * 32;
+        const int64_t padded_columns = ((columns + 63) / 64) * 64;
         auto query = tb::empty(q.sizes(), q.options().dtype(tb::kFloat32));
         auto indices = tb::empty({q.size(0), q.size(2), padded_columns}, q.options().dtype(tb::kInt32));
         auto mask = tb::empty(indices.sizes(), q.options().dtype(tb::kFloat16));
@@ -548,6 +665,13 @@ Tensor dense(const Tensor& query, const Tensor& key, const Tensor& value,
         query.size(2) <= count - offset, "attention query range is outside the cache");
     MFQ_RUNTIME_CHECK(std::isfinite(scale), "attention scale must be finite");
     MfqCudaGuard guard(query.device());
+    if(query.size(3)==256 && half_or_float(query) &&
+            key.scalar_type()==tb::kFloat16 && value.scalar_type()==tb::kFloat16) {
+        auto positions=tb::arange(query.size(2),query.options().dtype(tb::kInt64))+offset;
+        return mfq_sparse_attn_mma::launch<256,256,1,16,false>(
+            query,key.contiguous(),value.contiguous(),Tensor{},Tensor{},Tensor{},Tensor{},
+            scale,"qwen4_dense_causal_gqa",Tensor{},false,positions,count);
+    }
     const auto options = query.options().dtype(tb::kInt64);
     const auto kp = tb::arange(count, options).unsqueeze(0);
     const auto qp = tb::arange(query.size(2), options).unsqueeze(1) + offset;

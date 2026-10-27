@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <vector>
 
+mfq_tensor_backend::Tensor moe_router_gemv_cuda(
+    mfq_tensor_backend::Tensor input,mfq_tensor_backend::Tensor weight);
+
 std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     mfq_tensor_backend::Tensor logits, int64_t top_k, bool use_sigmoid, bool use_sqrt_softplus,
     bool normalize,
@@ -132,3 +135,10 @@ mfq_tensor_backend::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
     mfq_tensor_backend::Tensor output, mfq_tensor_backend::Tensor ids_dst,
     mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
     mfq_tensor_backend::Tensor tile_experts);
+
+mfq_tensor_backend::Tensor moe_dense_matmul_hip(const mfq_tensor_backend::Tensor&,
+    const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&);
+
+mfq_tensor_backend::Tensor moe_dense_swiglu_hip(const mfq_tensor_backend::Tensor&);
+mfq_tensor_backend::Tensor moe_dense_weighted_reduce_hip(const mfq_tensor_backend::Tensor&,
+    const mfq_tensor_backend::Tensor&);

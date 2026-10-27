@@ -117,7 +117,14 @@ def layer_mixers_from_config(config: Mapping[str, object]) -> tuple[str, ...]:
     """Return the backbone mixer schedule without validating anything else."""
 
     text = text_section(config)
-    return normalize_mixer_types(text.get("layers_block_type"), "layers_block_type")
+    raw = text.get("layers_block_type", text.get("layer_types"))
+    if raw is None and "hybrid_override_pattern" in text:
+        pattern = text["hybrid_override_pattern"]
+        labels = {"M": "linear_attention", "*": "full_attention", "-": "mlp", "E": "moe"}
+        if not isinstance(pattern, str) or not pattern or set(pattern) - labels.keys():
+            raise ValueError("hybrid_override_pattern must contain only M, *, -, E")
+        raw = [labels[item] for item in pattern]
+    return normalize_mixer_types(raw, "layers_block_type")
 
 
 def mtp_mixers_from_config(config: Mapping[str, object]) -> tuple[str, ...]:
@@ -370,7 +377,7 @@ class NemotronHConfig:
         head_dim = _positive(text.get("head_dim"), "head_dim")
         if heads % kv_heads:
             raise ValueError("Nemotron-H attention heads must divide into KV heads")
-        if heads * head_dim != hidden:
+        if heads * head_dim != hidden and "hybrid_override_pattern" not in text:
             raise ValueError(
                 f"Nemotron-H attention width {heads * head_dim} must equal hidden_size {hidden}"
             )
@@ -398,7 +405,7 @@ class NemotronHConfig:
                 f"Nemotron-H mamba expand {expand} disagrees with the inner width {inner}"
             )
         time_limit = tuple(
-            _float(value, "time_step_limit") for value in _sequence(text, "time_step_limit")
+            _float(value, "time_step_limit") for value in (_sequence(text, "time_step_limit") if "time_step_limit" in text else (0.0, float("inf")))
         )
         if len(time_limit) != 2 or not 0.0 <= time_limit[0] <= time_limit[1]:
             raise ValueError("Nemotron-H time_step_limit must be [low, high] with 0 <= low <= high")

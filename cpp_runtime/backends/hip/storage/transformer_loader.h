@@ -18,6 +18,8 @@ struct TransformerWeightLoader {
     const mfq::ModelSource& source;
     bool preserve_projection_boundaries = false;
     bool cpu_offloaded = false;
+    mutable std::shared_ptr<const QuantLinear> router_projection;
+    bool keep_quantized_router = false;
     std::size_t shared_gate_up_compatible_prefix = 2;
 
     bool has(const std::string& name) const;

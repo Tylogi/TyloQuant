@@ -1,3 +1,4 @@
+#include "runtime/decode_window.h"
 #include "hip/hip_runtime.h"
 #include "mfq_hip_activation_ops.h"
 #include "mfq_hip_quant_ops.h"
@@ -418,6 +419,15 @@ mfq_tensor_backend::Tensor nint_matmul(
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
     if (!w.q8_zero) {
+        const char* online=std::getenv("MFQ_HIP_NINT_ONLINE");
+        const bool online_size=w.out>=65536 ||
+            (w.out>=512 && uint64_t(w.out)*uint64_t(w.neuron_len)>=4ull*1024*1024);
+        if(M>8 && M<=32 && online_size && w.gs>=4 && w.gs<=64 && mfq::cuda::DecodeWindow::recording() &&
+                (!online || online[0]!='0'))
+            return profiler.measure("nint.matmul.online_f16",[&] {
+                return nint_matmul_online_f16_cuda(w.q_packed,w.row_q_bits,w.row_q_bit_offsets,
+                    w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,x,w.gs);
+            });
         if (M <= 8) {
             Workspace & ws = w.workspace(M);
             if (w.aligned_q8) {
@@ -428,6 +438,12 @@ mfq_tensor_backend::Tensor nint_matmul(
                         x, w.gs, ws.qx, ws.xscale);
                 });
             }
+            if(M>1 && ((w.uniform_qbits==5 && w.gs==28) ||
+                    (w.uniform_qbits==6 && (w.gs==24 || w.gs==28))))
+                return profiler.measure("nint.matmul.fixed_bits",[&] {
+                    return nint_matmul_fixed_bits_ws_cuda(w.q_packed,w.row_q_bits,w.row_q_bit_offsets,
+                        w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,x,w.gs,ws.qx,ws.xscale,w.uniform_qbits);
+                });
             if (M == 1 && w.fused_ok) {
                 return profiler.measure("nint.matmul.fused", [&]() {
                     return nint_matmul_fused_decode_cuda(
@@ -592,6 +608,10 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(
             });
         }
         return profiler.measure("nint.matmul.input_mul", [&]() {
+            if(x.size(0)>1 && ((w.uniform_qbits==5 && w.gs==28) ||
+                    (w.uniform_qbits==6 && (w.gs==24 || w.gs==28))))
+                return nint_matmul_input_mul_fixed_bits_ws_cuda(w.q_packed,w.row_q_bits,w.row_q_bit_offsets,
+                    w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,x,gate,mode,w.gs,ws.qx,ws.xscale,w.uniform_qbits);
             if (w.aligned_q8) {
                 return nint_matmul_input_mul_q8_ws_cuda(
                     w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
@@ -1410,6 +1430,8 @@ NintWeight to_device_nint(const NintCpu & c, bool cuda) {
     w.aggregate_bpw = c.aggregate_bpw;
     w.distribution_entropy = c.distribution_entropy;
     w.shape = c.shape;
+    w.uniform_qbits=c.row_q_bits.empty()?0:int(c.row_q_bits.front());
+    for(auto bit:c.row_q_bits)if(int(bit)!=w.uniform_qbits) {w.uniform_qbits=0;break;}
     w.aligned_q8 = c.gs % 4 == 0;
     for (size_t row = 0; row < c.row_q_bits.size(); ++row) {
         w.aligned_q8 = w.aligned_q8 && c.row_q_bits[row] == 8 &&

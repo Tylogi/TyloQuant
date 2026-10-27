@@ -5,6 +5,7 @@
 #include "mfq_hip_activation_ops.h"
 #include "mfq_hip_moe_ops.h"
 #include "mfq_hip_norm_ops.h"
+#include "mfq_hip_quant_ops.h"
 #include "storage/moe_expert_cache.h"
 
 #include <algorithm>
@@ -84,6 +85,9 @@ mfq_tensor_backend::Tensor FFN::forward_tensor_parallel_dense(CudaExecutionConte
                 if (activation_kind == mfq::models::GatedActivation::gelu) {
                     activation = gelu_mul_cuda(gate_output.contiguous(), up_output.contiguous());
                 } else if (limit > 0.0) {
+                    if(gate_output.scalar_type()==mfq_tensor_backend::kFloat16 &&
+                        up_output.scalar_type()==mfq_tensor_backend::kFloat16)
+                        return clipped_silu_mul_cuda(gate_output.contiguous(),up_output.contiguous(),limit);
                     auto clipped_gate = mfq_tensor_backend::clamp_max(
                         gate_output.to(mfq_tensor_backend::kFloat32), limit);
                     auto clipped_up = mfq_tensor_backend::clamp(
@@ -223,7 +227,9 @@ mfq_tensor_backend::Tensor FFN::forward_dense_f32_down_kld(CudaExecutionContext 
 mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                                              mfq_tensor_backend::Tensor x,
                                              MfqOptional<mfq_tensor_backend::Tensor> input_ids,
-                                             bool allow_important_neurons) const {
+                                             bool allow_important_neurons,
+                                             MfqOptional<mfq_tensor_backend::Tensor> router_bias) const {
+    const auto& effective_bias = router_bias.has_value() ? *router_bias : moe_router_bias;
     auto &profiler = execution.profiler;
     mfq_tensor_backend::Tensor xh;
     if (x.scalar_type() == mfq_tensor_backend::kFloat16) {
@@ -266,6 +272,112 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
         return profiler.measure("ffn.tensor_parallel",
                                 [&]() { return forward_tensor_parallel_dense(execution, xh); });
     }
+    if(is_moe && moe_ungated_experts) {
+        using Tensor=mfq_tensor_backend::Tensor;
+        MFQ_RUNTIME_CHECK(shared && moe_top_k>0 && (moe_router.defined() || moe_router_projection) &&
+            activation==mfq::models::MlpActivation::relu_squared,
+            "incomplete ungated MoE state");
+        auto flat=xh.reshape({-1,xh.size(-1)}).contiguous();
+        auto logits=moe_router_projection?moe_router_projection->forward(execution,flat.to(mfq_tensor_backend::kFloat32)):
+            mfq_tensor_backend::matmul(flat.to(mfq_tensor_backend::kFloat32),moe_router.transpose(0,1));
+        auto selected=moe_topk_cuda(logits.contiguous(),moe_top_k,moe_use_sigmoid,
+            moe_use_sqrt_softplus,moe_normalize,moe_delayed_softmax,
+            effective_bias.defined()?MfqOptional<Tensor>(effective_bias):mfq_nullopt,1e-20,moe_router_scale);
+        auto source=moe_latent_in.out()>0?moe_latent_in.forward(execution,flat):flat;
+        Tensor pairs;
+        if(moe_tq) {
+            MFQ_RUNTIME_CHECK(moe_tq->up && moe_tq->down && !moe_tq->gate,
+                "ungated TQ MoE requires Up and Down banks");
+            auto up=moe_tq->up->forward(source,selected[0]);
+            pairs=moe_tq->down->forward(relu_squared_cuda(up.contiguous()),selected[0]);
+        } else if(moe_dense_up.defined()) {
+            MFQ_RUNTIME_CHECK(moe_dense_down.defined() && !moe_dense_gate.defined(),
+                "ungated dense MoE requires Up and Down banks");
+            auto up=moe_dense_matmul_hip(moe_dense_up,source,selected[0]);
+            pairs=moe_dense_matmul_hip(moe_dense_down,relu_squared_cuda(up.contiguous()),selected[0]);
+        } else {
+            MFQ_RUNTIME_CHECK(moe_up.n_experts>0 && !moe_gate.n_experts && !moe_gate_up.n_experts,
+                "ungated packed MoE requires Up and Down banks");
+            auto plan=build_moe_route_plan(selected[0],moe_up.n_experts);
+            moe_up.prefetch(plan);moe_down.prefetch(plan);
+            std::optional<MfeWeight> staged_up,staged_down;
+            if(cpu_moe_up)staged_up=stage_cpu_mixed_moe(cpu_moe_up,execution.config);
+            auto up=(staged_up?*staged_up:moe_up).forward(execution,source,plan);
+            auto hidden=relu_squared_cuda(up.contiguous());
+            if(cpu_moe_down)staged_down=stage_cpu_mixed_moe(cpu_moe_down,execution.config);
+            pairs=(staged_down?*staged_down:moe_down).forward(execution,hidden,plan);
+        }
+        auto routed=moe_dense_weighted_reduce_hip(pairs,selected[1]);
+        if(moe_latent_out.out()>0)routed=moe_latent_out.forward(execution,routed);
+        auto shared_output=shared->forward(execution,xh).reshape(routed.sizes()).to(mfq_tensor_backend::kFloat16);
+        return (routed+shared_output).reshape(xh.sizes());
+    }
+    if(is_moe && (moe_tq || moe_dense_up.defined() || moe_dense_gate.defined() || moe_dense_down.defined())) {
+        using Tensor=mfq_tensor_backend::Tensor;
+        MFQ_RUNTIME_CHECK(shared && moe_top_k>0 && (moe_router.defined() || moe_router_projection),
+            "incomplete standard-bank MoE state");
+        MFQ_RUNTIME_CHECK(!moe_gate.n_experts && !moe_up.n_experts && !moe_gate_up.n_experts && !moe_down.n_experts,
+            "standard routed banks cannot be mixed with MFE projections");
+        auto flat=xh.reshape({-1,xh.size(-1)}).contiguous();
+        const bool native_router=execution.kl_mmq.mode==KlMmqMode::Default && flat.size(0)==1 &&
+            flat.scalar_type()==mfq_tensor_backend::kFloat16 && moe_router.defined() &&
+            moe_router.scalar_type()==mfq_tensor_backend::kFloat32 && moe_router.is_contiguous() &&
+            moe_router.dim()==2 && moe_router.size(0)==384 && moe_router.size(1)==flat.size(1) && flat.size(1)%4==0;
+        auto logits=moe_router_projection?moe_router_projection->forward(execution,flat.to(mfq_tensor_backend::kFloat32)):
+            native_router?moe_router_gemv_cuda(flat,moe_router):
+            mfq_tensor_backend::matmul(flat.to(mfq_tensor_backend::kFloat32),moe_router.transpose(0,1));
+        std::vector<Tensor> selected;
+        if(moe_hash_ids.defined()) {
+            MFQ_RUNTIME_CHECK(input_ids.has_value(),"hash-routed MoE requires current token ids");
+            auto ids=moe_hash_ids.index_select(0,input_ids.value().reshape({-1}).to(mfq_tensor_backend::kCUDA,mfq_tensor_backend::kInt64))
+                .to(mfq_tensor_backend::kInt32).contiguous();
+            selected={ids,moe_sqrtsoftplus_weights_cuda(logits.contiguous(),ids,1e-20,moe_router_scale)};
+        } else selected=moe_topk_cuda(logits.contiguous(),moe_top_k,moe_use_sigmoid,moe_use_sqrt_softplus,
+            moe_normalize,moe_delayed_softmax,effective_bias.defined()?MfqOptional<Tensor>(effective_bias):mfq_nullopt,
+            1e-20,moe_router_scale);
+        auto source=moe_latent_in.out()>0?moe_latent_in.forward(execution,flat):flat;
+        Tensor routed,pairs;
+        int experts=0;
+        if(moe_tq) {
+            MFQ_RUNTIME_CHECK(moe_tq->gate && moe_tq->up && moe_tq->down && !moe_dense_up.defined() &&
+                !moe_dense_gate.defined() && !moe_dense_down.defined(),"gated TQ MoE requires three matching banks");
+            experts=int(moe_tq->up->experts);
+            if(!geglu && execution.config.moe_route_stats_path.empty())
+                routed=moe_tq->forward(source,selected[0],selected[1],float(swiglu_limit));
+            else {
+                auto gate=moe_tq->gate->forward(source,selected[0]);
+                auto up=moe_tq->up->forward(source,selected[0]);
+                auto hidden=geglu?gelu_mul_cuda(gate.contiguous(),up.contiguous()):
+                    swiglu_limit>0?clipped_silu_mul_cuda(gate.contiguous(),up.contiguous(),swiglu_limit):
+                    (up*mfq_tensor_backend::silu(gate)).contiguous();
+                pairs=moe_tq->down->forward(hidden,selected[0]);
+                routed=moe_dense_weighted_reduce_hip(pairs,selected[1]);
+            }
+        } else {
+            MFQ_RUNTIME_CHECK(moe_dense_gate.defined() && moe_dense_up.defined() && moe_dense_down.defined(),
+                "gated dense MoE requires Gate, Up and Down banks");
+            experts=int(moe_dense_up.size(0));
+            auto gate=moe_dense_matmul_hip(moe_dense_gate,source,selected[0]);
+            auto up=moe_dense_matmul_hip(moe_dense_up,source,selected[0]);
+            Tensor hidden;
+            if(geglu)hidden=gelu_mul_cuda(gate.contiguous(),up.contiguous());
+            else if(swiglu_limit>0) {
+                auto g=mfq_tensor_backend::clamp_max(gate.to(mfq_tensor_backend::kFloat32),swiglu_limit);
+                auto u=mfq_tensor_backend::clamp(up.to(mfq_tensor_backend::kFloat32),-swiglu_limit,swiglu_limit);
+                hidden=(mfq_tensor_backend::silu(g)*u).to(mfq_tensor_backend::kFloat16).contiguous();
+            } else hidden=(up*mfq_tensor_backend::silu(gate)).contiguous();
+            pairs=moe_dense_matmul_hip(moe_dense_down,hidden,selected[0]);
+            routed=moe_dense_weighted_reduce_hip(pairs,selected[1]);
+        }
+        if(pairs.defined())record_moe_route_stats(execution,moe_layer,selected[0],selected[1],pairs,experts);
+        if(moe_latent_out.out()>0)routed=moe_latent_out.forward(execution,routed);
+        auto shared_output=shared->forward(execution,flat).reshape(routed.sizes()).to(mfq_tensor_backend::kFloat16).contiguous();
+        routed=routed.to(mfq_tensor_backend::kFloat16).contiguous();
+        auto output=moe_shared_ungated?acc_cuda(routed,shared_output):
+            moe_add_shared_gate_cuda(routed,shared_output,
+                mfq_tensor_backend::matmul(flat.to(mfq_tensor_backend::kFloat32),moe_shared_gate.transpose(0,1)).contiguous());
+        return output.reshape(xh.sizes());
+    }
     if (is_moe) {
         const int64_t rows = xh.numel() / xh.size(-1);
         if (execution.continuous_batch_cache_serial && uses_moe_expert_cache() && rows > 1) {
@@ -291,7 +403,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
             }
             return mfq_tensor_backend::cat(outputs, 0).reshape(xh.sizes());
         }
-        if (!shared || moe_top_k <= 0 || !moe_router.defined() ||
+        if (!shared || moe_top_k <= 0 || (!moe_router.defined() && !moe_router_projection) ||
             (!moe_shared_ungated && !moe_shared_gate.defined())) {
             throw std::runtime_error("incomplete MoE FFN state");
         }
@@ -338,7 +450,8 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
         return mfq::models::mixture_of_experts(
             [&] {
                 return profiler.measure("moe.router", [&]() {
-                    return mfq_tensor_backend::matmul(xf32, moe_router.transpose(0, 1));
+                    return moe_router_projection?moe_router_projection->forward(execution,xf32):
+                        mfq_tensor_backend::matmul(xf32, moe_router.transpose(0, 1));
                 });
             },
             [&](Tensor router_logits) {
@@ -363,8 +476,8 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                         return moe_topk_cuda(
                             router_logits.contiguous(), moe_top_k, moe_use_sigmoid,
                             moe_use_sqrt_softplus, moe_normalize, moe_delayed_softmax,
-                            moe_router_bias.defined()
-                                ? MfqOptional<mfq_tensor_backend::Tensor>(moe_router_bias)
+                            effective_bias.defined()
+                                ? MfqOptional<mfq_tensor_backend::Tensor>(effective_bias)
                                 : mfq_nullopt,
                             1e-20, moe_router_scale);
                     });
@@ -600,6 +713,11 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
     }
     using Tensor = mfq_tensor_backend::Tensor;
     using Activation = mfq::models::GatedActivation;
+    if(activation==mfq::models::MlpActivation::relu_squared) {
+        auto parts=gate_up.forward(execution,xh);
+        MFQ_RUNTIME_CHECK(parts.size()==1,"relu-squared FFN requires one Up projection");
+        return down.forward(execution,relu_squared_cuda(parts[0].contiguous()));
+    }
     return mfq::models::gated_mlp(
         xh, geglu, swiglu_limit,
         [&](const Tensor &input, Activation activation, double limit) -> std::optional<Tensor> {
@@ -619,6 +737,23 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
             return {};
         },
         [&](const Tensor &input, Activation activation, double limit) -> std::optional<Tensor> {
+            if(activation==Activation::silu && limit>0.0 && execution.config.ffn_swiglu_fusion &&
+               execution.kl_mmq.mode==KlMmqMode::Default && input.is_cuda() &&
+               input.scalar_type()==mfq_tensor_backend::kFloat16 && input.numel()==input.size(-1) &&
+               gate_up.layers.size()==2 && gate_up.layers[0].is_mxfp8() && gate_up.layers[1].is_mxfp8() &&
+               !gate_up.layers[0].tensor_parallel() && !gate_up.layers[1].tensor_parallel()) {
+                const auto& gate=gate_up.layers[0].mxfp8.weight;
+                const auto& up=gate_up.layers[1].mxfp8.weight;
+                if(gate.out==up.out && gate.out>1280 && gate.out%8==0 &&
+                   gate.neuron_len==up.neuron_len && gate.neuron_len==input.size(-1) &&
+                   gate.values.device()==input.device() && up.values.device()==input.device()) {
+                    return profiler.measure("ffn.mxfp8_gate_up_clipped", [&] {
+                        auto shape=input.sizes().vec();shape.back()=gate.out;
+                        return mxfp8_gate_up_clipped_swiglu_cuda(gate.values,gate.scales,up.values,up.scales,
+                            input.reshape({1,input.size(-1)}).contiguous(),limit).reshape(shape);
+                    });
+                }
+            }
             if(limit<=0.0 && activation==Activation::silu && execution.config.ffn_swiglu_fusion &&
                input.numel()==input.size(-1) && gate_up.layers.size()==2 &&
                gate_up.layers[0].is_tq() && gate_up.layers[1].is_tq() &&
@@ -648,6 +783,10 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                     "ffn.geglu", [&] { return gelu_mul_cuda(gate.contiguous(), up.contiguous()); });
             if (limit > 0.0)
                 return profiler.measure("ffn.swiglu_clamped", [&] {
+                    if(execution.config.ffn_swiglu_fusion && gate.is_cuda() &&
+                       gate.scalar_type()==mfq_tensor_backend::kFloat16 &&
+                       up.scalar_type()==mfq_tensor_backend::kFloat16)
+                        return clipped_silu_mul_cuda(gate.contiguous(),up.contiguous(),limit);
                     auto g =
                         mfq_tensor_backend::clamp_max(gate.to(mfq_tensor_backend::kFloat32), limit);
                     auto u = mfq_tensor_backend::clamp(up.to(mfq_tensor_backend::kFloat32), -limit,
@@ -730,6 +869,16 @@ mfq_tensor_backend::Tensor FFN::forward(CudaExecutionContext &execution,
                                         mfq_tensor_backend::Tensor x,
                                         MfqOptional<mfq_tensor_backend::Tensor> input_ids) const {
     return forward_impl(execution, std::move(x), input_ids, true);
+}
+
+mfq_tensor_backend::Tensor FFN::forward_with_router_bias(CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x,mfq_tensor_backend::Tensor input_ids,
+        const mfq_tensor_backend::Tensor& bias) const {
+    MFQ_RUNTIME_CHECK(is_moe && !moe_hash_ids.defined() && bias.defined() &&
+        ((bias.dim()==1 && bias.size(0)==(moe_router_projection?moe_router_projection->out():moe_router.size(0))) ||
+         (bias.dim()==2 && bias.size(0)==x.numel()/x.size(-1) && bias.size(1)==(moe_router_projection?moe_router_projection->out():moe_router.size(0)))),
+                      "MoE router correction bias shape mismatch");
+    return forward_impl(execution,std::move(x),std::move(input_ids),true,bias);
 }
 
 void prepare_ffn_workspaces(CudaExecutionContext &execution, FFN &f) {

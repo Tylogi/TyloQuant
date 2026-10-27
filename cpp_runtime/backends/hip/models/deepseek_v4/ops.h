@@ -76,17 +76,28 @@ struct Dsv4RopeTable {
 inline mfq_tensor_backend::Tensor dsv4_rotate_rope_tail(mfq_tensor_backend::Tensor x,
                                                         mfq_tensor_backend::Tensor positions,
                                                         const Dsv4RopeTable &table,
-                                                        bool inverse = false) {
+                                                        bool inverse = false,
+                                                        bool float_output = false,
+                                                        bool token_major = false) {
     if (x.dim() != 4 || x.size(-1) < 64) {
         throw std::runtime_error("DeepSeek V4 RoPE expects contiguous [B,H,T,D>=64]");
     }
     const int64_t width = x.size(-1);
+    if (x.is_cuda() && x.numel() > 0 && x.stride(3) == 1 && width % 2 == 0 &&
+        (x.scalar_type() == mfq_tensor_backend::kFloat16 ||
+         x.scalar_type() == mfq_tensor_backend::kFloat32)) {
+        return dsv4_tail_rope_cuda(
+            x, positions.contiguous().to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64),
+            table.cos, inverse ? table.negative_sin : table.sin, 64, float_output, token_major);
+    }
+    if (float_output) x = x.to(mfq_tensor_backend::kFloat32);
     auto head = x.slice(-1, 0, width - 64).contiguous();
     auto tail = x.slice(-1, width - 64, width).contiguous();
     auto rotated = glm_interleaved_rope_cuda(
         tail, positions.contiguous().to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64),
         table.cos, inverse ? table.negative_sin : table.sin, 64);
-    return mfq_tensor_backend::cat({head, rotated}, -1).contiguous();
+    auto output = mfq_tensor_backend::cat({head, rotated}, -1).contiguous();
+    return token_major ? output.transpose(1, 2).contiguous() : output;
 }
 
 inline std::vector<mfq_tensor_backend::Tensor>
