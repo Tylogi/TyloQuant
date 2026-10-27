@@ -751,6 +751,52 @@ __global__ __launch_bounds__(256) void ple_gate_norm_hip_kernel(
         normalized[base+c]=__fmul_rn(__fmul_rn(gated[base+c],inverse),1.f+weight[stream*hidden+c]);
 }
 
+// Reuse dilation-spaced PP tap windows and four adjacent channels.
+template<int Taps,int Tile>__global__ __launch_bounds__(256) void ple_conv_tiled_hip_kernel(
+ const float* input,const float* weight,const float* previous,const float* gated,
+ float* output,float* next,int tokens,int channels,int dilation) {
+ const int c=(blockIdx.x*256+threadIdx.x)*4;
+ if(c>=channels)return;
+ const int batch=blockIdx.z,history=(Taps-1)*dilation;
+ const int start=(blockIdx.y/dilation)*Tile*dilation+blockIdx.y%dilation;
+ if(start>=tokens)return;
+ const size_t base=size_t(batch)*tokens*channels,old_base=size_t(batch)*history*channels;
+ float4 weights[Taps],window[Taps];
+ #pragma unroll
+ for(int tap=0;tap<Taps;++tap) {
+  float4 w;
+  w.x=weight[c*Taps+tap];w.y=weight[(c+1)*Taps+tap];
+  w.z=weight[(c+2)*Taps+tap];w.w=weight[(c+3)*Taps+tap];weights[tap]=w;
+  if(tap<Taps-1){
+   const int t=start-history+tap*dilation;
+   window[tap]=t>=0?*reinterpret_cast<const float4*>(input+base+size_t(t)*channels+c):
+    previous?*reinterpret_cast<const float4*>(previous+old_base+size_t(t+history)*channels+c):float4{};
+  }
+ }
+ #pragma unroll
+ for(int step=0;step<Tile;++step) {
+  const int t=start+step*dilation;if(t>=tokens)break;
+  const size_t at=base+size_t(t)*channels+c;
+  window[Taps-1]=*reinterpret_cast<const float4*>(input+at);
+  float4 sum{};
+  #pragma unroll
+  for(int tap=0;tap<Taps;++tap) {
+   #define ACC(F) sum.F=__fadd_rn(sum.F,__fmul_rn(window[tap].F,weights[tap].F))
+   ACC(x);ACC(y);ACC(z);ACC(w);
+   #undef ACC
+  }
+  const auto g=*reinterpret_cast<const float4*>(gated+at);
+  float4 result;
+  #define FINISH(F) result.F=__fadd_rn(g.F,__fmul_rn(sum.F,1.f/(1.f+expf(-sum.F))))
+  FINISH(x);FINISH(y);FINISH(z);FINISH(w);
+  #undef FINISH
+  *reinterpret_cast<float4*>(output+at)=result;
+  if(t>=tokens-history)*reinterpret_cast<float4*>(next+old_base+size_t(t-(tokens-history))*channels+c)=window[Taps-1];
+  #pragma unroll
+  for(int tap=0;tap<Taps-1;++tap)window[tap]=window[tap+1];
+ }
+}
+
 // Read the causal history directly. Each element also writes its next-state
 // counterpart; no concatenation or intermediate tensor per convolution tap.
 template<class Input,class Output,bool Add>
@@ -786,6 +832,21 @@ __global__ void ple_conv_hip_kernel(const Input* input,const float* weight,
 template<class Input,class Output,bool Add>
 void launch_ple_conv(const Tensor& input,const Tensor& weight,const Tensor& previous,
     const Tensor& gated,Tensor& output,Tensor& next,int64_t dilation) {
+    if constexpr(std::is_same_v<Input,float> && std::is_same_v<Output,float> && Add) {
+        if(input.size(0)==1 && input.size(2)==10240 && weight.size(1)==4 && dilation==3 &&
+           (input.size(1)==2048 || input.size(1)==4096) && qsa_prefill_gfx942(input.get_device())) {
+            const int tokens=int(input.size(1));
+            if(tokens==2048)
+                ple_conv_tiled_hip_kernel<4,4><<<dim3(10,((tokens+11)/12)*3,1),256,0,mfq_current_cuda_stream()>>>(
+                    input.data_ptr<float>(),weight.data_ptr<float>(),previous.defined()?previous.data_ptr<float>():nullptr,
+                    gated.data_ptr<float>(),output.data_ptr<float>(),next.data_ptr<float>(),tokens,10240,3);
+            else
+                ple_conv_tiled_hip_kernel<4,8><<<dim3(10,((tokens+23)/24)*3,1),256,0,mfq_current_cuda_stream()>>>(
+                    input.data_ptr<float>(),weight.data_ptr<float>(),previous.defined()?previous.data_ptr<float>():nullptr,
+                    gated.data_ptr<float>(),output.data_ptr<float>(),next.data_ptr<float>(),tokens,10240,3);
+            MFQ_CUDA_CHECK(hipGetLastError());return;
+        }
+    }
     const int64_t count=std::max(output.numel(),next.numel());
     if(!count)return;
     const int blocks=int(std::min<int64_t>((count+255)/256,65535));
