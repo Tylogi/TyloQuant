@@ -2168,6 +2168,18 @@ mfq_tensor_backend::Tensor moe_router_gemv_cuda(
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
 }
 
+static bool moe_topk512_pp_supported(int device) {
+    static thread_local int cached_device=-1;
+    static thread_local bool supported=false;
+    if(cached_device!=device) {
+        hipDeviceProp_t properties{};
+        MFQ_CUDA_CHECK(hipGetDeviceProperties(&properties,device));
+        supported=std::strncmp(properties.gcnArchName,"gfx942",6)==0;
+        cached_device=device;
+    }
+    return supported;
+}
+
 std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
         mfq_tensor_backend::Tensor logits,
         int64_t top_k,
@@ -2242,6 +2254,17 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
     }
     const char* topk512_flag = std::getenv("MFQ_MOE_TOPK_512");
     const auto* topk512_batch = std::getenv("MFQ_MOE_TOPK_512_BATCH");
+    // Four logical32-lane rows share two complete physical CDNA waves.
+    if (!disable_topk_sort && (rows==2048 || rows==4096) && experts==512 && top_k==10 &&
+            logits.scalar_type()==mfq_tensor_backend::kFloat16 && bias_ptr==nullptr &&
+            !use_sigmoid && !use_sqrt_softplus && normalize && !delayed_softmax &&
+            (topk512_flag==nullptr || std::atoi(topk512_flag)!=0) &&
+            moe_topk512_pp_supported(logits.get_device())) {
+        hipLaunchKernelGGL((topk512_specialized_kernel<mfq_half,true,false,4>),
+            dim3(rows/4),dim3(32,4),0,stream,logits.data_ptr<mfq_half>(),ids.data_ptr<int32_t>(),
+            weights.data_ptr<float>(),static_cast<float>(norm_floor),static_cast<float>(scale));
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return {ids,weights};
+    }
     if ((rows == 1 || (rows <= 6 && (!topk512_batch || topk512_batch[0] != '0'))) &&
             experts == 512 && top_k == 10 && bias_ptr == nullptr &&
             !use_sigmoid && !use_sqrt_softplus && normalize && !delayed_softmax &&

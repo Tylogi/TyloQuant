@@ -2,14 +2,14 @@
 #include <hip/hip_math_constants.h>
 // 512-expert, top-10, unbiased softmax routing. Keep MFQ's original
 // per-lane summation and shuffle-down normalization order.
-template <typename scalar_t, bool Sorted, bool Redux=false>
-__global__ void __launch_bounds__(32) topk512_specialized_kernel(
+template <typename scalar_t, bool Sorted, bool Redux=false,int RowsPerBlock=1>
+__global__ void __launch_bounds__(32*RowsPerBlock) topk512_specialized_kernel(
         const scalar_t* __restrict__ logits, int32_t* __restrict__ ids,
         float* __restrict__ weights, float floor, float scale) {
-    const int lane = threadIdx.x;
-    logits += size_t(blockIdx.x) * 512;
-    ids += size_t(blockIdx.x) * 10;
-    weights += size_t(blockIdx.x) * 10;
+    const int lane = threadIdx.x,row=blockIdx.x*RowsPerBlock+threadIdx.y;
+    logits += size_t(row) * 512;
+    ids += size_t(row) * 10;
+    weights += size_t(row) * 10;
     float values[16];
     float maximum = -INFINITY;
 #pragma unroll
