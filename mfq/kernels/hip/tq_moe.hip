@@ -8,6 +8,7 @@
 #include <cmath>
 #include <climits>
 #include <type_traits>
+#include <cstring>
 #include "mfq_hip_compat.h"
 #include "tq_moe.h"
 #include "tq_vector.h"
@@ -1005,6 +1006,27 @@ template<int DT>__global__ void reduce(const S<DT>* pairs,const float* weights,S
     }
 }
 
+// Retain the original route sum order while loading/storing sixteen F16 columns.
+__global__ void reduce_vector16(const half* pairs,const float* weights,half* output,int tokens,int rows){
+ constexpr int V=16;
+ using Packed=uint16_t __attribute__((ext_vector_type(V)));
+ const int vectors=rows/V;const int64_t total=int64_t(tokens)*vectors;
+ for(int64_t at=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;at<total;at+=int64_t(blockDim.x)*gridDim.x){
+  const int64_t token=at/vectors,col=(at%vectors)*V;float sums[V]{};
+  #pragma unroll 1
+  for(int r=0;r<10;++r){
+   const Packed values=*reinterpret_cast<const Packed*>(pairs+(token*10+r)*rows+col);
+   const float coefficient=__ldg(weights+token*10+r);
+   #pragma unroll
+   for(int j=0;j<V;++j)sums[j]=__fadd_rn(sums[j],__fmul_rn(__half2float(__ushort_as_half(values[j])),coefficient));
+  }
+  Packed result;
+  #pragma unroll
+  for(int j=0;j<V;++j)result[j]=__half_as_ushort(__float2half_rn(sums[j]));
+  *reinterpret_cast<Packed*>(output+token*rows+col)=result;
+ }
+}
+
 template<int DT>struct EmbeddingStore {
     S<DT>* output;int valid;
     __device__ __forceinline__ void operator()(int j,float a,float b) {
@@ -1168,9 +1190,33 @@ extern "C" int mfq_tq_moe_swiglu(ProjectionView gate,ProjectionView up,const voi
     TqMoeRoutePlan plan,int dtype,float limit,hipStream_t stream) {
     return mfq_tq_moe::launch<true>(gate,up,x,y,rows,plan,dtype,false,limit,stream);
 }
+namespace {
+bool tq_reduce_vector_supported() {
+    int device=-1;
+    if(hipGetDevice(&device)!=hipSuccess)return false;
+    static thread_local int cached_device=-1;
+    static thread_local bool supported=false;
+    if(cached_device!=device) {
+        hipDeviceProp_t properties{};
+        supported=hipGetDeviceProperties(&properties,device)==hipSuccess &&
+            std::strncmp(properties.gcnArchName,"gfx942",6)==0;
+        cached_device=device;
+    }
+    return supported;
+}
+}
 extern "C" int mfq_tq_moe_reduce(const void* pairs,const float* weights,void* output,int tokens,
     int routes,int rows,int dtype,hipStream_t stream) {
     if(!pairs || !weights || !output || tokens<1 || routes<1 || rows<1 || dtype<0 || dtype>2)return int(hipErrorInvalidValue);
+    if(dtype==0 && tokens>=1024 && (tokens==2048 || tokens==4096) &&
+       routes==10 && rows==2560 &&
+       ((reinterpret_cast<uintptr_t>(pairs)|reinterpret_cast<uintptr_t>(output))&31u)==0 &&
+       tq_reduce_vector_supported()) {
+        const int blocks=(int64_t(tokens)*(rows/16)+255)/256;
+        mfq_tq_moe::reduce_vector16<<<blocks,256,0,stream>>>(
+            static_cast<const half*>(pairs),weights,static_cast<half*>(output),tokens,rows);
+        return int(hipGetLastError());
+    }
     const int blocks=int(std::min<int64_t>(65535,(int64_t(tokens)*rows+255)/256));
     #define RUN(D) mfq_tq_moe::reduce<D><<<blocks,256,0,stream>>>(static_cast<const mfq_tq_cuda_exact::S<D>*>(pairs),weights,static_cast<mfq_tq_cuda_exact::S<D>*>(output),tokens,routes,rows)
     if(dtype==0){RUN(0);}else if(dtype==1){RUN(1);}else{RUN(2);}
