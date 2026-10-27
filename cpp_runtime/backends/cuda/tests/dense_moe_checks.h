@@ -112,14 +112,16 @@ void check_dense_gated_layouts() {
                     CudaExecutionContext execution;
                     auto shared = ffn->shared->forward(execution, flat).reshape({rows, g.hidden}).to(tb::kFloat16);
                     auto reduced = moe_weighted_reduce_cuda(down, selected[1]);
-                    auto expected = reduced + shared.to(reduced.scalar_type());
-                    require_dense_close(ffn->forward(execution, input), expected, dense_tolerance(dtype),
+                    // The FFN returns the activation dtype whatever the bank stores.
+                    auto expected = (reduced + shared.to(reduced.scalar_type())).to(input.scalar_type());
+                    const auto tolerance = std::max(dense_tolerance(dtype), dense_tolerance(input.scalar_type()));
+                    require_dense_close(ffn->forward(execution, input), expected, tolerance,
                                         "dense FFN activation and split banks");
                     if (!ffn->moe_ungated_experts) {
                         ffn->moe_dense_gate_up = tb::cat({gate, ffn->moe_dense_up}, 1).contiguous();
                         ffn->moe_dense_gate = Tensor();
                         ffn->moe_dense_up = Tensor();
-                        require_dense_close(ffn->forward(execution, input), expected, dense_tolerance(dtype),
+                        require_dense_close(ffn->forward(execution, input), expected, tolerance,
                                             "dense FFN combined Gate/Up bank");
                     }
                 }

@@ -495,7 +495,8 @@ mfq_tensor_backend::Tensor run_quant_linear_shard(
                 : local * mfq_tensor_backend::silu(local_gate);
         }
         return dense_projection(std::move(local), shard.dense)
-            .to(shard.native_output ? shard.dense.scalar_type() : x.scalar_type());
+            .to(shard.native_output ? shard.dense.scalar_type()
+                                    : dense_output_dtype(x.scalar_type(), shard.dense.scalar_type()));
     }
     MFQ_RUNTIME_CHECK(
         !gate.has_value(),
@@ -1902,9 +1903,14 @@ mfq_tensor_backend::Tensor QuantLinear::forward_tensor_parallel_flat(
         : reduced;
 }
 
+mfq_tensor_backend::ScalarType dense_output_dtype(
+        mfq_tensor_backend::ScalarType activation, mfq_tensor_backend::ScalarType weight) {
+    return activation == mfq_tensor_backend::kFloat32 ? weight : activation;
+}
+
 mfq_tensor_backend::Tensor dense_projection(
         mfq_tensor_backend::Tensor input, const mfq_tensor_backend::Tensor& weight) {
-    const auto output_dtype = input.scalar_type();
+    const auto output_dtype = dense_output_dtype(input.scalar_type(), weight.scalar_type());
     input = input.to(weight.scalar_type());
     const int64_t rows = input.numel() / input.size(-1);
     if (rows > 1 && rows <= 6) {
@@ -2020,7 +2026,8 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul(
         auto gated = mode == 1
             ? local * mfq_tensor_backend::sigmoid(local_gate)
             : local * mfq_tensor_backend::silu(local_gate);
-        return forward_dense(gated).to(native_output ? dense.scalar_type() : x.scalar_type());
+        return forward_dense(gated).to(native_output ? dense.scalar_type()
+                                                     : dense_output_dtype(x.scalar_type(), dense.scalar_type()));
     }
     MFQ_RUNTIME_CHECK(mode == 1 || mode == 2,
         "input gate mode must be sigmoid or SiLU");

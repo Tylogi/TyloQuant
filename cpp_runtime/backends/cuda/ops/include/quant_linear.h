@@ -27,6 +27,12 @@ struct DenseLinearGroup;
 mfq_tensor_backend::Tensor dense_projection(
     mfq_tensor_backend::Tensor input, const mfq_tensor_backend::Tensor& weight);
 
+// Output dtype of a dense projection: the activation dtype, except that an FP32
+// activation (such as an FP32 norm output) keeps a half-precision weight's
+// dtype. Widening it to FP32 would bypass kernels fused on the store dtype.
+mfq_tensor_backend::ScalarType dense_output_dtype(
+    mfq_tensor_backend::ScalarType activation, mfq_tensor_backend::ScalarType weight);
+
 bool decode_branch_parallel_enabled(
     const CudaExecutionConfig& config,
     bool serial_branches,
