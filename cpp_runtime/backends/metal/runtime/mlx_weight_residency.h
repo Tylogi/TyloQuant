@@ -7,6 +7,7 @@
 #include <mlx/transforms.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace mfq::metal {
@@ -69,12 +71,13 @@ public:
             }
         }
         if (live.empty()) return {};
-        if (current->pending_bytes != 0) activate();
-        return std::unique_ptr<MlxWeightResidency>(new MlxWeightResidency(live, limit));
+        auto residency = std::unique_ptr<MlxWeightResidency>(new MlxWeightResidency(live, limit));
+        activate();
+        return residency;
     }
 
     static std::unique_ptr<MlxWeightResidency> retain_arrays(
-        const std::vector<mlx::core::array>& values, std::size_t limit) {
+        const std::vector<mlx::core::array>& values, std::size_t limit, bool indirect = false) {
         if (limit == 0 || !supported()) return {};
         std::vector<std::shared_ptr<mlx::core::array::Data>> live;
         std::unordered_set<const void*> seen;
@@ -84,9 +87,82 @@ public:
                 && seen.insert(allocation_buffer(*data).ptr()).second) live.push_back(std::move(data));
         }
         if (live.empty()) return {};
-        return std::unique_ptr<MlxWeightResidency>(new MlxWeightResidency(live, limit));
+        return std::unique_ptr<MlxWeightResidency>(new MlxWeightResidency(live, limit, indirect));
     }
 
+    void update_arrays(const std::vector<mlx::core::array>& values,std::size_t limit) {
+        std::vector<std::shared_ptr<mlx::core::array::Data>> live;
+        std::unordered_set<const void*> wanted;
+        std::size_t bytes=0;
+        for(const auto& value:values) {
+            auto data=value.data_shared_ptr();
+            if(!data||!allocation_buffer(*data).ptr()||!wanted.insert(allocation_buffer(*data).ptr()).second)continue;
+            const auto count=static_cast<MTL::Buffer*>(allocation_buffer(*data).ptr())->allocatedSize();
+            if(bytes>limit||count>limit-bytes)throw std::runtime_error("Metal weight residency exceeds the configured budget");
+            bytes+=count;live.push_back(std::move(data));
+        }
+        std::lock_guard lock(mutex_);
+        const std::size_t set_limit=indirect_ ? std::max<std::size_t>(8ULL<<30,limit/16+(limit%16!=0)) : 8ULL<<30;
+        std::vector<std::size_t> occupied(sets_.size(),0);
+        std::unordered_map<const void*,std::size_t> existing;
+        for(const auto& allocation:allocations_)if(wanted.contains(allocation.buffer.get())) {
+            occupied[allocation.set]+=allocation.bytes;
+            existing.emplace(allocation.buffer.get(),allocation.set);
+        }
+        std::vector<Allocation> next;next.reserve(live.size());
+        for(const auto& data:live) {
+            auto* buffer=static_cast<MTL::Buffer*>(allocation_buffer(*data).ptr());
+            const auto count=buffer->allocatedSize();
+            std::size_t slot;
+            if(const auto found=existing.find(buffer);found!=existing.end())slot=found->second;
+            else {
+                slot=0;
+                while(slot<occupied.size()&&occupied[slot]&&(count>set_limit-std::min(occupied[slot],set_limit)))++slot;
+                if(slot==occupied.size()) {
+                    if(occupied.size()<32)occupied.push_back(0);
+                    else slot=std::min_element(occupied.begin(),occupied.end())-occupied.begin();
+                }
+                occupied[slot]+=count;
+            }
+            next.push_back({data,NS::RetainPtr(buffer),slot,count});
+        }
+        std::vector<NS::SharedPtr<MTL::ResidencySet>> additions;
+        const auto existing_sets = sets_.size();
+        while(sets_.size()+additions.size()<occupied.size()) {
+            auto descriptor=NS::TransferPtr(MTL::ResidencySetDescriptor::alloc()->init());
+            descriptor->setInitialCapacity(live.size());
+            NS::Error* error=nullptr;
+            auto set=NS::TransferPtr(mlx::core::metal::device(mlx::core::Device::gpu).mtl_device()->newResidencySet(descriptor.get(),&error));
+            if(!set)throw std::runtime_error(error?error->localizedDescription()->utf8String():"Metal weight residency set unavailable");
+            additions.push_back(std::move(set));
+        }
+        sets_.reserve(occupied.size());
+        std::vector<bool> changed(occupied.size(),false);
+        for(auto& set:additions)sets_.push_back(std::move(set));
+        for(const auto& allocation:allocations_)if(!wanted.contains(allocation.buffer.get())) {
+            sets_[allocation.set]->removeAllocation(allocation.buffer.get());changed[allocation.set]=true;
+        }
+        for(const auto& allocation:next)if(!existing.contains(allocation.buffer.get())) {
+            const MTL::Allocation* item=allocation.buffer.get();
+            sets_[allocation.set]->addAllocations(&item,1);changed[allocation.set]=true;
+        }
+        for(std::size_t slot=0;slot<sets_.size();++slot)if(changed[slot]) {
+            sets_[slot]->commit();
+            if (slot >= existing_sets) sets_[slot]->requestResidency();
+        }
+        allocations_=std::move(next);
+        if(indirect_)indirect_owners_=std::move(live);
+        bytes_.store(bytes,std::memory_order_relaxed);
+    }
+
+    void use_command_buffer(MTL::CommandBuffer* buffer) {
+        std::lock_guard lock(mutex_);
+        if(!indirect_)throw std::logic_error("weight residency is not configured for indirect access");
+        if(sets_.size()>32)throw std::runtime_error("TQ indirect residency exceeds command-buffer capacity");
+        std::array<const MTL::ResidencySet*,32> sets;
+        for(std::size_t i=0;i<sets_.size();++i)sets[i]=sets_[i].get();
+        buffer->useResidencySets(sets.data(),sets_.size());
+    }
     ~MlxWeightResidency() {
         {
             std::lock_guard lock(mutex_);
@@ -94,7 +170,11 @@ public:
         }
         wake_.notify_one();
         if (heartbeat_.joinable()) heartbeat_.join();
-        for (auto& set : sets_) set->endResidency();
+        for (auto& set : sets_) {
+            set->endResidency();
+            set->removeAllAllocations();
+            set->commit();
+        }
     }
 
     MlxWeightResidency(const MlxWeightResidency&) = delete;
@@ -112,8 +192,9 @@ private:
 
     explicit MlxWeightResidency(
         const std::vector<std::shared_ptr<mlx::core::array::Data>>& live,
-        std::size_t limit) {
-        constexpr std::size_t set_limit = 8ULL << 30;
+        std::size_t limit, bool indirect = false) : indirect_(indirect) {
+        if(indirect_)indirect_owners_=live;
+        const std::size_t set_limit = indirect_ ? std::max<std::size_t>(8ULL << 30, limit / 16 + (limit % 16 != 0)) : 8ULL << 30;
         auto& device = mlx::core::metal::device(mlx::core::Device::gpu);
         std::size_t set_bytes = 0;
         for (const auto& data : live) {
@@ -141,6 +222,7 @@ private:
         }
         sets_.back()->commit();
         for (auto& set : sets_) set->requestResidency();
+        if (indirect_) return;
         heartbeat_ = std::thread([this] {
             std::unique_lock lock(mutex_);
             while (!wake_.wait_for(lock, std::chrono::milliseconds(500), [this] { return stopped_; })) {
@@ -155,7 +237,6 @@ private:
                 for (std::size_t index = 0; index < sets_.size(); ++index) {
                     if (changed[index]) sets_[index]->commit();
                 }
-                for (auto& set : sets_) set->requestResidency();
             }
         });
     }
@@ -171,7 +252,9 @@ private:
     }
 
     std::vector<NS::SharedPtr<MTL::ResidencySet>> sets_;
+    std::vector<std::shared_ptr<mlx::core::array::Data>> indirect_owners_;
     std::vector<Allocation> allocations_;
+    bool indirect_ = false;
     std::thread heartbeat_;
     std::mutex mutex_;
     std::condition_variable wake_;

@@ -88,6 +88,7 @@ public:
 
     bool contains(const std::string& name) const;
     const MfqRecord& record(const std::string& name) const;
+    std::vector<std::int64_t> tq_shape(const std::string& name) const;
     void observe_load_records(std::function<void(std::size_t, std::size_t)> callback) const;
     void stop_load_observation() const;
     void record_prepared(const std::string& name) const;

@@ -735,6 +735,14 @@ Qwen35TensorMetadata inspect_qwen35_tensor_metadata(
         return metadata;
     }
 
+    if (record.dtype == "TQ") {
+        metadata.shape = model.tq_shape(name);
+        metadata.packed = true;
+        metadata.axis = 0;
+        metadata.neuron_len = metadata.shape.back();
+        metadata.output_size = static_cast<std::uint32_t>(metadata.shape.front());
+        return metadata;
+    }
     if (is_nint8_zero_dtype(record.dtype)) {
         if (cursor.bytes(4, "NINT8-0 magic") != "NI80") {
             throw std::runtime_error(

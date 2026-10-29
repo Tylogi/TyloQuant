@@ -28,6 +28,9 @@ public:
              int threads,
              const std::function<void(std::int64_t, std::int64_t)>& function,
              HostParallelProfile* profile=nullptr);
+    void run_staged(std::int64_t end, std::int64_t ready_end, int threads,
+             const std::function<void(std::int64_t, std::int64_t)>& function,
+             const std::function<void()>& ready);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

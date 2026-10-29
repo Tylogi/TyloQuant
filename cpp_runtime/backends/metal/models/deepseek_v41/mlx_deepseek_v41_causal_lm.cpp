@@ -977,6 +977,13 @@ array MlxDeepseekV41CausalLm::forward_impl(
             auto* prefetched = routed_pipeline[index % 2].has_value()
                 ? &*routed_pipeline[index % 2]
                 : nullptr;
+            if (tq_expert_cache_ && routed_rows >= 512) {
+                const auto next_rows = replay_decoder && index + 1 >= std::size_t(decoder_begin)
+                    ? std::size_t(batch) * config_.sliding_window : routed_rows;
+                tq_expert_cache_->prefill_lookahead(index,
+                    index + 1 < layer_count && next_rows >= 512
+                        ? std::optional<std::size_t>(index + 1) : std::nullopt);
+            }
             auto result = layers_[index].forward(
                 hidden,
                 previous_pre,

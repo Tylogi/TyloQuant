@@ -661,14 +661,10 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
             routed = down.routed_matmul_reduce(routed_hidden, local_ids, routes.weights, route_groups);
         }
     } else if (tq_expert_cache_) {
-        routed = tq_expert_cache_->apply(expert_cache_layer_, routes.ids, [&](const auto& weights, const array* reuse) {
-            return weights.gate.swiglu(weights.up, source, routes.ids, swiglu_limit_, false, reuse);
-        }, [&](const auto& weights, const array& hidden, const array* reuse) {
-            return weights.down.routed_matmul_reduce(hidden, routes.ids, routes.weights, reuse);
-        }, &shared);
+        routed = tq_expert_cache_->apply_ffn(expert_cache_layer_, source, routes.ids,
+            routes.weights, swiglu_limit_, false, &shared);
     } else if (tq_) {
-        auto hidden = tq_->gate.swiglu(tq_->up, source, routes.ids, swiglu_limit_);
-        routed = tq_->down.routed_matmul_reduce(hidden, routes.ids, routes.weights);
+        routed = tq_->routed_ffn(source, routes.ids, routes.weights, swiglu_limit_);
     } else {
         auto routed_hidden = routed_gate_up_
             ? routed_gate_up_->routed_swiglu(

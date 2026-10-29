@@ -1128,6 +1128,7 @@ int checked_int(std::size_t value, const char* name) {
 array floating_contiguous(const array& input) {
     auto result = input;
     if (result.dtype() != mlx::core::float16 &&
+        result.dtype() != mlx::core::bfloat16 &&
         result.dtype() != mlx::core::float32) {
         result = mlx::core::astype(result, mlx::core::float16);
     }

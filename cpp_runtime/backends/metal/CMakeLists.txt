@@ -286,6 +286,7 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_pre_ln_vision.cpp
     runtime/mlx_sampling.cpp
     runtime/mlx_kernel_prepare.cpp
+    runtime/mlx_cached_kernel.cpp
     runtime/mlx_kernel_cache.cpp
     runtime/mlx_builtin_kernels.cpp
     runtime/mlx_inference_warmup.cpp
@@ -381,6 +382,14 @@ target_compile_features(mfq-metal-tq-test PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-tq-test PROPERTIES BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
 
 if(BUILD_TESTING)
+    foreach(name IN ITEMS cached-kernel compiled-prepare)
+        string(REPLACE "-" "_" source_name ${name})
+        add_executable(mfq-metal-${name}-test tests/mlx_${source_name}_test.cpp)
+        target_link_libraries(mfq-metal-${name}-test PRIVATE mfq-metal-runtime)
+        target_compile_features(mfq-metal-${name}-test PRIVATE cxx_std_20)
+        set_target_properties(mfq-metal-${name}-test PROPERTIES BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
+        add_test(NAME mfq-metal-${name}-test COMMAND mfq-metal-${name}-test)
+    endforeach()
     add_test(NAME mfq-metal-tq-container-test COMMAND mfq-metal-tq-test unused --expert-containers)
     add_test(NAME mfq-metal-tq-prefill-reduction-test COMMAND mfq-metal-tq-test --prefill-reduction)
     add_test(NAME mfq-metal-tq-projection-cache-test COMMAND mfq-metal-tq-test --projection-cache)
@@ -389,6 +398,7 @@ if(BUILD_TESTING)
     add_test(NAME mfq-metal-tq-compact-reuse-test COMMAND mfq-metal-tq-test --compact-reuse)
     add_test(NAME mfq-metal-tq-streamed-experts-test COMMAND mfq-metal-tq-test --streamed-experts)
     add_test(NAME mfq-metal-tq-routed-tiles-test COMMAND mfq-metal-tq-test unused --routed-tiles)
+    add_test(NAME mfq-metal-tq-indirect-residency-test COMMAND mfq-metal-tq-test --indirect-residency)
 endif()
 
 if(TARGET mfq-paged-prefix-cache)

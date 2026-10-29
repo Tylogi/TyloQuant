@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,10 @@ namespace mfq::metal {
 struct MlxTqExpertWeights {
     MlxTqWeight gate, up, down;
     void prepare(int top_k, float limit = 0.f, bool gelu = false) const;
+    std::optional<mlx::core::array> reuse_plan(const mlx::core::array& ids) const;
+    mlx::core::array routed_ffn(const mlx::core::array& input, const mlx::core::array& ids,
+        const mlx::core::array& weights, float limit = 0.f, bool gelu = false,
+        const mlx::core::array* reuse = nullptr) const;
 };
 
 struct MlxTqExpertCacheStats {
@@ -23,6 +28,8 @@ struct MlxTqExpertCacheStats {
     double io_seconds = 0, route_sync_seconds = 0, prepare_seconds = 0, graph_seconds = 0;
     std::size_t metadata_bytes = 0;
     std::uint64_t overlapped_read_batches = 0;
+    std::size_t pinned_bytes = 0;
+    std::uint64_t prefill_read_batches = 0, prefill_bytes_read = 0;
 };
 
 class MlxTqExpertCache {
@@ -40,6 +47,9 @@ public:
         const std::function<mlx::core::array(const MlxTqExpertWeights&,
             const mlx::core::array&, const mlx::core::array*)>& down,
         const mlx::core::array* parallel = nullptr);
+    mlx::core::array apply_ffn(std::size_t layer, const mlx::core::array& input,
+        const mlx::core::array& ids, const mlx::core::array& weights,
+        float limit = 0.f, bool gelu = false, const mlx::core::array* parallel = nullptr);
     MlxTqExpertCacheStats stats() const;
     std::size_t limit_bytes() const noexcept;
     std::size_t backing_bytes() const noexcept;
@@ -49,6 +59,7 @@ public:
     void validate_layer(std::size_t layer, int experts, int input, int intermediate) const;
     void prepare_layer(std::size_t layer, int top_k, float limit = 0.f, bool gelu = false) const;
     void clear();
+    void prefill_lookahead(std::size_t layer, std::optional<std::size_t> next);
 
 private:
     struct Impl;

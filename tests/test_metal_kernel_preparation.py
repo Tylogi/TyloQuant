@@ -4,13 +4,17 @@ from pathlib import Path
 METAL = Path(__file__).resolve().parents[1] / "cpp_runtime/backends/metal"
 
 
-def test_preparation_does_not_execute_graphs():
+def test_native_kernel_preparation_does_not_dispatch_graphs():
     source = (METAL / "runtime/mlx_kernel_prepare.cpp").read_text()
+    native = source.split("void prepare_mlx_kernel_gpu(", 1)[1].split("thread_local", 1)[0]
     for operation in (".eval(", "mlx::core::eval(", "get_command_encoder(",
                       "dispatch_threads(", "dispatch_threadgroups(", "allocator::malloc("):
-        assert operation not in source
+        assert operation not in native
     assert "device.get_library(" in source
     assert "device.get_kernel(" in source
+    assert "bounded(input_shapes, input_dtypes) && bounded(output_shapes, output_dtypes)" in source
+    assert "compiled_jobs_.push_back" in source
+    assert "mlx::core::zeros(input_shapes[index]" in source
 
 
 def test_preparation_defaults_to_available_cpu_concurrency():
@@ -18,7 +22,7 @@ def test_preparation_defaults_to_available_cpu_concurrency():
     assert "std::max(1u, std::thread::hardware_concurrency())" in source
     assert "std::size_t workers = maximum_workers;" in source
     assert "requested > maximum_workers" in source
-    assert "workers = std::min(workers, total);" in source
+    assert "workers = std::min(workers, std::max<std::size_t>(1, parallel_total));" in source
     assert "[1, 16]" not in source
     assert "std::vector<std::thread> threads;" in source
     assert "thread.joinable()" in source
@@ -30,7 +34,8 @@ def test_custom_kernel_cache_matches_source_and_compile_options():
     assert "MLX_VERSION_NUMERIC >= 32001" in source
     assert "std::hash<std::string>{}(std::get<1>(state))" in source
     assert "std::get<10>(state)" in source
-    assert "device.get_library(library_name," in source
+    cached = (METAL / "runtime/mlx_cached_kernel.cpp").read_text()
+    assert "backend.get_library(library_name," in cached
 
 
 def test_preparation_covers_host_and_device_sampling_inputs():
@@ -66,7 +71,7 @@ def test_flash_next_prepares_execution_paths_instead_of_weight_variants():
     moe = (METAL / "ops/mlx_moe.cpp").read_text()
     model = (METAL / "models/flash_next/mlx_qwen4_causal_lm.cpp").read_text()
     assert tensor.count("!preparation->model_paths()") == 2
-    assert "6, 8, 25, 32, 128, chunk_size" in preparation
+    assert "6, 7, 8, 12, 16, 20, 24, 25, 31, 32, 33, 64, 65, 96, 128, chunk_size" in preparation
     assert "!preparation->model_paths() && preparation->routes() > 0" in moe
     load = model.split("MlxQwen4CausalLm MlxQwen4CausalLm::load(", 1)[1].split("\n}\n", 1)[0]
     assert load.index("preparation->use_model_paths();") < load.index("Impl::load(")
