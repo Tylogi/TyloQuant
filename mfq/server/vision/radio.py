@@ -98,8 +98,13 @@ class RadioVisionProcessor:
         closest = closest_rows * closest_columns
 
         factor = min(math.sqrt(tokens_available / closest), 1.0)
-        rows = math.floor(factor * closest_rows)
-        columns = math.floor(factor * closest_columns)
+        rows = max(1, math.floor(factor * closest_rows))
+        columns = max(1, math.floor(factor * closest_columns))
+        if rows * columns > tokens_available:
+            raise VisionProcessingError(
+                "RADIO image aspect ratio cannot fit the model's patch budget; "
+                "use a less extreme aspect ratio"
+            )
 
         if tokens_available > self.min_num_patches and rows * columns < self.min_num_patches:
             grow = math.sqrt(self.min_num_patches / (rows * columns))

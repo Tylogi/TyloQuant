@@ -45,7 +45,9 @@ struct TestOps {
         if (failure == 1)
             throw InferenceInputError(InferenceInputErrorCode::Invalid, "invalid media");
         if (failure == 2)
-            throw std::runtime_error("device failed");
+            throw MfqBackendFailure("device failed");
+        if (failure == 4)
+            throw 42;
         auto sequence = generate_sequence(
             std::ref(*this), output, input.prompt.size(), 0, input.cache_plan.stable_prefix_tokens, 2);
         while (auto event = sequence.next())
@@ -268,8 +270,39 @@ static void check_preparation_steps() {
         assert(executor.empty() && ops.media_live == 0);
         assert(std::holds_alternative<Failed>(terminal_event(result)) == fail);
         assert(ops.text_runs == (fail ? 0 : 1));
+        assert(result.status.healthy);
+        if (fail) {
+            ops.fail_at = 0;
+            executor.admit(request(), nullptr, info(), ops);
+            for (int ticks = 0; ticks < 20 && !executor.empty(); ++ticks)
+                result = executor.step({"one"}, ops);
+            assert(std::holds_alternative<Completed>(terminal_event(result)));
+        }
         if (!fail) assert(std::get<Completed>(terminal_event(result)).metrics.multimodal_ms == 4);
     }
+}
+
+static void check_execution_error_isolation() {
+    struct Operations : TestOps {
+        void execute(const std::vector<RequestId>& eligible) {
+            if (std::find(eligible.begin(), eligible.end(), "bad") != eligible.end())
+                throw std::runtime_error("request execution failed");
+        }
+    } ops;
+    ops.batch = true;
+    RequestExecutor executor(2);
+    executor.admit(request("bad"), nullptr, info(), ops);
+    executor.admit(request("good"), nullptr, info(), ops);
+    auto failed = executor.step({"bad"}, ops);
+    assert(failed.status.healthy && failed.has_work);
+    assert(failed.events.back().id == "bad");
+    assert(std::holds_alternative<Failed>(terminal_event(failed)));
+    EngineStepResult result;
+    for (int ticks = 0; ticks < 20 && !executor.empty(); ++ticks)
+        result = executor.step({"good"}, ops);
+    assert(executor.empty() && result.status.healthy);
+    assert(result.events.back().id == "good");
+    assert(std::holds_alternative<Completed>(terminal_event(result)));
 }
 
 struct Environment {
@@ -395,6 +428,7 @@ int main() {
     }
     check_waiting_and_cleanup();
     check_preparation_steps();
+    check_execution_error_isolation();
     check_engine_lifecycle();
     check_runtime_config();
     // A restored prefix and snapshot boundary must not enlarge a prefill tick.
@@ -482,8 +516,8 @@ int main() {
         executor.cancel("b");
         executor.step({}, ops);
     }
-    // Request errors are recoverable; device or cleanup failures stop admission.
-    for (int failure : {1, 2, 3}) {
+    // Request errors are recoverable; device, cleanup or unknown failures stop admission.
+    for (int failure : {1, 2, 3, 4}) {
         TestOps ops;
         ops.failure = failure == 3 ? 1 : failure;
         ops.reset_fails = failure == 3;
@@ -493,9 +527,10 @@ int main() {
         const auto &error = std::get<Failed>(terminal_event(result));
         assert(error.code == (failure == 1 ? "invalid_request" : "backend_failure"));
         assert(ops.live == 0 && ops.resets == 1 && executor.empty());
-        assert(result.status.healthy == (failure == 1));
+        const bool recoverable = failure == 1;
+        assert(result.status.healthy == recoverable);
         ops.failure = 0;
         assert(executor.admit(request(), nullptr, info(), ops) ==
-               (failure == 1 ? Admission::accepted : Admission::deferred));
+               (recoverable ? Admission::accepted : Admission::deferred));
     }
 }

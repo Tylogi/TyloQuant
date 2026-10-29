@@ -1,3 +1,4 @@
+#include "mfq/fatal_diagnostics.h"
 #include "common.h"
 
 #include "httplib.h"
@@ -495,6 +496,7 @@ int run_mfq_http_transport(
                         "invalid duplex input");
                 }
             } catch (const std::exception & error) {
+                mfq::log_runtime_error("transport", error.what());
                 send_event({
                     {"type", "session.closed"},
                     {"session_id", owned_session},
@@ -548,6 +550,7 @@ int run_mfq_http_transport(
     const auto add_runtime_metrics = [&](json & value) {
 
         const auto snapshot = scheduler.snapshot();
+        value["healthy"] = snapshot.status.healthy;
         const auto& metrics = snapshot.runtime;
         value["runtime_metrics_age_ms"] = std::chrono::duration<double, std::milli>(
             mfq::engine::Clock::now() - snapshot.captured).count();
@@ -589,7 +592,7 @@ int run_mfq_http_transport(
         };
         add_runtime_metrics(health);
         add_session_metrics(health);
-        set_json(res, health);
+        set_json(res, health, scheduler.snapshot().status.healthy ? 200 : 503);
     });
 
     server.Get("/runtime/realtime/capabilities", [&] (
@@ -643,6 +646,7 @@ int run_mfq_http_transport(
             reloading.store(false);
             set_json(res, result);
         } catch (const std::exception & error) {
+            mfq::log_runtime_error("transport", error.what());
             reloading.store(false);
             set_json(res, error_body(error.what(), "server_error"), 500);
         }
@@ -655,6 +659,7 @@ int run_mfq_http_transport(
             add_session_metrics(result);
             set_json(res, result);
         } catch (const std::exception& error) {
+            mfq::log_runtime_error("transport", error.what());
             set_json(res, error_body(error.what(), "server_error"), 500);
         }
     });
@@ -675,7 +680,10 @@ int run_mfq_http_transport(
             set_json(res, result);
         } catch (const ApiError& error) { handle_api_error(res, error); }
         catch (const MfqResourceExhausted& error) { set_json(res, error_body(error.what(), "resident_budget_exhausted"), 413); }
-        catch (const std::exception& error) { set_json(res, error_body(error.what(), "server_error"), 500); }
+        catch (const std::exception& error) {
+            mfq::log_runtime_error("transport", error.what());
+            set_json(res, error_body(error.what(), "server_error"), 500);
+        }
     });
 
     server.Post(R"(/runtime/cache/(trim|budget))", [&] (
@@ -725,6 +733,7 @@ int run_mfq_http_transport(
         } catch (const ApiError & error) {
             handle_api_error(res, error);
         } catch (const std::exception & error) {
+            mfq::log_runtime_error("transport", error.what());
             set_json(res, error_body(error.what(), "server_error"), 500);
         }
     });
@@ -780,6 +789,7 @@ int run_mfq_http_transport(
         } catch (const ApiError & error) {
             handle_api_error(res, error);
         } catch (const std::exception & error) {
+            mfq::log_runtime_error("transport", error.what());
             set_json(res, error_body(error.what(), "server_error"), 500);
         }
     });
@@ -797,6 +807,7 @@ int run_mfq_http_transport(
                     {"released_snapshots", released},
                 });
             } catch (const std::exception & error) {
+                mfq::log_runtime_error("transport", error.what());
                 set_json(res, error_body(error.what(), "server_error"), 500);
             }
         });
@@ -846,6 +857,7 @@ int run_mfq_http_transport(
             finish_reload();
             handle_api_error(res, error);
         } catch (const std::exception & error) {
+            mfq::log_runtime_error("transport", error.what());
             finish_reload();
             set_json(res, error_body(error.what(), "server_error"), 500);
         }
@@ -869,7 +881,10 @@ int run_mfq_http_transport(
                 scheduler.control(parse_token_count_request(parse_body(req))))));
         } catch (const ApiError& error) { handle_api_error(res, error); }
         catch (const std::invalid_argument& error) { set_json(res, error_body(error.what(), "invalid_request_error"), 400); }
-        catch (const std::exception& error) { set_json(res, error_body(error.what(), "server_error"), 500); }
+        catch (const std::exception& error) {
+            mfq::log_runtime_error("transport", error.what());
+            set_json(res, error_body(error.what(), "server_error"), 500);
+        }
     });
 
     server.Post("/runtime/score", [&](const httplib::Request& req, httplib::Response& res) {
@@ -881,7 +896,10 @@ int run_mfq_http_transport(
                 scheduler.control(parse_score_request(parse_body(req))))));
         } catch (const ApiError& error) { handle_api_error(res, error); }
         catch (const std::invalid_argument& error) { set_json(res, error_body(error.what(), "invalid_request_error"), 400); }
-        catch (const std::exception& error) { set_json(res, error_body(error.what(), "server_error"), 500); }
+        catch (const std::exception& error) {
+            mfq::log_runtime_error("transport", error.what());
+            set_json(res, error_body(error.what(), "server_error"), 500);
+        }
     });
 
     auto runtime_generate_handler = [&](const httplib::Request & req, httplib::Response & res) {
@@ -998,6 +1016,7 @@ int run_mfq_http_transport(
                     } catch (const ApiError & error) {
                         write_sse(sink, stream_error_body(error));
                     } catch (const std::exception & error) {
+                        mfq::log_runtime_error("transport", error.what());
                         write_sse(sink, error_body(error.what(), "runtime_error"));
                     }
                     sink.done();
@@ -1008,6 +1027,7 @@ int run_mfq_http_transport(
         } catch (const mfq::engine::InferenceInputError & error) {
             handle_api_error(res, api_error(error));
         } catch (const std::exception & error) {
+            mfq::log_runtime_error("transport", error.what());
             set_json(res, error_body(error.what(), "server_error"), 500);
         }
     };
@@ -1019,6 +1039,7 @@ int run_mfq_http_transport(
         try {
             if (ep) std::rethrow_exception(ep);
         } catch (const std::exception & error) {
+            mfq::log_runtime_error("transport", error.what());
             message = error.what();
         }
         set_json(res, error_body(message, "server_error"), 500);

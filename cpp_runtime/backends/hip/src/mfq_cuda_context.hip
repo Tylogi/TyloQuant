@@ -1,5 +1,6 @@
 #include "hip/hip_runtime.h"
 #include "mfq_hip_context.h"
+#include "mfq/runtime.h"
 
 #include <algorithm>
 #include <atomic>
@@ -147,6 +148,15 @@ std::shared_ptr<Context> default_context(int device) {
 
 void check(hipError_t status, const char* expression, const char* file, int line) {
     if (status != hipSuccess) {
+        if (status == hipErrorIllegalAddress || status == hipErrorAssert ||
+            status == hipErrorLaunchFailure || status == hipErrorECCNotCorrectable ||
+            status == hipErrorContextIsDestroyed) {
+            throw MfqBackendFailure(location_message(
+                "HIP", hipGetErrorString(status), expression, file, line));
+        }
+        if (status == hipErrorOutOfMemory)
+            throw MfqResourceExhausted(location_message(
+                "HIP", hipGetErrorString(status), expression, file, line));
         throw Error(location_message(
             "CUDA", hipGetErrorString(status), expression, file, line));
     }
@@ -154,6 +164,9 @@ void check(hipError_t status, const char* expression, const char* file, int line
 
 void check(hipblasStatus_t status, const char* expression, const char* file, int line) {
     if (status != HIPBLAS_STATUS_SUCCESS) {
+        if (status == HIPBLAS_STATUS_ALLOC_FAILED)
+            throw MfqResourceExhausted(location_message(
+                "hipBLAS", cublas_status_name(status), expression, file, line));
         throw Error(location_message(
             "cuBLAS", cublas_status_name(status), expression, file, line));
     }

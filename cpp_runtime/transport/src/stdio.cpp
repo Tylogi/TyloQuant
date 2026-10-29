@@ -1,3 +1,4 @@
+#include "mfq/fatal_diagnostics.h"
 #include "common.h"
 
 #include <algorithm>
@@ -167,6 +168,7 @@ public:
         const auto add_runtime_metrics = [&](json & value) {
 
             const auto snapshot = scheduler.snapshot();
+            value["healthy"] = snapshot.status.healthy;
             const auto& metrics = snapshot.runtime;
             value["runtime_metrics_age_ms"] = std::chrono::duration<double, std::milli>(
                 mfq::engine::Clock::now() - snapshot.captured).count();
@@ -946,6 +948,7 @@ public:
                         } catch (const std::invalid_argument& error) {
                             send_error(id,400,"invalid_request_error",error.what());
                         } catch (const std::exception & error) {
+                            mfq::log_runtime_error("transport", error.what());
                             send_error(
                                 id, 500, "server_error", error.what());
                         }
@@ -969,6 +972,7 @@ public:
             } catch (const std::invalid_argument& error) {
                 send_error(id, 400, "invalid_request_error", error.what());
             } catch (const std::exception & error) {
+                mfq::log_runtime_error("transport", error.what());
                 send_error(id, 500, "server_error", error.what());
             }
         }

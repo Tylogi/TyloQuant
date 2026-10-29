@@ -170,6 +170,15 @@ std::shared_ptr<Context> default_context(int device) {
 
 void check(cudaError_t status, const char* expression, const char* file, int line) {
     if (status != cudaSuccess) {
+        if (status == cudaErrorIllegalAddress || status == cudaErrorAssert ||
+            status == cudaErrorLaunchFailure || status == cudaErrorECCUncorrectable ||
+            status == cudaErrorContextIsDestroyed) {
+            throw MfqBackendFailure(location_message(
+                "CUDA", cudaGetErrorString(status), expression, file, line));
+        }
+        if (status == cudaErrorMemoryAllocation)
+            throw MfqResourceExhausted(location_message(
+                "CUDA", cudaGetErrorString(status), expression, file, line));
         throw Error(location_message(
             "CUDA", cudaGetErrorString(status), expression, file, line));
     }
@@ -177,6 +186,9 @@ void check(cudaError_t status, const char* expression, const char* file, int lin
 
 void check(cublasStatus_t status, const char* expression, const char* file, int line) {
     if (status != CUBLAS_STATUS_SUCCESS) {
+        if (status == CUBLAS_STATUS_ALLOC_FAILED)
+            throw MfqResourceExhausted(location_message(
+                "cuBLAS", cublas_status_name(status), expression, file, line));
         throw Error(location_message(
             "cuBLAS", cublas_status_name(status), expression, file, line));
     }

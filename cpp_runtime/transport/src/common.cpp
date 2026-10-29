@@ -1,3 +1,4 @@
+#include "mfq/fatal_diagnostics.h"
 #include "common.h"
 
 #include "nlohmann/json.hpp"
@@ -90,6 +91,7 @@ static common_reasoning_format request_reasoning_format(const json & body) {
         return common_reasoning_format_from_name(
             body["reasoning_format"].get<std::string>());
     } catch (const std::exception & error) {
+        mfq::log_runtime_error("transport", error.what());
         throw ApiError(
             400, "invalid_request_error", error.what(), "reasoning_format");
     }
@@ -287,6 +289,7 @@ static mfq::engine::ChatInput parse_chat_input(
     } catch (const ApiError &) {
         throw;
     } catch (const std::exception & error) {
+        mfq::log_runtime_error("transport", error.what());
         throw ApiError(
             400, "invalid_request_error", error.what(), "messages");
     }

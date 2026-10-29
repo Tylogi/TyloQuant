@@ -47,3 +47,58 @@ Write-Output 'PASS release environment guard'
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'PASS release environment guard' in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows release staging')
+def test_native_symbols_are_an_explicit_packaging_option(tmp_path):
+    script = tmp_path / 'symbols.ps1'
+    script.write_text(r'''
+param([string]$BuildScript, [string]$Root)
+$ErrorActionPreference = 'Stop'
+$syntax = [System.Management.Automation.Language.Parser]::ParseFile($BuildScript, [ref]$null, [ref]$null)
+foreach ($definition in $syntax.FindAll({param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]}, $false)) {
+    if ($definition.Name -in @('Stage-WindowsRuntime', 'Write-NativeSymbolArchive')) {
+        Invoke-Expression $definition.Extent.Text
+    }
+}
+function Reset-Directory($Path) {
+    if (Test-Path $Path) { Remove-Item $Path -Recurse -Force }
+    New-Item $Path -ItemType Directory | Out-Null
+}
+function Fail($Message) { throw $Message }
+function Find-CudaRuntimeDirectory($Path) { return $Path }
+function Copy-VisualCppRuntimeDlls($Path) {}
+function Copy-RuntimeDlls($Source, $Destination, $Patterns = @('*.dll')) {
+    foreach ($pattern in $Patterns) {
+        Get-ChildItem $Source -Filter $pattern | Copy-Item -Destination $Destination
+    }
+}
+$native = Join-Path $Root 'native'
+New-Item $native -ItemType Directory | Out-Null
+foreach ($name in @('mfq-runtime.pdb', 'mfq-diagnostics.pdb', 'cudart64_1.dll', 'cublas64_1.dll', 'cublasLt64_1.dll')) {
+    Set-Content (Join-Path $native $name) 'fixture'
+}
+$context = @{NativeOutput=@{DirectoryName=$native}; WindowsRuntimeDirectory=(Join-Path $Root 'stage'); CudaRoot=$native
+    ScriptDirectory=$Root; OutputDirectory=(Join-Path $Root 'dist')}
+New-Item $context.OutputDirectory -ItemType Directory | Out-Null
+foreach ($IncludeNativeSymbols in @($false, $true)) {
+    Stage-WindowsRuntime $context
+    # PDBs carry build-machine paths and must stay out of the shipped runtime.
+    if (Get-ChildItem $context.WindowsRuntimeDirectory -Filter '*.pdb') { throw 'symbols staged into the runtime' }
+}
+Write-NativeSymbolArchive $context
+$archive = Join-Path $context.OutputDirectory 'mfq-native-symbols-x64.zip'
+$extracted = Join-Path $Root 'symbols'
+Expand-Archive $archive $extracted
+foreach ($name in @('mfq-runtime.pdb', 'mfq-diagnostics.pdb', 'README.txt')) {
+    if (-not (Test-Path (Join-Path $extracted $name))) { throw "symbol archive is missing $name" }
+}
+Write-Output 'PASS optional native symbols'
+''', encoding='utf-8')
+    build_script = Path(__file__).resolve().parents[1] / 'packaging/build_release_windows.ps1'
+    result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File',
+                             str(script), str(build_script), str(tmp_path)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'PASS optional native symbols' in result.stdout

@@ -62,6 +62,23 @@ def _image(width: int, height: int, seed: int = 0) -> Image.Image:
     return Image.fromarray((rng.random((height, width, 3)) * 255).astype(np.uint8))
 
 
+@pytest.mark.parametrize("size", [(4000, 50), (50, 4000), (4096, 4096), (1, 4096)])
+def test_large_and_narrow_images_respect_model_patch_budget(size):
+    processor = RadioVisionProcessor()
+    image = Image.new("RGB", size)
+    patches, (_, rows, columns) = processor._prepare_image(image, processor.tokens_available(1))
+    assert rows > 0 and columns > 0
+    assert rows % processor.downsample_factor == columns % processor.downsample_factor == 0
+    assert rows * columns <= processor.max_num_patches
+    assert patches.shape == (rows * columns, 3 * processor.patch_size**2)
+
+
+def test_unrepresentable_aspect_ratio_is_a_clear_input_error():
+    processor = RadioVisionProcessor()
+    with pytest.raises(VisionProcessingError, match="aspect ratio.*patch budget"):
+        processor.target_patches(1_000_000, 1, processor.tokens_available(1))
+
+
 def test_antialiased_bicubic_matches_torch() -> None:
     rng = np.random.default_rng(11)
     for height, width, target_height, target_width in RESIZE_CASES:

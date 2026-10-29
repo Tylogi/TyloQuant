@@ -255,6 +255,26 @@ def test_stdio_runtime_client_fails_pending_requests_on_eof() -> None:
     asyncio.run(run())
 
 
+def test_stdio_process_death_includes_bounded_stderr_and_exit_status(caplog) -> None:
+    async def run() -> None:
+        client = _client(lambda _request: [])
+        client._process.returncode = 0xC0000409
+        client.record_stderr(b"old log\n" * 10000)
+        client.record_stderr(b"runtime_fatal error=invalid_parameter\nstacktrace: fatal_probe.cpp:42\n")
+        pending = asyncio.create_task(client.health())
+        await asyncio.sleep(0)
+        client._process.stdout.feed_eof()
+        with pytest.raises(BackendError) as caught:
+            await pending
+        assert caught.value.status_code == 503
+        assert "0xC0000409" in str(caught.value)
+        assert len(client._stderr_tail) <= 32768
+        assert "fatal_probe.cpp:42" in caplog.text
+        await client.aclose()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("event_limit", [2, 64])
 @pytest.mark.parametrize("abandon", [False, True])
 def test_stdio_full_stream_does_not_block_control_replies(event_limit, abandon) -> None:

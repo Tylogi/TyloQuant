@@ -483,6 +483,14 @@ add_library(mfq::cuda-runtime ALIAS mfq-cuda-runtime)
 mfq_configure_cuda_runtime_target(mfq-cuda-runtime)
 
 if(BUILD_TESTING)
+    add_executable(mfq-vision-attention-test ${MFQ_CUDA_ROOT}/tests/vision_attention_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-vision-attention-test)
+    target_compile_definitions(mfq-vision-attention-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_compile_options(mfq-vision-attention-test PRIVATE
+        $<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>)
+    target_link_libraries(mfq-vision-attention-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-vision-attention-test COMMAND mfq-vision-attention-test)
+
     add_executable(mfq-cuda-format-bench
         ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_format_bench.cpp)
     mfq_configure_cuda_runtime_target(mfq-cuda-format-bench)
