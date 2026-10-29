@@ -121,7 +121,9 @@ struct DeepseekV41Dspark final : MtpModule {
                    function.size(1) == function_width && scale.numel() == 3 && base.numel() == 24 &&
                    norm.numel() == config.hidden;
         };
-        const auto routed_experts = result->mlp.moe_split_gate_up
+        const auto routed_experts = result->mlp.moe_tq
+                                        ? result->mlp.moe_tq->gate->experts
+                                        : result->mlp.moe_split_gate_up
                                         ? result->mlp.moe_gate.n_experts
                                         : result->mlp.moe_gate_up.n_experts;
         MFQ_RUNTIME_CHECK(valid_mhc(result->attention_mhc_function, result->attention_mhc_scale,
@@ -144,7 +146,8 @@ struct DeepseekV41Dspark final : MtpModule {
                               result->key_value_norm.numel() == config.head_dim &&
                               result->sinks.numel() == config.n_heads &&
                               routed_experts == config.dspark_n_experts &&
-                              result->mlp.moe_down.n_experts == config.dspark_n_experts,
+                              (result->mlp.moe_tq?result->mlp.moe_tq->down->experts:
+                                  result->mlp.moe_down.n_experts) == config.dspark_n_experts,
                           "DeepSeek-V4.1 DSpark stage tensor geometry disagrees at stage ", stage);
         return result;
     }

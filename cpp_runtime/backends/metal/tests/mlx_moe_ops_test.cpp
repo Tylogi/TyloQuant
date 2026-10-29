@@ -462,6 +462,23 @@ void test_small_m_softmax_topk() {
     }
 }
 
+void test_small_m_route_group_boundaries() {
+    constexpr int experts = 32;
+    for (int rows : {2, 6, 7, 16}) for (int top_k : {1, 15, 16}) {
+        auto logits = mlx::core::reshape(mlx::core::sin(mlx::core::arange(rows * experts,
+            mlx::core::float32) * array(.7919f)), Shape{rows, experts});
+        const auto grouped = mfq::metal::moe_topk(logits, top_k, false, false, true);
+        const auto plain = mfq::metal::moe_topk(logits, top_k, false, false, true,
+            false, std::nullopt, std::nullopt, 1e-20f, 1.f, false);
+        const auto ids = integers(grouped.ids);
+        require(ids == integers(plain.ids) && floats(grouped.weights) == floats(plain.weights),
+            "route grouping changes TopK IDs or weights");
+        const auto expected = mfq::metal::moe_route_groups_host(ids, rows, top_k);
+        require(grouped.groups && expected && integers(*grouped.groups) == integers(*expected),
+            "route groups differ from the host oracle at the TopK boundary");
+    }
+}
+
 void test_softmax_topk_normalization_parameters() {
     constexpr int experts = 32;
     std::vector<float> logits(experts);
@@ -1450,6 +1467,7 @@ int main() {
         test_dense_router_logits();
         test_single_row_softmax_topk();
         test_small_m_softmax_topk();
+        test_small_m_route_group_boundaries();
         test_softmax_topk_normalization_parameters();
         test_prefill_softmax_topk_shared_reuse();
         test_fused_dense_router_topk();

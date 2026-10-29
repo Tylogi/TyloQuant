@@ -128,7 +128,7 @@ void DecodeWindow::mark(int layer,const char* phase) {
         // input preparation (including the mapped host-plan wait). Scope 2
         // retains its existing event count for historical comparisons.
         constexpr const char* boundaries[]={"attention_core_begin","attention_core_end",
-            "ffn_pre_end","expert_begin","shared_end","ple_begin","ple_end"};
+            "ffn_pre_end","expert_begin","shared_end","ple_begin","ple_end","gate_up_end","down_end"};
         if(std::none_of(std::begin(phases),std::end(phases),
                 [&](const char* allowed){return std::strcmp(phase,allowed)==0;}) &&
             (std::strcmp(scope,"3")!=0 || std::none_of(std::begin(boundaries),std::end(boundaries),
@@ -227,6 +227,12 @@ std::size_t DecodeWindow::nodes() const {
     for(std::size_t i=0;i<segments();++i)if(const auto* graph=graphs_.find(i,1))result+=graph->nodes();
     return result;
 }
+void DecodeWindow::set_kernel_rows(std::size_t segment,cudaGraphNode_t node,unsigned rows) {
+    if(!valid())throw std::logic_error("graph kernel update requires a captured window");
+    const auto* graph=graphs_.find(segment,1);
+    if(!graph)throw std::out_of_range("graph kernel update has no matching segment");
+    graph->set_kernel_rows(node,rows);
+}
 void DecodeWindow::host_barrier(std::function<void()> serve) {
     if(active!=this)throw std::logic_error("host I/O barrier outside window capture");
     if(recording_segments_)graphs_.end(barriers_.size(),1);
@@ -236,6 +242,7 @@ void DecodeWindow::host_barrier(std::function<void()> serve) {
 void DecodeWindow::capture(const std::function<void()>& body,const std::function<void()>& restore,
         const std::function<void()>& release_output) {
     if(valid())return;
+    const HostRegistrationBlock registration;
     if(active)throw std::logic_error("nested MFQ window capture");
     struct Recording {
         explicit Recording(DecodeWindow* window){active=window;}
@@ -316,10 +323,14 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
 }
 void DecodeWindow::run() {
     if(failed_ || !valid())throw std::runtime_error("MFQ window is unavailable after a failed execution");
+    const HostRegistrationBlock registration;
     const mfq::cpu::ScopedHostAffinity placement(runtime_options::decode_host_pin()
         ?mfq::cpu::planned_host_core():-1);
     const auto* trace_option=std::getenv("MFQ_TRACE_MOE_SERVE");
     const bool trace=trace_option && trace_option[0] && trace_option[0]!='0' && (replays_<2 || replays_%64==0);
+    // Value 2 adds one summary per replay, including later slow tokens that
+    // the sampled verbose trace would otherwise omit. Ordinary runs add no I/O.
+    const bool trace_steps=trace_option && trace_option[0]=='2';
     const char* phase="reset";
     const auto checkpoint=[&](const char* next) {
         phase=next;
@@ -371,6 +382,19 @@ void DecodeWindow::run() {
         observe_layers();sample(profile_ns_);
         replay_ns_+=std::chrono::duration_cast<std::chrono::nanoseconds>(previous-started).count();++replays_;
         const auto elapsed=std::chrono::duration<double,std::milli>(previous-started).count();
+        if(trace_steps) {
+            double gpu_ms=0;
+            if(profile_clock_ && !layer_points_.empty()) {
+                const auto first=profile_clock_->host.front();
+                const auto last=profile_clock_->host[layer_points_.size()-1];
+                if(first && last>=first)gpu_ms=double(last-first)/1e6;
+            }
+            std::fprintf(stderr,"runtime_decode_window_step role=%s rows=%d replay=%llu ms=%.6f reset_ms=%.6f "
+                "launch_ms=%.6f serve_ms=%.6f wait_ms=%.6f finish_ms=%.6f gpu_ms=%.6f\n",
+                profile_role_.c_str(),profile_rows_,static_cast<unsigned long long>(replays_),elapsed,
+                (reset_ns_-reset_before)/1e6,(launch_ns_-launch_before)/1e6,(serve_ns_-serve_before)/1e6,
+                (wait_ns_-wait_before)/1e6,(finish_ns_-finish_before)/1e6,gpu_ms);
+        }
         if(trace && replays_<=64 && elapsed>=45.0)
             std::cerr<<"runtime_decode_window_slow role="<<profile_role_<<" rows="<<profile_rows_
                 <<" replay="<<replays_<<" ms="<<elapsed<<" reset_ms="<<(reset_ns_-reset_before)/1e6

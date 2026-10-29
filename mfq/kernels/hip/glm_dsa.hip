@@ -1,13 +1,15 @@
 #include "hip/hip_runtime.h"
+#include "mfq_hip_compat.h"
+
 #include <hip/hip_fp16.h>
 #include "mfq_tensor_backend.h"
 #include <hip/hip_runtime.h>
+
 
 #include <algorithm>
 #include <cmath>
 
 #include "mfq_sparse_attn_mma_f16.cuh"
-#include "mfq_hip_compat.h"
 
 namespace {
 
@@ -79,6 +81,32 @@ __device__ __forceinline__ float glm_warp_sum(float value) {
     return value;
 }
 
+template<typename T,typename Output,bool TokenMajor>
+__global__ void dsv4_tail_rope_kernel(const T* x,const int64_t* positions,
+        const float* cosine,const float* sine,Output* output,int64_t pairs,int heads,int tokens,int width,
+        int rotary_dim,int table_stride,int64_t batch_stride,int64_t head_stride,int64_t token_stride) {
+    for(int64_t pair=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;pair<pairs;
+            pair+=int64_t(gridDim.x)*blockDim.x) {
+        const int column=int(pair%(width/2))*2;
+        auto row=pair/(width/2);
+        const int token=int(row%tokens);row/=tokens;
+        const int head=int(row%heads),batch=int(row/heads);
+        const int64_t destination=TokenMajor
+            ? ((int64_t(batch)*tokens+token)*heads+head)*width+column : pair*2;
+        const auto source=int64_t(batch)*batch_stride+int64_t(head)*head_stride+
+            int64_t(token)*token_stride+column;
+        const float a=glm_load(x[source]),b=glm_load(x[source+1]);
+        if(column>=width-rotary_dim) {
+            const auto index=positions[token]*table_stride+(column-width+rotary_dim)/2;
+            const float c=cosine[index],s=sine[index];
+            output[destination]=glm_store<Output>(a*c-b*s);
+            output[destination+1]=glm_store<Output>(b*c+a*s);
+        } else {
+            output[destination]=glm_store<Output>(a);output[destination+1]=glm_store<Output>(b);
+        }
+    }
+}
+
 __global__ void glm_indexer_layer_norm_kernel(
     const half * __restrict__ x,
     const float * __restrict__ weight,
@@ -145,7 +173,7 @@ __global__ void glm_cache_write_kernel(
 }
 
 // One block computes 32 index heads by 64 keys. Eight warps map exactly to
-// the 2x4 WMMA output tiles; the head-weighted ReLU reduction stays on chip.
+// the 2x4 MFMA output tiles; the head-weighted ReLU reduction stays on chip.
 __global__ void glm_indexer_scores_kernel(
     const half * __restrict__ q,
     const half * __restrict__ k,
@@ -155,7 +183,8 @@ __global__ void glm_indexer_scores_kernel(
     const int64_t * __restrict__ seq_lens,
     float score_scale, float weight_scale)
 {
-#if __CUDA_ARCH__ >= 700
+#if defined(__HIP_DEVICE_COMPILE__)
+
     __shared__ half q_tile[kIndexerHeads][kIndexerDim];
     __shared__ half k_tile[kIndexerKeysPerTile][kIndexerDim];
     __shared__ float score_tile[kIndexerHeads][kIndexerKeysPerTile];
@@ -180,33 +209,26 @@ __global__ void glm_indexer_scores_kernel(
     }
     __syncthreads();
 
-    const int warp = threadIdx.y;
-    const int head_base = (warp / 4) * 16;
-    const int key_local_base = (warp % 4) * 16;
-    // Direct FMA score tile (wmma tile path replaced for HIP): each lane
-    // owns eight elements, e = lane + 32*j -> (row, col).
-    float acc[8];
-#pragma unroll
-    for (int element = 0; element < 8; ++element) acc[element] = 0.0f;
-#pragma unroll
-    for (int element = 0; element < 8; ++element) {
-        const int e = (int)threadIdx.x + 32 * element;
-        const int row = e >> 4;
-        const int column = e & 15;
-        float value = 0.0f;
-#pragma unroll
-        for (int d = 0; d < kIndexerDim; ++d) {
-            value += __half2float(q_tile[head_base + row][d]) *
-                     __half2float(k_tile[key_local_base + column][d]);
+    const int lane=tid&63, wave=tid>>6;
+    const int head_base=(wave/2)*16;
+    using F4=float __attribute__((ext_vector_type(4)));
+    using H4=_Float16 __attribute__((ext_vector_type(4)));
+    // Each wave computes two 16x16 head/key tiles with FP32 accumulation.
+    #pragma unroll
+    for(int tile=0;tile<2;++tile) {
+        const int key_base=(wave%2)*32+tile*16;
+        F4 acc{};
+        #pragma unroll
+        for(int d=0;d<kIndexerDim;d+=16) {
+            const auto a=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                q_tile[head_base+(lane&15)]+d+(lane>>4)*4));
+            const auto b=__builtin_bit_cast(H4,*reinterpret_cast<const uint2*>(
+                k_tile[key_base+(lane&15)]+d+(lane>>4)*4));
+            acc=__builtin_amdgcn_mfma_f32_16x16x16f16(a,b,acc,0,0,0);
         }
-        acc[element] = value;
-    }
-    __syncwarp();
-#pragma unroll
-    for (int element = 0; element < 8; ++element) {
-        const int e = (int)threadIdx.x + 32 * element;
-        score_tile[head_base + (e >> 4)][key_local_base + (e & 15)] =
-            acc[element];
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            score_tile[head_base+(lane>>4)*4+j][key_base+(lane&15)]=acc[j];
     }
     __syncthreads();
 
@@ -290,6 +312,43 @@ mfq_tensor_backend::Tensor glm_interleaved_rope_cuda(
     MFQ_RUNTIME_CHECK(status == hipSuccess, "glm_interleaved_rope launch failed: ",
                 hipGetErrorString(status));
     return out;
+}
+
+mfq_tensor_backend::Tensor dsv4_tail_rope_cuda(
+    mfq_tensor_backend::Tensor x,mfq_tensor_backend::Tensor positions,
+    mfq_tensor_backend::Tensor cosine,mfq_tensor_backend::Tensor sine,int64_t rotary_dim,
+    bool float_output,bool token_major) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.dim()==4 && x.stride(3)==1 && x.numel()>0 &&
+        (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32) &&
+        positions.device()==x.device() && positions.scalar_type()==tb::kInt64 && positions.is_contiguous() &&
+        positions.numel()==x.size(2) && cosine.device()==x.device() && sine.device()==x.device() &&
+        cosine.scalar_type()==tb::kFloat32 && sine.scalar_type()==tb::kFloat32 &&
+        cosine.is_contiguous() && sine.is_contiguous() && cosine.dim()==2 && sine.sizes()==cosine.sizes() &&
+        x.size(3)%2==0 && rotary_dim>0 && rotary_dim<=x.size(3) && rotary_dim%2==0 &&
+        cosine.size(1)>=rotary_dim/2,"DeepSeek tail RoPE geometry or dtype mismatch");
+    auto shape=x.sizes().vec();
+    if(token_major)std::swap(shape[1],shape[2]);
+    auto output=tb::empty(shape,x.options().dtype(float_output?tb::kFloat32:x.scalar_type()));
+    const auto pairs=x.numel()/2;
+    const auto blocks=unsigned(std::min<int64_t>(65535,(pairs+255)/256));
+#define MFQ_TAIL_ROPE(TYPE, PTR, OUT, OUTPTR, TOKENMAJOR) \
+    dsv4_tail_rope_kernel<TYPE,OUT,TOKENMAJOR><<<blocks,256,0,mfq_current_cuda_stream()>>>( \
+        reinterpret_cast<const TYPE*>(x.data_ptr<PTR>()),positions.data_ptr<int64_t>(), \
+        cosine.data_ptr<float>(),sine.data_ptr<float>(),reinterpret_cast<OUT*>(output.data_ptr<OUTPTR>()), \
+        pairs,int(x.size(1)),int(x.size(2)),int(x.size(3)),int(rotary_dim),int(cosine.size(1)), \
+        x.stride(0),x.stride(1),x.stride(2))
+#define MFQ_TAIL_LAYOUT(TYPE, PTR, OUT, OUTPTR) \
+    if(token_major) {MFQ_TAIL_ROPE(TYPE,PTR,OUT,OUTPTR,true);} \
+    else {MFQ_TAIL_ROPE(TYPE,PTR,OUT,OUTPTR,false);}
+    if(x.scalar_type()==tb::kFloat16) {
+        if(float_output) {MFQ_TAIL_LAYOUT(half,mfq_half,float,float);}
+        else {MFQ_TAIL_LAYOUT(half,mfq_half,half,mfq_half);}
+    } else {MFQ_TAIL_LAYOUT(float,float,float,float);}
+#undef MFQ_TAIL_LAYOUT
+#undef MFQ_TAIL_ROPE
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
 }
 
 mfq_tensor_backend::Tensor glm_dsa_indexer_layer_norm_cuda(

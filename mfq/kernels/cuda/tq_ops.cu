@@ -1,0 +1,503 @@
+#define TRELLIS_FIXED_BOOK 1
+#define TRELLIS_NORMALIZED_WINDOW 1
+#define TRELLIS_PAIR_BOOK 1
+#include "tq_decode.cuh"
+#include "tq_ops.h"
+#include <cuda_bf16.h>
+#include <cublas_v2.h>
+#include <type_traits>
+#include <cmath>
+
+template<int DT> using Scalar=std::conditional_t<DT==2,float,uint16_t>;
+
+template<int DT> __device__ __forceinline__ float scalar_float(Scalar<DT> value) {
+    if constexpr(DT==2)return value;
+    else if constexpr(DT==1)return __bfloat162float(__ushort_as_bfloat16(value));
+    else return __half2float(__ushort_as_half(value));
+}
+
+template<int DT> __device__ __forceinline__ Scalar<DT> scalar_round(float value) {
+    if constexpr(DT==2)return value;
+    else if constexpr(DT==1)return __bfloat16_as_ushort(__float2bfloat16_rn(value));
+    else return __half_as_ushort(__float2half_rn(value));
+}
+
+
+template<int DT,int V,bool Columns=false> struct DotValues {
+    const Scalar<DT>* x;
+    int logical;
+    const half* columns;
+    uint32_t packed_x[V/2];
+    float sums[2];
+    __device__ __forceinline__ void operator()(int j,float a,float b) {
+        if constexpr(Columns) {
+            const uint32_t packed=__ldg(reinterpret_cast<const uint32_t*>(columns+j));
+            a=__fmul_rn(a,__half2float(__ushort_as_half(uint16_t(packed))));
+            b=__fmul_rn(b,__half2float(__ushort_as_half(uint16_t(packed>>16))));
+        }
+        if constexpr(DT==2) {
+            if(j<logical)sums[j%2]=__fmaf_rn(a,__ldg(x+j),sums[j%2]);
+            if(j+1<logical)sums[(j+1)%2]=__fmaf_rn(b,__ldg(x+j+1),sums[(j+1)%2]);
+        } else {
+            sums[j%2]=__fmaf_rn(a,scalar_float<DT>(uint16_t(packed_x[j/2])),sums[j%2]);
+            sums[(j+1)%2]=__fmaf_rn(b,scalar_float<DT>(uint16_t(packed_x[j/2]>>16)),sums[(j+1)%2]);
+        }
+    }
+};
+
+
+// Retain the FP16 Gaussian book. Apply the shared row/group scale after a
+// small FP32 dot, avoiding per-weight FP16 rounding. BF16/FP32 keep the
+// reconstruction path below to preserve their existing rounding behavior.
+template<int DT,int W,bool C,int Bits,int V>
+__device__ __forceinline__ float factored_range(TrellisProjectionView m,uint64_t d,int row,
+        const Scalar<DT>* x,int begin,int end) {
+    const int tid=threadIdx.x%(W*32);
+    float acc=0;
+    for(int col=begin+tid*V;col<end;col+=W*32*V) {
+        DotValues<DT,V,C> consumer{};
+        consumer.x=x+col;consumer.logical=m.input_columns-col;
+        if constexpr(DT!=2) {
+            #pragma unroll
+            for(int j=0;j<V/2;++j)consumer.packed_x[j]=0;
+            if(col+V<=m.input_columns && (reinterpret_cast<uintptr_t>(x)&(V==4?7:15))==0) {
+                if constexpr(V==4) {
+                    const uint2 a=__ldg(reinterpret_cast<const uint2*>(x+col));
+                    consumer.packed_x[0]=a.x;consumer.packed_x[1]=a.y;
+                }
+                #pragma unroll
+                for(int j=0;j<V/8;++j) {
+                    const uint4 a=__ldg(reinterpret_cast<const uint4*>(x+col+8*j));
+                    consumer.packed_x[4*j]=a.x;consumer.packed_x[4*j+1]=a.y;
+                    consumer.packed_x[4*j+2]=a.z;consumer.packed_x[4*j+3]=a.w;
+                }
+            } else {
+                #pragma unroll
+                for(int j=0;j<V;++j)if(col+j<m.input_columns)
+                    consumer.packed_x[j/2]|=uint32_t(__ldg(x+col+j))<<((j&1)*16);
+            }
+        }
+
+        if constexpr(C)consumer.columns=static_cast<const half*>(m.scales)+col;
+        visit_values<V,true,C,Bits,DotValues<DT,V,C>,true>(m.words,d,m.scales,
+            static_cast<const half*>(m.relative),nullptr,nullptr,row,col,m.stored_columns,m.gslog,consumer);
+        const float partial=consumer.sums[0]+consumer.sums[1];
+        float scale=1.f;
+        if constexpr(!C) {
+            const int group=row*((m.stored_columns+(1<<m.gslog)-1)>>m.gslog)+(col>>m.gslog);
+            const uint8_t selector=__ldg(static_cast<const uint8_t*>(m.scales)+(group>>1));
+            scale=__half2float(__ldg(static_cast<const half*>(m.relative)+((selector>>((group&1)*4))&15)));
+        }
+        acc=__fmaf_rn(scale,partial,acc);
+    }
+    return __fmul_rn(__half2float(__ushort_as_half(uint16_t(d>>40))),acc);
+}
+
+template<int DT,int W,bool C,int Bits,int V>
+__device__ __forceinline__ float projection_range(TrellisProjectionView m,uint64_t d,int row,const Scalar<DT>* x,int begin,int end) {
+    if constexpr(DT==0)return factored_range<DT,W,C,Bits,V>(m,d,row,x,begin,end);
+    const int tid=threadIdx.x%(W*32);
+    DotValues<DT,V> consumer{};
+    for(int col=begin+tid*V;col<end;col+=W*32*V) {
+        consumer.x=x+col;consumer.logical=m.input_columns-col;
+        if constexpr(DT!=2) {
+            #pragma unroll
+            for(int j=0;j<V/2;++j)consumer.packed_x[j]=0;
+            if(col+V<=m.input_columns && (reinterpret_cast<uintptr_t>(x)&(V==4?7:15))==0) {
+                if constexpr(V==4) {
+                    const uint2 a=__ldg(reinterpret_cast<const uint2*>(x+col));
+                    consumer.packed_x[0]=a.x;consumer.packed_x[1]=a.y;
+                }
+                #pragma unroll
+                for(int j=0;j<V/8;++j) {
+                    const uint4 a=__ldg(reinterpret_cast<const uint4*>(x+col+8*j));
+                    consumer.packed_x[4*j]=a.x;consumer.packed_x[4*j+1]=a.y;
+                    consumer.packed_x[4*j+2]=a.z;consumer.packed_x[4*j+3]=a.w;
+                }
+            } else {
+                #pragma unroll
+                for(int j=0;j<V;++j)if(col+j<m.input_columns)
+                    consumer.packed_x[j/2]|=uint32_t(__ldg(x+col+j))<<((j&1)*16);
+            }
+        }
+        visit_values<V,true,C,Bits>(m.words,d,m.scales,static_cast<const half*>(m.relative),nullptr,nullptr,
+                                    row,col,m.stored_columns,m.gslog,consumer);
+    }
+    return consumer.sums[0]+consumer.sums[1];
+}
+
+
+
+template<int DT,int W,bool C,bool Tail>
+__device__ __forceinline__ float width_dispatch(TrellisProjectionView m,int row,const Scalar<DT>* x) {
+    const uint64_t d=__ldg(m.descriptors+row);
+    constexpr int TILE=W*32*16;
+    const int tail=Tail?m.input_columns%TILE:0;
+    const bool compact=Tail && tail>0 && tail<=W*32*4;
+    const int prefix=compact?m.input_columns-tail:m.input_columns;
+    float value=0;
+    #define GB(K) case K-1:value=projection_range<DT,W,C,K,16>(m,d,row,x,0,prefix);break
+    switch((d>>32)&7){GB(1);GB(2);GB(3);GB(4);GB(5);GB(6);GB(7);GB(8);}
+    #undef GB
+    if constexpr(Tail) {
+        if(compact)value+=projection_range<DT,W,C,0,4>(m,d,row,x,prefix,m.input_columns);
+    }
+    return value;
+}
+
+template<int DT,int W,bool Tail>
+__device__ __forceinline__ float matrix_dot(TrellisProjectionView m,int row,const Scalar<DT>* x) {
+    if(m.columns)return width_dispatch<DT,W,true,Tail>(m,row,x);
+    return width_dispatch<DT,W,false,Tail>(m,row,x);
+}
+
+template<int W,int R>
+__device__ __forceinline__ float reduce(float value,float (&partial)[R][W]) {
+    int lane=threadIdx.x&31,warp=threadIdx.x/32,slot=warp/W;
+    #pragma unroll
+    for(int j=16;j;j/=2)value+=__shfl_down_sync(0xffffffff,value,j);
+    if constexpr(W>1) {
+        if(lane==0)partial[slot][warp%W]=value;
+        __syncthreads();
+        value=lane<W?partial[slot][lane]:0.f;
+        #pragma unroll
+        for(int j=16;j;j/=2)value+=__shfl_down_sync(0xffffffff,value,j);
+    }
+    return value;
+}
+
+
+// Each warp handles one projection row. Gate and Up rows use the same dot
+// implementation and meet only for their shared SwiGLU epilogue.
+template<int DT,int W,int R,bool Batch>
+__global__ __launch_bounds__(W*R*64)
+void parallel_gu_kernel(TrellisProjectionView gate,TrellisProjectionView up,
+        const Scalar<DT>* x,Scalar<DT>* y,const TrellisProjectionView* batch_g,
+        const TrellisProjectionView* batch_u,int xs,int ys) {
+    const int group=threadIdx.x/(W*32),role=group&1,slot=group/2;
+    const int row=blockIdx.x*R+slot;
+    TrellisProjectionView m;
+    if constexpr(Batch)m=role?batch_u[blockIdx.y]:batch_g[blockIdx.y];
+    else m=role?up:gate;
+    x+=std::size_t(blockIdx.y)*xs;y+=std::size_t(blockIdx.y)*ys;
+    float value=row<m.rows?matrix_dot<DT,W,false>(m,row,x):0.f;
+    __shared__ float partial[2*R][W],values[R][2];
+    value=reduce<W,2*R>(value,partial);
+    if(threadIdx.x%(W*32)==0) {
+        if(row<m.rows && m.bias)value+=__ldg(m.bias+row);
+        values[slot][role]=scalar_float<DT>(scalar_round<DT>(value));
+    }
+    __syncthreads();
+    if(!role && row<m.rows && threadIdx.x%(W*32)==0) {
+        const float g=values[slot][0],u=values[slot][1];
+        y[row]=scalar_round<DT>(u*(g/(1.f+expf(-g))));
+    }
+}
+
+// A compact device plan covers unrelated matrices without padding every
+// projection to the largest row count or copying their compressed weights.
+template<int DT>
+__global__ __launch_bounds__(128)
+void parallel_projection_kernel(const TrellisProjectionJob* jobs,int count,
+        const Scalar<DT>* x,Scalar<DT>* y,int xs,int ys) {
+    int lo=0,hi=count;
+    while(lo<hi) {
+        const int mid=lo+(hi-lo)/2;
+        if(blockIdx.x<unsigned(jobs[mid].block_end))hi=mid;
+        else lo=mid+1;
+    }
+    if(lo==count)return;
+    const auto job=jobs[lo];
+    const int begin=lo?jobs[lo-1].block_end:0;
+    const int row=(blockIdx.x-begin)*TRELLIS_GROUP_ROWS+threadIdx.x/32;
+    const auto m=job.weight;
+    if(row>=m.rows)return; // Entire warps are either valid or padding.
+    x+=std::size_t(blockIdx.y)*xs;
+    y+=std::size_t(blockIdx.y)*ys+job.output_offset;
+    float value=matrix_dot<DT,1,true>(m,row,x);
+    #pragma unroll
+    for(int step=16;step;step/=2)value+=__shfl_down_sync(0xffffffff,value,step);
+    if((threadIdx.x&31)==0) {
+        if(m.bias)value+=__ldg(m.bias+row);
+        y[row]=scalar_round<DT>(value);
+    }
+}
+
+extern "C" int mfq_tq_parallel(const TrellisProjectionJob* jobs,int count,int blocks,
+        const void* x,void* y,int tokens,int xs,int ys,int dtype,cudaStream_t stream) {
+    if(!jobs || !x || !y || count<1 || blocks<1 || tokens<1 || tokens>65535 || xs<1 || ys<1)return -1;
+    const dim3 grid(blocks,tokens);
+    #define RUN(DT) { parallel_projection_kernel<DT><<<grid,TRELLIS_GROUP_ROWS*32,0,stream>>>(jobs,count, \
+        static_cast<const Scalar<DT>*>(x),static_cast<Scalar<DT>*>(y),xs,ys);return int(cudaGetLastError()); }
+    if(dtype==0)RUN(0);
+    if(dtype==1)RUN(1);
+    if(dtype==2)RUN(2);
+    #undef RUN
+    return -1;
+}
+
+template<int DT,int W,int R,bool Pair,bool Batch>
+__global__ __launch_bounds__(W*R*32)
+void projection_kernel(TrellisProjectionView g,TrellisProjectionView u,const Scalar<DT>* x,Scalar<DT>* y,
+        const TrellisProjectionView* batch_g,const TrellisProjectionView* batch_u,int xs,int ys) {
+    if constexpr(Batch) {
+        g=batch_g[blockIdx.y];
+        if constexpr(Pair)u=batch_u[blockIdx.y];
+    }
+    x+=std::size_t(blockIdx.y)*xs;
+    y+=std::size_t(blockIdx.y)*ys;
+    int row=blockIdx.x*R+threadIdx.x/(W*32);float ga=0,ua=0;
+    if(row<g.rows) {
+        ga=matrix_dot<DT,W,!Pair>(g,row,x);
+        if constexpr(Pair)ua=matrix_dot<DT,W,false>(u,row,x);
+    }
+    __shared__ float sg[R][W],su[R][W];
+    ga=reduce<W,R>(ga,sg);if constexpr(Pair)ua=reduce<W,R>(ua,su);
+    if(row<g.rows && threadIdx.x%(W*32)==0) {
+        if(g.bias)ga+=__ldg(g.bias+row);
+        if constexpr(Pair) {
+            if(u.bias)ua+=__ldg(u.bias+row);
+            ga=scalar_float<DT>(scalar_round<DT>(ga));ua=scalar_float<DT>(scalar_round<DT>(ua));
+            y[row]=scalar_round<DT>(ua*(ga/(1.f+expf(-ga))));
+        } else y[row]=scalar_round<DT>(ga);
+    }
+}
+
+
+template<int DT,int W,int R,bool Pair,bool Batch>
+int launch_projection_impl(TrellisProjectionView g,TrellisProjectionView u,const void* x,void* y,cudaStream_t s,
+        const TrellisProjectionView* bg,const TrellisProjectionView* bu,int count,int xs,int ys) {
+    // Doubling a SwiGLU row's work groups must fit CUDA's block thread limit.
+    if constexpr(Pair && W*R<=16) {
+        int e=launchable(parallel_gu_kernel<DT,W,R,Batch>,W*R*64);if(e)return e;
+        parallel_gu_kernel<DT,W,R,Batch><<<dim3((g.rows+R-1)/R,count),W*R*64,0,s>>>(g,u,
+            static_cast<const Scalar<DT>*>(x),static_cast<Scalar<DT>*>(y),bg,bu,xs,ys);
+    } else {
+        int e=launchable(projection_kernel<DT,W,R,Pair,Batch>,W*R*32);if(e)return e;
+        projection_kernel<DT,W,R,Pair,Batch><<<dim3((g.rows+R-1)/R,count),W*R*32,0,s>>>(g,u,
+            static_cast<const Scalar<DT>*>(x),static_cast<Scalar<DT>*>(y),bg,bu,xs,ys);
+    }
+    return int(cudaGetLastError());
+}
+
+template<int DT,int W,int R,bool Pair>
+int launch_projection(TrellisProjectionView g,TrellisProjectionView u,const void* x,void* y,cudaStream_t s,
+        const TrellisProjectionView* bg=nullptr,const TrellisProjectionView* bu=nullptr,int count=1,int xs=0,int ys=0) {
+    if(bg)return launch_projection_impl<DT,W,R,Pair,true>(g,u,x,y,s,bg,bu,count,xs,ys);
+    return launch_projection_impl<DT,W,R,Pair,false>(g,u,x,y,s,bg,bu,count,xs,ys);
+}
+
+template<int DT,bool Pair>
+int geometry(TrellisProjectionView g,TrellisProjectionView u,const void* x,void* y,int w,int r,cudaStream_t s,
+        const TrellisProjectionView* bg=nullptr,const TrellisProjectionView* bu=nullptr,int count=1,int xs=0,int ys=0) {
+    #define G(W,R) if(w==W && r==R)return launch_projection<DT,W,R,Pair>(g,u,x,y,s,bg,bu,count,xs,ys)
+    G(1,4);G(2,2);G(4,1);G(8,1);G(16,1);G(32,1);
+    #undef G
+    return -2;
+}
+
+extern "C" int mfq_tq_gemv(TrellisProjectionView g,const void* x,void* y,int dtype,int w,int r,cudaStream_t s) {
+    if(g.input_columns<=0 || g.input_columns>g.stored_columns || g.rows<=0 || g.stored_columns%256 ||
+       !g.words || !g.descriptors || !g.scales || !g.relative || !x || !y ||
+       (!g.columns && (g.gslog<4 || g.gslog>20)))return -1;
+    if(w==0) {
+        // Expansion and square projections expose parallelism across rows;
+        // contractions retain multiple warps cooperating on each row.
+        if(g.rows>=g.input_columns){w=1;r=4;}
+        else {w=g.stored_columns<=2048?2:4;r=g.stored_columns<=2048?2:1;}
+    }
+    if(dtype==0)return geometry<0,false>(g,g,x,y,w,r,s);
+    if(dtype==1)return geometry<1,false>(g,g,x,y,w,r,s);
+    if(dtype==2)return geometry<2,false>(g,g,x,y,w,r,s);
+    return -1;
+}
+
+extern "C" int mfq_tq_swiglu(TrellisProjectionView g,TrellisProjectionView u,const void* x,void* h,int dtype,int w,int r,cudaStream_t s) {
+    if(g.rows!=u.rows || g.input_columns!=u.input_columns || g.rows<=0 || g.input_columns<=0 ||
+       g.stored_columns<g.input_columns || u.stored_columns<u.input_columns ||
+       g.stored_columns%256 || u.stored_columns%256 || !g.words || !u.words ||
+       !g.descriptors || !u.descriptors || !g.scales || !u.scales || !g.relative || !u.relative || !x || !h ||
+       (!g.columns && (g.gslog<4 || g.gslog>20)) || (!u.columns && (u.gslog<4 || u.gslog>20)))return -1;
+    if(w==0){w=4;r=1;}
+    if(dtype==0)return geometry<0,true>(g,u,x,h,w,r,s);
+    if(dtype==1)return geometry<1,true>(g,u,x,h,w,r,s);
+    if(dtype==2)return geometry<2,true>(g,u,x,h,w,r,s);
+    return -1;
+}
+
+extern "C" int mfq_tq_ffn(TrellisProjectionView g,TrellisProjectionView u,TrellisProjectionView d,const void* x,void* h,void* y,int dtype,cudaStream_t s) {
+    if(d.input_columns!=g.rows)return -1;
+    int e=mfq_tq_swiglu(g,u,x,h,dtype,0,0,s);if(e)return e;
+    return mfq_tq_gemv(d,h,y,dtype,0,0,s);
+}
+
+template<bool Pair>
+int batch_projection(const TrellisProjectionView* g,const TrellisProjectionView* u,
+        const void* x,void* y,int count,int rows,int xs,int ys,int dtype,int w,int r,cudaStream_t s) {
+    if(!g || (Pair && !u) || !x || !y || count<1 || count>65535 || rows<1 || xs<0 || ys<rows)return -1;
+    if(w==0){w=1;r=4;}
+    TrellisProjectionView shape{};shape.rows=rows;
+    if(dtype==0)return geometry<0,Pair>(shape,shape,x,y,w,r,s,g,u,count,xs,ys);
+    if(dtype==1)return geometry<1,Pair>(shape,shape,x,y,w,r,s,g,u,count,xs,ys);
+    if(dtype==2)return geometry<2,Pair>(shape,shape,x,y,w,r,s,g,u,count,xs,ys);
+    return -1;
+}
+
+extern "C" int mfq_tq_gemv_batch(const TrellisProjectionView* weights,const void* x,void* y,
+        int count,int rows,int xs,int ys,int dtype,int w,int r,cudaStream_t s) {
+    return batch_projection<false>(weights,nullptr,x,y,count,rows,xs,ys,dtype,w,r,s);
+}
+
+extern "C" int mfq_tq_swiglu_batch(const TrellisProjectionView* gate,const TrellisProjectionView* up,
+        const void* x,void* h,int count,int rows,int xs,int ys,int dtype,int w,int r,cudaStream_t s) {
+    return batch_projection<true>(gate,up,x,h,count,rows,xs,ys,dtype,w,r,s);
+}
+
+#include "tq_float_tokens.cuh"
+#include "tq_matmul.cuh"
+#include "tq_prefill_float.cuh"
+#include "tq_parallel_tokens.cuh"
+#include "tq_q8_tokens.cuh"
+#include "tq_routed_views.cuh"
+#include "tq_indexed.cuh"
+#include "tq_indexed_mma.cuh"
+#include "tq_prefill_moe.cuh"
+#include "tq_prefill_gemm.cuh"
+
+extern "C" int mfq_tq_gemv_tokens(TrellisProjectionView g,const void* x,void* y,int tokens,int dtype,cudaStream_t s) {
+    if(tokens<1 || tokens>65535)return -1;
+    if(tokens==1)return mfq_tq_gemv(g,x,y,dtype,0,0,s);
+    if(g.input_columns<=0 || g.input_columns>g.stored_columns || g.rows<=0 || g.stored_columns%256 ||
+       !g.words || !g.descriptors || !g.scales || !g.relative || !x || !y ||
+       (!g.columns && (g.gslog<4 || g.gslog>20)))return -1;
+    if(dtype==0) {
+        if(tokens==3)tq_multi_projection_kernel<3><<<dim3((g.rows+3)/4,1),128,0,s>>>(g,
+            static_cast<const uint16_t*>(x),static_cast<uint16_t*>(y),tokens,g.input_columns,g.rows);
+        else if(tokens<8 && tokens!=4)tq_multi_projection_kernel<2><<<dim3((g.rows+3)/4,(tokens+1)/2),128,0,s>>>(g,
+            static_cast<const uint16_t*>(x),static_cast<uint16_t*>(y),tokens,g.input_columns,g.rows);
+        else tq_multi_projection_kernel<4><<<dim3((g.rows+3)/4,(tokens+3)/4),128,0,s>>>(g,
+            static_cast<const uint16_t*>(x),static_cast<uint16_t*>(y),tokens,g.input_columns,g.rows);
+        return int(cudaGetLastError());
+    }
+    if(dtype==1 || dtype==2)return tq_float_tokens::launch(g,x,y,tokens,1,dtype,s);
+    return -1;
+}
+
+extern "C" int mfq_tq_swiglu_tokens(TrellisProjectionView g,TrellisProjectionView u,
+        const void* x,void* y,int tokens,int dtype,cudaStream_t s) {
+    if(tokens<1 || tokens>65535 || g.rows!=u.rows || g.input_columns!=u.input_columns ||
+       g.rows<=0 || g.input_columns<=0 || g.stored_columns<g.input_columns ||
+       u.stored_columns<u.input_columns || g.stored_columns%256 || u.stored_columns%256 ||
+       !g.words || !u.words || !g.descriptors || !u.descriptors || !g.scales || !u.scales ||
+       !g.relative || !u.relative || !x || !y ||
+       (!g.columns && (g.gslog<4 || g.gslog>20)) || (!u.columns && (u.gslog<4 || u.gslog>20)))return -1;
+    if(dtype==0 && tokens>1) {
+        if(tokens==3)tq_multi_swiglu_kernel<3><<<dim3((g.rows+3)/4,1),256,0,s>>>(g,u,
+            static_cast<const uint16_t*>(x),static_cast<uint16_t*>(y),tokens);
+        else if(tokens<8 && tokens!=4)tq_multi_swiglu_kernel<2><<<dim3((g.rows+3)/4,(tokens+1)/2),256,0,s>>>(g,u,
+            static_cast<const uint16_t*>(x),static_cast<uint16_t*>(y),tokens);
+        else tq_multi_swiglu_kernel<4><<<dim3((g.rows+3)/4,(tokens+3)/4),256,0,s>>>(g,u,
+            static_cast<const uint16_t*>(x),static_cast<uint16_t*>(y),tokens);
+        return int(cudaGetLastError());
+    }
+    if(dtype==0)return geometry<0,true>(g,u,x,y,1,4,s,nullptr,nullptr,tokens,g.input_columns,g.rows);
+    if(dtype==1)return geometry<1,true>(g,u,x,y,1,4,s,nullptr,nullptr,tokens,g.input_columns,g.rows);
+    if(dtype==2)return geometry<2,true>(g,u,x,y,1,4,s,nullptr,nullptr,tokens,g.input_columns,g.rows);
+    return -1;
+}
+
+template<int DT>
+__global__ void weighted_reduce_kernel(const Scalar<DT>* experts,const float* weights,
+        Scalar<DT>* output,int routes,int width) {
+    const std::size_t token=blockIdx.y;
+    const std::size_t col=std::size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(col>=std::size_t(width))return;
+    float value=0.f;
+    for(int route=0;route<routes;++route) {
+        const std::size_t pair=token*routes+route;
+        value=__fadd_rn(value,__fmul_rn(__ldg(weights+pair),scalar_float<DT>(__ldg(experts+pair*width+col))));
+    }
+    output[token*width+col]=scalar_round<DT>(value);
+}
+
+extern "C" int mfq_tq_weighted_reduce(const void* experts,const float* weights,void* output,
+        int tokens,int routes,int width,int dtype,cudaStream_t stream) {
+    if(!experts || !weights || !output || experts==output || static_cast<const void*>(weights)==output ||
+       tokens<1 || tokens>65535 || routes<1 || width<1)return -1;
+    const dim3 grid((std::size_t(width)+255)/256,tokens);
+    #define REDUCE(DT) { weighted_reduce_kernel<DT><<<grid,256,0,stream>>>( \
+        static_cast<const Scalar<DT>*>(experts),weights,static_cast<Scalar<DT>*>(output),routes,width); \
+        return int(cudaGetLastError()); }
+    if(dtype==0)REDUCE(0);
+    if(dtype==1)REDUCE(1);
+    if(dtype==2)REDUCE(2);
+    #undef REDUCE
+    return -1;
+}
+
+template<int DT,bool Columns,int Bits>
+__device__ __forceinline__ void embedding_row(TrellisProjectionView m,uint64_t descriptor,int row,int col,Scalar<DT>* y) {
+    half weight[16];
+    decode_vector<16,true,Columns,Bits>(m.words,descriptor,m.scales,static_cast<const half*>(m.relative),
+        nullptr,nullptr,row,col,m.stored_columns,m.gslog,weight);
+    #pragma unroll
+    for(int j=0;j<16;++j)if(col+j<m.input_columns)y[col+j]=scalar_round<DT>(__half2float(weight[j]));
+}
+
+template<int DT,bool Columns>
+__device__ __forceinline__ void embedding_width(TrellisProjectionView m,uint64_t d,int row,int col,Scalar<DT>* y) {
+    #define EB(K) case K-1:embedding_row<DT,Columns,K>(m,d,row,col,y);break
+    switch((d>>32)&7){EB(1);EB(2);EB(3);EB(4);EB(5);EB(6);EB(7);EB(8);}
+}
+
+template<int DT>
+__global__ void embedding_kernel(TrellisProjectionView m,const int64_t* ids,Scalar<DT>* output) {
+    const int col=(blockIdx.x*blockDim.x+threadIdx.x)*16;
+    if(col>=m.input_columns)return;
+    const auto row=ids?ids[blockIdx.y]:int64_t(blockIdx.y);
+    auto* y=output+std::size_t(blockIdx.y)*m.input_columns;
+    if(row<0 || row>=m.rows) {
+        #pragma unroll
+        for(int j=0;j<16;++j)if(col+j<m.input_columns)y[col+j]=scalar_round<DT>(0.f);
+        return;
+    }
+    const auto descriptor=__ldg(m.descriptors+row);
+    if(m.columns)embedding_width<DT,true>(m,descriptor,int(row),col,y);
+    else embedding_width<DT,false>(m,descriptor,int(row),col,y);
+}
+
+extern "C" int mfq_tq_embedding(TrellisProjectionView m,const int64_t* ids,int count,void* output,int dtype,cudaStream_t s) {
+    if(count<1 || count>65535 || (!ids && count>m.rows) || m.rows<1 || m.input_columns<1 ||
+       m.input_columns>m.stored_columns || m.stored_columns%256 || !m.words || !m.descriptors ||
+       !m.scales || !m.relative || !output || (!m.columns && (m.gslog<4 || m.gslog>20)))return -1;
+    const dim3 grid((m.input_columns+511)/512,count);
+    if(dtype==0)embedding_kernel<0><<<grid,32,0,s>>>(m,ids,static_cast<Scalar<0>*>(output));
+    else if(dtype==1)embedding_kernel<1><<<grid,32,0,s>>>(m,ids,static_cast<Scalar<1>*>(output));
+    else if(dtype==2)embedding_kernel<2><<<grid,32,0,s>>>(m,ids,static_cast<Scalar<2>*>(output));
+    else return -1;
+    return int(cudaGetLastError());
+}
+
+template<int DT>
+__global__ void embedding_rows_kernel(const TrellisProjectionView* rows,int columns,Scalar<DT>* output) {
+    const auto m=rows[blockIdx.y];
+    const int col=(blockIdx.x*blockDim.x+threadIdx.x)*16;
+    if(col>=columns)return;
+    const auto d=__ldg(m.descriptors);
+    auto* target=output+std::size_t(blockIdx.y)*columns;
+    if(m.columns)embedding_width<DT,true>(m,d,0,col,target);
+    else embedding_width<DT,false>(m,d,0,col,target);
+}
+extern "C" int mfq_tq_embedding_rows(const TrellisProjectionView* rows,int count,int columns,
+        void* output,int dtype,cudaStream_t stream) {
+    if(!rows || !output || count<1 || columns<1 || dtype<0 || dtype>2)return -1;
+    for(int64_t first=0;first<count;first+=65535) {
+        const dim3 grid((uint64_t(columns)+511)/512,min(int64_t(65535),int64_t(count)-first));
+        #define ROWS(D) embedding_rows_kernel<D><<<grid,32,0,stream>>>(rows+first,columns, \
+            static_cast<Scalar<D>*>(output)+first*columns)
+        if(dtype==0){ROWS(0);}else if(dtype==1){ROWS(1);}else {ROWS(2);}
+        #undef ROWS
+        const auto error=cudaGetLastError();if(error)return int(error);
+    }
+    return 0;
+}

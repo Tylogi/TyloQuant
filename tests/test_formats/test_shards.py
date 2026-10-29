@@ -75,10 +75,11 @@ def test_sparse_copy_falls_back_when_extent_seek_is_unavailable(
     assert target_path.read_bytes() == b"head-payload"
 
 
-def test_shard_name_round_trip(tmp_path: Path) -> None:
-    base = tmp_path / "model.v1.mfq"
+@pytest.mark.parametrize("suffix", [".mfq", ".tq"])
+def test_shard_name_round_trip(tmp_path: Path, suffix: str) -> None:
+    base = tmp_path / f"model.v1{suffix}"
     shard = format_shard_path(base, 2, 17)
-    assert shard.name == "model.v1-00002-of-00017.mfq"
+    assert shard.name == f"model.v1-00002-of-00017{suffix}"
     assert parse_shard_path(shard) == (base, 2, 17)
     assert parse_size("4G") == 4_000_000_000
     assert parse_size("512m") == 512_000_000
@@ -98,10 +99,11 @@ def test_file_version_tracks_replacement_with_same_size_and_mtime(tmp_path: Path
     assert shard_file_versions(path) != before
 
 
+@pytest.mark.parametrize("suffix", [".mfq", ".tq"])
 def test_offline_split_loads_from_any_shard_without_changing_records(
-    tmp_path: Path,
+    tmp_path: Path, suffix: str,
 ) -> None:
-    source = tmp_path / "model.mfq"
+    source = tmp_path / f"model{suffix}"
     _source_model(source)
     with open_mmap(source) as original:
         raw = {
@@ -111,13 +113,13 @@ def test_offline_split_loads_from_any_shard_without_changing_records(
 
     shards = split_mfq(
         source,
-        tmp_path / "split.mfq",
+        tmp_path / f"split{suffix}",
         split_max_tensors=1,
     )
     assert [path.name for path in shards] == [
-        "split-00001-of-00003.mfq",
-        "split-00002-of-00003.mfq",
-        "split-00003-of-00003.mfq",
+        f"split-00001-of-00003{suffix}",
+        f"split-00002-of-00003{suffix}",
+        f"split-00003-of-00003{suffix}",
     ]
 
     for entry in (shards[0], shards[1], shards[-1]):
@@ -155,11 +157,12 @@ def test_missing_shard_is_rejected(tmp_path: Path) -> None:
         open_mmap(shards[0])
 
 
-def test_unrelated_invalid_shard_names_do_not_prevent_loading_a_complete_model(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extension", ["MFQ", "TQ"])
+def test_unrelated_invalid_shard_names_do_not_prevent_loading_a_complete_model(tmp_path: Path, extension: str) -> None:
     source = tmp_path / "model.mfq"
     _source_model(source)
     shards = split_mfq(source, tmp_path / "split.mfq", split_max_tensors=1)
-    shards = [shard.rename(shard.with_suffix(".MFQ")) for shard in shards]
+    shards = [shard.rename(shard.with_suffix(f".{extension}")) for shard in shards]
     (tmp_path / "unrelated-00000-of-00002.mfq").write_bytes(b"not a model")
     (tmp_path / "other-00001-of-00003.mfq").mkdir()
     with open_mmap(shards[-1]) as store:

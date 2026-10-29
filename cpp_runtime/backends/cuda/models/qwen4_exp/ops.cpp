@@ -300,7 +300,16 @@ static Projection qwen_gdn_profile_projection(Projection project,const char* beg
 static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down,
                        Linear router, Linear shared_gate, Linear sg, Linear su, Linear sd,
                        const Config &c, MoeFfnPrefetch* prefetch=nullptr) {
-    auto shared_raw=[sg,su,sd,shared_gate](CudaExecutionContext& execution,const Tensor& source) {
+    std::shared_ptr<TqProjectionGroup> shared_tq;
+    const auto shared_g=weight_loader::linear_weight(sg),shared_u=weight_loader::linear_weight(su);
+    if(shared_g && shared_u && shared_g->is_tq() && shared_u->is_tq() &&
+       shared_g->tq.image.is_cuda() && shared_u->tq.image.is_cuda())
+        shared_tq=std::make_shared<TqProjectionGroup>(std::vector<TqWeight>{shared_g->tq,shared_u->tq});
+    auto shared_raw=[sg,su,sd,shared_gate,shared_tq](CudaExecutionContext& execution,const Tensor& source) {
+        if(shared_tq) {
+            auto output=sd(execution,shared_tq->swiglu(source));
+            return tb::sigmoid(shared_gate(execution,source))*output;
+        }
         auto unfused=[](const auto&...){return std::optional<Tensor>{};};
         auto output=mfq::models::gated_mlp(source,false,0.0,unfused,unfused,
             [&](Tensor input){return std::array<Tensor,2>{sg(execution,input),su(execution,input)};},
@@ -369,8 +378,16 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
             if(auto output=try_shared_gate_sigmoid_cuda(input,shared_gate_weight->dense))return *output;
         return tb::sigmoid(shared_gate(execution,input));
     };
-    auto pipeline=make_moe_ffn_pipeline(gate_up.projections,down.projections,shared,{},std::move(shared_weights),prefetch);
-    return [gate_up, down, router, shared, pipeline, c](CudaExecutionContext &execution,
+    std::shared_ptr<TqMoeBanks> tq;
+    if(!gate_up.tq_projections.empty() || !down.tq_projections.empty()) {
+        MFQ_RUNTIME_CHECK(gate_up.tq_projections.size()==2 && down.tq_projections.size()==1 &&
+            gate_up.projections.empty() && down.projections.empty(),
+            "TQ MoE requires separate Gate, Up and Down banks");
+        tq=std::make_shared<TqMoeBanks>();
+        tq->gate=gate_up.tq_projections[0];tq->up=gate_up.tq_projections[1];tq->down=down.tq_projections[0];
+    }
+    auto pipeline=tq?MoeFfnForward{}:make_moe_ffn_pipeline(gate_up.projections,down.projections,shared,{},std::move(shared_weights),prefetch);
+    return [gate_up, down, router, shared, pipeline, tq, c](CudaExecutionContext &execution,
                                                                const Tensor &x) {
         auto source = x.reshape({-1, c.hidden}).to(tb::kFloat16);
         const auto layer_prefill = mfq::cuda::runtime_options::moe_prefill_layer();
@@ -399,6 +416,9 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
             },
             [&](const auto &selected) {
                 if(use_pipeline)return pipeline(execution,source,selected[0].to(tb::kInt32).contiguous(),selected[1]);
+                if(tq)return execution.profiler.measure("tq.moe",[&] {
+                    return tq->forward(source,selected[0],selected[1],0,&execution.profiler);
+                });
                 return mfq::models::routed_experts(
                     [&] { return gate_up(execution, source, selected[0]); },
                     [&](Tensor gu) {
@@ -429,9 +449,11 @@ struct BlockLoader : weight_loader::Loader {
     using PleWeights = qwen4_exp::PleWeights;
     Linear* router_capture=nullptr;
     MoeFfnPrefetch* prefetch_capture=nullptr;
+    bool* tq_graph_capture=nullptr;
     struct Embedding {
         attention_ops::Embedding function;
         std::shared_ptr<mfq::NintRows> range;
+        std::shared_ptr<TqRowTable> tq;
         Tensor operator()(const Tensor& ids) const { return function(ids); }
     };
 
@@ -531,10 +553,16 @@ struct BlockLoader : weight_loader::Loader {
     auto moe(weight_loader::Routed gate_up, weight_loader::Routed down, Linear router,
                     Linear shared_gate, Linear sg, Linear su, Linear sd, const Config &c) const {
         if(router_capture)*router_capture=router;
+        if(tq_graph_capture)*tq_graph_capture=gate_up.tq_projections.size()==2 && down.tq_projections.size()==1;
         return qwen_moe(std::move(gate_up), std::move(down), std::move(router), std::move(shared_gate),
                         std::move(sg), std::move(su), std::move(sd), c, prefetch_capture);
     }
     auto embedding(const std::string &name) const {
+        if(is_tq_row_table(source,name)) {
+            auto table=std::make_shared<TqRowTable>(source,name);
+            Embedding lookup{[table](const Tensor& ids){return table->lookup(ids);},{},table};
+            return std::pair{std::move(lookup),std::array<int64_t,2>{static_cast<int64_t>(table->rows()),table->width()}};
+        }
         if (require_tensor(source, name).dtype == "NINT") {
             auto table = load_nint_row_table(source, name);
             Embedding lookup{[table](const Tensor &ids) {
@@ -558,13 +586,24 @@ struct BlockLoader : weight_loader::Loader {
                     std::vector<int64_t> multipliers, std::vector<int64_t> offsets,
                     std::vector<int64_t> sizes, PleWeights weights) {
         std::vector<attention_ops::Embedding> functions;std::vector<std::shared_ptr<mfq::NintRows>> ranges;
-        for(auto& shard:shards){functions.push_back(std::move(shard.function));ranges.push_back(std::move(shard.range));}
+        std::vector<std::shared_ptr<TqRowTable>> tq;
+        for(auto& shard:shards){functions.push_back(std::move(shard.function));ranges.push_back(std::move(shard.range));tq.push_back(std::move(shard.tq));}
         std::shared_ptr<NintRowPipeline> pipeline;
         if(std::all_of(ranges.begin(),ranges.end(),[](const auto& p){return bool(p);})) {
             pipeline=std::make_shared<NintRowPipeline>(std::move(ranges));
         }
+        NgramEmbedding::RowLookup row_lookup;
+        NgramEmbedding::StageFactory stage_factory;
+        if(std::all_of(tq.begin(),tq.end(),[](const auto& p){return bool(p);})) {
+            row_lookup=[tq,rows](const auto& ids,const auto& device) {
+                return lookup_tq_shards(tq,rows,ids,device);
+            };
+            stage_factory=[tq=std::move(tq),rows](const auto& shape,const auto& device) {
+                return make_tq_row_stage(tq,rows,shape,device);
+            };
+        }
         NgramEmbedding embedding(std::move(functions), rows, width, c.ngram, c.ngram_heads, c.eos,
-                                 std::move(multipliers), std::move(offsets), std::move(sizes),std::move(pipeline));
+                                 std::move(multipliers), std::move(offsets), std::move(sizes),std::move(pipeline),std::move(row_lookup),std::move(stage_factory));
         return std::make_unique<Ple>(std::move(embedding), std::move(weights), c.hidden, c.streams,
                                      c.ngram, c.eps);
     }
@@ -582,6 +621,7 @@ struct Qwen4Block final : Block {
     Linear ffn,router;
     Linear next_router;
     MoeFfnPrefetch prefetch,next_prefetch;
+    bool tq_graph_ffn=false;
     std::shared_ptr<RouterLookaheadInputs> router_audit;
     std::unique_ptr<Gdn> gdn;
     std::unique_ptr<Qsa> qsa;
@@ -614,10 +654,10 @@ struct Qwen4Block final : Block {
     }
     Qwen4Block(CudaExecutionContext &execution, const mfq::ModelSource &file,
                const Config &c, int layer, bool predictor = false) {
-        BlockLoader loader{{execution, file, "qwen4_exp"},&router,&prefetch};
+        BlockLoader loader{{execution, file, "qwen4_exp"},&router,&prefetch,&tq_graph_ffn};
         mfq::models::qwen4_exp::load_block(*this, loader, c, layer, predictor);
     }
-    bool retain_graph_storage=false;
+    bool retain_graph_storage=false,retained_prefix=false;
     void reset(int64_t) override {
         if (gdn)
             gdn->reset(retain_graph_storage);
@@ -644,16 +684,19 @@ struct Qwen4Block final : Block {
     }
     Tensor execute(CudaExecutionContext &execution, Tensor x, const Tensor &ids,
                    const Tensor &positions, const Tensor &full_positions, int64_t confirmed = 0,const Tensor& host_ids = {}) {
+        retained_prefix=confirmed>0 && ids.size(1)<=8;
         return mfq::models::qwen4_exp::decoder_layer_chained(
             std::move(x), bool(ple), bool(gdn),
             [&](const Tensor &hidden) {
                 return execution.profiler.measure("prefill.ple",[&] {
-                    return ple->forward(execution, hidden, ids, true, confirmed,host_ids);
+                    return ple->forward(execution, hidden, ids, true, confirmed,host_ids,
+                        full_positions.size(-1)-ids.size(1));
                 });
             },
             [](Tensor hidden, Tensor positional) { return hidden + positional; },
             [&](const Tensor &hidden) { return execution.profiler.measure("prefill.gr_attention",[&] {return attention_gr.pre(execution, hidden);}); },
-            [&](Tensor branch) { return execution.profiler.measure("prefill.gdn",[&] {return gdn->forward(execution, branch, true, confirmed);}); },
+            [&](Tensor branch) { return execution.profiler.measure("prefill.gdn",[&] {return gdn->forward(execution, branch, true, confirmed,
+                full_positions.size(-1)-ids.size(1));}); },
             [&](Tensor branch) {
                 return execution.profiler.measure("prefill.qsa",[&] {return qsa->forward(execution, branch, positions, full_positions, true);});
             },
@@ -1267,7 +1310,7 @@ struct Qwen4DecodeGraph {
     struct PleStage {
         qwen4_exp::Ple* ple;
         mfq_tensor_backend::Tensor rows;
-        std::shared_ptr<NintRowStage> transfer;
+        std::shared_ptr<RowStage> transfer;
         std::vector<qwen4_exp::NgramEmbedding::Context> prefix_context;
         HostBuffer flags{128,true};
         uint32_t* device=nullptr;
@@ -1278,7 +1321,7 @@ struct Qwen4DecodeGraph {
             charge_tensor_host_bytes(128);
             MFQ_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&device),flags.data(),0));
             std::memset(flags.data(),0,128);publish_mapped_flag(host()+16);
-            transfer=ple->graph_stage(tokens,mfq_tensor_backend::Device{mfq_tensor_backend::kCUDA,0});
+            transfer=ple->graph_stage(tokens,mfq_tensor_backend::Device{mfq_tensor_backend::kCUDA,mfq_current_cuda_device()});
             rows=transfer->output().reshape({1,tokens,hidden});
         }
         ~PleStage(){
@@ -1406,7 +1449,7 @@ struct Qwen4DecodeGraph {
                 std::cerr<<"runtime_qwen4_graph_capacity position="<<model.cache_pos
                     <<" required="<<required<<" planned="<<planned<<" capacity="<<kv_capacity<<'\n';
         }
-        const bool prediction=tokens==1 && model.router_lookahead.value_or(
+        const bool prediction=tokens==1 && !model.execution->tq_expert_cache && model.router_lookahead.value_or(
             mfq::cuda::runtime_options::router_lookahead_override().value_or(
                 moe_expert_cache_ssd_router_prefetch(model.execution->moe_expert_cache)));
         auto& owner=cells[{tokens,kind,confirmed,prediction}];
@@ -1438,7 +1481,8 @@ struct Qwen4DecodeGraph {
             // storage; refresh pooled keys even when this graph is already valid.
             for(auto* attention:qsa)attention->prepare_graph(model.positions,kv_capacity);
             if(!cell.window.valid()) {
-                prepare_moe_graph_pool(model.execution->moe_expert_cache);
+                if(!prepare_moe_graph_pool(model.execution->moe_expert_cache))
+                    prepare_tq_graph_pool(model.execution->tq_expert_cache);
                 DecodeGraphBranchScope branch_scope(
                     model.execution->decode_graph_serial_branches);
                 const auto capture_started=std::chrono::steady_clock::now();
@@ -1584,9 +1628,18 @@ mfq_tensor_backend::Tensor qwen4_decode_graph_compact_topk(const Qwen4CausalLm& 
 std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_logits(Qwen4CausalLm& model,mfq_tensor_backend::Tensor ids,int kind,
         const mfq_tensor_backend::Tensor& host_ids) {
     if (!streamed_decode_graphs(*model.execution)) return {};
-    if(!model.execution->config.moe_pipeline || !model.execution->moe_expert_cache || model.cache_pos==0 || model.speculative_start>=0)return {};
+    const bool tq=bool(model.execution->tq_expert_cache);
+    if((!tq && (!model.execution->config.moe_pipeline || !model.execution->moe_expert_cache)) ||
+            model.cache_pos==0 || model.speculative_start>=0)return {};
     if(ids.dim()==1)ids=ids.unsqueeze(0);
     if(ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<1 || ids.size(1)>8 || model.positions.dim()!=1)return {};
+    if(tq) {
+        if(!tq_graph_supports_tokens(ids.size(1)))return {};
+        for(const auto& block:model.blocks) {
+            const auto& b=static_cast<const qwen4_exp::Qwen4Block&>(*block);
+            if(!b.tq_graph_ffn || (b.ple && !b.ple->graph_supported()))return {};
+        }
+    }
     MFQ_RUNTIME_CHECK(model.cache_pos+ids.size(1)<=model.max_position_embeddings(),"MFQ window exceeds context");
     if(!model.graph_registry)model.graph_registry=std::make_unique<Qwen4DecodeGraph>(model);
     return model.graph_registry->run(model,model.device_ids(std::move(ids)),kind,nullptr,0,nullptr,host_ids);
@@ -1642,8 +1695,10 @@ std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
         bool* initialized,const mfq_tensor_backend::Tensor& host_ids,mfq_tensor_backend::Tensor* logits,
         std::vector<int32_t>* greedy_tokens,bool compact_sampling) {
     if(initialized)*initialized=false;
-    if(!streamed_decode_graphs(*model.execution) || !model.execution->config.moe_pipeline ||
-            !model.execution->moe_expert_cache || model.speculative_start>=0)return {};
+    const bool tq=bool(model.execution->tq_expert_cache);
+    if(!streamed_decode_graphs(*model.execution) ||
+            (!tq && (!model.execution->config.moe_pipeline || !model.execution->moe_expert_cache)) ||
+            model.speculative_start>=0)return {};
     // Retained windows own initialized, reset recurrent/KV storage. The
     // first row of a new prompt can replay them without an eager FFN copy.
     if(model.cache_pos==0 && (!model.graph_registry || !model.graph_registry->reusable()))return {};
@@ -1651,9 +1706,10 @@ std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
     if(ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<1 || ids.size(1)>8 ||
         (model.cache_pos!=0 && model.positions.dim()!=1) ||
         confirmed<0 || (confirmed && confirmed>=ids.size(1)))return {};
+    if(tq && !tq_graph_supports_tokens(ids.size(1)))return {};
     for(const auto& block:model.blocks) {
         const auto& b=static_cast<const qwen4_exp::Qwen4Block&>(*block);
-        if(!b.prefetch || (b.ple && !b.ple->graph_supported()))return {};
+        if((!b.prefetch && !b.tq_graph_ffn) || (b.ple && !b.ple->graph_supported()))return {};
     }
     MFQ_RUNTIME_CHECK(model.cache_pos+ids.size(1)<=model.max_position_embeddings(),"MFQ window exceeds context");
     if(!model.graph_registry)model.graph_registry=std::make_unique<Qwen4DecodeGraph>(model);
@@ -1696,13 +1752,17 @@ void qwen4_warmup_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp,int maximum_
     model.reuse_decode_graphs=!reuse || reuse[0]!='0';
     auto* predictor=dynamic_cast<qwen4_exp::Qwen4ExpMtp*>(mtp);
     if(predictor)predictor->reuse_decode_graphs=model.reuse_decode_graphs;
+    const bool tq=bool(model.execution->tq_expert_cache);
+    // Keep TQ startup to the target decode window. Wider verification shapes
+    // are captured on demand; predictor graph preparation remains separate.
+    if(tq)predictor=nullptr;
     const auto* warmup=std::getenv("MFQ_QWEN4_WARMUP_GRAPHS");
     if(!model.reuse_decode_graphs || (warmup && warmup[0]=='0') ||
         model.max_position_embeddings()<32 || !streamed_decode_graphs(*model.execution) ||
-        !model.execution->config.moe_pipeline || !model.execution->moe_expert_cache)return;
+        (!tq && (!model.execution->config.moe_pipeline || !model.execution->moe_expert_cache)))return;
     for(const auto& block:model.blocks) {
         const auto& b=static_cast<const qwen4_exp::Qwen4Block&>(*block);
-        if(!b.prefetch || (b.qsa && !b.qsa->graph_capacity()) || (b.ple && !b.ple->graph_supported()))return;
+        if((!b.prefetch && !b.tq_graph_ffn) || (b.qsa && !b.qsa->graph_capacity()) || (b.ple && !b.ple->graph_supported()))return;
     }
     // Startup state contains synthetic tokens and is discarded before serving.
     // Saving every recurrent state during each capture needlessly doubles its
@@ -1733,7 +1793,7 @@ void qwen4_warmup_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp,int maximum_
     std::vector<tb::Tensor> raw_rows;
     // Eager FFN cells retain their transfer wire per layer until this pass
     // completes; eight-row bootstrap cells multiply that transient footprint.
-    for(int row=0;row<16;++row) {
+    for(int row=0;row<(tq?1:16);++row) {
         auto token=ids.narrow(1,row,1);
         tb::Tensor hidden;
         (void)model.hidden_forward(token,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&hidden);
@@ -2369,7 +2429,9 @@ void Qwen4Model::adapter_load_final_state(const mfq::ModelSource &source,
 
 std::unique_ptr<Block> Qwen4Model::adapter_load_block(const mfq::ModelSource &source, int layer,
                                                       int, const std::string &) {
-    return std::make_unique<qwen4_exp::Qwen4Block>(*execution, source, config, layer);
+    auto block=std::make_unique<qwen4_exp::Qwen4Block>(*execution, source, config, layer);
+    loaded_blocks.push_back(block.get());
+    return block;
 }
 
 void Qwen4Model::adapter_reset(int64_t new_batch) {
@@ -2383,6 +2445,7 @@ void Qwen4Model::adapter_reset(int64_t new_batch) {
     batch = new_batch;
 }
 void Qwen4Model::adapter_begin_forward(bool) {
+    for(auto* block:loaded_blocks)block->retained_prefix=false;
     if(graph_registry) {
         if(reuse_decode_graphs && graph_registry->reusable()) {
             for(auto* attention:graph_registry->qsa)attention->leave_graph();
@@ -2397,9 +2460,15 @@ Qwen4Model::adapter_block_positions(const mfq_tensor_backend::Tensor &full_posit
 }
 
 void Qwen4Model::adapter_finish_forward(const mfq_tensor_backend::Tensor &full_positions,
-                                        int64_t new_batch, int64_t) {
+                                        int64_t new_batch, int64_t tokens) {
     positions = full_positions;
     batch = new_batch;
+    // Short eager verification retains the same prefix states as its graph.
+    // Accepted drafts can be kept without rerunning them as scalar projections.
+    speculative_prefix_retention=tokens<=8 && !loaded_blocks.empty() &&
+        std::all_of(loaded_blocks.begin(),loaded_blocks.end(),[](const auto* block) {
+            return block->retained_prefix;
+        });
 }
 
 // Keep each compressed expert image resident while advancing all prompt chunks
@@ -2407,9 +2476,13 @@ void Qwen4Model::adapter_finish_forward(const mfq_tensor_backend::Tensor &full_p
 bool qwen4_layer_major_prefill_eligible(const Qwen4CausalLm& model, int64_t tokens) {
     const auto enabled=mfq::cuda::runtime_options::moe_prefill_layer_major();
     const auto whole=mfq::cuda::runtime_options::moe_prefill_layer();
-    if((enabled && *enabled==0) || !whole || *whole==0 || tokens<=128 ||
+    const bool tq=model.execution && bool(model.execution->tq_expert_cache);
+    // TQ already groups ordinary bank rows by expert. Its layer-major path
+    // does not require registration in the legacy MFE transfer pipeline.
+    // Keep explicit user overrides and the existing legacy selection policy.
+    if((enabled && *enabled==0) || (whole && *whole==0) || (!tq && !whole) || tokens<=128 ||
        tokens>16384 || model.speculative_start>=0 || !model.execution ||
-       !model.execution->config.moe_pipeline || !model.execution->moe_expert_cache ||
+       (!tq && !model.execution->config.moe_pipeline) || !model.execution->moe_expert_cache ||
        model.execution->dense_cpu_layer_count || model.execution->tensor_parallel.enabled() ||
        model.execution->expert_parallel.enabled())return false;
     const auto primary=model.execution->layer_placement.primary_device();

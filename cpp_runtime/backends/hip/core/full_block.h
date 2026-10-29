@@ -39,6 +39,7 @@ struct FullBlock : Block {
     QuantLinear o;
     FFN ffn;
     KVCache cache;
+    mfq::cuda::KvQuantization kv_quantization;
     mfq_tensor_backend::Tensor decode_partial_o;
     mfq_tensor_backend::Tensor decode_partial_m;
     mfq_tensor_backend::Tensor decode_partial_l;
@@ -46,7 +47,7 @@ struct FullBlock : Block {
     mfq_tensor_backend::Tensor decode_mma_kv_max;
     mfq_tensor_backend::Tensor decode_mma_meta;
 
-    static constexpr int64_t kDecodeAttentionMaxParts = 64;
+    static constexpr int64_t kDecodeAttentionMaxParts = 256;
 
     bool supports_speculation() const noexcept override { return !sliding; }
     void reset(int64_t batch) override;

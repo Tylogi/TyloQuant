@@ -1774,6 +1774,8 @@ bool can_fuse_gated_hc_two_stage(
     const std::optional<MlxLinear>& injection_weight,
     int hidden_size,
     int hc_count) {
+    if (down_weight.tq_weight_ref() || up_weight.tq_weight_ref()
+        || (injection_weight && injection_weight->tq_weight_ref())) return false;
     if (!gated_hc_fast_path_enabled() ||
         hidden_size != 2560 || hc_count != 4 ||
         input.ndim() != 3 || input.shape(0) != 1 ||
@@ -2024,6 +2026,31 @@ MlxQwen4GatedResidualPre fused_gated_hc_two_stage_after(
     };
 }
 
+const mlx::core::fast::CustomKernelFunction& gated_hc_activation_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return mlx::core::fast::metal_kernel("mfq_gated_hc_activation",
+            {"down", "inject"}, {"low", "injection"}, R"METAL(
+uint index = thread_position_in_grid.x;
+if (index < uint(down_shape[0])) {
+    T scaled = down[index] / T(GROUPS);
+    low[index] = scaled * gr_sigmoid(scaled);
+}
+if (index < uint(inject_shape[0])) {
+    T scaled = inject[index] / T(GROUPS);
+    injection[index] = T(2.f) * gr_sigmoid(scaled);
+}
+)METAL", R"METAL(
+template <typename T> inline T gr_sigmoid(T value) {
+    auto tail = 1 / (1 + metal::precise::exp(metal::abs(value)));
+    return value < 0 ? tail : 1 - tail;
+}
+)METAL", true, false, options);
+    }();
+    return kernel;
+}
+
 MlxQwen4GatedResidualPre gated_hc_from_normalized(
     array normalized,
     array residual,
@@ -2037,7 +2064,26 @@ MlxQwen4GatedResidualPre gated_hc_from_normalized(
     const auto* dense_up = up_weight.dense_weight_ref();
     const auto* dense_inject = inject_weight ? inject_weight->dense_weight_ref() : nullptr;
     std::optional<array> fused_injection;
+    std::optional<array> activated_low;
     array down_projection = [&] {
+        if (const auto* down = down_weight.tq_weight_ref(); down && inject_weight) {
+            if (const auto* injection = inject_weight->tq_weight_ref()) {
+                auto projections = MlxTqWeight::matmul_many({*down, *injection}, normalized);
+                if (normalized.size() / static_cast<std::size_t>(width) <= 16) {
+                    auto activations = gated_hc_activation_kernel()(
+                        {mlx::core::reshape(projections[0], {-1}), mlx::core::reshape(projections[1], {-1})},
+                        {projections[0].shape(), projections[1].shape()}, {normalized.dtype(), normalized.dtype()},
+                        {static_cast<int>(std::max(projections[0].size(), projections[1].size())), 1, 1}, {128, 1, 1},
+                        {{"T", normalized.dtype()}, {"GROUPS", hc_count}}, std::nullopt, false, {});
+                    activated_low = std::move(activations[0]);
+                    fused_injection = std::move(activations[1]);
+                } else {
+                    fused_injection = array(2.0f, normalized.dtype()) * mlx::core::sigmoid(
+                        projections[1] / array(float(hc_count), normalized.dtype()));
+                }
+                return std::move(projections[0]);
+            }
+        }
         if (dense_down && dense_inject && can_fuse_gated_hc_projections(
                 normalized,
                 *dense_down,
@@ -2069,10 +2115,13 @@ MlxQwen4GatedResidualPre gated_hc_from_normalized(
                 hidden_size,
                 hc_count);
         }
-        auto low = down_projection / connection_count;
-        low = low * mlx::core::sigmoid(low);
-        auto logits = hc_project(up_weight, low);
+        auto low = activated_low ? *activated_low : down_projection / connection_count;
+        if (!activated_low) low = low * mlx::core::sigmoid(low);
         const auto rows = normalized.size() / static_cast<std::size_t>(width);
+        if (const auto* tq = up_weight.tq_weight_ref(); tq && tq->can_fuse_gated_mix(low)
+            && low.dtype() == normalized.dtype())
+            return tq->gated_mix(low, normalized, hc_count);
+        auto logits = hc_project(up_weight, low);
         const auto elements = rows * static_cast<std::size_t>(hidden_size);
         if (gated_hc_fast_path_enabled() && rows >= 64 &&
             gated_hc_float_dtype(logits.dtype()) && gated_hc_float_dtype(normalized.dtype()) &&

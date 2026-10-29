@@ -43,6 +43,9 @@ public:
     // Finish the current GPU segment before running host I/O. During graph
     // preparation only the supplied placeholder buffers are consumed.
     void host_barrier(std::function<void()> serve);
+    // Update the next segment at a completed host barrier, before its launch.
+    // Zero disables a kernel while preserving the captured dependency edges.
+    void set_kernel_rows(std::size_t segment,cudaGraphNode_t node,unsigned rows);
     template<class T,class Factory> std::shared_ptr<T> workspace(const void* identity,Factory create) {
         auto& owner=workspaces_[identity];if(!owner)owner=create();return std::static_pointer_cast<T>(owner);
     }

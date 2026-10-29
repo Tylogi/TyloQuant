@@ -27,7 +27,8 @@ MlxMoeTopKResult moe_topk(
     const std::optional<mlx::core::array>& bias = std::nullopt,
     const std::optional<mlx::core::array>& available = std::nullopt,
     float norm_floor = 1e-20f,
-    float scale = 1.0f);
+    float scale = 1.0f,
+    bool route_groups = true);
 
 // One-row dense MoE router GEMV. A SIMD group owns each expert row so the
 // small [experts, hidden] projection uses the whole GPU instead of the stock

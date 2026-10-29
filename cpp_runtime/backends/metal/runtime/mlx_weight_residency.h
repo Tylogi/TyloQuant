@@ -73,6 +73,20 @@ public:
         return std::unique_ptr<MlxWeightResidency>(new MlxWeightResidency(live, limit));
     }
 
+    static std::unique_ptr<MlxWeightResidency> retain_arrays(
+        const std::vector<mlx::core::array>& values, std::size_t limit) {
+        if (limit == 0 || !supported()) return {};
+        std::vector<std::shared_ptr<mlx::core::array::Data>> live;
+        std::unordered_set<const void*> seen;
+        for (const auto& value : values) {
+            auto data = value.data_shared_ptr();
+            if (data && allocation_buffer(*data).ptr()
+                && seen.insert(allocation_buffer(*data).ptr()).second) live.push_back(std::move(data));
+        }
+        if (live.empty()) return {};
+        return std::unique_ptr<MlxWeightResidency>(new MlxWeightResidency(live, limit));
+    }
+
     ~MlxWeightResidency() {
         {
             std::lock_guard lock(mutex_);

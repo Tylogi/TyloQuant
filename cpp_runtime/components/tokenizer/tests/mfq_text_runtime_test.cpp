@@ -5,6 +5,7 @@
 #include "mfq_text.h"
 #include "mfq_grammar.h"
 #include "unicode.h"
+#include "jinja/parser.h"
 
 #include <cmath>
 #include <cstdio>
@@ -18,6 +19,28 @@ namespace {
 
 void require(bool condition, const char * message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void test_jinja_dictionary_arguments() {
+    const auto render = [](const std::string & source) {
+        jinja::context context(source);
+        const auto program = jinja::parse_from_tokens(jinja::lexer().tokenize(source));
+        return jinja::runtime::gather_string_parts(jinja::runtime(context).execute(program))->as_string().str();
+    };
+    require(render("{% set key='b' %}{% set d={'a':1} %}{{ dict(d, **{key:2}, c=3)|tojson }}{{ d|tojson }}")
+        == "{\"a\": 1, \"b\": 2, \"c\": 3}{\"a\": 1}", "Jinja mapping unpack/copy mismatch");
+    require(render("{{ dict([['a',1],['b',2]], **{'a':3})|tojson }}")
+        == "{\"a\": 3, \"b\": 2}", "Jinja dictionary replacement mismatch");
+    require(render("{% macro f(a,b) %}{{a}}:{{b}}{% endmacro %}{{f(**{'a':1,'b':2})}}")
+        == "1:2", "Jinja macro keyword unpack mismatch");
+    require(render("{{ namespace(**{'a':7}).a }}") == "7", "Jinja namespace keyword unpack mismatch");
+    for (const std::string source : {
+        "{{ dict(**1) }}", "{{ dict(**{1:'a'}) }}", "{{ dict(a=1, **{'a':2}) }}",
+        "{{ dict(**{'a':1}, a=2) }}", "{{ dict({}, {}) }}", "{{ dict([['a']]) }}"}) {
+        bool failed = false;
+        try { render(source); } catch (const std::exception &) { failed = true; }
+        require(failed, "Jinja invalid dictionary arguments were accepted");
+    }
 }
 
 constexpr const char * kTekkenRegex =
@@ -133,6 +156,7 @@ std::filesystem::path write_tokenizer_fixture() {
 }  // namespace
 
 int main() try {
+    test_jinja_dictionary_arguments();
     test_tekken_regex_split();
     const auto path = write_tokenizer_fixture();
     std::ifstream input(path, std::ios::binary);

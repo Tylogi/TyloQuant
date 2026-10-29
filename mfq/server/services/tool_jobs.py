@@ -23,6 +23,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from mfq.formats.header import MFQ_SUFFIXES
 from mfq.formats.companions import with_engram_shards
 
 from mfq.server.api.network import download_environment, hub_download_url
@@ -1346,7 +1347,7 @@ class ToolJobHandlers:
     async def _download_environment(self, provider: str, request) -> tuple[dict[str, str], bool]:
         endpoint = os.environ.get('HF_ENDPOINT', 'https://huggingface.co') if provider == 'huggingface' else os.environ.get('MODELSCOPE_ENDPOINT', 'https://modelscope.cn')
         filename = next((name for name in request.include if not any(char in name for char in '*?[')
-            and name.lower().endswith(('.mfq', '.safetensors', '.gguf', '.bin'))), None)
+            and name.lower().endswith((*MFQ_SUFFIXES, '.safetensors', '.gguf', '.bin'))), None)
         options = {'direct': True} if request.direct else {}
         if filename and not request.direct:
             options['sample_url'] = hub_download_url(provider, request.repo_id, request.revision, filename)
@@ -1383,7 +1384,7 @@ class ToolJobHandlers:
     def reusable_download_files(destination: Path, files) -> dict[str, int]:
         result = {}
         for item in files:
-            if not item.name.lower().endswith('.mfq') or item.byte_size <= 0:
+            if not item.name.lower().endswith(MFQ_SUFFIXES) or item.byte_size <= 0:
                 continue
             try:
                 path = (destination / item.name).resolve()
@@ -1401,7 +1402,7 @@ class ToolJobHandlers:
     def download_files_present(destination: Path, request, files, *, mfq_only: bool = False) -> bool:
         selected = ToolJobHandlers.selected_download_files(request, files)
         if mfq_only:
-            weights = [item for item in selected if item.name.lower().endswith(('.mfq', '.gguf'))]
+            weights = [item for item in selected if item.name.lower().endswith((*MFQ_SUFFIXES, '.gguf'))]
             if weights:
                 selected = weights
         if not selected:

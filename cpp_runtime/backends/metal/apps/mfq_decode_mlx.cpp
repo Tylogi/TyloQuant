@@ -467,6 +467,11 @@ std::optional<std::size_t> native_hf_source_bytes(
 }
 
 bool is_independently_streamed_record(std::string_view name) noexcept {
+    constexpr std::string_view marker = ".tq_row_shard.";
+    const auto shard = name.rfind(marker);
+    if (shard != std::string_view::npos && shard + marker.size() < name.size()
+        && std::all_of(name.begin() + shard + marker.size(), name.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        name = name.substr(0, shard);
     return name.ends_with(".associative_memory.embedding.weight") ||
         name.ends_with(".engram.embed.weight");
 }
@@ -2806,6 +2811,8 @@ private:
                         static_cast<double>(stats->bytes_read));
                     metrics.emplace_back("ssd_expert_read_calls", static_cast<double>(stats->read_calls));
                     metrics.emplace_back("ssd_expert_prepare_seconds", stats->prepare_seconds);
+                    metrics.emplace_back("ssd_expert_route_sync_seconds", stats->route_sync_seconds);
+                    metrics.emplace_back("ssd_expert_graph_seconds", stats->routed_graph_seconds);
                     metrics.emplace_back("ssd_expert_view_seconds", stats->view_seconds);
                     metrics.emplace_back("ssd_expert_device_route_layers", stats->device_route_layers);
                     metrics.emplace_back("ssd_expert_device_route_hits", stats->device_route_hits);
@@ -3209,7 +3216,7 @@ int run_native_runtime(
             << load_seconds << " s; runtime=native-cpp"
             << " expert_backing="
             << (expert_cache_bytes.has_value()
-                    ? "mfe-ssd"
+                    ? "ssd-streamed"
                     : "full-resident")
             << std::endl;
         const auto load_runtime =
@@ -3424,7 +3431,7 @@ int run_native_runtime(
             << load_seconds << " s; runtime=native-cpp"
             << " expert_backing="
             << (expert_cache_bytes.has_value()
-                    ? "mfe-ssd"
+                    ? "ssd-streamed"
                     : "full-resident")
             << std::endl;
         const auto load_runtime =

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
+from mfq.formats.header import MFQ_SUFFIXES
 from mfq.formats.companions import is_engram_shard
 
 from mfq.server.runtime.backend import (
@@ -433,8 +434,8 @@ class ServerService:
                 return job
             if (path == destination and tables and tables == other_tables and
                     (job.kind, other.repo_id, other.revision) == (request.kind, payload.repo_id, payload.revision)):
-                weights = [name for name in payload.include if name.lower().endswith('.mfq') and not is_engram_shard(name)]
-                other_weights = [name for name in other.include if name.lower().endswith('.mfq') and not is_engram_shard(name)]
+                weights = [name for name in payload.include if name.lower().endswith(MFQ_SUFFIXES) and not is_engram_shard(name)]
+                other_weights = [name for name in other.include if name.lower().endswith(MFQ_SUFFIXES) and not is_engram_shard(name)]
                 if weights and other_weights and not any(
                     fnmatch.fnmatchcase(left, right) or fnmatch.fnmatchcase(right, left)
                     for left in weights for right in other_weights):
@@ -452,7 +453,7 @@ class ServerService:
             destinations = await asyncio.to_thread(self.tool_handlers.download_destinations, request.kind, payload)
             existing = await asyncio.to_thread(lambda: [path for path in destinations if path.is_dir() and any(path.iterdir())])
             needs_dependencies = payload.repo_type == 'model' and any(
-                pattern.lower().endswith('.mfq') and ('/' in pattern or '-of-' in pattern)
+                pattern.lower().endswith(MFQ_SUFFIXES) and ('/' in pattern or '-of-' in pattern)
                 for pattern in payload.include)
             if not existing and not needs_dependencies:
                 return

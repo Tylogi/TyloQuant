@@ -1530,6 +1530,7 @@ struct MlxDeepseekV4Attention::Impl {
               components.q_norm,
               static_cast<float>(config.rms_eps)) {
         validate();
+        components.wo_a.prepare_grouped_row_matmul(checked_int(config.o_groups, "output groups"));
         if (ratio != 0) {
             const Shape strides{ratio, 1};
             pool_rope.emplace(

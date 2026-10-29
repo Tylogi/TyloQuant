@@ -5,11 +5,15 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <atomic>
+#include <cstdio>
 #include <limits>
 #include <type_traits>
 
 #include "../hip/packed_backward.cuh"
 #include "mfq_hip_compat.h"
+#include "mfq_hip_quant_ops.h"
 
 namespace {
 
@@ -44,12 +48,386 @@ __device__ __forceinline__ float decode_e4m3fn(std::uint8_t raw) {
     return (raw & 128u) == 0u ? magnitude : -magnitude;
 }
 
+__device__ __forceinline__ void decode_e4m3fn_four(uint32_t packed,float (&decoded)[4]) {
+#if defined(__gfx942__)
+    const auto lo=__builtin_amdgcn_cvt_pk_f32_fp8(packed,false);
+    const auto hi=__builtin_amdgcn_cvt_pk_f32_fp8(packed,true);
+#pragma unroll
+    for(int item=0;item<4;++item) {
+        const uint8_t code=uint8_t(packed>>(item*8));
+        float value=(item<2?lo[item&1]:hi[item&1])*2.f;
+        if(code==128)value=-0.f;
+        if((code&127)==127)value=__int_as_float(0x7fffffff);
+        decoded[item]=value;
+    }
+#else
+#pragma unroll
+    for(int item=0;item<4;++item)decoded[item]=decode_e4m3fn(uint8_t(packed>>(item*8)));
+#endif
+}
+
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int delta = 16; delta > 0; delta >>= 1) {
         value += __shfl_down_sync(0xffffffffu, value, delta);
     }
     return value;
+}
+
+template<int Lanes,int Vector,class Output,bool VectorLoads=false>__global__ __launch_bounds__(256) void mxfp8_native_dot_kernel(
+        const uint8_t* values,const uint8_t* scales,const half* input,Output* output,
+        int n,int k,int groups,int row_shift,int col_shift) {
+    const int lane=threadIdx.x%Lanes,neuron=blockIdx.x*(256/Lanes)+threadIdx.x/Lanes;
+    if constexpr(Lanes<=64) {if(neuron>=n)return;}
+    const auto* x=input+size_t(neuron/(n/groups))*k;
+    const auto* v=values+size_t(neuron)*k;
+    const auto* s=scales+size_t(neuron>>row_shift)*(k>>col_shift);
+    const int tile=Lanes*Vector,end=k;
+    float sum[4]{};
+    for(int base=0;neuron<n && base<end;base+=tile) {
+        static_assert(!VectorLoads || Vector==8 || Vector==16);
+        uint32_t word_cache[4]{},input_cache[8]{};
+        float common_scale=0.f;
+        if constexpr(VectorLoads) {
+            const int col=base+lane*Vector;
+            if(col<end) {
+                if constexpr(Vector==16) {
+                const auto packed=*reinterpret_cast<const uint4*>(v+col);
+                word_cache[0]=packed.x;word_cache[1]=packed.y;word_cache[2]=packed.z;word_cache[3]=packed.w;
+                const auto lo=*reinterpret_cast<const uint4*>(x+col);
+                const auto hi=*reinterpret_cast<const uint4*>(x+col+8);
+                input_cache[0]=lo.x;input_cache[1]=lo.y;input_cache[2]=lo.z;input_cache[3]=lo.w;
+                input_cache[4]=hi.x;input_cache[5]=hi.y;input_cache[6]=hi.z;input_cache[7]=hi.w;
+                } else {
+                    const auto packed=*reinterpret_cast<const uint2*>(v+col);
+                    word_cache[0]=packed.x;word_cache[1]=packed.y;
+                    const auto lo=*reinterpret_cast<const uint4*>(x+col);
+                    input_cache[0]=lo.x;input_cache[1]=lo.y;input_cache[2]=lo.z;input_cache[3]=lo.w;
+                }
+                common_scale=decode_e8m0(s[col>>col_shift]);
+            }
+        }
+        #pragma unroll
+        for(int j=0;j<Vector/4;++j) {
+            const int col=base+lane*Vector+j*4;
+            if(col<end) {
+                const uint32_t packed=VectorLoads?word_cache[j]:*reinterpret_cast<const uint32_t*>(v+col);
+                float weight[4];decode_e4m3fn_four(packed,weight);
+                const float scale=VectorLoads?common_scale:decode_e8m0(s[col>>col_shift]);
+                const auto xv=VectorLoads?make_uint2(input_cache[j*2],input_cache[j*2+1]):*reinterpret_cast<const uint2*>(x+col);
+                const half2 lo=__builtin_bit_cast(half2,xv.x),hi=__builtin_bit_cast(half2,xv.y);
+                const float2 xl=__half22float2(lo),xh=__half22float2(hi);
+                sum[0]=fmaf(xl.x,weight[0]*scale,sum[0]);sum[1]=fmaf(xl.y,weight[1]*scale,sum[1]);
+                sum[2]=fmaf(xh.x,weight[2]*scale,sum[2]);sum[3]=fmaf(xh.y,weight[3]*scale,sum[3]);
+            }
+        }
+    }
+    float total=(sum[0]+sum[1])+(sum[2]+sum[3]);
+    #pragma unroll
+    for(int delta=(Lanes<64?Lanes:64)/2;delta;delta>>=1)total+=__shfl_down(total,delta,(Lanes<64?Lanes:64));
+    if constexpr(Lanes>64) {
+        __shared__ float partial[4];
+        if((threadIdx.x&63)==0)partial[threadIdx.x/64]=total;
+        __syncthreads();
+        if(lane==0) {
+            total=partial[threadIdx.x/64];
+            #pragma unroll
+            for(int j=1;j<Lanes/64;++j)total+=partial[threadIdx.x/64+j];
+        }
+    }
+    if(lane==0 && neuron<n) {
+        if constexpr(std::is_same_v<Output,float>)output[neuron]=total;
+        else output[neuron]=__float2half_rn(total);
+    }
+}
+
+template<class Output,bool Native=false>
+__global__ void mxfp8_wide_dot_kernel(const uint8_t* values,const uint8_t* scales,
+        const __half* input,Output* output,int width,int outputs_per_group,
+        int scale_row_shift,int scale_column_shift) {
+    const int neuron=blockIdx.x,tid=threadIdx.x;
+    const auto* x=input+size_t(neuron/outputs_per_group)*width;
+    const auto* row_values=values+size_t(neuron)*width;
+    const auto* row_scales=scales+size_t(neuron>>scale_row_shift)*(width>>scale_column_shift);
+    extern __shared__ float products[];
+    __shared__ unsigned unsafe_scale;
+    if(tid==0)unsafe_scale=0;
+    __syncthreads();
+    if constexpr(Native) {
+        for(int col=tid*4;col<width;col+=blockDim.x*4) {
+            const uint8_t scale_code=row_scales[col>>scale_column_shift];
+            if(scale_code<34 || scale_code>229)atomicOr(&unsafe_scale,1u);
+            const auto packed=*reinterpret_cast<const uint32_t*>(row_values+col);
+            float decoded[4];decode_e4m3fn_four(packed,decoded);
+            const float scale=decode_e8m0(scale_code);
+#pragma unroll
+            for(int item=0;item<4;++item)
+                products[col+item]=__half2float(x[col+item])*(decoded[item]*scale);
+        }
+    } else {
+        for(int col=tid;col<width;col+=blockDim.x) {
+            const uint8_t scale=row_scales[col>>scale_column_shift];
+            if(scale<34 || scale>229)atomicOr(&unsafe_scale,1u);
+            products[col]=__half2float(x[col])*(decode_e4m3fn(row_values[col])*decode_e8m0(scale));
+        }
+    }
+    __syncthreads();
+    if(tid<32) {
+        float total=0.f;
+        if(unsafe_scale) {
+            for(int col=tid;col<width;col+=32) {
+                const float weight=decode_e4m3fn(row_values[col])*decode_e8m0(row_scales[col>>scale_column_shift]);
+                total+=__half2float(x[col])*weight;
+            }
+        } else {
+            // Half activations times scaled E4M3 values have at most fifteen
+            // significand bits. In this exponent range every product is an
+            // exact FP32 value; the original accumulation order is unchanged.
+            for(int col=tid;col<width;col+=32)total=__fadd_rn(total,products[col]);
+        }
+        total=warp_sum(total);
+        if(tid==0) {
+            if constexpr(std::is_same_v<Output,float>)output[neuron]=total;
+            else output[neuron]=__float2half_rn(total);
+        }
+    }
+}
+
+template<class Output,bool CacheActivation,bool Native=false>
+__global__ void mxfp8_packed_four_kernel(const uint8_t* values,const uint8_t* scales,
+        const __half* input,Output* output,int outputs,int width,int outputs_per_group,
+        int scale_row_shift,int scale_column_shift) {
+    // Eight threads retain the original thirty-two independent accumulation
+    // lanes. A dword load supplies four adjacent lanes without changing sums.
+    const int tid=threadIdx.x,lane=tid&7;
+    const int neuron=blockIdx.x*32+tid/8;
+    extern __shared__ float shared_input[];
+    if constexpr(CacheActivation) {
+        const auto* block_input=input+size_t(blockIdx.x*32/outputs_per_group)*width;
+        for(int col=tid;col<width;col+=blockDim.x)shared_input[col]=__half2float(block_input[col]);
+        __syncthreads();
+    }
+    if(neuron>=outputs)return;
+    const auto* x=input+size_t(neuron/outputs_per_group)*width;
+    const auto* row_values=values+size_t(neuron)*width;
+    const auto* row_scales=scales+size_t(neuron>>scale_row_shift)*(width>>scale_column_shift);
+    float accum[4]{};
+    for(int base=0;base<width;base+=128) {
+        #pragma unroll
+        for(int tile=0;tile<4;++tile) {
+            const int col=base+tile*32+lane*4;
+            const uint32_t packed=*reinterpret_cast<const uint32_t*>(row_values+col);
+            const float scale=decode_e8m0(row_scales[col>>scale_column_shift]);
+            float decoded[4];
+            if constexpr(Native)decode_e4m3fn_four(packed,decoded);
+            else {
+                #pragma unroll
+                for(int item=0;item<4;++item)decoded[item]=decode_e4m3fn(uint8_t(packed>>(item*8)));
+            }
+            #pragma unroll
+            for(int item=0;item<4;++item) {
+                const float weight=decoded[item]*scale;
+                const float activation=CacheActivation?shared_input[col+item]:__half2float(x[col+item]);
+                accum[item]+=activation*weight;
+            }
+        }
+    }
+    #pragma unroll
+    for(int delta=4;delta>0;delta>>=1) {
+        #pragma unroll
+        for(int item=0;item<4;++item)accum[item]+=__shfl_down(accum[item],delta,8);
+    }
+    if(lane==0) {
+        accum[0]+=accum[2];accum[1]+=accum[3];accum[0]+=accum[1];
+        if constexpr(std::is_same_v<Output,float>)output[neuron]=accum[0];
+        else output[neuron]=__float2half_rn(accum[0]);
+    }
+}
+
+template<class Output,bool Native=false>
+__global__ void mxfp8_staged_rows_kernel(const uint8_t* values,const uint8_t* scales,
+        const __half* input,Output* output,int outputs,int width,int outputs_per_group,
+        int scale_row_shift,int scale_column_shift) {
+    const int tid=threadIdx.x,lane=tid&31,warp=tid>>5;
+    const int neuron=blockIdx.x*8+warp;
+    if(neuron>=outputs)return;
+    const auto* x=input+size_t(neuron/outputs_per_group)*width;
+    const auto* row_values=values+size_t(neuron)*width;
+    const auto* row_scales=scales+size_t(neuron>>scale_row_shift)*(width>>scale_column_shift);
+    __shared__ float weight_tiles[8*128];
+    float* tile=weight_tiles+warp*128;
+    float total=0.f;
+    for(int base=0;base<width;base+=128) {
+        const int col=base+lane*4;
+        const uint32_t packed=*reinterpret_cast<const uint32_t*>(row_values+col);
+        const float scale=decode_e8m0(row_scales[col>>scale_column_shift]);
+        if constexpr(Native) {
+            float decoded[4];decode_e4m3fn_four(packed,decoded);
+            #pragma unroll
+            for(int item=0;item<4;++item)tile[lane*4+item]=decoded[item]*scale;
+        } else {
+            #pragma unroll
+            for(int item=0;item<4;++item)tile[lane*4+item]=decode_e4m3fn(uint8_t(packed>>(item*8)))*scale;
+        }
+        __syncwarp();
+        #pragma unroll
+        for(int item=0;item<4;++item)total+=__half2float(x[base+lane+item*32])*tile[lane+item*32];
+        __syncwarp();
+    }
+    total=warp_sum(total);
+    if(lane==0) {
+        if constexpr(std::is_same_v<Output,float>)output[neuron]=total;
+        else output[neuron]=__float2half_rn(total);
+    }
+}
+
+template<class Output>
+__global__ void mxfp8_shuffle_rows_kernel(const uint8_t* values,const uint8_t* scales,
+        const __half* input,Output* output,int outputs,int width,int outputs_per_group,
+        int scale_row_shift,int scale_column_shift) {
+    const int tid=threadIdx.x,lane=tid&31,neuron=blockIdx.x*8+(tid>>5);
+    if(neuron>=outputs)return;
+    const auto* x=input+size_t(neuron/outputs_per_group)*width;
+    const auto* row_values=values+size_t(neuron)*width;
+    const auto* row_scales=scales+size_t(neuron>>scale_row_shift)*(width>>scale_column_shift);
+    float total=0.f;
+    for(int base=0;base<width;base+=128) {
+        // Permute coalesced dword readers so two quad transposes produce
+        // the original lane + 32*item accumulation order entirely in registers.
+        const int col=base+((lane>>2)|((lane&3)<<3))*4;
+        const auto packed=*reinterpret_cast<const uint32_t*>(row_values+col);
+        float w[4];decode_e4m3fn_four(packed,w);
+        const float scale=decode_e8m0(row_scales[col>>scale_column_shift]);
+        #pragma unroll
+        for(int item=0;item<4;++item)w[item]*=scale;
+        float a=__shfl_xor((lane&1)?w[0]:w[1],1,32);
+        float b=__shfl_xor((lane&1)?w[2]:w[3],1,32);
+        if(lane&1) {w[0]=a;w[2]=b;} else {w[1]=a;w[3]=b;}
+        a=__shfl_xor((lane&2)?w[0]:w[2],2,32);
+        b=__shfl_xor((lane&2)?w[1]:w[3],2,32);
+        if(lane&2) {w[0]=a;w[1]=b;} else {w[2]=a;w[3]=b;}
+        #pragma unroll
+        for(int item=0;item<4;++item)total+=__half2float(x[base+lane+item*32])*w[item];
+    }
+    total=warp_sum(total);
+    if(lane==0) {
+        if constexpr(std::is_same_v<Output,float>)output[neuron]=total;
+        else output[neuron]=__float2half_rn(total);
+    }
+}
+
+template<int Lanes,int Vector,bool VectorLoads=false>__global__ __launch_bounds__(256) void mxfp8_gate_up_native_kernel(
+        const uint8_t* gv,const uint8_t* gs,const uint8_t* uv,const uint8_t* us,
+        const half* x,half* output,int n,int k,int gr,int gc,int ur,int uc,float limit) {
+    const int lane=threadIdx.x%Lanes,neuron=blockIdx.x*(256/Lanes)+threadIdx.x/Lanes;
+    if constexpr(Lanes<=64) {if(neuron>=n)return;}
+    float gsum[4]{},usum[4]{};
+    for(int base=0;neuron<n && base<k;base+=Lanes*Vector) {
+        uint32_t gate_cache[4]{},up_cache[4]{},input_cache[8]{};
+        float common_gate=0.f,common_up=0.f;
+        if constexpr(VectorLoads) {
+            const int col=base+lane*Vector;
+            if(col<k) {
+                if constexpr(Vector==16) {
+                    const auto g=*reinterpret_cast<const uint4*>(gv+size_t(neuron)*k+col);
+                    const auto u=*reinterpret_cast<const uint4*>(uv+size_t(neuron)*k+col);
+                    gate_cache[0]=g.x;gate_cache[1]=g.y;gate_cache[2]=g.z;gate_cache[3]=g.w;
+                    up_cache[0]=u.x;up_cache[1]=u.y;up_cache[2]=u.z;up_cache[3]=u.w;
+                    const auto hi=*reinterpret_cast<const uint4*>(x+col+8);
+                    input_cache[4]=hi.x;input_cache[5]=hi.y;input_cache[6]=hi.z;input_cache[7]=hi.w;
+                } else {
+                    const auto g=*reinterpret_cast<const uint2*>(gv+size_t(neuron)*k+col);
+                    const auto u=*reinterpret_cast<const uint2*>(uv+size_t(neuron)*k+col);
+                    gate_cache[0]=g.x;gate_cache[1]=g.y;up_cache[0]=u.x;up_cache[1]=u.y;
+                }
+                const auto lo=*reinterpret_cast<const uint4*>(x+col);
+                input_cache[0]=lo.x;input_cache[1]=lo.y;input_cache[2]=lo.z;input_cache[3]=lo.w;
+                common_gate=decode_e8m0(gs[size_t(neuron>>gr)*(k>>gc)+(col>>gc)]);
+                common_up=decode_e8m0(us[size_t(neuron>>ur)*(k>>uc)+(col>>uc)]);
+            }
+        }
+        #pragma unroll
+        for(int j=0;j<Vector/4;++j) {
+            const int col=base+lane*Vector+j*4;
+            if(col<k) {
+                float g[4],u[4];
+                decode_e4m3fn_four(VectorLoads?gate_cache[j]:*reinterpret_cast<const uint32_t*>(gv+size_t(neuron)*k+col),g);
+                decode_e4m3fn_four(VectorLoads?up_cache[j]:*reinterpret_cast<const uint32_t*>(uv+size_t(neuron)*k+col),u);
+                const float gscale=VectorLoads?common_gate:decode_e8m0(gs[size_t(neuron>>gr)*(k>>gc)+(col>>gc)]);
+                const float uscale=VectorLoads?common_up:decode_e8m0(us[size_t(neuron>>ur)*(k>>uc)+(col>>uc)]);
+                const auto xv=VectorLoads?make_uint2(input_cache[j*2],input_cache[j*2+1]):*reinterpret_cast<const uint2*>(x+col);
+                const auto lo=__half22float2(__builtin_bit_cast(half2,xv.x)),hi=__half22float2(__builtin_bit_cast(half2,xv.y));
+                float activation[4]{lo.x,lo.y,hi.x,hi.y};
+                #pragma unroll
+                for(int q=0;q<4;++q) {gsum[q]=fmaf(activation[q],g[q]*gscale,gsum[q]);usum[q]=fmaf(activation[q],u[q]*uscale,usum[q]);}
+            }
+        }
+    }
+    float g=(gsum[0]+gsum[1])+(gsum[2]+gsum[3]),u=(usum[0]+usum[1])+(usum[2]+usum[3]);
+    #pragma unroll
+    for(int delta=32;delta;delta>>=1) {g+=__shfl_down(g,delta,64);u+=__shfl_down(u,delta,64);}
+    if constexpr(Lanes>64) {
+        __shared__ float gp[4],up[4];
+        if((threadIdx.x&63)==0) {gp[threadIdx.x/64]=g;up[threadIdx.x/64]=u;}
+        __syncthreads();
+        if(lane==0) {
+            g=gp[threadIdx.x/64];u=up[threadIdx.x/64];
+            #pragma unroll
+            for(int j=1;j<Lanes/64;++j) {g+=gp[threadIdx.x/64+j];u+=up[threadIdx.x/64+j];}
+        }
+    }
+    if(lane==0 && neuron<n) {
+        g=__half2float(__float2half_rn(g));u=__half2float(__float2half_rn(u));
+        asm volatile("" : "+v"(g), "+v"(u));
+        g=fminf(g,limit);u=fminf(fmaxf(u,-limit),limit);
+        float activated=g/(1.f+expf(-g));asm volatile("" : "+v"(activated));
+        float product=activated*u;asm volatile("" : "+v"(product));
+        output[neuron]=__float2half_rn(product);
+    }
+}
+__global__ void mxfp8_gate_up_clipped_kernel(
+        const uint8_t* gate_values,const uint8_t* gate_scales,
+        const uint8_t* up_values,const uint8_t* up_scales,
+        const __half* input,__half* output,int outputs,int width,
+        int gate_row_shift,int gate_column_shift,int up_row_shift,int up_column_shift,float limit) {
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5,neuron=blockIdx.x*8+warp;
+    if(neuron>=outputs)return;
+    const auto* gv=gate_values+size_t(neuron)*width;
+    const auto* uv=up_values+size_t(neuron)*width;
+    const auto* gs=gate_scales+size_t(neuron>>gate_row_shift)*(width>>gate_column_shift);
+    const auto* us=up_scales+size_t(neuron>>up_row_shift)*(width>>up_column_shift);
+    __shared__ float tiles[2][8*128];
+    float* gt=tiles[0]+warp*128;float* ut=tiles[1]+warp*128;
+    float gate_sum=0.f,up_sum=0.f;
+    for(int base=0;base<width;base+=128) {
+        const int col=base+lane*4;
+        float g[4],u[4];
+        decode_e4m3fn_four(*reinterpret_cast<const uint32_t*>(gv+col),g);
+        decode_e4m3fn_four(*reinterpret_cast<const uint32_t*>(uv+col),u);
+        const float gscale=decode_e8m0(gs[col>>gate_column_shift]);
+        const float uscale=decode_e8m0(us[col>>up_column_shift]);
+        #pragma unroll
+        for(int item=0;item<4;++item) {gt[lane*4+item]=g[item]*gscale;ut[lane*4+item]=u[item]*uscale;}
+        __syncwarp();
+        #pragma unroll
+        for(int item=0;item<4;++item) {
+            const float x=__half2float(input[base+lane+item*32]);
+            gate_sum+=x*gt[lane+item*32];up_sum+=x*ut[lane+item*32];
+        }
+        __syncwarp();
+    }
+    gate_sum=warp_sum(gate_sum);up_sum=warp_sum(up_sum);
+    if(lane==0) {
+        float g=__half2float(__float2half_rn(gate_sum));
+        float u=__half2float(__float2half_rn(up_sum));
+        asm volatile("" : "+v"(g), "+v"(u));
+        g=fminf(g,limit);u=fminf(fmaxf(u,-limit),limit);
+        float activated=g/(1.f+expf(-g));
+        asm volatile("" : "+v"(activated));
+        float product=activated*u;
+        asm volatile("" : "+v"(product));
+        output[neuron]=__float2half_rn(product);
+    }
 }
 
 template <
@@ -66,7 +444,7 @@ __global__ void mxfp8_small_m_kernel(
         int outputs,
         int width,
         int groups,
-        int outputs_per_group) {
+        int outputs_per_group, int scale_row_shift, int scale_column_shift) {
     extern __shared__ float shared_activation[];
     constexpr int kWarps = 8;
     const int lane = int(threadIdx.x) & 31;
@@ -102,7 +480,7 @@ __global__ void mxfp8_small_m_kernel(
         }
     }
 
-    const int scale_columns = width / 128;
+    const int scale_columns = width >> scale_column_shift;
     for (int block_column = 0; block_column < width; block_column += 128) {
         float scale[OUTPUTS_PER_WARP];
 #pragma unroll
@@ -110,8 +488,8 @@ __global__ void mxfp8_small_m_kernel(
             const int global_output = first_output + output;
             scale[output] = global_output < outputs
                 ? decode_e8m0(scales[
-                    (global_output / 128) * scale_columns +
-                    block_column / 128])
+                    (global_output >> scale_row_shift) * scale_columns +
+                    (block_column >> scale_column_shift)])
                 : 0.0f;
         }
 #pragma unroll
@@ -138,9 +516,10 @@ __global__ void mxfp8_small_m_kernel(
                 if (global_output >= outputs) {
                     continue;
                 }
+                const float weight_scale = scale_column_shift == 7 ? scale[output] : decode_e8m0(
+                    scales[(global_output >> scale_row_shift) * scale_columns + (column >> scale_column_shift)]);
                 const float weight = decode_e4m3fn(
-                    values[(std::size_t)global_output * width + column]) *
-                    scale[output];
+                    values[(std::size_t)global_output * width + column]) * weight_scale;
 #pragma unroll
                 for (int row = 0; row < TILE_M; ++row) {
                     accum[row][output] += activation[row] * weight;
@@ -178,9 +557,138 @@ void launch_mxfp8_small_m(
         int groups,
         int outputs_per_group,
         hipStream_t stream) {
+    const int outputs = int(values.size(0));
+    static const int tune_mode = [] {
+        const char* value = std::getenv("MFQ_HIP_MXFP8_NATIVE_TUNE");
+        return !value ? 13 : std::atoi(value);
+    }();
     constexpr int threads = 256;
     constexpr int warps = threads / 32;
-    const int outputs = int(values.size(0));
+    static const bool vector_remaining=[] {
+        const char* value=std::getenv("MFQ_HIP_MXFP8_REMAINING");return !value || value[0]!='0';
+    }();
+    if(tune_mode>=13 && vector_remaining && TILE_M==1 && groups==1 &&
+            ((outputs==4096 && values.size(1)==1280) ||
+             (outputs==25600 && values.size(1)==6144))) {
+        const int width=int(values.size(1));
+        const int rs=scales.size(1)==width/128?7:scales.size(0)==outputs?0:5;
+        const int cs=scales.size(1)==width/128?7:5;
+        #define REMAINING(L) mxfp8_native_dot_kernel<L,16,Output,true><<<(outputs+256/L-1)/(256/L),256,0,stream>>>(values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),reinterpret_cast<Output*>(y.data_ptr()),outputs,width,groups,rs,cs)
+        if(outputs==4096){REMAINING(16);}else{REMAINING(64);}
+        #undef REMAINING
+        static const bool log=std::getenv("MFQ_HIP_MXFP8_REMAINING_LOG")!=nullptr;
+        static std::atomic<unsigned> logged_shapes{0};const unsigned bit=outputs==4096?1u:2u;
+        if(log && !(logged_shapes.fetch_or(bit,std::memory_order_relaxed)&bit))
+            std::fprintf(stderr,"native_mxfp8_remaining shape=%dx%d lanes=%d vector=16\n",outputs,width,outputs==4096?16:64);
+        return;
+    }
+    static const bool vector_more=[] {
+        const char* value=std::getenv("MFQ_HIP_MXFP8_VECTOR_MORE");return !value || value[0]!='0';
+    }();
+    if(tune_mode>=13 && vector_more && TILE_M==1 &&
+            ((groups==1 && (outputs==512 || outputs==1280) && values.size(1)==5120) ||
+             (groups==8 && outputs==8192 && values.size(1)==4096))) {
+        const int width=int(values.size(1));
+        const int rs=scales.size(1)==width/128?7:scales.size(0)==outputs?0:5;
+        const int cs=scales.size(1)==width/128?7:5;
+        #define MORE(L,V) mxfp8_native_dot_kernel<L,V,Output,true><<<(outputs+256/L-1)/(256/L),256,0,stream>>>(values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),reinterpret_cast<Output*>(y.data_ptr()),outputs,width,groups,rs,cs)
+        if(outputs==8192){MORE(64,16);}else{MORE(256,8);}
+        #undef MORE
+        static const bool log=std::getenv("MFQ_HIP_MXFP8_VECTOR_MORE_LOG")!=nullptr;
+        static std::atomic<unsigned> logged_shapes{0};const unsigned bit=outputs==512?1:outputs==1280?2:4;
+        if(log && !(logged_shapes.fetch_or(bit,std::memory_order_relaxed)&bit))
+            std::fprintf(stderr,"native_mxfp8_vector_more shape=%dx%d groups=%d vector=%d\n",outputs,width,groups,outputs==8192?16:8);
+        return;
+    }
+    static const bool vector_loads=[] {
+        const char* value=std::getenv("MFQ_HIP_MXFP8_VECTOR_LOADS");return !value || value[0]!='0';
+    }();
+    if(tune_mode>=13 && vector_loads && TILE_M==1 && groups==1 &&
+            ((outputs==5120 && values.size(1)==8192) || (outputs==32768 && values.size(1)==1280))) {
+        const int width=int(values.size(1));
+        const int rs=scales.size(1)==width/128?7:scales.size(0)==outputs?0:5;
+        const int cs=scales.size(1)==width/128?7:5;
+        #define LOADS(L) mxfp8_native_dot_kernel<L,16,Output,true><<<(outputs+256/L-1)/(256/L),256,0,stream>>>(values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),reinterpret_cast<Output*>(y.data_ptr()),outputs,width,groups,rs,cs)
+        if(outputs==32768){LOADS(16);}else{LOADS(64);}
+        #undef LOADS
+        static const bool log=std::getenv("MFQ_HIP_MXFP8_VECTOR_LOADS_LOG")!=nullptr;
+        static std::atomic_flag logged_query=ATOMIC_FLAG_INIT,logged_output=ATOMIC_FLAG_INIT;
+        auto& logged=outputs==32768?logged_query:logged_output;
+        if(log && !logged.test_and_set(std::memory_order_relaxed))
+            std::fprintf(stderr,"native_mxfp8_vector_loads shape=%dx%d vector=16\n",outputs,width);
+        return;
+    }
+
+    // Native 64-lane reductions avoid decoded LDS tiles. Narrow output axes
+    // use all four waves per neuron to expose enough blocks to the device.
+    // Both weight storage and all reads retain the original compressed format.
+    const int width=int(values.size(1));
+    if(tune_mode>=12 && TILE_M==1 &&
+            ((outputs<=1280 && width==5120) ||
+             (outputs==8192 && width==4096 && groups==8) ||
+             (outputs==5120 && (width==8192 || width==2304)))) {
+        const int rs=scales.size(1)==width/128?7:scales.size(0)==outputs?0:5;
+        const int cs=scales.size(1)==width/128?7:5;
+#define MFQ_NATIVE_DOT(L,V) mxfp8_native_dot_kernel<L,V,Output><<<(outputs+256/L-1)/(256/L),256,0,stream>>>(values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),reinterpret_cast<Output*>(y.data_ptr()),outputs,width,groups,rs,cs)
+        if(outputs<=1280) {MFQ_NATIVE_DOT(256,4);}
+        else if(width>=8192) {MFQ_NATIVE_DOT(64,16);}
+        else {MFQ_NATIVE_DOT(64,4);}
+#undef MFQ_NATIVE_DOT
+        return;
+    }
+
+    if(tune_mode && TILE_M==1 && outputs<=1280 && values.size(1)>=4096 && values.size(1)<=8192) {
+        const int row_shift=scales.size(1)==values.size(1)/128?7:scales.size(0)==values.size(0)?0:5;
+        const int column_shift=scales.size(1)==values.size(1)/128?7:5;
+        if(tune_mode>=9 && values.size(1)%4==0) {
+            mxfp8_wide_dot_kernel<Output,true><<<outputs,256,size_t(values.size(1))*sizeof(float),stream>>>(
+                values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
+                reinterpret_cast<Output*>(y.data_ptr()),int(values.size(1)),outputs_per_group,row_shift,column_shift);
+        } else {
+            mxfp8_wide_dot_kernel<Output><<<outputs,256,size_t(values.size(1))*sizeof(float),stream>>>(
+                values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
+                reinterpret_cast<Output*>(y.data_ptr()),int(values.size(1)),outputs_per_group,row_shift,column_shift);
+        }
+        return;
+    }
+    if(tune_mode>=2 && TILE_M==1 && outputs>=16384 && values.size(1)<=2048 && values.size(1)%128==0) {
+        const int row_shift=scales.size(1)==values.size(1)/128?7:scales.size(0)==values.size(0)?0:5;
+        const int column_shift=scales.size(1)==values.size(1)/128?7:5;
+        if(tune_mode>=3 && outputs_per_group%32==0) {
+            if(tune_mode>=9) {
+                mxfp8_packed_four_kernel<Output,true,true><<<(outputs+31)/32,256,size_t(values.size(1))*sizeof(float),stream>>>(
+                    values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
+                    reinterpret_cast<Output*>(y.data_ptr()),outputs,int(values.size(1)),outputs_per_group,row_shift,column_shift);
+            } else {
+                mxfp8_packed_four_kernel<Output,true><<<(outputs+31)/32,256,size_t(values.size(1))*sizeof(float),stream>>>(
+                    values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
+                    reinterpret_cast<Output*>(y.data_ptr()),outputs,int(values.size(1)),outputs_per_group,row_shift,column_shift);
+            }
+        } else {
+            mxfp8_packed_four_kernel<Output,false><<<(outputs+31)/32,256,0,stream>>>(
+                values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
+                reinterpret_cast<Output*>(y.data_ptr()),outputs,int(values.size(1)),outputs_per_group,row_shift,column_shift);
+        }
+        return;
+    }
+    if(tune_mode>=8 && TILE_M==1 && outputs%8==0) {
+        const int row_shift=scales.size(1)==values.size(1)/128?7:scales.size(0)==values.size(0)?0:5;
+        const int column_shift=scales.size(1)==values.size(1)/128?7:5;
+        if(tune_mode>=10 && values.size(1)>=8192) {
+            mxfp8_shuffle_rows_kernel<Output><<<(outputs+7)/8,256,0,stream>>>(
+                values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
+                reinterpret_cast<Output*>(y.data_ptr()),outputs,int(values.size(1)),outputs_per_group,row_shift,column_shift);
+        } else if(tune_mode>=9) {
+        mxfp8_staged_rows_kernel<Output,true><<<(outputs+7)/8,256,0,stream>>>(
+            values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
+            reinterpret_cast<Output*>(y.data_ptr()),outputs,int(values.size(1)),outputs_per_group,row_shift,column_shift);
+        } else {
+        mxfp8_staged_rows_kernel<Output><<<(outputs+7)/8,256,0,stream>>>(
+            values.data_ptr<uint8_t>(),scales.data_ptr<uint8_t>(),reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
+            reinterpret_cast<Output*>(y.data_ptr()),outputs,int(values.size(1)),outputs_per_group,row_shift,column_shift);
+        }
+        return;
+    }
 #define MFQ_LAUNCH_MXFP8_OPW_CACHE(OPW, CACHE) \
     do { \
         const int outputs_per_block = warps * (OPW); \
@@ -196,7 +704,9 @@ void launch_mxfp8_small_m(
                 reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), \
                 reinterpret_cast<Output *>(y.data_ptr()), \
                 int(x.size(0)), outputs, int(values.size(1)), \
-                groups, outputs_per_group); \
+                groups, outputs_per_group, \
+                scales.size(1) == values.size(1) / 128 ? 7 : scales.size(0) == values.size(0) ? 0 : 5, \
+                scales.size(1) == values.size(1) / 128 ? 7 : 5); \
     } while (false)
 #define MFQ_LAUNCH_MXFP8_OPW(OPW) \
     do { \
@@ -223,7 +733,7 @@ __global__ void mxfp8_dequant_kernel(
         const std::uint8_t * __restrict__ scales,
         __half * __restrict__ dense,
         int outputs,
-        int width) {
+        int width, int scale_row_shift, int scale_column_shift) {
     const std::size_t index =
         std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t count = std::size_t(outputs) * width;
@@ -232,10 +742,46 @@ __global__ void mxfp8_dequant_kernel(
     }
     const int output = int(index / width);
     const int column = int(index - std::size_t(output) * width);
-    const int scale_columns = width / 128;
+    const int scale_columns = width >> scale_column_shift;
     const float scale = decode_e8m0(
-        scales[(output / 128) * scale_columns + column / 128]);
+        scales[(output >> scale_row_shift) * scale_columns + (column >> scale_column_shift)]);
     dense[index] = __float2half_rn(decode_e4m3fn(values[index]) * scale);
+}
+
+__global__ void mxfp8_dequant_vector16_kernel(
+        const uint8_t* __restrict__ values,
+        const uint8_t* __restrict__ scales,
+        half* __restrict__ dense,
+        int outputs, int width, int scale_row_shift, int scale_column_shift) {
+    const size_t index = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 16;
+    if (index >= size_t(outputs) * width) return;
+    const int row = int(index / width);
+    const int column = int(index - size_t(row) * width);
+    // Both scale block widths are multiples of sixteen, so these packed
+    // weights share one scale. Keep the original FP16 reconstruction.
+    const float scale = decode_e8m0(scales[
+        size_t(row >> scale_row_shift) * (width >> scale_column_shift) +
+        (column >> scale_column_shift)]);
+    const uint4 packed = *reinterpret_cast<const uint4*>(values + index);
+    const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+    using Half4 = _Float16 __attribute__((ext_vector_type(4)));
+#pragma unroll
+    for (int part = 0; part < 4; ++part) {
+        float decoded[4];
+        decode_e4m3fn_four(words[part], decoded);
+        Half4 result;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            // The scalar reconstruction canonicalizes the encoded negative
+            // zero before scaling. Preserve that bit pattern here as well.
+            const float value = uint8_t(words[part] >> (j * 8)) == 128u
+                ? 0.f : decoded[j];
+            result[j] = __builtin_bit_cast(_Float16,
+                __float2half_rn(__fmul_rn(value, scale)));
+        }
+        *reinterpret_cast<uint2*>(dense + index + part * 4) =
+            __builtin_bit_cast(uint2, result);
+    }
 }
 
 __global__ void mxfp8_embedding_kernel(
@@ -245,7 +791,7 @@ __global__ void mxfp8_embedding_kernel(
         __half * __restrict__ output,
         int count,
         int vocab,
-        int width) {
+        int width, int scale_row_shift, int scale_column_shift) {
     const int64_t total = static_cast<int64_t>(count) * width;
     for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x +
              threadIdx.x;
@@ -256,9 +802,9 @@ __global__ void mxfp8_embedding_kernel(
         const int64_t token = ids[token_index];
         float value = 0.0f;
         if (token >= 0 && token < vocab) {
-            const int scale_columns = width / 128;
+            const int scale_columns = width >> scale_column_shift;
             const float scale = decode_e8m0(scales[
-                (token / 128) * scale_columns + column / 128]);
+                (token >> scale_row_shift) * scale_columns + (column >> scale_column_shift)]);
             value = decode_e4m3fn(values[token * width + column]) * scale;
         }
         output[linear] = __float2half_rn(value);
@@ -344,12 +890,67 @@ void validate_mxfp8(
                     values.size(1) <= std::numeric_limits<int>::max() &&
                     values.size(1) % 128 == 0,
                 "MXFP8 input width must be divisible by 128");
-    MFQ_RUNTIME_CHECK(scales.size(0) == (values.size(0) + 127) / 128 &&
-                    scales.size(1) == values.size(1) / 128,
-                "MXFP8 scale geometry mismatch");
+    const bool block128 = scales.size(0) == (values.size(0) + 127) / 128 && scales.size(1) == values.size(1) / 128;
+    const bool block32 = scales.size(0) == (values.size(0) + 31) / 32 && scales.size(1) == values.size(1) / 32;
+    const bool row32 = scales.size(0) == values.size(0) && scales.size(1) == values.size(1) / 32;
+    MFQ_RUNTIME_CHECK(block128 || block32 || row32, "MXFP8 scale geometry mismatch");
 }
 
 } // namespace
+
+mfq_tensor_backend::Tensor mxfp8_gate_up_clipped_swiglu_cuda(
+        mfq_tensor_backend::Tensor gate_values,mfq_tensor_backend::Tensor gate_scales,
+        mfq_tensor_backend::Tensor up_values,mfq_tensor_backend::Tensor up_scales,
+        mfq_tensor_backend::Tensor input,double limit) {
+    namespace tb=mfq_tensor_backend;
+    validate_mxfp8(gate_values,gate_scales);validate_mxfp8(up_values,up_scales);
+    MFQ_RUNTIME_CHECK(gate_values.sizes()==up_values.sizes() && gate_values.size(0)%8==0 &&
+        input.is_cuda() && input.scalar_type()==tb::kFloat16 && input.is_contiguous() &&
+        input.dim()==2 && input.size(0)==1 && input.size(1)==gate_values.size(1) &&
+        gate_values.device()==input.device() && gate_scales.device()==input.device() &&
+        up_values.device()==input.device() && up_scales.device()==input.device() &&
+        limit>0 && std::isfinite(limit),"invalid native MXFP8 clipped SwiGLU geometry");
+    const int outputs=int(gate_values.size(0)),width=int(gate_values.size(1));
+    auto output=tb::empty({1,outputs},input.options());
+    const int gr=gate_scales.size(1)==width/128?7:gate_scales.size(0)==outputs?0:5;
+    const int gc=gate_scales.size(1)==width/128?7:5;
+    const int ur=up_scales.size(1)==width/128?7:up_scales.size(0)==outputs?0:5;
+    const int uc=up_scales.size(1)==width/128?7:5;
+
+    static const int tune_mode=[] {
+        const char* value=std::getenv("MFQ_HIP_MXFP8_NATIVE_TUNE");
+        return !value?13:std::atoi(value);
+    }();
+    if(tune_mode>=13 && outputs==2304 && width==5120) {
+        static const bool shared_vector=[] {
+            const char* value=std::getenv("MFQ_HIP_MXFP8_SHARED_VECTOR");return !value || value[0]!='0';
+        }();
+        if(shared_vector) {
+        mxfp8_gate_up_native_kernel<128,16,true><<<(outputs+1)/2,256,0,mfq_current_cuda_stream()>>>(
+            gate_values.data_ptr<uint8_t>(),gate_scales.data_ptr<uint8_t>(),
+            up_values.data_ptr<uint8_t>(),up_scales.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+            outputs,width,gr,gc,ur,uc,float(limit));
+            static const bool log=std::getenv("MFQ_HIP_MXFP8_SHARED_VECTOR_LOG")!=nullptr;
+            static std::atomic_flag logged=ATOMIC_FLAG_INIT;
+            if(log && !logged.test_and_set(std::memory_order_relaxed))
+                std::fprintf(stderr,"native_mxfp8_shared_vector shape=2304x5120 lanes=128 vector=16\n");
+        } else {
+        mxfp8_gate_up_native_kernel<128,4><<<(outputs+1)/2,256,0,mfq_current_cuda_stream()>>>(
+            gate_values.data_ptr<uint8_t>(),gate_scales.data_ptr<uint8_t>(),
+            up_values.data_ptr<uint8_t>(),up_scales.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+            outputs,width,gr,gc,ur,uc,float(limit));
+        }
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
+    }
+    mxfp8_gate_up_clipped_kernel<<<outputs/8,256,0,mfq_current_cuda_stream()>>>(
+        gate_values.data_ptr<uint8_t>(),gate_scales.data_ptr<uint8_t>(),
+        up_values.data_ptr<uint8_t>(),up_scales.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+        outputs,width,gr,gc,ur,uc,float(limit));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();return output;
+}
 
 mfq_tensor_backend::Tensor mxfp8_dequant_cuda(
         mfq_tensor_backend::Tensor values,
@@ -359,13 +960,30 @@ mfq_tensor_backend::Tensor mxfp8_dequant_cuda(
         values.sizes(), values.options().dtype(mfq_tensor_backend::kFloat16));
     const std::size_t count = std::size_t(values.numel());
     constexpr int threads = 256;
+    if (count >= 4096 && values.size(1) % 16 == 0 &&
+            (reinterpret_cast<uintptr_t>(values.data_ptr<uint8_t>()) & 15u) == 0) {
+        const int scale_column_shift = scales.size(1) == values.size(1) / 128 ? 7 : 5;
+        const int scale_row_shift = scale_column_shift == 7 ? 7 :
+            scales.size(0) == values.size(0) ? 0 : 5;
+        mxfp8_dequant_vector16_kernel<<<
+            (count + threads * 16 - 1) / (threads * 16), threads,
+            0, mfq_current_cuda_stream()>>>(
+                values.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+                reinterpret_cast<half*>(dense.data_ptr<mfq_half>()),
+                int(values.size(0)), int(values.size(1)),
+                scale_row_shift, scale_column_shift);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return dense;
+    }
     const int blocks = int((count + threads - 1) / threads);
    hipLaunchKernelGGL(( mxfp8_dequant_kernel), 
         dim3(blocks), dim3(threads), 0, mfq_current_cuda_stream(), 
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
             reinterpret_cast<__half *>(dense.data_ptr<mfq_half>()),
-            int(values.size(0)), int(values.size(1)));
+            int(values.size(0)), int(values.size(1)),
+            scales.size(1) == values.size(1) / 128 ? 7 : scales.size(0) == values.size(0) ? 0 : 5,
+            scales.size(1) == values.size(1) / 128 ? 7 : 5);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return dense;
 }
@@ -396,7 +1014,9 @@ mfq_tensor_backend::Tensor mxfp8_embedding_lookup_cuda(
                 values.data_ptr<std::uint8_t>(),
                 scales.data_ptr<std::uint8_t>(), token_ids.data_ptr<int64_t>(),
                 reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
-                count, vocab, width);
+                count, vocab, width,
+                scales.size(1) == width / 128 ? 7 : scales.size(0) == vocab ? 0 : 5,
+                scales.size(1) == width / 128 ? 7 : 5);
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return output;
@@ -439,6 +1059,8 @@ mfq_tensor_backend::Tensor mxfp8_matmul_f16_cuda(
         mfq_tensor_backend::Tensor scales,
         mfq_tensor_backend::Tensor input) {
     validate_mxfp8(values, scales);
+    if (scales.size(1) == values.size(1) / 32)
+        return mxfp8_groupwise_gemm_f16_cuda(values, scales, input.unsqueeze(1), 1);
     MFQ_RUNTIME_CHECK(input.is_cuda() && input.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     input.is_contiguous() && input.dim() == 2 &&
                     input.size(0) > 0 && input.size(1) == values.size(1) &&
@@ -504,6 +1126,8 @@ mfq_tensor_backend::Tensor mxfp8_gemm_f32_cuda(
         mfq_tensor_backend::Tensor scales,
         mfq_tensor_backend::Tensor x) {
     validate_mxfp8(values, scales);
+    if (scales.size(1) == values.size(1) / 32)
+        return mxfp8_groupwise_gemm_f32_cuda(values, scales, x.unsqueeze(1), 1);
     MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     x.is_contiguous() && x.dim() == 2 &&
                     x.size(1) == values.size(1),

@@ -645,6 +645,7 @@ MlxDeepseekV41Attention::MlxDeepseekV41Attention(
         kv_source != components_.index_key_norm.has_value()) {
         throw std::runtime_error("DeepSeek-V4.1 CSA2 components disagree with schedule");
     }
+    components_.output_a.prepare_grouped_row_matmul(checked_int(config_.o_groups, "output groups"));
     std::vector<const MlxLinear*> input_projections{
         &components_.query_a,
         &components_.key_value,

@@ -199,6 +199,7 @@ public:
     void prewarm_ssd_expert_arena();
     void clear_expert_cache();
     std::size_t set_expert_cache_limit(std::size_t bytes);
+    std::optional<std::size_t> trim_preallocated_expert_cache(std::size_t bytes);
     std::size_t reclaimable_expert_bytes() const noexcept;
     std::size_t resident_full_expert_bytes() const noexcept;
     // Telemetry reads metadata only: no evaluation, copies, or device sync.

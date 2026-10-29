@@ -26,6 +26,7 @@ struct FFN {
     MfeWeight moe_gate_up;
     MfeWeight moe_gate;
     MfeWeight moe_up;
+    std::shared_ptr<TqMoeBanks> moe_tq;
     MfeWeight moe_down;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_gate_up;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_gate;
@@ -39,6 +40,7 @@ struct FFN {
     QuantLinear moe_latent_in;
     QuantLinear moe_latent_out;
     mfq_tensor_backend::Tensor moe_router;
+    std::shared_ptr<const QuantLinear> moe_router_projection;
     mfq_tensor_backend::Tensor moe_shared_gate;
     mfq_tensor_backend::Tensor moe_router_bias;
     mfq_tensor_backend::Tensor moe_hash_ids;
@@ -71,7 +73,8 @@ struct FFN {
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> input_ids,
-        bool allow_important_neurons) const;
+        bool allow_important_neurons,
+        MfqOptional<mfq_tensor_backend::Tensor> router_bias = mfq_nullopt) const;
     bool can_forward_fused_residual(
         const CudaExecutionConfig& config,
         const mfq_tensor_backend::Tensor& x,
@@ -81,6 +84,10 @@ struct FFN {
         const CudaExecutionConfig& config,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor residual) const;
+    mfq_tensor_backend::Tensor forward_with_router_bias(
+        CudaExecutionContext& execution, mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor input_ids,
+        const mfq_tensor_backend::Tensor& bias) const;
     mfq_tensor_backend::Tensor forward(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,

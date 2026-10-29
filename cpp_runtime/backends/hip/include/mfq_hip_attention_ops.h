@@ -10,6 +10,15 @@ mfq_tensor_backend::Tensor rotary_embedding_cached_cuda(
     mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor positions,
     mfq_tensor_backend::Tensor frequencies, mfq_tensor_backend::Tensor axes,
     int64_t maximum);
+void rotary_pooled_cache_update_cuda(
+    const mfq_tensor_backend::Tensor& raw,const mfq_tensor_backend::Tensor& weight,
+    const mfq_tensor_backend::Tensor& positions,const mfq_tensor_backend::Tensor& cache_positions,
+    const mfq_tensor_backend::Tensor& pooled,const mfq_tensor_backend::Tensor& frequencies,
+    const mfq_tensor_backend::Tensor& axes,int64_t maximum,double eps);
+mfq_tensor_backend::Tensor rotary_pooled_prefill_cuda(
+    const mfq_tensor_backend::Tensor& raw,const mfq_tensor_backend::Tensor& weight,
+    const mfq_tensor_backend::Tensor& positions,const mfq_tensor_backend::Tensor& frequencies,
+    const mfq_tensor_backend::Tensor& axes,int64_t maximum,double eps);
 mfq_tensor_backend::Tensor rotary_normalized_cached_cuda(
     mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor weight,
     mfq_tensor_backend::Tensor positions, mfq_tensor_backend::Tensor frequencies,
@@ -43,6 +52,9 @@ mfq_tensor_backend::Tensor minicpm_bf16_rope_cache_write_cuda(
     mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     int64_t rotary_dim);
 mfq_tensor_backend::Tensor attention_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale, bool causal);
+mfq_tensor_backend::Tensor attention_cached_prefill_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache,
+    mfq_tensor_backend::Tensor v_cache, double scale, int64_t prefix);
 mfq_tensor_backend::Tensor attention_swa_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
                                  double scale, int64_t window);
 mfq_tensor_backend::Tensor attention_cache_swa_cuda(
@@ -83,6 +95,10 @@ mfq_tensor_backend::Tensor attention_glm_mla576_decode_cuda(
 mfq_tensor_backend::Tensor glm_interleaved_rope_cuda(
     mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor positions,
     mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin, int64_t rotary_dim);
+mfq_tensor_backend::Tensor dsv4_tail_rope_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor positions,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin, int64_t rotary_dim,
+    bool float_output = false, bool token_major = false);
 mfq_tensor_backend::Tensor glm_dsa_indexer_scores_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor weights,
     int64_t query_offset, int64_t logical_k);
@@ -109,3 +125,9 @@ mfq_tensor_backend::Tensor attention_cache_decode_dynamic_cuda(
     double scale, mfq_tensor_backend::Tensor partial_o,
     mfq_tensor_backend::Tensor partial_m,
     mfq_tensor_backend::Tensor partial_l, int64_t max_parts);
+mfq_tensor_backend::Tensor attention_cache_decode_grouped_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache,
+    mfq_tensor_backend::Tensor v_cache, mfq_tensor_backend::Tensor seq_len,
+    double scale, mfq_tensor_backend::Tensor partial_o,
+    mfq_tensor_backend::Tensor partial_m, mfq_tensor_backend::Tensor partial_l,
+    int64_t planned_length);

@@ -1,0 +1,7 @@
+#pragma once
+static constexpr const char* kTqDecode = R"TQMETAL(@MFQ_TQ_DECODE_SOURCE@)TQMETAL";
+static constexpr const char* kTqNax = R"TQNAX(
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+@MFQ_TQ_NAX_SOURCE@
+@MFQ_TQ_MATMUL_SOURCE@
+)TQNAX";

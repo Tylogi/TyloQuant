@@ -2,6 +2,7 @@
 
 #include "mfq/hf_model_source.h"
 #include "mfq/mfq_model_source.h"
+#include "mfq/tq_fixture_source.h"
 #include "mfq_legacy_model_graph.h"
 
 #include <cstdlib>
@@ -20,6 +21,11 @@ std::shared_ptr<const ModelSource> open_model_source(
         }
     }
 
+    const auto filename=path.filename().u8string();
+    const std::string fixture_suffix=".tq-fixture.json";
+    if(filename.size()>=fixture_suffix.size() &&
+       filename.compare(filename.size()-fixture_suffix.size(),fixture_suffix.size(),fixture_suffix)==0)
+        return open_tq_fixture_source(path);
     std::error_code error;
     if (std::filesystem::is_directory(path, error) && !error) {
         return std::make_shared<HfModelSource>(path);

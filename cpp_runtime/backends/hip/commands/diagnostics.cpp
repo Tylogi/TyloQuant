@@ -118,6 +118,7 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     bool check_engine_isolation = false;
     bool check_flash_next = false;
     bool check_flash_next_mtp = false;
+    bool check_nemotron_h=false,check_nemotron_h_mtp=false,check_nemotron_h_vision=false;
     bool compare_dsv4_hc_ops = false;
     bool compare_dsv4_hc_model = false;
     bool check_attention_swa_decode = false;
@@ -480,6 +481,11 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 "MTP benchmark requires gen>=2, reps1-100 and context>=gen+17");
             std::cout << std::unitbuf;
         }
+        if(check_nemotron_h_vision && !context_size)context_size=128;
+        if(check_nemotron_h_mtp) {
+            if(!context_size)context_size=128;
+            MFQ_RUNTIME_CHECK(context_size>=64,"Nemotron-H MTP requires --ctx-size >=64");
+        }
         if (check_qwen35_mtp) {
             if (context_size == 0) context_size = 512;
             if (context_size < 64) throw std::runtime_error("MTP correctness gate requires --ctx-size >= 64");
@@ -519,7 +525,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         execution.profiler.enabled = false;
         mfq_tensor_backend::NoGradGuard no_grad;
         return with_loaded_cuda_model(execution, *this,
-            check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty(),
+            check_qwen35_mtp || check_flash_next_mtp || check_nemotron_h_mtp || check_nemotron_h_vision || !bench_qwen35_mtp.empty(),
             [&](auto& model, auto& runtime_components,
                     auto t0, auto t1) -> int {
         using Model = std::remove_cvref_t<decltype(model)>;
@@ -529,6 +535,21 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             }
             throw std::runtime_error(
                 "continuous batching requires Qwen35CausalLm");
+        }
+        if(check_nemotron_h || check_nemotron_h_mtp || check_nemotron_h_vision) {
+            if constexpr(std::is_same_v<Model,mfq::cuda::NemotronHCausalLm>) {
+                if(check_nemotron_h_mtp) {
+                    auto* predictor=dynamic_cast<mfq::cuda::nemotron_h::NemotronHMtp*>(runtime_components.mtp.get());
+                    MFQ_RUNTIME_CHECK(predictor,"Nemotron-H diagnostic requires MTP weights");
+                    return run_nemotron_h_mtp_check(model,*predictor);
+                }
+                if(check_nemotron_h_vision) {
+                    MFQ_RUNTIME_CHECK(runtime_components.radio_vision,"Nemotron-H diagnostic requires RADIO weights");
+                    return run_nemotron_h_vision_check(model,*runtime_components.radio_vision);
+                }
+                return run_nemotron_h_check(model);
+            }
+            throw std::runtime_error("Nemotron-H diagnostic requires a Nemotron-H causal LM");
         }
         if (check_flash_next) {
             if constexpr (
@@ -1062,6 +1083,7 @@ bool has_diagnostic_action(const DiagnosticsCommandOptions& value) {
         value.check_qwen35_mtp || value.check_continuous_batching ||
         value.check_engine_isolation ||
         value.check_flash_next || value.check_flash_next_mtp ||
+        value.check_nemotron_h || value.check_nemotron_h_mtp || value.check_nemotron_h_vision ||
         value.check_runtime_assets || value.check_mfq_container ||
         value.compare_dsv4_hc_ops || value.compare_dsv4_hc_model ||
         value.compare_mma_attention || value.compare_decode_splitk ||
@@ -1158,6 +1180,9 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
         else if (option == "--check-deepseek-v41") result.check_deepseek_v41 = true;
         else if (option == "--check-text-session-state") result.check_text_session_state = true;
         else if (option == "--check-qwen35-mtp") result.check_qwen35_mtp = true;
+        else if(option=="--check-nemotron-h")result.check_nemotron_h=true;
+        else if(option=="--check-nemotron-h-mtp")result.check_nemotron_h_mtp=true;
+        else if(option=="--check-nemotron-h-vision")result.check_nemotron_h_vision=true;
         else if (option == "--check-flash-next") result.check_flash_next = true;
         else if (option == "--check-flash-next-mtp") result.check_flash_next_mtp = true;
         else if (option == "--bench-qwen35-mtp") result.bench_qwen35_mtp = args.value(option);

@@ -6,6 +6,7 @@
 #include "mxfp4_sq.h"
 #include "nint.h"
 #include "vq.h"
+#include "tq.h"
 
 #include "cuda_execution.h"
 #include "mfq_tensor_backend.h"
@@ -85,6 +86,7 @@ enum class QuantLinearKind {
     Fp8Sq,
     Mxfp8,
     Dense,
+    Tq,
 };
 
 
@@ -113,6 +115,7 @@ struct QuantLinear {
     Fp8SqLinear fp8_sq;
     Mxfp8Linear mxfp8;
     mfq_tensor_backend::Tensor dense;
+    TqWeight tq;
     TensorParallelAxis tensor_parallel_axis =
         TensorParallelAxis::Mirrored;
     std::vector<QuantLinearShard> tensor_parallel_shards;
@@ -130,6 +133,7 @@ struct QuantLinear {
     bool is_fp8_sq() const { return kind == QuantLinearKind::Fp8Sq; }
     bool is_mxfp8() const { return kind == QuantLinearKind::Mxfp8; }
     bool is_dense() const { return kind == QuantLinearKind::Dense; }
+    bool is_tq() const { return kind == QuantLinearKind::Tq; }
 
     mfq_tensor_backend::Tensor forward_tensor_parallel_flat(
             CudaExecutionContext& execution,
@@ -179,6 +183,7 @@ struct QuantLinearGroup {
     bool nvq_prefix2 = false;
     bool decode_branch_parallel = true;
     NintLinearGroup nint;
+    TqProjectionGroup tq;
     std::vector<QuantLinear> layers;
     std::vector<int64_t> outs;
     mutable std::shared_ptr<CudaIndependentBranchExecutor>

@@ -1,4 +1,4 @@
-#include "hip/hip_runtime.h"
+#include <hip/hip_runtime.h>
 #include "kv_cache.h"
 
 #include "hip_execution.h"
@@ -17,11 +17,13 @@ KVCache::KVCache(
         int64_t D,
         bool use_ring,
         mfq_tensor_backend::Device device,
-        mfq_tensor_backend::ScalarType dtype)
-    : ring(use_ring) {
+        mfq_tensor_backend::ScalarType dtype, mfq::cuda::KvQuantization settings)
+    : ring(use_ring), quantization(settings), paged_dtype(dtype) {
     auto opts = mfq_tensor_backend::TensorOptions().device(device).dtype(dtype);
-    k = mfq_tensor_backend::zeros({B, H, max_seq, D}, opts);
-    v = mfq_tensor_backend::zeros({B, H, max_seq, D}, opts);
+    if(quantization.enabled())opts=opts.dtype(mfq_tensor_backend::kInt32);
+    MFQ_RUNTIME_CHECK(!ring || !quantization.enabled(),"TurboQuant ring cache is unsupported");
+    k = mfq_tensor_backend::zeros({B,H,max_seq,quantization.enabled()?mfq::cuda::cuda_kv_packed_width(int(D),quantization.key_bits()):D},opts);
+    v = mfq_tensor_backend::zeros({B,H,max_seq,quantization.enabled()?mfq::cuda::cuda_kv_packed_width(int(D),quantization.value_bits()):D},opts);
 }
 
 KVCache KVCache::paged_view(
@@ -52,6 +54,21 @@ std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> KVCache::appen
         (void)start_pos;
         auto kh = kk.to(scalar_type()).contiguous();
         auto vh = vv.to(scalar_type()).contiguous();
+        if(quantization.enabled()) {
+            auto packed_k=mfq::cuda::cuda_kv_encode(kh,quantization.key_bits(),false);
+            auto packed_v=mfq::cuda::cuda_kv_encode(vh,quantization.value_bits(),true);
+            if(is_paged())mfq::cuda::cuda_kv_write_paged(quantized_pages(),packed_k,packed_v,pos);
+            else if(pos.dim()==1) {
+                k.index_copy_(2,pos,packed_k);v.index_copy_(2,pos,packed_v);
+            } else {
+                for(int64_t b=0;b<kh.size(0);++b) {
+                    auto at=pos.narrow(0,b,1).reshape({-1});
+                    k.narrow(0,b,1).index_copy_(2,at,packed_k.narrow(0,b,1));
+                    v.narrow(0,b,1).index_copy_(2,at,packed_v.narrow(0,b,1));
+                }
+            }
+            return {k,v};
+        }
         if (is_paged()) {
             MFQ_RUNTIME_CHECK(
                 paged_batch == kh.size(0) && paged_heads == kh.size(1) &&

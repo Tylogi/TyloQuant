@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import numpy as np
 import pytest
 
-from mfq.formats.companions import with_engram_shards
+from mfq.formats.companions import is_engram_table, with_engram_shards
 from mfq.formats.header import FileHeader
 from mfq.formats.io import open_mmap, save
 from mfq.formats.shards import shard_file_versions
@@ -26,10 +26,20 @@ TABLE = 'model.block.1.associative_memory.embedding.weight'
 SHARED = 'Engram/model-EW-Engram-MXFP8-00002-of-00003.mfq'
 
 
-def checkpoint(root, precision='Q3'):
-    paths = [root / precision / f'model-EW-{precision}-{index:05d}-of-00003.mfq'
+@pytest.mark.parametrize('name, expected', [
+    (TABLE, True), (TABLE + '.tq_row_shard.00000', True),
+    ('model.block.1.engram.embed.weight.tq_row_shard.2', True),
+    (TABLE + '.tq_row_shard.', False), (TABLE + '.tq_row_shard.invalid', False),
+    ('model.output.weight.tq_row_shard.00000', False),
+])
+def test_engram_tq_row_shard_names(name, expected):
+    assert is_engram_table(name) is expected
+
+
+def checkpoint(root, precision='Q3', suffix='.mfq'):
+    paths = [root / precision / f'model-EW-{precision}-{index:05d}-of-00003{suffix}'
              for index in (1, 3)]
-    table = root / SHARED
+    table = root / SHARED.replace(".mfq", suffix)
     for index, path, name in ((0, paths[0], 'model.token_embedding.weight'),
                               (1, table, TABLE), (2, paths[1], 'model.output.weight')):
         if index == 1 and table.exists():
@@ -42,9 +52,10 @@ def checkpoint(root, precision='Q3'):
     return paths, table
 
 
-def test_two_precision_tiers_read_one_shared_table_without_copies(tmp_path):
-    first, table = checkpoint(tmp_path, 'Q3')
-    second, _ = checkpoint(tmp_path, 'Q2.5')
+@pytest.mark.parametrize("suffix", [".mfq", ".tq", ".TQ"])
+def test_two_precision_tiers_read_one_shared_table_without_copies(tmp_path, suffix):
+    first, table = checkpoint(tmp_path, 'Q3', suffix)
+    second, _ = checkpoint(tmp_path, 'Q2.5', suffix)
     for entry in (first[0], first[-1], second[0]):
         with open_mmap(entry) as store:
             assert store.paths[1] == table
@@ -54,8 +65,8 @@ def test_two_precision_tiers_read_one_shared_table_without_copies(tmp_path):
         assert artifact.resource.complete and artifact.resource.shard_count == 3
         assert artifact.resource.ssd_ple_bytes > 0
         assert str(table) not in model_deletion_plan(artifact).files
-    assert len(list(tmp_path.rglob('*Engram*.mfq'))) == 1
-    assert len(list(tmp_path.rglob('*.mfq'))) == 5
+    assert len(list(tmp_path.rglob(f'*Engram*{suffix}'))) == 1
+    assert len(list(tmp_path.rglob(f'*{suffix}'))) == 5
 
 
 def test_checkpoint_versions_track_shared_table_changes(tmp_path):
@@ -139,25 +150,27 @@ def test_table_size_is_excluded_while_metadata_is_pending_and_old_cache_is_refre
 
 
 @pytest.mark.parametrize('provider', ['modelscope', 'huggingface'])
-def test_download_preflight_adds_required_tables_and_detects_missing_dependency(tmp_path, provider):
+@pytest.mark.parametrize('suffix', ['.mfq', '.tq'])
+def test_download_preflight_adds_required_tables_and_detects_missing_dependency(tmp_path, provider, suffix):
+    shared = SHARED.replace('.mfq', suffix)
     async def run():
         handlers = make_handlers(tmp_path)
-        primary = 'Q3/model-EW-Q3-00001-of-00003.mfq'
-        files = [HubModelFile(name=primary, byte_size=5), HubModelFile(name=SHARED, byte_size=7)]
+        primary = f'Q3/model-EW-Q3-00001-of-00003{suffix}'
+        files = [HubModelFile(name=primary, byte_size=5), HubModelFile(name=shared, byte_size=7)]
         hub = SimpleNamespace(download_files=AsyncMock(return_value=SimpleNamespace(files=files)))
         service = ServerService(SessionStore(tmp_path / 'state.db'), FakeBackend(),
                                 hub_catalog=hub, tool_handlers=handlers)
         request = CreateJobRequest(kind=f'download.{provider}', payload={
-            'repo_id': 'owner/model', 'destination': 'models/owner/model', 'include': ['Q3/*.mfq'],
+            'repo_id': 'owner/model', 'destination': 'models/owner/model', 'include': [f'Q3/*{suffix}'],
         })
         await service._check_download_job(request)
-        assert SHARED in request.payload['include'] and request.payload['expected_bytes'] == 12
+        assert shared in request.payload['include'] and request.payload['expected_bytes'] == 12
         payload, destination = handlers.download_request(request.kind, request.payload)
         target = destination / primary
         target.parent.mkdir(parents=True)
         target.write_bytes(b'12345')
         assert not ToolJobHandlers.download_files_present(destination, payload, files)
-        target = destination / SHARED
+        target = destination / shared
         target.parent.mkdir(parents=True)
         target.write_bytes(b'1234567')
         assert ToolJobHandlers.download_files_present(destination, payload, files)

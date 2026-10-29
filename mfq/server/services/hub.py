@@ -23,6 +23,7 @@ from urllib.request import proxy_bypass_environment
 import httpx
 
 from mfq.architectures.tensor_schema import tensor_schema_for_config
+from mfq.formats.header import MFQ_SUFFIXES
 from mfq.formats.companions import is_engram_shard, with_engram_shards
 from mfq.server.protocol.models import (
     HubMemoryPool,
@@ -52,7 +53,7 @@ HubProvider = Literal["huggingface", "modelscope"]
 
 _REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _MFQ_SHARD_PATTERN = re.compile(
-    r"^(?P<name>.+?)(?:-\d{5}-of-\d{5})?\.mfq$", re.IGNORECASE
+    r"^(?P<name>.+?)(?:-\d{5}-of-\d{5})?\.(?:mfq|tq)$", re.IGNORECASE
 )
 _PRECISION_PATTERN = re.compile(
     r"(?:^|[-_.])((?:S|V|Q|NINT|NVQ)\d+(?:\.\d+)?(?:[-_][A-Za-z0-9]+)?)",
@@ -379,7 +380,7 @@ def _model_variants(
     runtime_compatible: bool | None = True,
 ) -> list[HubModelVariant]:
     variants: list[HubModelVariant] = []
-    mfq_groups: dict[str, list[HubModelFile]] = {}
+    mfq_groups: dict[tuple[str, str], list[HubModelFile]] = {}
     hf_files: list[HubModelFile] = []
     for item in files:
         parent, separator, basename = item.name.rpartition("/")
@@ -392,7 +393,8 @@ def _model_variants(
                 label = parent
             else:
                 label = f"{parent}/{stem}"
-            mfq_groups.setdefault(label, []).append(item)
+            suffix = '.tq' if basename.lower().endswith('.tq') else '.mfq'
+            mfq_groups.setdefault((label, suffix), []).append(item)
         elif basename.lower().endswith(".gguf"):
             configuration = _configuration_status(
                 item.byte_size,
@@ -414,7 +416,7 @@ def _model_variants(
         elif basename.lower().endswith((".safetensors", ".bin")):
             hf_files.append(item)
     by_name = {item.name: item for item in files}
-    for label, group in mfq_groups.items():
+    for (label, suffix), group in mfq_groups.items():
         if all(is_engram_shard(item.name) for item in group):
             continue
         group = [by_name[name] for name in with_engram_shards(
@@ -444,7 +446,7 @@ def _model_variants(
         configuration.reasons.append('Estimated resident weights include a 10% allowance on packed or unclassified weights; exclude streamed PLE, KV, prefix caches and temporary workspaces.' if inspected else 'File-size estimate with a 10% allowance; tensor metadata is unavailable.')
         variants.append(
             HubModelVariant(
-                id=f"mfq:{label}",
+                id=f"{suffix[1:]}:{label}",
                     label=label,
                     format="mfq",
                     precision=_precision_from_name(label),
@@ -656,7 +658,7 @@ class HubCatalog:
             try:
                 info = await self.download_files(source.provider, source.repo_id, source.revision)
                 files = [item for item in info.files if item.byte_size >= 262144 and
-                    item.name.lower().endswith(('.mfq', '.safetensors', '.gguf', '.bin'))]
+                    item.name.lower().endswith((*MFQ_SUFFIXES, '.safetensors', '.gguf', '.bin'))]
                 if files:
                     use_proxy, speed = await probe_download_route(hub_download_url(
                         source.provider, source.repo_id, info.revision, files[0].name))
@@ -699,12 +701,12 @@ class HubCatalog:
 
     def _reuse_mfq_files(self, info: HubModelInfo) -> HubModelInfo:
         known = {}
-        identities = {self._mfq_file_identity(info, item) for item in info.files if item.name.lower().endswith('.mfq')}
+        identities = {self._mfq_file_identity(info, item) for item in info.files if item.name.lower().endswith(MFQ_SUFFIXES)}
         update = {}
         for cached in self._official_cache.values():
             if cached is None:
                 continue
-            cached_identities = {self._mfq_file_identity(cached, item) for item in cached.files if item.name.lower().endswith('.mfq')}
+            cached_identities = {self._mfq_file_identity(cached, item) for item in cached.files if item.name.lower().endswith(MFQ_SUFFIXES)}
             if identities and None not in identities and identities == cached_identities:
                 for field in ('architectures', 'modalities', 'parameter_count', 'parameter_breakdown',
                               'mtp_supported', 'cache_profile', 'ple_parameter_count', 'runtime_compatible',
@@ -731,13 +733,13 @@ class HubCatalog:
     @staticmethod
     def _missing_mfq_files(info: HubModelInfo) -> list[tuple[int, HubModelFile]]:
         return [(index, item) for index, item in enumerate(info.files)
-                if item.name.lower().endswith('.mfq') and item.byte_size >= 64
+                if item.name.lower().endswith(MFQ_SUFFIXES) and item.byte_size >= 64
                 and (item.weight_bytes is None or item.ssd_ple_bytes is None
                      or is_engram_shard(item.name) and item.weight_bytes != 0)]
 
     @staticmethod
     def _missing_model_metadata(info: HubModelInfo) -> bool:
-        return any(item.name.lower().endswith('.mfq') and item.byte_size >= 64 for item in info.files) and (
+        return any(item.name.lower().endswith(MFQ_SUFFIXES) and item.byte_size >= 64 for item in info.files) and (
             not info.config_inspected or not info.architectures or info.mtp_supported is None)
 
     def _start_detail_refresh(self, profile: HubSystemProfile) -> bool:
@@ -779,7 +781,7 @@ class HubCatalog:
         architectures = []
         predictors = []
         legacy_blocks = []
-        file_count = sum(item.name.lower().endswith('.mfq') and item.byte_size >= 64 for item in files)
+        file_count = sum(item.name.lower().endswith(MFQ_SUFFIXES) and item.byte_size >= 64 for item in files)
         def result() -> HubModelInfo:
             config = configs[0] if configs else {}
             text = config.get('text_config', config)
@@ -839,7 +841,7 @@ class HubCatalog:
             await asyncio.gather(*(inspect(index, item) for index, item in candidates))
             if self._missing_model_metadata(result()):
                 remaining = [(index, item) for index, item in enumerate(files)
-                    if item.name.lower().endswith('.mfq') and item.byte_size >= 64 and index not in {i for i, _ in candidates}]
+                    if item.name.lower().endswith(MFQ_SUFFIXES) and item.byte_size >= 64 and index not in {i for i, _ in candidates}]
                 remaining = remaining[:1] + remaining[:0:-1]
                 for index, item in remaining:
                     if not self._missing_model_metadata(result()):
@@ -925,7 +927,10 @@ class HubCatalog:
 
     @staticmethod
     def _is_official_repo(repo_id: str) -> bool:
-        return bool(_REPOSITORY_PATTERN.fullmatch(repo_id) and repo_id.split('/')[0].casefold() == 'tylogi' and 'mfq' in repo_id.split('/')[1].casefold())
+        if not _REPOSITORY_PATTERN.fullmatch(repo_id):
+            return False
+        owner, name = repo_id.casefold().split('/')
+        return owner == 'tylogi' and ('mfq' in name or 'tq' in re.split('[-_]', name))
 
     @staticmethod
     async def _discover_official(provider: HubProvider) -> list[str]:
@@ -1008,7 +1013,7 @@ class HubCatalog:
             info = source_models[index]
             if info is None:
                 return (-1, 0, -index)
-            weights = [item for item in info.files if item.name.lower().endswith('.mfq')]
+            weights = [item for item in info.files if item.name.lower().endswith(MFQ_SUFFIXES)]
             coverage = sum(item.weight_bytes is not None for item in weights) / len(weights) if weights else 0
             return (int(info.parameter_breakdown is not None) + int(info.cache_profile is not None), coverage, -index)
         selected_index = max(range(len(source_models)), key=source_quality)

@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 MFQ_MAGIC = b"MFQ1"
+# TQ checkpoints use the same MFQ1 container and shard metadata.
+MFQ_SUFFIXES = (".mfq", ".tq")
 
 
 @dataclass

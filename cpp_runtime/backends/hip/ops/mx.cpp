@@ -21,7 +21,9 @@ mfq_tensor_backend::Tensor mxfp8_matmul(
         const int64_t rows = x.size(0);
         const int64_t outputs = weight.out;
         const int64_t width = weight.neuron_len;
-        const int64_t scale_columns = width / 128;
+        const int64_t scale_columns = weight.scales.size(1);
+        const int64_t block_columns = width / scale_columns;
+        const int64_t block_rows = block_columns == 128 ? 128 : weight.scales.size(0) == outputs ? 1 : 32;
         const auto * input = x.data_ptr<mfq_half>();
         const auto * values = weight.values.data_ptr<uint8_t>();
         const auto * scales = weight.scales.data_ptr<uint8_t>();
@@ -45,7 +47,7 @@ mfq_tensor_backend::Tensor mxfp8_matmul(
                             static_cast<int>(exponent) - 7);
                     if ((raw & 128u) != 0u) decoded = -decoded;
                     const uint8_t raw_scale = scales[
-                        (neuron / 128) * scale_columns + column / 128];
+                        (neuron / block_rows) * scale_columns + column / block_columns];
                     const float weight_value = decoded * std::ldexp(
                         1.0f, static_cast<int>(raw_scale) - 127);
                     for (int64_t row = 0; row < rows; ++row) {
@@ -69,6 +71,10 @@ mfq_tensor_backend::Tensor mxfp8_matmul(
                 weight.values, weight.scales, x);
         });
     }
+    if (weight.scales.size(1) == weight.neuron_len / 32)
+        return profiler.measure("mxfp8.block32_mfma_f16", [&]() {
+            return mxfp8_groupwise_gemm_f16_cuda(weight.values, weight.scales, x.unsqueeze(1), 1);
+        });
     return profiler.measure("mxfp8.packed_matmul", [&]() {
         return mxfp8_matmul_f16_cuda(
             weight.values, weight.scales, x);
@@ -89,6 +95,10 @@ mfq_tensor_backend::Tensor mxfp8_matmul_f32(
                 weight.values, weight.scales, x);
         });
     }
+    if (weight.scales.size(1) == weight.neuron_len / 32)
+        return profiler.measure("mxfp8.block32_mfma_f32", [&]() {
+            return mxfp8_groupwise_gemm_f32_cuda(weight.values, weight.scales, x.unsqueeze(1), 1);
+        });
     return profiler.measure("mxfp8.gemm_f32", [&]() {
         return mxfp8_gemm_f32_cuda(
             weight.values, weight.scales, x);
@@ -101,7 +111,9 @@ mfq_tensor_backend::Tensor mxfp8_cpu_reference(
     auto scales = weight.scales.to(mfq_tensor_backend::kCPU).contiguous();
     const auto * value_bytes = values.data_ptr<uint8_t>();
     const auto * scale_bytes = scales.data_ptr<uint8_t>();
-    const int64_t scale_columns = weight.neuron_len / 128;
+    const int64_t scale_columns = weight.scales.size(1);
+    const int64_t block_columns = weight.neuron_len / scale_columns;
+    const int64_t block_rows = block_columns == 128 ? 128 : weight.scales.size(0) == weight.out ? 1 : 32;
     std::vector<float> dense(
         static_cast<size_t>(weight.out * weight.neuron_len));
     for (int64_t row = 0; row < weight.out; ++row) {
@@ -126,7 +138,7 @@ mfq_tensor_backend::Tensor mxfp8_cpu_reference(
             }
             const uint8_t raw_scale = scale_bytes[
                 static_cast<size_t>(
-                    (row / 128) * scale_columns + column / 128)];
+                    (row / block_rows) * scale_columns + column / block_columns)];
             const float scale = raw_scale == 255u
                 ? std::numeric_limits<float>::quiet_NaN()
                 : std::ldexp(1.0f, int(raw_scale) - 127);
@@ -141,87 +153,38 @@ mfq_tensor_backend::Tensor mxfp8_cpu_reference(
         .to(mfq_tensor_backend::kFloat16).contiguous();
 }
 
-mfq_tensor_backend::Tensor mxfp8_groupwise_matmul(
-        CudaProfiler& profiler,
-        const Mxfp8Weight & weight,
-        mfq_tensor_backend::Tensor grouped,
-        int64_t groups) {
-    grouped = grouped.contiguous().to(mfq_tensor_backend::kFloat16);
-    MFQ_RUNTIME_CHECK(
-        grouped.dim() == 3 && grouped.size(1) == groups &&
-            grouped.size(2) == weight.neuron_len &&
-            weight.out % groups == 0,
-        "MXFP8 groupwise projection geometry mismatch");
-    const int64_t outputs_per_group = weight.out / groups;
-    MFQ_RUNTIME_CHECK(
-        outputs_per_group % 128 == 0,
-        "MXFP8 groupwise output width must preserve scale blocks");
-    if (grouped.size(0) <= 8) {
-        return profiler.measure("mxfp8.groupwise_small_m", [&]() {
-            return mxfp8_groupwise_small_m_cuda(
-                weight.values, weight.scales, grouped, groups);
+mfq_tensor_backend::Tensor mxfp8_groupwise_matmul(CudaProfiler& profiler,const Mxfp8Weight& weight,
+        mfq_tensor_backend::Tensor grouped,int64_t groups) {
+    namespace tb=mfq_tensor_backend;grouped=grouped.contiguous().to(tb::kFloat16);
+    MFQ_RUNTIME_CHECK(groups>0 && grouped.dim()==3 && grouped.size(1)==groups &&
+        grouped.size(2)==weight.neuron_len && weight.out%groups==0,"invalid groupwise MXFP8 projection");
+    const auto per_group=weight.out/groups;
+    const bool block128=weight.neuron_len%128==0 && weight.scales.size(0)==(weight.out+127)/128 &&
+        weight.scales.size(1)==weight.neuron_len/128;
+    if(grouped.size(0)<=8 && per_group%32==0)
+        return profiler.measure("mxfp8.groupwise_small_m_f16",[&] {
+            return mxfp8_groupwise_small_m_cuda(weight.values,weight.scales,grouped,groups);
         });
-    }
-    std::vector<mfq_tensor_backend::Tensor> outputs;
-    outputs.reserve(static_cast<size_t>(groups));
-    const int64_t scale_rows_per_group = outputs_per_group / 128;
-    for (int64_t group = 0; group < groups; ++group) {
-        Mxfp8Weight shard;
-        shard.out = outputs_per_group;
-        shard.neuron_len = weight.neuron_len;
-        shard.values = weight.values.narrow(
-            0, group * outputs_per_group,
-            outputs_per_group).contiguous();
-        shard.scales = weight.scales.narrow(
-            0, group * scale_rows_per_group,
-            scale_rows_per_group).contiguous();
-        outputs.push_back(mxfp8_matmul(
-            profiler, shard,
-            grouped.select(1, group).contiguous()));
-    }
-    return mfq_tensor_backend::cat(outputs, -1).contiguous();
+    return profiler.measure("mxfp8.groupwise_mfma_f16",[&] {
+        return mxfp8_groupwise_gemm_f16_cuda(weight.values,weight.scales,grouped,groups);
+    });
 }
 
-mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(
-        CudaProfiler& profiler,
-        const Mxfp8Weight & weight,
-        mfq_tensor_backend::Tensor grouped,
-        int64_t groups) {
-    grouped = grouped.contiguous().to(mfq_tensor_backend::kFloat16);
-    MFQ_RUNTIME_CHECK(
-        grouped.dim() == 3 && grouped.size(1) == groups &&
-            grouped.size(2) == weight.neuron_len &&
-            weight.out % groups == 0,
-        "MXFP8 groupwise FP32-output projection geometry mismatch");
-    const int64_t outputs_per_group = weight.out / groups;
-    MFQ_RUNTIME_CHECK(
-        outputs_per_group % 128 == 0,
-        "MXFP8 groupwise output width must preserve scale blocks");
-    if (grouped.size(0) <= 8) {
-        return profiler.measure(
-            "mxfp8.groupwise_small_m_f32", [&]() {
-                return mxfp8_groupwise_small_m_f32_cuda(
-                    weight.values, weight.scales, grouped, groups);
-            });
-    }
-    std::vector<mfq_tensor_backend::Tensor> outputs;
-    outputs.reserve(static_cast<size_t>(groups));
-    const int64_t scale_rows_per_group = outputs_per_group / 128;
-    for (int64_t group = 0; group < groups; ++group) {
-        Mxfp8Weight shard;
-        shard.out = outputs_per_group;
-        shard.neuron_len = weight.neuron_len;
-        shard.values = weight.values.narrow(
-            0, group * outputs_per_group,
-            outputs_per_group).contiguous();
-        shard.scales = weight.scales.narrow(
-            0, group * scale_rows_per_group,
-            scale_rows_per_group).contiguous();
-        outputs.push_back(mxfp8_matmul_f32(
-            profiler, shard,
-            grouped.select(1, group).contiguous()));
-    }
-    return mfq_tensor_backend::cat(outputs, -1).contiguous();
+mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(CudaProfiler& profiler,const Mxfp8Weight& weight,
+        mfq_tensor_backend::Tensor grouped,int64_t groups) {
+    namespace tb=mfq_tensor_backend;grouped=grouped.contiguous().to(tb::kFloat16);
+    MFQ_RUNTIME_CHECK(groups>0 && grouped.dim()==3 && grouped.size(1)==groups &&
+        grouped.size(2)==weight.neuron_len && weight.out%groups==0,"invalid groupwise MXFP8 projection");
+    const auto per_group=weight.out/groups;
+    const bool block128=weight.neuron_len%128==0 && weight.scales.size(0)==(weight.out+127)/128 &&
+        weight.scales.size(1)==weight.neuron_len/128;
+    if(grouped.size(0)<=8 && per_group%32==0)
+        return profiler.measure("mxfp8.groupwise_small_m_f32",[&] {
+            return mxfp8_groupwise_small_m_f32_cuda(weight.values,weight.scales,grouped,groups);
+        });
+    return profiler.measure("mxfp8.groupwise_mfma_f32",[&] {
+        return mxfp8_groupwise_gemm_f32_cuda(weight.values,weight.scales,grouped,groups);
+    });
 }
 
 mfq_tensor_backend::Tensor mxfp4_matmul(
@@ -315,10 +278,10 @@ Mxfp8Cpu unpack_mxfp8(
     const uint64_t scale_columns = read_u64_from(blob, offset);
     if (rows > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
             columns > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
-            columns % 128 != 0 ||
-            storage_rows != rows || storage_columns != columns ||
-            scale_rows != (rows + 127) / 128 ||
-            scale_columns != columns / 128) {
+            columns % 32 != 0 || storage_rows != rows || storage_columns != columns ||
+            !((columns % 128 == 0 && scale_rows == (rows + 127) / 128 && scale_columns == columns / 128) ||
+              (scale_rows == (rows + 31) / 32 && scale_columns == columns / 32) ||
+              (scale_rows == rows && scale_columns == columns / 32))) {
         throw std::runtime_error("invalid MXFP8 payload geometry");
     }
     const size_t value_bytes = checked_mxfp8_size(
@@ -330,6 +293,8 @@ Mxfp8Cpu unpack_mxfp8(
         throw std::runtime_error("invalid MXFP8 payload length");
     }
     Mxfp8Cpu result;
+    result.block_columns = scale_columns == columns / 32 ? 32 : 128;
+    result.block_rows = result.block_columns == 128 ? 128 : scale_rows == rows ? 1 : 32;
     result.out = static_cast<int64_t>(rows);
     result.neuron_len = static_cast<int64_t>(columns);
     result.values.assign(
@@ -510,13 +475,16 @@ Mxfp8Cpu slice_mxfp8_cpu(
     }
     const int64_t extent = axis == TensorParallelAxis::Output
         ? source.out : source.neuron_len;
+    const auto alignment = axis == TensorParallelAxis::Output ? source.block_rows : source.block_columns;
     if (begin < 0 || begin >= end || end > extent ||
-            begin % 128 != 0 ||
-            (end != extent && end % 128 != 0)) {
+            begin % alignment != 0 ||
+            (end != extent && end % alignment != 0)) {
         throw std::runtime_error(
-            "MXFP8 tensor-parallel shards must preserve 128-element blocks");
+            "MXFP8 tensor-parallel shards must preserve native scale blocks");
     }
     Mxfp8Cpu result;
+    result.block_rows = source.block_rows;
+    result.block_columns = source.block_columns;
     if (axis == TensorParallelAxis::Output) {
         result.out = end - begin;
         result.neuron_len = source.neuron_len;
@@ -527,11 +495,11 @@ Mxfp8Cpu slice_mxfp8_cpu(
         result.values.assign(
             source.values.begin() + static_cast<ptrdiff_t>(value_begin),
             source.values.begin() + static_cast<ptrdiff_t>(value_end));
-        const int64_t scale_columns = source.neuron_len / 128;
+        const int64_t scale_columns = source.neuron_len / source.block_columns;
         const size_t scale_begin =
-            static_cast<size_t>((begin / 128) * scale_columns);
+            static_cast<size_t>((begin / source.block_rows) * scale_columns);
         const size_t scale_end = static_cast<size_t>(
-            ((end + 127) / 128) * scale_columns);
+            ((end + source.block_rows - 1) / source.block_rows) * scale_columns);
         result.scales.assign(
             source.scales.begin() + static_cast<ptrdiff_t>(scale_begin),
             source.scales.begin() + static_cast<ptrdiff_t>(scale_end));
@@ -550,9 +518,9 @@ Mxfp8Cpu slice_mxfp8_cpu(
                 static_cast<size_t>(row * source.neuron_len + begin),
             static_cast<size_t>(result.neuron_len));
     }
-    const int64_t source_scale_columns = source.neuron_len / 128;
-    const int64_t result_scale_columns = result.neuron_len / 128;
-    const int64_t scale_rows = (source.out + 127) / 128;
+    const int64_t source_scale_columns = source.neuron_len / source.block_columns;
+    const int64_t result_scale_columns = result.neuron_len / source.block_columns;
+    const int64_t scale_rows = (source.out + source.block_rows - 1) / source.block_rows;
     result.scales.resize(
         static_cast<size_t>(scale_rows * result_scale_columns));
     for (int64_t row = 0; row < scale_rows; ++row) {
@@ -560,7 +528,7 @@ Mxfp8Cpu slice_mxfp8_cpu(
             result.scales.data() +
                 static_cast<size_t>(row * result_scale_columns),
             source.scales.data() + static_cast<size_t>(
-                row * source_scale_columns + begin / 128),
+                row * source_scale_columns + begin / source.block_columns),
             static_cast<size_t>(result_scale_columns));
     }
     return result;
@@ -577,7 +545,7 @@ Mxfp8Weight to_device_mxfp8(
         {source.out, source.neuron_len});
     result.scales = cpu_u8_tensor(
         source.scales,
-        {(source.out + 127) / 128, source.neuron_len / 128});
+        {(source.out + source.block_rows - 1) / source.block_rows, source.neuron_len / source.block_columns});
     if (cuda) {
         const int target_device = device >= 0
             ? device : mfq_current_cuda_device();

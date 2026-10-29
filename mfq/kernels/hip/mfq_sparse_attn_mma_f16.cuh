@@ -16,6 +16,8 @@
 #include "../hip/selected_attention.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 #include "mfq_hip_compat.h"
@@ -33,6 +35,8 @@ struct RuntimeInput {
     int causal_columns = 0;
     bool half_query = false;
     bool wide_positions = false;
+    const half2* secondary_kv = nullptr;
+    int kv_split_index = 0;
 };
 
 inline uint3 sparse_fastdiv_values(uint32_t divisor) {
@@ -46,11 +50,19 @@ inline uint3 sparse_fastdiv_values(uint32_t divisor) {
     return make_uint3(multiplier, shift, divisor);
 }
 
+// Keep the existing four-way KV reduction while sharing a causal tile
+// across eight queries. Runtime admission below restricts this to gfx942.
+template<int DKQ,int DV,int Queries,int Heads,bool SharedKV>
+static constexpr __device__ int sparse_attention_threads(){
+    if constexpr(DKQ==256 && DV==256 && Queries==8 && Heads==4 && !SharedKV)return 512;
+    return ggml_cuda_fattn_mma_get_nthreads(DKQ,DV,Queries*Heads);
+}
+
 // Shared selected-token attention kernel. Model-specific indexers own the
 // selection order and optional validity mask; this kernel owns KV gathering,
 // MMA, online softmax and stream-K reduction.
 template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view,
-         bool needs_fixup, bool is_fixup>
+         bool needs_fixup, bool is_fixup,bool SplitKV=false,bool Compact=false>
 static __device__ __forceinline__ void process_sparse_attention_tile(
     const void * __restrict__ q,
     const half * __restrict__ k,
@@ -77,8 +89,8 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
     RuntimeInput input) {
     constexpr int ncols = ncols1 * ncols2;
     constexpr int nthreads =
-        ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols);
-    constexpr int nwarps = nthreads / 32;
+        sparse_attention_threads<DKQ,DV,ncols1,ncols2,V_is_K_view>();
+    constexpr int nwarps = nthreads / ggml_cuda_get_physical_warp_size();
     constexpr bool use_logit_softcap = false;
     constexpr bool use_indirect = true;
 
@@ -124,31 +136,63 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
         tile_input.query_head_stride = input.query_head_stride;
         tile_input.query_column_stride = input.query_column_stride;
         tile_input.half_query = input.half_query;
-        int64_t end = input.wide_positions ? static_cast<const int64_t*>(input.positions)[jt]
-            : static_cast<const int32_t*>(input.positions)[jt];
+        // Multi-query causal tiles are used only for caller-proven consecutive
+        // positions. The last query bounds KV reads for the complete tile.
+        const int query_last=min(M-1,(jt+1)*ncols1-1);
+        int64_t end = input.wide_positions ? static_cast<const int64_t*>(input.positions)[query_last]
+            : static_cast<const int32_t*>(input.positions)[query_last];
         end = end < -1 ? -1 : end;
         end = end >= max_seq ? max_seq - 1 : end;
         end = end >= input.causal_columns ? input.causal_columns - 1 : end;
-        tile_input.causal_query_offset = static_cast<int>(end) - jt;
+        tile_input.causal_query_offset = static_cast<int>(end) - query_last;
         tile_input.causal_row_count = static_cast<int>(end + 1);
     }
 
+    if constexpr(DKQ==256 && DV==256 && !V_is_K_view && !needs_fixup && !is_fixup) {
+        if(input.positions) {
+            constexpr int batch=ggml_cuda_fattn_mma_get_nbatch_fa(DKQ,DV,ncols);
+            // Keep one fully masked iteration for an empty causal row.
+            kb0_stop=min(kb0_stop,max(1,(tile_input.causal_row_count+batch-1)/batch));
+        }
+    }
+    if constexpr(SplitKV) {
+        tile_input.secondary_kv=input.secondary_kv;
+        tile_input.kv_split_index=input.kv_split_index;
+    }
+#if defined(AMD_MFMA_AVAILABLE)
+    // One selection row is shared by every wave in this head group.
+    // Trailing fully masked tiles cannot contribute to the sink softmax.
+    if constexpr (DKQ == 512 && DV == 512 && ncols1 == 1 && (ncols2 == 32 || ncols2 == 64) &&
+                  V_is_K_view && !SplitKV && !needs_fixup && !is_fixup) {
+        if (sequence_mask && M >= 128) {
+            constexpr int batch = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+            static_assert(batch == 64, "mask trimming expects a wave-sized KV tile");
+            while (kb0_stop > kb0_start + 1) {
+                const int at = (kb0_stop - 1) * batch + threadIdx.x;
+                const bool keep = at < selected &&
+                    __half_as_ushort(sequence_mask[int64_t(jt) * selected + at]) != 0xfc00;
+                if (__any(keep)) break;
+                --kb0_stop;
+            }
+        }
+    }
+#endif
     flash_attn_ext_f16_process_tile<
         DKQ, DV, ncols1, ncols2, nwarps,
         use_logit_softcap, V_is_K_view, needs_fixup, is_fixup,
-        use_indirect>(
+        use_indirect,Compact>(
         q_f2, k_h2, v_h2, sequence_mask, tile_sinks, dst, meta,
         scale, 1.0f, 0.0f, ne01, heads, gqa_ratio, selected,
         DKQ / 2, M * (DKQ / 2), DKQ / 2,
         V_is_K_view ? DKQ / 2 : DV / 2,
         sequence_mask == nullptr ? 0 : selected,
         jt, zt_gqa, kb0_start, kb0_stop, row_indices,
-        input.positions != nullptr, 0, tile_input);
+        input.positions != nullptr, -selected, tile_input);
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view>
+template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view,bool SplitKV=false,bool Unsplit=false,bool Compact=false>
 __launch_bounds__(
-    ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1 * ncols2),
+    (sparse_attention_threads<DKQ,DV,ncols1,ncols2,V_is_K_view>()),
     ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1 * ncols2))
 __global__ void sparse_attention_kernel(
     const void * __restrict__ q,
@@ -168,9 +212,9 @@ __global__ void sparse_attention_kernel(
     int selected,
     uint3 ne01,
     RuntimeInput input) {
-#if defined(FLASH_ATTN_AVAILABLE) && defined(TURING_MMA_AVAILABLE)
-    static_assert(ncols1 == 1,
-        "selected-token tiles require one index row per query tile");
+#if defined(FLASH_ATTN_AVAILABLE) && (defined(TURING_MMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE))
+    static_assert(ncols1==1 || (DKQ==256 && DV==256 && !V_is_K_view),
+        "multi-query tiles require causal 256-wide attention");
     static_assert(DKQ % 2 == 0 && DV % 2 == 0, "attention widths must be even");
     static_assert(!V_is_K_view || DV <= DKQ, "V view exceeds K width");
 
@@ -184,6 +228,14 @@ __global__ void sparse_attention_kernel(
     const int64_t work_per_sequence =
         static_cast<int64_t>(iter_k) * iter_j * iter_z_gqa * kv_heads;
     const int64_t total_work = work_per_sequence * B;
+    // PP assigns a complete query tile to each block. Specializing this case
+    // removes stream-K fixup state and its register spills from the hot kernel.
+    if constexpr(Unsplit) {
+        process_sparse_attention_tile<DKQ,DV,ncols1,ncols2,V_is_K_view,false,false,SplitKV,Compact>(
+            q,k,v,indices,mask,sinks,out,meta,scale,M,heads,kv_heads,max_seq,selected,ne01,
+            int64_t(blockIdx.x)*iter_k,work_per_sequence,iter_k,iter_j,iter_z_gqa,0,iter_k,input);
+        return;
+    }
     int64_t kbc = static_cast<int64_t>(blockIdx.x) * total_work / gridDim.x;
     const int64_t kbc_stop =
         static_cast<int64_t>(blockIdx.x + 1) * total_work / gridDim.x;
@@ -194,14 +246,14 @@ __global__ void sparse_attention_kernel(
     while (kbc < kbc_stop && kb0_stop == iter_k) {
         if (kb0_start == 0) {
             process_sparse_attention_tile<
-                DKQ, DV, ncols1, ncols2, V_is_K_view, false, false>(
+                DKQ, DV, ncols1, ncols2, V_is_K_view, false, false,SplitKV,Compact>(
                 q, k, v, indices, mask, sinks, out, meta, scale,
                 M, heads, kv_heads, max_seq, selected, ne01, kbc,
                 work_per_sequence, iter_k, iter_j, iter_z_gqa,
                 kb0_start, kb0_stop, input);
         } else {
             process_sparse_attention_tile<
-                DKQ, DV, ncols1, ncols2, V_is_K_view, true, false>(
+                DKQ, DV, ncols1, ncols2, V_is_K_view, true, false,SplitKV,Compact>(
                 q, k, v, indices, mask, sinks, out, meta, scale,
                 M, heads, kv_heads, max_seq, selected, ne01, kbc,
                 work_per_sequence, iter_k, iter_j, iter_z_gqa,
@@ -215,7 +267,7 @@ __global__ void sparse_attention_kernel(
 
     if (kbc < kbc_stop) {
         process_sparse_attention_tile<
-            DKQ, DV, ncols1, ncols2, V_is_K_view, false, true>(
+                DKQ, DV, ncols1, ncols2, V_is_K_view, false, true,SplitKV,Compact>(
             q, k, v, indices, mask, sinks, out, meta, scale,
             M, heads, kv_heads, max_seq, selected, ne01, kbc,
             work_per_sequence, iter_k, iter_j, iter_z_gqa,
@@ -228,7 +280,7 @@ __global__ void sparse_attention_kernel(
 #endif
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view>
+template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view,bool SplitKV=false,bool Compact=false>
 Tensor launch(
     const Tensor& q,
     const Tensor& k,
@@ -242,9 +294,10 @@ Tensor launch(
     const Tensor& gate = Tensor{},
     bool half_output = false,
     const Tensor& positions = Tensor{},
-    int64_t causal_columns = 0) {
-    static_assert(ncols1 == 1,
-        "selected-token tiles require one index row per query tile");
+    int64_t causal_columns = 0,
+    const Tensor& secondary_kv = Tensor{}) {
+    static_assert(ncols1==1 || (DKQ==256 && DV==256 && !V_is_K_view),
+        "multi-query tiles require causal 256-wide attention");
     constexpr int ncols = ncols1 * ncols2;
     MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
         q.size(0) <= INT_MAX && q.size(1) <= INT_MAX && q.size(2) <= INT_MAX &&
@@ -256,9 +309,18 @@ Tensor launch(
     const int kv_heads = static_cast<int>(k.size(1));
     const int max_seq = static_cast<int>(k.size(2));
     const bool causal = positions.defined();
+    MFQ_RUNTIME_CHECK(ncols1==1 || causal,name,": selected index rows require single-query tiles");
+    if(secondary_kv.defined()) {
+        MFQ_RUNTIME_CHECK(V_is_K_view && !causal && B==1 && M==1 && kv_heads==1 &&
+            secondary_kv.is_cuda() && secondary_kv.device()==k.device() && secondary_kv.is_contiguous() &&
+            secondary_kv.scalar_type()==mfq_tensor_backend::kFloat16 && secondary_kv.dim()==4 &&
+            secondary_kv.size(0)==1 && secondary_kv.size(1)==1 && secondary_kv.size(2)>0 &&
+            secondary_kv.size(2)<=INT_MAX-max_seq && secondary_kv.size(3)==DKQ,
+            name,": invalid secondary KV buffer");
+    }
     MFQ_RUNTIME_CHECK(!causal || (causal_columns > 0 && causal_columns <= INT_MAX - 32),
         name, ": causal selection exceeds 32-bit indexing");
-    const int selected = causal ? static_cast<int>(((causal_columns + 31) / 32) * 32)
+    const int selected = causal ? static_cast<int>(((causal_columns + 63) / 64) * 64)
         : static_cast<int>(indices.size(2));
 
     MFQ_RUNTIME_CHECK(B > 0 && M > 0 && heads > 0 && kv_heads > 0 &&
@@ -310,14 +372,36 @@ Tensor launch(
         name, ": hipGetDevice failed");
     MFQ_RUNTIME_CHECK(hipGetDeviceProperties(&properties, device) == hipSuccess,
         name, ": hipGetDeviceProperties failed");
-    const int cc = properties.major * 100 + properties.minor * 10;
-    MFQ_RUNTIME_CHECK(turing_mma_available(cc),
-        name, ": requires Turing-class tensor cores or newer");
-    const auto config = ampere_mma_available(cc)
-        ? ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols)
-        : ggml_cuda_fattn_mma_get_config_turing(DKQ, DV, ncols);
+    char* arch_end = nullptr;
+    const long arch = std::strtol(properties.gcnArchName + 3, &arch_end, 16);
+    MFQ_RUNTIME_CHECK(std::strncmp(properties.gcnArchName, "gfx", 3) == 0 &&
+        arch_end != properties.gcnArchName + 3 && (*arch_end == '\0' || *arch_end == ':') &&
+        arch > 0 && arch < 0x10000, name, ": invalid HIP architecture");
+    const int cc = GGML_CUDA_CC_OFFSET_AMD + static_cast<int>(arch);
+    MFQ_RUNTIME_CHECK(amd_mfma_available(cc) || amd_wmma_available(cc),
+        name, ": requires AMD matrix instructions");
+    static_assert(!Compact || (DKQ==256 && DV==256 && ncols1==1 && ncols2==16 && !V_is_K_view && !SplitKV));
+    MFQ_RUNTIME_CHECK(!Compact || (arch==0x942 && !causal && M>=128 && heads==24 && kv_heads==2),
+        name,": compact LDS requires the measured gfx942 sparse PP geometry");
+    auto config = ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc);
+    if constexpr(ncols==48){
+        static_assert(DKQ==256 && DV==256 && ncols1==12 && ncols2==4 && !V_is_K_view,
+            "48-column tiles are reserved for measured causal QSA");
+        MFQ_RUNTIME_CHECK(arch==0x942 && causal && M==4096 && B==1 && heads==24 && kv_heads==2,
+            name,": twelve-query tile requires the measured gfx942 causal PP geometry");
+    }
+    if constexpr(DKQ==256 && DV==256 && ncols1==8 && ncols2==4 && !V_is_K_view){
+        MFQ_RUNTIME_CHECK(arch==0x942 && causal && M==4096 && B==1 && heads==24 && kv_heads==2,
+            name,": wide query tile requires the measured gfx942 causal PP geometry");
+        config.nthreads=512;
+        // Limit the combine scratch while retaining the original KV tile.
+        config.nbatch_combine=64;
+    }
+    // Keep64 KV rows per softmax step. Halving feature/combine tiles permits
+    // more resident blocks without changing the causal or MLA configuration.
+    if constexpr(Compact)config.nbatch_K2=config.nbatch_V2=config.nbatch_combine=64;
     const int nthreads = config.nthreads;
-    const int nwarps = nthreads / 32;
+    const int nwarps = nthreads / properties.warpSize;
     const int nbatch_fa = config.nbatch_fa;
     const int nbatch_k2 = config.nbatch_K2;
     const int nbatch_v2 = config.nbatch_V2;
@@ -328,9 +412,10 @@ Tensor launch(
         name, ": unsupported MMA geometry");
     const int cols_per_warp = ::min(ncols, get_cols_per_warp(cc));
     const size_t shared_kv = static_cast<size_t>(nbatch_fa) *
-        ::max(nbatch_k2 + 4, nbatch_v2 + 4) * sizeof(half2);
+        ::max(ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_k2, cc),
+            ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_v2, cc)) * sizeof(half2);
     const size_t shared_q = static_cast<size_t>(ncols) *
-        (DKQ / 2 + 4) * sizeof(half2);
+        ggml_cuda_fattn_mma_get_q_stride(DKQ, DV, ncols, cc) * sizeof(half2);
     const size_t shared_mask = static_cast<size_t>(ncols1) *
         (nbatch_fa / 2 + 4) * sizeof(half2);
     const size_t shared_combine = static_cast<size_t>(nwarps) *
@@ -341,15 +426,15 @@ Tensor launch(
                  : shared_q + shared_kv + shared_mask);
 
     using Kernel = decltype(&sparse_attention_kernel<
-        DKQ, DV, ncols1, ncols2, V_is_K_view>);
+        DKQ, DV, ncols1, ncols2, V_is_K_view,SplitKV,false,Compact>);
     Kernel kernel = sparse_attention_kernel<
-        DKQ, DV, ncols1, ncols2, V_is_K_view>;
+        DKQ, DV, ncols1, ncols2, V_is_K_view,SplitKV,false,Compact>;
     static bool shmem_set[32] = {};
     MFQ_RUNTIME_CHECK(device >= 0 && device < 32,
         name, ": unsupported CUDA device index");
     if (!shmem_set[device]) {
         const hipError_t status = hipFuncSetAttribute(
-            kernel, hipFuncAttributeMaxDynamicSharedMemorySize,
+            reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(shmem));
         MFQ_RUNTIME_CHECK(status == hipSuccess,
             name, ": shared-memory attribute failed: ", hipGetErrorString(status));
@@ -379,6 +464,22 @@ Tensor launch(
     const int rounded_blocks = ::max(
         ntiles_dst, (raw_blocks / ntiles_dst) * ntiles_dst);
     const int blocks_per_tile = rounded_blocks / ntiles_dst;
+    // Keep the existing launch grid and reduction order; specialize only work
+    // that already assigns one complete query tile to a block.
+    if constexpr(!SplitKV && ((DKQ==512 && DV==512 && ncols1==1 && ncols2>=32 && V_is_K_view) ||
+        (DKQ==256 && DV==256 && !V_is_K_view))) {
+        if(M>=128 && blocks_per_tile==1 && (DKQ!=256 || causal || Compact)) {
+            kernel=sparse_attention_kernel<DKQ,DV,ncols1,ncols2,V_is_K_view,SplitKV,true,Compact>;
+            static bool direct_shmem[32]={};
+            if(!direct_shmem[device]) {
+                const hipError_t direct_status=hipFuncSetAttribute(reinterpret_cast<const void*>(kernel),
+                    hipFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(shmem));
+                MFQ_RUNTIME_CHECK(direct_status==hipSuccess,name,": direct shared-memory attribute failed: ",hipGetErrorString(direct_status));
+                direct_shmem[device]=true;
+            }
+        }
+    }
+
 
     const size_t meta_float2 = static_cast<size_t>(rounded_blocks) *
         ncols * (2 + DV / 2);
@@ -400,11 +501,15 @@ Tensor launch(
 
     Tensor out = mfq_tensor_backend::empty({B, M, heads, DV}, q.options().dtype(mfq_tensor_backend::kFloat32));
     const auto stream = mfq_current_cuda_stream();
-    const RuntimeInput input{causal ? positions.data_ptr() : nullptr,
+    RuntimeInput input{causal ? positions.data_ptr() : nullptr,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3), static_cast<int>(causal_columns),
         q.scalar_type() == mfq_tensor_backend::kFloat16,
         causal && positions.scalar_type() == mfq_tensor_backend::kInt64};
-   hipLaunchKernelGGL(( kernel), dim3(rounded_blocks), dim3(dim3(32, nwarps, 1)), shmem, stream, 
+    if(secondary_kv.defined()) {
+        input.secondary_kv=reinterpret_cast<const half2*>(secondary_kv.data_ptr<mfq_half>());
+        input.kv_split_index=max_seq;
+    }
+   hipLaunchKernelGGL(( kernel), dim3(rounded_blocks), dim3(dim3(properties.warpSize, nwarps, 1)), shmem, stream,
         q.data_ptr(),
         reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),
         reinterpret_cast<const half *>(v.data_ptr<mfq_half>()),

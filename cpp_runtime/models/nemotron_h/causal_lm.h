@@ -89,7 +89,7 @@ void load_moe(Block& block, Loader& ops, const Config& config, int layer,
     ffn.moe_shared_ungated = true;
     const bool dense_bank = ffn.moe_dense_up.defined() || ffn.moe_dense_down.defined();
     const auto rows = static_cast<int64_t>(config.num_routed_experts);
-    const bool expert_shapes =
+    bool expert_shapes =
         dense_bank ? ffn.moe_dense_up.dim() == 3 &&
                          ffn.moe_dense_up.size(0) == rows &&
                          ffn.moe_dense_up.size(1) == config.moe_intermediate_size &&
@@ -104,9 +104,22 @@ void load_moe(Block& block, Loader& ops, const Config& config, int layer,
                          ffn.moe_down.n_experts == config.num_routed_experts &&
                          ffn.moe_down.neuron_len == config.moe_intermediate_size &&
                          ffn.moe_down.out_per_expert == config.moe_latent_size;
-    if (!expert_shapes || ffn.moe_router.dim() != 2 ||
-        ffn.moe_router.size(0) != config.num_routed_experts ||
-        ffn.moe_router.size(1) != config.hidden_size ||
+    if constexpr(requires { ffn.moe_tq; }) {
+        if(ffn.moe_tq) {
+            const auto& tq=*ffn.moe_tq;
+            expert_shapes=tq.up && tq.down && !tq.gate &&
+                tq.up->experts==config.num_routed_experts && tq.down->experts==config.num_routed_experts &&
+                tq.up->out==config.moe_intermediate_size && tq.up->input==config.moe_latent_size &&
+                tq.down->out==config.moe_latent_size && tq.down->input==config.moe_intermediate_size;
+        }
+    }
+    bool router_shape=ffn.moe_router.dim()==2 &&
+        ffn.moe_router.size(0)==config.num_routed_experts &&
+        ffn.moe_router.size(1)==config.hidden_size;
+    if constexpr(requires { ffn.moe_router_projection; })
+        if(ffn.moe_router_projection)router_shape=ffn.moe_router_projection->out()==config.num_routed_experts &&
+            ffn.moe_router_projection->neuron_len()==config.hidden_size;
+    if (!expert_shapes || !router_shape ||
         ops.elements(ffn.moe_router_bias) != config.num_routed_experts ||
         ffn.moe_latent_in.out() != config.moe_latent_size ||
         ffn.moe_latent_in.neuron_len() != config.hidden_size ||

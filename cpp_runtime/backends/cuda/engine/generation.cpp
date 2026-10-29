@@ -1,3 +1,4 @@
+#include "runtime/routed_cache_resources.h"
 #include "generation.h"
 #include "generation_flow.h"
 #include "token_row_prefetch.h"
@@ -107,7 +108,11 @@ template <typename Model> struct CudaGenerationOps {
         Tensor hidden;
         bool layer_major=false,short_windows=false;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
-            if((!prepared || !prepared->transformed()) && model.reuse_decode_graphs &&
+            // TQ groups all prompt rows by expert without expanding an entire
+            // layer. Splitting these batches into verification windows would
+            // repeatedly transfer the same expert when it is not resident.
+            const bool verification_windows=!model.execution->tq_expert_cache || chunk.count<=8;
+            if(verification_windows && (!prepared || !prepared->transformed()) && model.reuse_decode_graphs &&
                     model.graph_registry && chunk.count<=128) {
                 // The same bounded prompt windows as MTP avoid materializing
                 // a whole expert layer before a short prompt has any scratch.
@@ -388,7 +393,7 @@ template <class Model> struct CudaGenerationContext {
         // CUDA synchronization. Subtract it from the end snapshot to isolate
         // steady decode I/O from the much larger prefill scan.
         std::cerr << "moe_phase_metrics boundary=" << boundary;
-        for(const auto& [name,value]:moe_expert_memory_metrics(model.execution->moe_expert_cache)) {
+        for(const auto& [name,value]:routed_expert_memory_metrics(*model.execution)) {
             if(name=="ssd_expert_read_wait_ms" || name=="expert_route_wait_ms" ||
                name=="expert_host_fetch_ms" || name=="expert_host_copy_ms" || name=="expert_transfer_cache_prepare_ms" || name=="ssd_expert_bytes_read" ||
                name=="ssd_expert_read_count" || name=="ram_expert_cache_hits" ||

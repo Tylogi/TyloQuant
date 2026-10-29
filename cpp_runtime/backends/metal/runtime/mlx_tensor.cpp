@@ -353,6 +353,7 @@ std::optional<array> unpack_quantized_weight(
                 std::is_same_v<Weight, MlxNintWeight>
                 || std::is_same_v<Weight, MlxNint8ZeroWeight>
                 || std::is_same_v<Weight, MlxVqWeight>
+                || std::is_same_v<Weight, MlxTqWeight>
             ) {
                 return mlx::core::astype(
                     value.embedding(
@@ -545,6 +546,7 @@ MlxLinear MlxLinear::load(
         return result;
     };
     const auto& record = model.record(name);
+    if (record.dtype == "TQ") return finish(MlxLinear(MlxTqWeight::load(model, name)));
     if (is_nint8_zero_dtype(record.dtype)) {
         const auto mapped = model.map_record(name);
         return finish(MlxLinear(
@@ -581,6 +583,9 @@ MlxLinear::MlxLinear(MlxNintWeight weight)
     : input_size_(weight.input_size()),
       output_size_(weight.output_size()),
       weight_(std::move(weight)) {}
+
+MlxLinear::MlxLinear(MlxTqWeight weight)
+    : weight_(weight), input_size_(weight.input_size()), output_size_(weight.output_size()) {}
 
 MlxLinear::MlxLinear(MlxNint8ZeroWeight weight)
     : input_size_(weight.input_size()),
@@ -629,6 +634,7 @@ array MlxLinear::operator()(const array& input) const {
     if (input.ndim() == 0 || input.shape(-1) != input_size_) {
         throw std::runtime_error("linear input width mismatch");
     }
+    if (const auto* tq = std::get_if<MlxTqWeight>(&weight_)) return tq->matmul(input);
     if (mlx_reference_enabled()) {
         if (auto dense = unpack_quantized_weight(
                 weight_, output_size_)) {
@@ -725,6 +731,16 @@ array MlxLinear::moe_shared(
         gate_logits);
 }
 
+void MlxLinear::prepare_grouped_row_matmul(int group_count) const {
+    if (!tq_weight_ref()) return;
+    if (auto* preparation = MlxKernelPreparation::current()) preparation->collect([&] {
+        for (const auto rows : preparation->row_buckets())
+            for (auto dtype : {mlx::core::float16, mlx::core::float32})
+                preparation->add(grouped_row_matmul(
+                    mlx::core::zeros(Shape{rows, group_count, input_size_}, dtype), group_count));
+    });
+}
+
 array MlxLinear::grouped_row_matmul(
     const array& input,
     int group_count) const {
@@ -736,6 +752,7 @@ array MlxLinear::grouped_row_matmul(
         throw std::runtime_error(
             "grouped-row linear shape/group mismatch");
     }
+    if (const auto* tq = std::get_if<MlxTqWeight>(&weight_)) return tq->grouped_row_matmul(input, group_count);
     if (mlx_reference_enabled()) {
         if (auto dense = unpack_quantized_weight(
                 weight_, output_size_)) {
@@ -964,11 +981,16 @@ const MlxMxWeight* MlxLinear::mx_weight_ref() const noexcept {
     return std::get_if<MlxMxWeight>(&weight_);
 }
 
+const MlxTqWeight* MlxLinear::tq_weight_ref() const noexcept {
+    return std::get_if<MlxTqWeight>(&weight_);
+}
+
 const array* MlxLinear::dense_weight_ref() const noexcept {
     return std::get_if<array>(&weight_);
 }
 
 void MlxLinear::materialize_fp16() {
+    if (std::holds_alternative<MlxTqWeight>(weight_)) return;
     if (const auto* dense = std::get_if<array>(&weight_);
         dense && (!g_fp16_weight_scopes || dense->dtype() == mlx::core::float16)) return;
     auto dense = materialize_weight_fp16(weight_, output_size_);
@@ -997,6 +1019,7 @@ struct MlxProjectionBatch::Impl {
     struct Segment {
         std::vector<std::size_t> indices;
         std::optional<MlxGroupedLinear> grouped;
+        std::vector<MlxTqWeight> tq;
     };
 
     explicit Impl(std::vector<const MlxLinear*> sources) {
@@ -1023,6 +1046,21 @@ struct MlxProjectionBatch::Impl {
         std::size_t begin = 0;
         while (begin < references.size()) {
             const std::size_t remaining = references.size() - begin;
+            if (const auto* first = references[begin]->tq_weight_ref()) {
+                Segment segment;
+                for (std::size_t offset = 0; offset < std::min(remaining, std::size_t(8)); ++offset) {
+                    const auto* weight = references[begin + offset]->tq_weight_ref();
+                    if (!weight || weight->input_size() != first->input_size()) break;
+                    segment.indices.push_back(begin + offset);
+                    segment.tq.push_back(*weight);
+                }
+                if (segment.tq.size() >= 2) {
+                    grouped_projection_count += segment.tq.size();
+                    begin += segment.tq.size();
+                    segments.push_back(std::move(segment));
+                    continue;
+                }
+            }
             std::optional<MlxGroupedLinear> selected;
             std::size_t selected_count = 0;
             for (std::size_t count = remaining; count >= 2; --count) {
@@ -1057,9 +1095,9 @@ struct MlxProjectionBatch::Impl {
             begin += count;
         }
         for (std::size_t first = 0; first < segments.size(); ++first) {
-            if (segments[first].grouped) continue;
+            if (segments[first].grouped || !segments[first].tq.empty()) continue;
             for (std::size_t second = first + 1; second < segments.size(); ++second) {
-                if (segments[second].grouped) continue;
+                if (segments[second].grouped || !segments[second].tq.empty()) continue;
                 const std::array<const MlxLinear*, 2> pair{
                     references[segments[first].indices.front()],
                     references[segments[second].indices.front()]};
@@ -1107,6 +1145,12 @@ std::vector<array> MlxProjectionBatch::operator()(
             static_cast<std::size_t>(input.shape(-1));
     std::vector<array> outputs(impl_->linears.size(), input);
     for (const auto& segment : impl_->segments) {
+        if (!segment.tq.empty()) {
+            auto values = MlxTqWeight::matmul_many(segment.tq, input);
+            for (std::size_t offset = 0; offset < segment.indices.size(); ++offset)
+                outputs[segment.indices[offset]] = std::move(values[offset]);
+            continue;
+        }
         const bool use_grouped = segment.grouped &&
             segment.grouped->supports(input) &&
             (rows > 1 ||
@@ -1137,6 +1181,14 @@ array MlxProjectionBatch::swiglu(
         throw std::invalid_argument(
             "SwiGLU projection limit must be finite and non-negative");
     }
+    if (const auto* gate = impl_->linears[0].tq_weight_ref()) {
+        if (const auto* up = impl_->linears[1].tq_weight_ref()) {
+            const int tokens = input.size() / gate->input_size();
+            auto result = gate->swiglu(*up, input, mlx::core::zeros(Shape{tokens, 1}, mlx::core::int32), limit);
+            auto shape = input.shape(); shape.back() = gate->output_size();
+            return mlx::core::reshape(result, shape);
+        }
+    }
     if (impl_->segments.size() == 1 &&
         impl_->segments.front().indices.size() == 2 &&
         impl_->segments.front().grouped) {
@@ -1163,6 +1215,8 @@ array MlxProjectionBatch::swiglu(
 
 bool MlxProjectionBatch::supports_fused_swiglu(
     const array& input) const noexcept {
+    if (impl_->linears.size() == 2 && impl_->linears[0].tq_weight_ref()
+        && impl_->linears[1].tq_weight_ref()) return true;
     if (impl_->linears.size() != 2 ||
         impl_->segments.size() != 1 ||
         impl_->segments.front().indices.size() != 2 ||
@@ -1194,7 +1248,7 @@ bool MlxProjectionBatch::projections_share_group(
         impl_->segments.begin(),
         impl_->segments.end(),
         [begin, count](const Impl::Segment& segment) {
-            if (!segment.grouped) return false;
+            if (!segment.grouped && segment.tq.empty()) return false;
             for (std::size_t index = begin; index < begin + count; ++index)
                 if (std::find(segment.indices.begin(), segment.indices.end(), index)
                     == segment.indices.end()) return false;
@@ -1221,6 +1275,7 @@ MlxEmbedding MlxEmbedding::load(
         return result;
     };
     const auto& record = model.record(name);
+    if (record.dtype == "TQ") return finish(MlxEmbedding(MlxTqWeight::load(model, name)));
     if (is_nint8_zero_dtype(record.dtype)) {
         const auto mapped = model.map_record(name);
         return finish(MlxEmbedding(
@@ -1256,6 +1311,9 @@ MlxEmbedding::MlxEmbedding(MlxNintWeight weight)
       hidden_size_(weight.input_size()),
       weight_(std::move(weight)) {}
 
+MlxEmbedding::MlxEmbedding(MlxTqWeight weight)
+    : weight_(weight), vocabulary_size_(weight.output_size()), hidden_size_(weight.input_size()) {}
+
 MlxEmbedding::MlxEmbedding(MlxNint8ZeroWeight weight)
     : vocabulary_size_(weight.output_size()),
       hidden_size_(weight.input_size()),
@@ -1282,6 +1340,7 @@ MlxEmbedding::MlxEmbedding(array weight)
 }
 
 void MlxEmbedding::materialize_fp16() {
+    if (std::holds_alternative<MlxTqWeight>(weight_)) return;
     if (const auto* dense = std::get_if<array>(&weight_);
         dense && (!g_fp16_weight_scopes || dense->dtype() == mlx::core::float16)) return;
     auto dense = materialize_weight_fp16(weight_, vocabulary_size_);
@@ -1291,6 +1350,7 @@ void MlxEmbedding::materialize_fp16() {
 array MlxEmbedding::operator()(
     const array& token_ids,
     Dtype dtype) const {
+    if (const auto* tq = std::get_if<MlxTqWeight>(&weight_)) return tq->embedding(token_ids, dtype);
     const bool reference = mlx_reference_enabled();
     const auto finish_quantized = [&](const auto& packed) {
         auto result = reference
@@ -1347,6 +1407,7 @@ array MlxEmbedding::project(const array& input) const {
         throw std::runtime_error(
             "embedding projection input width mismatch");
     }
+    if (const auto* tq = std::get_if<MlxTqWeight>(&weight_)) return tq->matmul(input);
     if (mlx_reference_enabled()) {
         if (auto dense = unpack_quantized_weight(
                 weight_, vocabulary_size_)) {

@@ -1148,17 +1148,11 @@ static int run_qwen4_decode_hidden_check(mfq::cuda::Qwen4CausalLm& model) {
     int graph_steps=0;
     for(int step=0;step<20;++step) {
         tb::Tensor raw,hidden;
-        if(step==7 || step==11) {
-            // Resume eager execution and then return to the graph. A confirmed
-            // transaction must remain ineligible until committed or rejected.
-            const auto input=step==11?tb::cat({ids_for(step),ids_for(step+1)},1):ids_for(step);
-            hidden=model.hidden_forward(input,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&raw,step==11?1:0);
-            if(step==11) {
-                MFQ_RUNTIME_CHECK(!qwen4_decode_graph_hidden(model,ids_for(step),nullptr),
-                    "hidden graph accepted an active speculative transaction");
-                model.rollback_speculative();
-                hidden=hidden.narrow(1,0,1).contiguous();raw=raw.narrow(1,0,1).contiguous();
-            }
+        if(step==7) {
+            // Equal-width scalar history also checks eager/graph transitions.
+            // Verification windows are compared independently below: scalar
+            // and batched quantized projections may round differently.
+            hidden=model.hidden_forward(ids_for(step),mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&raw);
         } else {
             auto result=qwen4_decode_graph_hidden(model,ids_for(step),&raw);
             MFQ_RUNTIME_CHECK(result.has_value(),"hidden graph was not exercised");
@@ -1184,7 +1178,11 @@ static int run_qwen4_decode_hidden_check(mfq::cuda::Qwen4CausalLm& model) {
             tb::Tensor raw;
             expected.push_back(host(model.hidden_forward(input,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&raw,1)));
             expected_raw.push_back(host(raw));
-            if(accepted<0)model.commit_speculative();else {
+            MFQ_RUNTIME_CHECK(!qwen4_decode_graph_hidden(model,ids_for(0),nullptr),
+                "hidden graph accepted an active speculative transaction");
+            if(accepted<0)model.commit_speculative();else if(model.speculative_prefix_retention) {
+                model.rollback_speculative(accepted);
+            } else {
                 model.rollback_speculative();
                 if(accepted)model.hidden_forward(input.narrow(1,1,accepted));
             }

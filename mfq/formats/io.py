@@ -101,9 +101,11 @@ from mfq.formats.npq0_s import Npq0STensor, pack_npq0_s, unpack_npq0_s
 from mfq.formats.nvq import NvqJscTensor, NvqTensor, pack_nvq, unpack_nvq
 from mfq.formats.nvq1_l import Nvq1LTensor, pack_nvq1_l, unpack_nvq1_l
 from mfq.formats.nvq1_s import Nvq1STensor, pack_nvq1_s, unpack_nvq1_s
+from mfq.formats.tq import TQTensor
 
 MfqTensor: TypeAlias = (
-    NintTensor
+    TQTensor
+    | NintTensor
     | Nint8ZeroTensor
     | MfeTensor
     | NvqTensor
@@ -926,6 +928,8 @@ def unpack_dense(dtype: str, blob: bytes) -> np.ndarray:
 def _unpack_tensor(dtype: str, blob: bytes | memoryview) -> MfqTensor:
     if dtype == ASSET_DTYPE:
         return bytes(blob)
+    if dtype == "TQ":
+        return TQTensor.from_bytes(blob)
     if dtype in MX_DTYPES:
         return unpack_mx(dtype, blob)
     dtype = canonical_dtype(dtype)
@@ -976,6 +980,8 @@ def _pack_tensor(tensor: MfqTensor, *, allow_moe: bool = True) -> tuple[str, byt
 
     if isinstance(tensor, bytes):
         return ASSET_DTYPE, tensor
+    if isinstance(tensor, TQTensor):
+        return "TQ", tensor.to_bytes()
     if isinstance(tensor, MxTensor):
         return tensor.dtype, pack_mx(tensor)
     if isinstance(tensor, Mxfp4SqTensor):

@@ -109,6 +109,14 @@ int main() try {
                 "stable prefix does not include expanded image spans");
         }
     }
+    for(bool benchmark:{false,true}) {
+        InferenceInput input;input.chat=false;input.prompt="abc";
+        input.sampling.max_tokens=4;input.prefix_cache_enabled=false;
+        if(benchmark)input.benchmark_prompt_tokens=32;
+        auto prepared=processor.prepare(std::move(input),1024);
+        require(prepared.benchmark_fixed_tokens==benchmark,"fixed output length leaked outside synthetic benchmark");
+        if(benchmark)require(prepared.prompt.size()==32,"benchmark prompt length differs");
+    }
     std::cout << "MFQ text processor media-prefix boundaries passed\n";
     return 0;
 } catch (const std::exception& error) {

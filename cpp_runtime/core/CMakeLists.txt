@@ -56,6 +56,9 @@ add_library(mfq-model-source STATIC
     include/mfq/mfq_model_source.h
     mfq_model_source.cpp
     model_source.cpp
+    tq_fixture_source.cpp
+    include/mfq/tq_fixture_source.h
+    include/mfq/tq_rows.h
 )
 add_library(mfq::model-source ALIAS mfq-model-source)
 target_include_directories(mfq-model-source PUBLIC

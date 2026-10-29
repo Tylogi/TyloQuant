@@ -12,6 +12,7 @@
 #include "mfq/kernels/cuda/qwen4_exp.h"
 #include "mfq/kernels/cuda/ple_fused.h"
 #include "runtime/nint_row_pipeline.h"
+#include "runtime/row_stage.h"
 #include "runtime/kv_offload.h"
 #include "runtime/kv_memory.h"
 #include "runtime/decode_window.h"
@@ -207,7 +208,7 @@ class Gdn {
         const auto inplace_option=mfq::cuda::runtime_options::gdn_inplace_state();
         const auto* checkpoint_option=std::getenv("MFQ_MTP_GDN_FUSED_CHECKPOINT");
         if(grouped && confirmed==1 && x.size(0)==1 && x.size(1)>=2 && x.size(1)<=8 &&
-            (window_option?window_option[0]!='0':nk_==16 && nv_==48) &&
+            (!window_option || window_option[0]!='0') && nv_<=65535 &&
             (!inplace_option || *inplace_option) && (!checkpoint_option || checkpoint_option[0]!='0') &&
             d_==128 && kernel_==4 && fused_core_ && fused_decode_ && fused_preparation_ &&
             fused_output_ && transposed_state_ && conv_.defined() && state_.defined() &&
@@ -263,13 +264,40 @@ class Gdn {
         grouped_projection_ = enabled;
     }
     Tensor forward(CudaExecutionContext &execution, const Tensor &x, bool cache,
-                   int64_t confirmed = 0) {
+                   int64_t confirmed = 0, int64_t cache_position = -1) {
         MFQ_RUNTIME_CHECK(x.is_cuda() && x.dim() == 3 && x.size(0) > 0,
                           "recurrent attention requires nonempty [B,T,H] input");
-        return mfq::models::recurrent_window(
+        if(cache && cache_position>=0 && confirmed>0 && confirmed<x.size(1) && x.size(1)<=8) {
+            MFQ_RUNTIME_CHECK(!saved_conv_.defined() && conv_.defined() && state_.defined(),
+                              "GDN verification requires committed recurrent state");
+            std::vector<Tensor> conv,state;
+            for(int64_t i=confirmed;i<x.size(1);++i) {
+                conv.push_back(tb::empty_like(conv_));state.push_back(tb::empty_like(state_));
+            }
+            auto result=forward_graph(execution,x,confirmed,conv,state);
+            bind_graph_checkpoint(conv,state,cache_position+confirmed);
+            return result;
+        }
+        const auto batch=mfq::cuda::runtime_options::gdn_batch_projection();
+        const bool grouped=cache && confirmed>0 && confirmed<x.size(1) && x.size(1)<=8 &&
+            grouped_projection_ && w_.input_projection && (!batch || *batch);
+        std::vector<Tensor> projected;
+        if(grouped)projected=w_.input_projection(execution,x);
+        auto result=mfq::models::recurrent_window(
             x.size(1), cache, confirmed, saved_conv_.defined(),
             [&](int64_t start, int64_t count) {
-                return forward_chunk(execution, x.narrow(1, start, count), cache);
+                if(!grouped)return forward_chunk(execution,x.narrow(1,start,count),cache);
+                // Share both projections across the verification window and
+                // preserve the same per-prefix recurrent order as the graph.
+                std::vector<Tensor> outputs;
+                for(int64_t begin=start;begin<start+count;) {
+                    const auto rows=begin==0?count:int64_t(1);
+                    std::vector<Tensor> inputs;
+                    for(const auto& value:projected)inputs.push_back(value.narrow(1,begin,rows));
+                    outputs.push_back(forward_chunk(execution,x.narrow(1,begin,rows),cache,std::move(inputs),false));
+                    begin+=rows;
+                }
+                return outputs.size()==1?std::move(outputs.front()):tb::cat(outputs,1);
             },
             [&] {
                 saved_conv_ = conv_.clone();
@@ -277,6 +305,7 @@ class Gdn {
             },
             [&] { rollback(); },
             [](Tensor prefix, Tensor suffix) { return tb::cat({prefix, suffix}, 1); });
+        return grouped?w_.output(execution,result):result;
     }
     Tensor forward_chunk(CudaExecutionContext &execution, const Tensor &x, bool cache,
                          std::vector<Tensor> projections = {},bool project_output=true,
@@ -550,12 +579,15 @@ class Gdn {
 class NgramEmbedding {
   public:
     using Context = mfq::models::qwen4_exp::NgramContext;
+    using RowLookup = std::function<Tensor(const std::vector<int64_t>&,const tb::Device&)>;
+    using StageFactory = std::function<std::shared_ptr<RowStage>(const std::vector<int64_t>&,const tb::Device&)>;
     NgramEmbedding(std::vector<Embedding> shards, int64_t rows, int64_t dimension, int64_t ngram,
                    int64_t heads_per_ngram, int64_t eos, std::vector<int64_t> multipliers,
-                   std::vector<int64_t> offsets, std::vector<int64_t> vocab,std::shared_ptr<NintRowPipeline> pipeline = {})
+                   std::vector<int64_t> offsets, std::vector<int64_t> vocab,std::shared_ptr<NintRowPipeline> pipeline = {},
+                   RowLookup row_lookup = {},StageFactory stage_factory = {})
         : shards_(std::move(shards)), rows_(rows), dimension_(dimension), ngram_(ngram),
           heads_(heads_per_ngram), eos_(eos), multipliers_(std::move(multipliers)),
-          offsets_(std::move(offsets)), vocab_(std::move(vocab)),pipeline_(std::move(pipeline)) {
+          offsets_(std::move(offsets)), vocab_(std::move(vocab)),pipeline_(std::move(pipeline)),row_lookup_(std::move(row_lookup)),stage_factory_(std::move(stage_factory)) {
         MFQ_RUNTIME_CHECK(!shards_.empty() && rows_ > 0 && dimension_ > 0 && ngram_ > 1 &&
                               heads_ > 0 && multipliers_.size() == size_t(ngram_) &&
                               offsets_.size() == size_t((ngram_ - 1) * heads_) &&
@@ -567,7 +599,7 @@ class NgramEmbedding {
                               "Qwen4 ngram vocabulary lies outside embedding shards");
     }
     void reset() { context_ = {};hash_ready_=false; }
-    bool graph_supported() const { return bool(pipeline_); }
+    bool graph_supported() const { return bool(pipeline_) || bool(stage_factory_); }
     const Context &context() const { return context_; }
     void restore(Context context) { context_ = std::move(context);hash_ready_=false; }
     Context prefix_context(const Tensor& host_ids,int64_t count) const {
@@ -588,22 +620,24 @@ class NgramEmbedding {
             multipliers_,offsets_,vocab_,context_,true);
         pipeline_->issue(hashes.ids,{b,t,(ngram_-1)*heads_},early_prefix);
     }
-    std::shared_ptr<NintRowStage> graph_stage(int64_t b,int64_t t,const tb::Device& device) {
-        MFQ_RUNTIME_CHECK(pipeline_,"PLE graph requires canonical range rows");
-        return pipeline_->make_stage({b,t,(ngram_-1)*heads_},device);
+    std::shared_ptr<RowStage> graph_stage(int64_t b,int64_t t,const tb::Device& device) {
+        const std::vector<int64_t> shape{b,t,(ngram_-1)*heads_};
+        if(stage_factory_)return stage_factory_(shape,device);
+        MFQ_RUNTIME_CHECK(pipeline_,"PLE graph requires prepared range rows");
+        return std::make_shared<NintStage>(pipeline_,shape,device);
     }
-    void upload_graph(const Tensor& host_ids,NintRowStage& stage) {
-        MFQ_RUNTIME_CHECK(pipeline_ && host_ids.is_cpu() && host_ids.dim()==2,"PLE graph requires host token IDs");
+    void upload_graph(const Tensor& host_ids,RowStage& stage) {
+        MFQ_RUNTIME_CHECK(graph_supported() && host_ids.is_cpu() && host_ids.dim()==2,"PLE graph requires host token IDs");
         auto host=host_ids.to(tb::kInt64).contiguous();const auto b=host.size(0),t=host.size(1);
         if(cacheable_hashes(b,t)) {
             auto& hashes=graph_hashes(host);
-            pipeline_->upload(stage,hashes.ids,{b,t,(ngram_-1)*heads_});
+            stage.upload(hashes.ids,{b,t,(ngram_-1)*heads_});
             restore(std::move(hashes.next));
             return;
         }
         auto hashes=mfq::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),b,t,ngram_,heads_,eos_,
             multipliers_,offsets_,vocab_,context_,true);
-        pipeline_->upload(stage,hashes.ids,{b,t,(ngram_-1)*heads_});
+        stage.upload(hashes.ids,{b,t,(ngram_-1)*heads_});
         restore(std::move(hashes.next));
     }
     Tensor forward(const Tensor &ids, bool cache, Tensor *hashed_ids = nullptr,const Tensor& host_ids = {}) {
@@ -616,6 +650,12 @@ class NgramEmbedding {
         auto hashes = mfq::models::qwen4_exp::ngram_hashes(
             source, b, t, ngram_, heads_, eos_, multipliers_, offsets_, vocab_, context_, cache);
         auto &global = hashes.ids;
+        if(row_lookup_) {
+            auto result=row_lookup_(global,ids.device());
+            if(hashed_ids)*hashed_ids=tb::tensor(global).reshape({b,t,nh}).to(ids.device());
+            if(cache)restore(std::move(hashes.next));
+            return result.reshape({b,t,nh*dimension_});
+        }
         if(pipeline_) {
             auto result=pipeline_->collect(global,{b,t,nh},ids.device());
             if(hashed_ids)*hashed_ids=tb::tensor(global).reshape({b,t,nh}).to(ids.device());
@@ -648,11 +688,25 @@ class NgramEmbedding {
     }
 
   private:
+    struct NintStage final:RowStage {
+        std::shared_ptr<NintRowPipeline> pipeline;
+        std::shared_ptr<NintRowStage> stage;
+        NintStage(std::shared_ptr<NintRowPipeline> p,const std::vector<int64_t>& shape,const tb::Device& device)
+            :pipeline(std::move(p)),stage(pipeline->make_stage(shape,device)) {}
+        Tensor output()const override{return stage->output();}
+        bool mapped_rows()const override{return stage->mapped_rows();}
+        void decode()override{stage->decode();}
+        void upload(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape)override {
+            pipeline->upload(*stage,ids,shape);
+        }
+    };
     std::vector<Embedding> shards_;
     int64_t rows_, dimension_, ngram_, heads_, eos_;
     std::vector<int64_t> multipliers_, offsets_, vocab_;
     Context context_;
     std::shared_ptr<NintRowPipeline> pipeline_;
+    RowLookup row_lookup_;
+    StageFactory stage_factory_;
     bool reuse_hashes_=[] {
         const auto* option=std::getenv("MFQ_PLE_HASH_REUSE");return !option || option[0]!='0';
     }();
@@ -724,10 +778,10 @@ class Ple {
         } else {reset();conv_=convolution.clone();}
         embedding_.restore(std::move(context));
     }
-    std::shared_ptr<NintRowStage> graph_stage(int64_t tokens,const tb::Device& device) {
+    std::shared_ptr<RowStage> graph_stage(int64_t tokens,const tb::Device& device) {
         return embedding_.graph_stage(1,tokens,device);
     }
-    void upload_graph(const Tensor& host_ids,NintRowStage& stage) {embedding_.upload_graph(host_ids,stage);}
+    void upload_graph(const Tensor& host_ids,RowStage& stage) {embedding_.upload_graph(host_ids,stage);}
     NgramEmbedding::Context graph_prefix_context(const Tensor& host_ids,int64_t count) const {
         return embedding_.prefix_context(host_ids,count);
     }
@@ -751,11 +805,24 @@ class Ple {
     }
     void prefetch_tokens(const Tensor& ids,bool early_prefix=false) { embedding_.prefetch(ids,early_prefix); }
     Tensor forward(CudaExecutionContext &execution, const Tensor &x, const Tensor &ids, bool cache,
-                   int64_t confirmed = 0,const Tensor& host_ids = {}) {
+                   int64_t confirmed = 0,const Tensor& host_ids = {},int64_t cache_position = -1) {
         MFQ_RUNTIME_CHECK(x.dim() == 3 && ids.dim() == 2 && x.size(0) == ids.size(0) &&
                               x.size(1) == ids.size(1) && x.size(2) == hidden_ * streams_ &&
                               confirmed >= 0 && confirmed <= x.size(1) && (!confirmed || cache),
                           "invalid Qwen4 PLE input");
+        if(cache && cache_position>=0 && confirmed>0 && confirmed<x.size(1) && x.size(1)<=8) {
+            MFQ_RUNTIME_CHECK(!saved_ && conv_.defined(),"PLE verification requires committed convolution state");
+            auto host=host_ids.defined()?host_ids:ids.to(tb::kCPU,tb::kInt64);
+            std::vector<Tensor> conv;
+            std::vector<NgramEmbedding::Context> context;
+            for(int64_t i=confirmed;i<x.size(1);++i) {
+                conv.push_back(tb::empty_like(conv_));context.push_back(embedding_.prefix_context(host,i));
+            }
+            auto rows=embedding_.forward(ids,true,nullptr,host);
+            auto result=forward_graph(execution,x,ids,rows,confirmed,conv);
+            bind_graph_checkpoint(conv,std::move(context),cache_position+confirmed);
+            return result;
+        }
         return mfq::models::recurrent_window(
             x.size(1), cache, confirmed, saved_,
             [&](int64_t start, int64_t count) {
@@ -1289,13 +1356,16 @@ class Qsa {
         }
         const auto b = hidden.size(0), t = hidden.size(1), offset = use_cache ? position() : 0;
         const auto prefill_option=mfq::cuda::runtime_options::qsa_prefill_fused();
-        const bool fused_prefill=!projections.empty() || (t>8 && (!prefill_option || *prefill_option!=0));
+        // Scalar decode and verification use the same grouped projections and
+        // normalization/RoPE preparation as captured execution. Keeping short
+        // eager calls on separate norms introduces extra FP16 rounding steps.
+        const bool prepared_inputs=!projections.empty() || (!prefill_option || *prefill_option!=0);
         MFQ_RUNTIME_CHECK(
             t <= c_.maximum - offset && full_positions.size(-1) == offset + t &&
                 (!use_cache || (offset == values_.position() && offset == index_.position())),
             "Qwen4 QSA cache/position geometry mismatch");
         auto project_inputs = [&] {
-                if(fused_prefill)
+                if(prepared_inputs)
                     return project(execution,hidden,current_positions,!history_only && offset+t>c_.budget,{},{},{},std::move(projections));
                 auto pair = w_.query(execution, hidden).reshape({b, t, c_.heads, 2 * c_.width});
                 auto gate = pair.narrow(-1, c_.width, c_.width);
@@ -1349,10 +1419,25 @@ class Qsa {
             try {append_inputs(p);}catch(...) {truncate(offset);throw;}
             return {};
         }
+        const bool short_gate=prepared_inputs && fused_projection_ && rotary_->fused() &&
+            t<=8 && !quantization_.enabled() &&
+            (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32);
+        const auto attend_projected=[&](const Projection& p,const Tensor& selected) {
+            auto key=p.key.permute({0,2,1,3}),value=p.value.permute({0,2,1,3});
+            if(!short_gate)return attend(p.query,key,value,selected,offset);
+            const auto positions=tb::arange(offset,offset+t,hidden.options().dtype(tb::kInt64));
+            const auto hot=prepare_hot(selected,positions,offset+t);
+            // Match the decode graph's fused gate and FP32 attention
+            // accumulation for short eager/correction calls as well.
+            if(selected.defined())return mfq_qwen4_exp::sparse_gqa_attention_gate(
+                p.query,key,value,selected,p.gate,hidden.scalar_type()==tb::kFloat16,hot);
+            return mfq_qwen4_exp::causal_gqa_attention_gate(p.query,key,value,positions,
+                p.gate,offset+t,hidden.scalar_type()==tb::kFloat16,hot);
+        };
         return mfq::models::qwen4_exp::sparse_attention(
             offset + t, c_.budget, use_cache, project_inputs, append_inputs,
             [&](const Projection &p) {
-                return attend(p.query, p.key.permute({0,2,1,3}), p.value.permute({0,2,1,3}), {}, offset);
+                return attend_projected(p,{});
             },
             [&](const Projection &p) {
                 return pooled_.update(*rotary_,p.raw,w_.index_key_norm,full_positions,
@@ -1369,10 +1454,11 @@ class Qsa {
                 return ids;
             },
             [&](const Projection &p, Tensor ids) {
-                return attend(p.query, p.key.permute({0,2,1,3}), p.value.permute({0,2,1,3}), ids, offset);
+                return attend_projected(p,ids);
             },
             [&](Tensor attended, const Projection &p) {
-                auto gated = attended.to(tb::kFloat32) * tb::sigmoid(p.gate.to(tb::kFloat32));
+                auto gated = short_gate?std::move(attended):
+                    attended.to(tb::kFloat32) * tb::sigmoid(p.gate.to(tb::kFloat32));
                 auto result = gated.reshape({b, t, c_.heads * c_.width}).to(hidden.scalar_type());
                 return project_output ? w_.output(execution,result) : result;
             },

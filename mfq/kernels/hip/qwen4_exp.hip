@@ -8,10 +8,46 @@
 #include <cmath>
 #include <limits>
 #include <type_traits>
+#include <hipcub/hipcub.hpp>
 #include "mfq_hip_compat.h"
 
 namespace mfq_qwen4_exp {
 namespace tb = mfq_tensor_backend;
+
+namespace {
+template<class Position>
+__global__ void fill_decode_positions_kernel(int64_t* cache,Position* positions,
+    int64_t tokens,int64_t entries,int64_t start,int64_t delta) {
+    for(int64_t i=threadIdx.x;i<entries;i+=blockDim.x) {
+        positions[i]=static_cast<Position>(start+i%tokens+delta);
+        if(i<tokens)cache[i]=start+i;
+    }
+}
+}
+void fill_decode_positions(const Tensor& cache,const Tensor& positions,int64_t start,int64_t delta) {
+    MFQ_RUNTIME_CHECK(cache.defined() && positions.defined() && cache.is_cuda() && positions.is_cuda() &&
+        cache.device()==positions.device() && cache.is_contiguous() && positions.is_contiguous() &&
+        cache.scalar_type()==tb::kInt64 && cache.numel()>0 && positions.numel()>=cache.numel() &&
+        positions.numel()%cache.numel()==0 &&
+        (positions.scalar_type()==tb::kInt32 || positions.scalar_type()==tb::kInt64),
+        "decode position buffers have incompatible geometry");
+    const auto begin=reinterpret_cast<uintptr_t>(cache.data_ptr()),other=reinterpret_cast<uintptr_t>(positions.data_ptr());
+    MFQ_RUNTIME_CHECK(begin+cache.numel()*cache.element_size()<=other ||
+        other+positions.numel()*positions.element_size()<=begin,"decode position buffers overlap");
+    const __int128 first=__int128(start)+delta,last=first+cache.numel()-1;
+    MFQ_RUNTIME_CHECK(start>=0 && __int128(start)+cache.numel()-1<=INT64_MAX &&
+        first>=INT64_MIN && last<=INT64_MAX && (positions.scalar_type()!=tb::kInt32 ||
+        (first>=INT32_MIN && last<=INT32_MAX)),"decode position values exceed their integer dtype");
+    MfqCudaGuard guard(cache.device());
+    if(positions.scalar_type()==tb::kInt32)
+        fill_decode_positions_kernel<<<1,64,0,mfq_current_cuda_stream()>>>(cache.data_ptr<int64_t>(),positions.data_ptr<int32_t>(),
+            cache.numel(),positions.numel(),start,delta);
+    else fill_decode_positions_kernel<<<1,64,0,mfq_current_cuda_stream()>>>(cache.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),
+            cache.numel(),positions.numel(),start,delta);
+    MFQ_CUDA_CHECK(hipGetLastError());
+}
+
+
 
 namespace {
 template<class Value, bool Injection>
@@ -104,11 +140,20 @@ __global__ void gated_residual_post_norm_kernel(const Branch* branch,const Resid
         const float f=static_cast<float>(value);
         sum=__fadd_rn(sum,__fmul_rn(f,f));
     }
-    __shared__ float partial[256];partial[threadIdx.x]=sum;__syncthreads();
-    for(int stride=blockDim.x/2;stride>0;stride/=2) {
-        if(threadIdx.x<stride)partial[threadIdx.x]=__fadd_rn(partial[threadIdx.x],partial[threadIdx.x+stride]);
-        __syncthreads();
+    // CDNA reductions stay within the physical wave until the four wave sums
+    // are ready. This replaces eight block barriers at the 2560-wide shape.
+    const int lane=int(threadIdx.x)%warpSize,wave=int(threadIdx.x)/warpSize;
+    const int width=blockDim.x<warpSize?int(blockDim.x):warpSize;
+    for(int stride=width/2;stride;stride>>=1)sum=__fadd_rn(sum,__shfl_down(sum,stride,width));
+    __shared__ float partial[8];
+    if(lane==0)partial[wave]=sum;
+    __syncthreads();
+    if(threadIdx.x==0) {
+        float total=0.f;
+        for(int w=0;w<(int(blockDim.x)+warpSize-1)/warpSize;++w)total=__fadd_rn(total,partial[w]);
+        partial[0]=total;
     }
+    __syncthreads();
     const float mean=__fdiv_rn(partial[0],static_cast<float>(hidden));
     const float inverse=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(mean,eps)));
     for(int column=threadIdx.x;column<hidden;column+=blockDim.x) {
@@ -276,11 +321,592 @@ std::vector<Tensor> gated_residual_post_norm(const Tensor& branch,const Tensor& 
     return {updated,normalized};
 }
 
+namespace {
+// Fuse four FP32 index-head products, ReLU and head summation over a16-token/128-key tile.
+// A34-float LDS row distributes the scalar MFMA reads across banks.
+template<class Q,class K>__global__ __launch_bounds__(512) void qsa_prefill_scores_kernel(const Q* query,const K* pool,float* scores,
+ int tokens,int pools,int64_t qb,int64_t qt,int64_t qh,int64_t pb,int64_t pp){
+#if defined(__gfx942__)
+ using F4=float __attribute__((ext_vector_type(4)));
+ __shared__ float q[4*16*34],p[128*34];
+ const int tid=threadIdx.x,lane=tid&63,wave=tid>>6,batch=blockIdx.z;
+ const int t0=blockIdx.y*16,p0=blockIdx.x*128;
+ F4 acc[4][1]{};
+ for(int kb=0;kb<128;kb+=32){
+  for(int at=tid;at<4*16*32;at+=512){const int c=at%32,t=(at/32)%16,h=at/(16*32);
+   q[(h*16+t)*34+c]=t0+t<tokens?float(query[int64_t(batch)*qb+int64_t(t0+t)*qt+int64_t(h)*qh+kb+c]):0.f;}
+  for(int at=tid;at<128*32;at+=512){const int c=at%32,row=at/32;
+   p[row*34+c]=p0+row<pools?float(pool[int64_t(batch)*pb+int64_t(p0+row)*pp+kb+c]):0.f;}
+  __syncthreads();
+  #pragma unroll
+  for(int k=0;k<32;k+=4){const float a=p[(wave*16+(lane&15))*34+k+(lane>>4)];
+   #pragma unroll
+   for(int h=0;h<4;++h){
+    #pragma unroll
+    for(int mt=0;mt<1;++mt){const float b=q[(h*16+mt*16+(lane&15))*34+k+(lane>>4)];
+     acc[h][mt]=__builtin_amdgcn_mfma_f32_16x16x4f32(a,b,acc[h][mt],0,0,0);}
+   }
+  }
+  __syncthreads();
+ }
+ #pragma unroll
+ for(int mt=0;mt<1;++mt){const int t=t0+mt*16+(lane&15);
+  #pragma unroll
+  for(int j=0;j<4;++j){const int key=p0+wave*16+(lane>>4)*4+j;
+   if(t<tokens && key<pools){float total=0.f;
+    #pragma unroll
+    for(int h=0;h<4;++h)total+=fmaxf(acc[h][mt][j],0.f);
+    scores[(int64_t(batch)*tokens+t)*pools+key]=total*0.08838834764831845f;}
+  }
+ }
+#endif
+}
+bool qsa_prefill_gfx942(int device) {
+ static thread_local int previous=-1;static thread_local bool supported=false;
+ if(previous!=device){hipDeviceProp_t properties{};MFQ_CUDA_CHECK(hipGetDeviceProperties(&properties,device));
+  supported=std::strncmp(properties.gcnArchName,"gfx942",6)==0;previous=device;}
+ return supported;
+}
+
+// Eight independent pooled keys per CTA reuse the four short index queries.
+// Convert cached FP16 keys in registers, retaining FP32 scoring arithmetic.
+template<class Query,class Key>
+__global__ __launch_bounds__(256) void qsa_decode_scores_kernel(const Query* query,const Key* pooled,
+    float* scores,int pools,int tokens,int64_t qb,int64_t qt,int64_t qh,int64_t pb,int64_t pp) {
+    const int lane=threadIdx.x&31,slot=threadIdx.x>>5;
+    const int key=blockIdx.x*8+slot,token=blockIdx.y%tokens,batch=blockIdx.y/tokens;
+    if(key>=pools)return;
+    float k[4];
+    #pragma unroll
+    for(int r=0;r<4;++r)k[r]=static_cast<float>(pooled[int64_t(batch)*pb+int64_t(key)*pp+r*32+lane]);
+    float total=0;
+    #pragma unroll
+    for(int head=0;head<4;++head) {
+        float dot=0;
+        #pragma unroll
+        for(int r=0;r<4;++r)
+            dot=__fmaf_rn(static_cast<float>(query[int64_t(batch)*qb+int64_t(token)*qt+head*qh+r*32+lane]),k[r],dot);
+        #pragma unroll
+        for(int shift=16;shift;shift>>=1)dot+=__shfl_xor(dot,shift,32);
+        total+=fmaxf(dot,0.f);
+    }
+    if(!lane)scores[(int64_t(batch)*tokens+token)*pools+key]=total*0.08838834764831845f;
+}
+}
+
 Tensor block_scores(const Tensor& query, const Tensor& pooled) {
     mfq_selected_attention::values({&query, &pooled});
     MfqCudaGuard guard(query.device());
+    if(query.dim()==4 && pooled.dim()==3 && query.size(0)==1 && pooled.size(0)==1 &&
+        query.size(1)>=128 && query.size(1)<=65535 && query.size(2)==4 && query.size(3)==128 &&
+        pooled.size(1)>0 && pooled.size(1)<=INT_MAX && pooled.size(2)==128 &&
+        query.stride(3)==1 && pooled.stride(2)==1 &&
+        (query.scalar_type()==tb::kFloat32 || query.scalar_type()==tb::kFloat16) &&
+        (pooled.scalar_type()==tb::kFloat32 || pooled.scalar_type()==tb::kFloat16) && qsa_prefill_gfx942(query.get_device())) {
+        auto scores=tb::empty({1,query.size(1),pooled.size(1)},query.options().dtype(tb::kFloat32));
+        const auto launch=[&]<class Q,class K>() {
+            qsa_prefill_scores_kernel<Q,K><<<dim3((pooled.size(1)+127)/128,(query.size(1)+15)/16),512,0,mfq_current_cuda_stream()>>>(
+                query.data_ptr<Q>(),pooled.data_ptr<K>(),scores.data_ptr<float>(),int(query.size(1)),int(pooled.size(1)),
+                query.stride(0),query.stride(1),query.stride(2),pooled.stride(0),pooled.stride(1));
+        };
+        if(query.scalar_type()==tb::kFloat32){
+            if(pooled.scalar_type()==tb::kFloat32)launch.template operator()<float,float>();
+            else launch.template operator()<float,mfq_half>();
+        }else{
+            if(pooled.scalar_type()==tb::kFloat32)launch.template operator()<mfq_half,float>();
+            else launch.template operator()<mfq_half,mfq_half>();
+        }
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return scores;
+    }
+    if(query.dim()==4 && pooled.dim()==3 && query.size(0)==pooled.size(0) &&
+        query.size(1)>0 && query.size(1)<=6 && query.size(2)==4 && query.size(3)==128 &&
+        pooled.size(2)==128 && pooled.size(1)>0 && query.stride(3)==1 && pooled.stride(2)==1 &&
+        (query.scalar_type()==tb::kFloat32 || query.scalar_type()==tb::kFloat16) &&
+        (pooled.scalar_type()==tb::kFloat32 || pooled.scalar_type()==tb::kFloat16)) {
+        auto scores=tb::empty({query.size(0),query.size(1),pooled.size(1)},query.options().dtype(tb::kFloat32));
+        const auto launch=[&]<class Query,class Key>() {
+            hipLaunchKernelGGL((qsa_decode_scores_kernel<Query,Key>),dim3((pooled.size(1)+7)/8,query.size(0)*query.size(1)),dim3(256),0,
+                mfq_current_cuda_stream(),query.data_ptr<Query>(),pooled.data_ptr<Key>(),scores.data_ptr<float>(),
+                int(pooled.size(1)),int(query.size(1)),query.stride(0),query.stride(1),query.stride(2),pooled.stride(0),pooled.stride(1));
+        };
+        if(query.scalar_type()==tb::kFloat32) {
+            if(pooled.scalar_type()==tb::kFloat32)launch.template operator()<float,float>();
+            else launch.template operator()<float,mfq_half>();
+        } else {
+            if(pooled.scalar_type()==tb::kFloat32)launch.template operator()<mfq_half,float>();
+            else launch.template operator()<mfq_half,mfq_half>();
+        }
+        MFQ_CUDA_CHECK(hipGetLastError());
+        return scores;
+    }
     return mfq_selected_attention::dots(query, pooled).sum(-2) /
         std::sqrt(double(query.size(-1)));
+}
+
+namespace {
+// Stable FP32 radix sorting retains lower-index ties without sorting index bits.
+template<int Items>__global__ __launch_bounds__(256) void qsa_prefill_select_kernel(const float* scores,int32_t* output,int pools,int offset){
+ using Sort=hipcub::BlockRadixSort<float,256,Items,int32_t>;
+ extern __shared__ __align__(16) unsigned char temporary[];auto& storage=*reinterpret_cast<typename Sort::TempStorage*>(temporary);
+ const int tid=threadIdx.x,token=blockIdx.x,end=offset+token;
+ for(int i=tid;i<2051;i+=256)output[size_t(token)*2051+i]=-1;
+ float keys[Items];int32_t values[Items];
+ #pragma unroll
+ for(int j=0;j<Items;++j){const int index=tid*Items+j;keys[j]=index<pools && (index+1)*4-1<=end?scores[size_t(token)*pools+index]:-INFINITY;values[j]=index;}
+ __syncthreads();Sort(storage).SortDescendingBlockedToStriped(keys,values,0,32);
+ #pragma unroll
+ for(int j=0;j<2;++j){const int index=values[j],rank=tid+j*256;
+  if(index<pools && (index+1)*4-1<=end){
+   #pragma unroll
+   for(int k=0;k<4;++k)output[size_t(token)*2051+rank*4+k]=index*4+k;
+  }
+ }
+ if(tid<3 && tid<(end+1)%4)output[size_t(token)*2051+2048+tid]=end+1-(end+1)%4+tid;
+}
+__global__ __launch_bounds__(256) void qsa_prefill_select_parts(const float* scores,float* partial,int32_t* indices,int pools,int offset){
+ using Sort=hipcub::BlockRadixSort<float,256,32,int32_t>;
+ extern __shared__ __align__(16) unsigned char temporary[];auto& storage=*reinterpret_cast<Sort::TempStorage*>(temporary);
+ const int tid=threadIdx.x,token=blockIdx.x,part=blockIdx.y,end=offset+token;
+ float keys[32];int32_t values[32];
+ #pragma unroll
+ for(int j=0;j<32;++j){const int index=part*8192+tid*32+j;keys[j]=index<pools && (index+1)*4-1<=end?scores[size_t(token)*pools+index]:-INFINITY;values[j]=index;}
+ Sort(storage).SortDescendingBlockedToStriped(keys,values,0,32);
+ #pragma unroll
+ for(int j=0;j<2;++j){const size_t out=size_t(token)*1024+part*512+tid+j*256;partial[out]=keys[j];indices[out]=values[j];}
+}
+__global__ __launch_bounds__(256) void qsa_prefill_select_merge(const float* partial,const int32_t* indices,int32_t* output,int pools,int offset){
+ using Sort=hipcub::BlockRadixSort<float,256,4,int32_t>;
+ extern __shared__ __align__(16) unsigned char temporary[];auto& storage=*reinterpret_cast<Sort::TempStorage*>(temporary);
+ const int tid=threadIdx.x,token=blockIdx.x,end=offset+token;
+ for(int i=tid;i<2051;i+=256)output[size_t(token)*2051+i]=-1;
+ float keys[4];int32_t values[4];
+ #pragma unroll
+ for(int j=0;j<4;++j){const size_t index=size_t(token)*1024+tid*4+j;keys[j]=partial[index];values[j]=indices[index];}
+ __syncthreads();Sort(storage).SortDescendingBlockedToStriped(keys,values,0,32);
+ #pragma unroll
+ for(int j=0;j<2;++j){const int index=values[j],rank=tid+j*256;
+  if(index<pools && (index+1)*4-1<=end){
+   #pragma unroll
+   for(int k=0;k<4;++k)output[size_t(token)*2051+rank*4+k]=index*4+k;
+  }
+ }
+ if(tid<3 && tid<(end+1)%4)output[size_t(token)*2051+2048+tid]=end+1-(end+1)%4+tid;
+}
+
+template<int Items>__global__ __launch_bounds__(256) void qsa_decode_select_kernel(const float* scores,int32_t* output,int pools,const int64_t* positions){
+ using Sort=hipcub::BlockRadixSort<uint64_t,256,Items>;
+ extern __shared__ __align__(16) unsigned char temporary[];
+ auto& storage=*reinterpret_cast<typename Sort::TempStorage*>(temporary);
+ const int tid=threadIdx.x,token=blockIdx.x;const int64_t end=positions[token];
+ if(end+1<=2048){for(int i=tid;i<2051;i+=256)output[size_t(token)*2051+i]=i<=end?i:-1;return;}
+ for(int i=tid;i<2051;i+=256)output[size_t(token)*2051+i]=-1;
+ uint64_t keys[Items];
+ #pragma unroll
+ for(int j=0;j<Items;++j){const int index=tid+j*256;uint64_t key=0;
+  if(index<pools && (index+1)*4-1<=end){unsigned bits=__float_as_uint(scores[size_t(token)*pools+index]);
+   if(!(bits&0x7fffffffu))bits=0;
+   const unsigned ordered=bits^((bits>>31)?0xffffffffu:0x80000000u);
+   key=(uint64_t(ordered)<<13)|uint64_t(8191-index);
+  }
+  keys[j]=key;
+ }
+ __syncthreads();
+ Sort(storage).SortDescendingBlockedToStriped(keys,0,45);
+ #pragma unroll
+ for(int j=0;j<Items;++j){const int rank=tid+j*256;
+  if(rank<512 && keys[j]){const int index=8191-int(keys[j]&8191);
+   #pragma unroll
+   for(int k=0;k<4;++k)output[size_t(token)*2051+rank*4+k]=index*4+k;
+  }
+ }
+ if(tid<3 && tid<(end+1)%4)output[size_t(token)*2051+2048+tid]=end+1-(end+1)%4+tid;
+}
+
+// A global top512 key must be in its partition's top512. Sort short partitions,
+// then rank each retained key against the other sorted lists in parallel.
+template<bool HostPosition>__global__ __launch_bounds__(256) void qsa_decode_select_parts(const float* scores,
+    uint64_t* partial,int pools,const int64_t* positions,int64_t offset) {
+    using Sort=hipcub::BlockRadixSort<float,256,8,int32_t>;
+    extern __shared__ __align__(16) unsigned char temporary[];
+    auto& storage=*reinterpret_cast<Sort::TempStorage*>(temporary);
+    const int tid=threadIdx.x,part=blockIdx.x;
+    const int64_t end=HostPosition?offset:positions[0];
+    if(end+1<=2048)return;
+    float keys[8];int32_t indices[8];
+    #pragma unroll
+    for(int j=0;j<8;++j) {
+        const int index=part*2048+tid*8+j;
+        keys[j]=index<pools && (index+1)*4-1<=end?scores[index]:-INFINITY;
+        indices[j]=index;
+    }
+    // Blocked input order is increasing index, preserving stable score ties.
+    Sort(storage).SortDescendingBlockedToStriped(keys,indices,0,32);
+    #pragma unroll
+    for(int j=0;j<2;++j) {
+        unsigned bits=__float_as_uint(keys[j]);
+        if(!(bits&0x7fffffffu))bits=0;
+        const unsigned ordered=bits^((bits>>31)?0xffffffffu:0x80000000u);
+        const int index=indices[j];
+        partial[part*512+tid+j*256]=index<pools && (index+1)*4-1<=end?
+            (uint64_t(ordered)<<15)|uint64_t(32767-index):0;
+    }
+}
+
+template<bool HostPosition>__global__ __launch_bounds__(256) void qsa_decode_select_merge(const uint64_t* partial,
+    int32_t* output,int parts,const int64_t* positions,int64_t offset) {
+    const int tid=threadIdx.x,index=blockIdx.x*256+tid,part=index/512,local=index%512;
+    const int64_t end=HostPosition?offset:positions[0];
+    if(end+1<=2048) {
+        if(!blockIdx.x)for(int i=tid;i<2051;i+=256)output[i]=i<=end?i:-1;
+        return;
+    }
+    if(!blockIdx.x && tid<3)
+        output[2048+tid]=tid<(end+1)%4?int(end+1-(end+1)%4+tid):-1;
+    const uint64_t key=partial[index];
+    if(!key)return;
+    int rank=local;
+    for(int other=0;other<parts && rank<512;++other) {
+        if(other==part)continue;
+        int lo=0,hi=512;
+        while(lo<hi) {
+            const int middle=(lo+hi)/2;
+            if(partial[other*512+middle]>key)lo=middle+1;
+            else hi=middle;
+        }
+        rank+=lo;
+    }
+    if(rank<512) {
+        const int selected=32767-int(key&32767);
+        #pragma unroll
+        for(int k=0;k<4;++k)output[rank*4+k]=selected*4+k;
+    }
+}
+
+__global__ void qsa_rank_kernel(const float* scores,const int64_t* positions,
+    float* ranked,int64_t total,int pools,int pool) {
+    for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<total;i+=int64_t(gridDim.x)*blockDim.x)
+        ranked[i]=(i%pools+1)*pool-1<=positions[i/pools]?scores[i]:-1e30f;
+}
+__global__ void qsa_selected_kernel(const int64_t* indices,const int64_t* positions,
+    int32_t* selected,int64_t total,int count,int pool,int budget,int columns) {
+    for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<total;i+=int64_t(gridDim.x)*blockDim.x) {
+        const int row=i/columns,slot=i%columns;
+        const int64_t end=positions[row];int64_t value=-1;
+        if(end+1<=budget) {
+            if(slot<=end)value=slot;
+        } else if(slot<count*pool) {
+            const int64_t block=indices[int64_t(row)*count+slot/pool];
+            if((block+1)*pool-1<=end)value=block*pool+slot%pool;
+        } else if(slot>=budget) {
+            const int tail=(end+1)%pool,offset=slot-budget;
+            if(offset<tail)value=end+1-tail+offset;
+        }
+        selected[i]=int32_t(value);
+    }
+}
+}
+
+Tensor qsa_prefill_select(const Tensor& scores,int64_t query_offset) {
+    if(!scores.defined() || !scores.is_cuda() || scores.scalar_type()!=tb::kFloat32 ||
+       !scores.is_contiguous() || scores.dim()!=3 || scores.size(0)!=1 ||
+       (scores.size(1)!=1 && scores.size(1)<128) || scores.size(1)>65535 || scores.size(2)<1 || scores.size(2)>16384 ||
+       query_offset<0 || query_offset>INT_MAX-scores.size(1) || !qsa_prefill_gfx942(scores.get_device()))return Tensor{};
+    MfqCudaGuard guard(scores.device());
+    auto selected=tb::empty({1,scores.size(1),2051},scores.options().dtype(tb::kInt32));
+    if(scores.size(1)==1 && query_offset>=2048 && scores.size(2)>2304) {
+        const int pools=int(scores.size(2)),parts=(pools+2047)/2048;
+        auto temporary=tb::empty({parts*512},scores.options().dtype(tb::kInt64));
+        auto* keys=reinterpret_cast<uint64_t*>(temporary.data_ptr<int64_t>());
+        using Sort=hipcub::BlockRadixSort<float,256,8,int32_t>;
+        constexpr size_t bytes=sizeof(Sort::TempStorage);static_assert(bytes<=49152);
+        qsa_decode_select_parts<true><<<parts,256,bytes,mfq_current_cuda_stream()>>>(
+            scores.data_ptr<float>(),keys,pools,nullptr,query_offset);
+        qsa_decode_select_merge<true><<<parts*2,256,0,mfq_current_cuda_stream()>>>(
+            keys,selected.data_ptr<int32_t>(),parts,nullptr,query_offset);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
+    }
+    if(scores.size(2)>8192) {
+        auto temporary=tb::empty({scores.size(1),2048},scores.options());
+        using First=hipcub::BlockRadixSort<float,256,32,int32_t>;
+        using Second=hipcub::BlockRadixSort<float,256,4,int32_t>;
+        constexpr size_t first=sizeof(First::TempStorage),second=sizeof(Second::TempStorage);
+        static_assert(first<=49152 && second<=49152);
+        auto* keys=temporary.data_ptr<float>();
+        auto* indices=reinterpret_cast<int32_t*>(keys+size_t(scores.size(1))*1024);
+        qsa_prefill_select_parts<<<dim3(unsigned(scores.size(1)),2),256,first,mfq_current_cuda_stream()>>>(
+            scores.data_ptr<float>(),keys,indices,int(scores.size(2)),int(query_offset));
+        qsa_prefill_select_merge<<<unsigned(scores.size(1)),256,second,mfq_current_cuda_stream()>>>(
+            keys,indices,selected.data_ptr<int32_t>(),int(scores.size(2)),int(query_offset));
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
+    }
+    const auto launch=[&]<int Items>() {
+        using Sort=hipcub::BlockRadixSort<float,256,Items,int32_t>;
+        constexpr size_t bytes=sizeof(typename Sort::TempStorage);static_assert(bytes<=49152);
+        qsa_prefill_select_kernel<Items><<<unsigned(scores.size(1)),256,bytes,mfq_current_cuda_stream()>>>(
+            scores.data_ptr<float>(),selected.data_ptr<int32_t>(),int(scores.size(2)),int(query_offset));
+    };
+    if(scores.size(1)==1 && scores.size(2)<=512)launch.template operator()<2>();
+    else if(scores.size(1)==1 && scores.size(2)<=1024)launch.template operator()<4>();
+    else if(scores.size(2)<=2048)launch.template operator()<8>();
+    else if(scores.size(1)==1 && scores.size(2)<=2304)launch.template operator()<9>();
+    else if(scores.size(2)<=4096)launch.template operator()<16>();
+    else launch.template operator()<32>();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
+}
+
+Tensor qsa_graph_select(const Tensor& scores,const Tensor& positions,int64_t pool,int64_t budget) {
+    MFQ_RUNTIME_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.scalar_type()==tb::kFloat32 &&
+        scores.dim()==3 && scores.size(0)==1 && scores.size(1)>0 && scores.size(2)>0 &&
+        positions.device()==scores.device() && positions.scalar_type()==tb::kInt64 && positions.is_contiguous() &&
+        positions.dim()==1 && positions.numel()==scores.size(1) && pool>0 && budget>0 && budget%pool==0 &&
+        budget+pool-1<=std::numeric_limits<int>::max() && scores.size(2)<=std::numeric_limits<int>::max(),
+        "QSA graph selection shape/type disagrees");
+    MfqCudaGuard guard(scores.device());
+    const int pools=int(scores.size(2)),count=int(std::min(budget/pool,scores.size(2)));
+    const int columns=int(budget+pool-1);
+    if(scores.size(1)==1 && pool==4 && budget==2048 && pools>=2048 && pools<=2304 && qsa_prefill_gfx942(scores.get_device())) {
+        auto selected=tb::empty({1,1,columns},scores.options().dtype(tb::kInt32));
+        const auto launch=[&]<int Items>() {
+            using Sort=hipcub::BlockRadixSort<uint64_t,256,Items>;
+            constexpr size_t bytes=sizeof(typename Sort::TempStorage);static_assert(bytes<=49152);
+            qsa_decode_select_kernel<Items><<<1,256,bytes,mfq_current_cuda_stream()>>>(
+                scores.data_ptr<float>(),selected.data_ptr<int32_t>(),pools,positions.data_ptr<int64_t>());
+        };
+        if(pools==2048)launch.template operator()<8>();else launch.template operator()<9>();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
+    }
+    if(scores.size(1)==1 && pool==4 && budget==2048 && pools>2304 && pools<=16512 &&
+       qsa_prefill_gfx942(scores.get_device())) {
+        auto selected=tb::empty({1,1,columns},scores.options().dtype(tb::kInt32));
+        const int parts=(pools+2047)/2048;
+        auto temporary=tb::empty({parts*512},scores.options().dtype(tb::kInt64));
+        auto* keys=reinterpret_cast<uint64_t*>(temporary.data_ptr<int64_t>());
+        using Sort=hipcub::BlockRadixSort<float,256,8,int32_t>;
+        constexpr size_t bytes=sizeof(Sort::TempStorage);static_assert(bytes<=49152);
+        qsa_decode_select_parts<false><<<parts,256,bytes,mfq_current_cuda_stream()>>>(
+            scores.data_ptr<float>(),keys,pools,positions.data_ptr<int64_t>(),0);
+        qsa_decode_select_merge<false><<<parts*2,256,0,mfq_current_cuda_stream()>>>(
+            keys,selected.data_ptr<int32_t>(),parts,positions.data_ptr<int64_t>(),0);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();return selected;
+    }
+    auto ranked=tb::empty_like(scores);
+    hipLaunchKernelGGL(qsa_rank_kernel,dim3(std::min<int64_t>(65535,(scores.numel()+255)/256)),dim3(256),0,
+        mfq_current_cuda_stream(),scores.data_ptr<float>(),positions.data_ptr<int64_t>(),ranked.data_ptr<float>(),
+        scores.numel(),pools,int(pool));
+    auto indices=std::get<1>(tb::topk(ranked,count,-1,true,false));
+    auto selected=tb::empty({1,scores.size(1),columns},positions.options().dtype(tb::kInt32));
+    hipLaunchKernelGGL(qsa_selected_kernel,dim3(std::min<int64_t>(65535,(selected.numel()+255)/256)),dim3(256),0,
+        mfq_current_cuda_stream(),indices.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),selected.data_ptr<int32_t>(),
+        selected.numel(),count,int(pool),int(budget),columns);
+    MFQ_CUDA_CHECK(hipGetLastError());
+    return selected;
+}
+
+
+namespace {
+__device__ __forceinline__ float qwen4_wave_sum(float value) {
+    #pragma unroll
+    for(int offset=warpSize/2;offset;offset>>=1)value+=__shfl_down(value,offset,warpSize);
+    return value;
+}
+__device__ __forceinline__ float qwen4_block_sum(float value,float* waves) {
+    const int lane=threadIdx.x%warpSize,wave=threadIdx.x/warpSize;
+    value=qwen4_wave_sum(value);
+    if(lane==0)waves[wave]=value;
+    __syncthreads();
+    if(wave==0)value=qwen4_wave_sum(lane<int(blockDim.x)/warpSize?waves[lane]:0.f);
+    if(threadIdx.x==0)waves[0]=value;
+    __syncthreads();
+    return waves[0];
+}
+
+// Qwen4 PLE: per-stream signed-root dot gate, broadcast value, grouped RMSNorm.
+// Keep the normalization weight offset used by this runtime's Qwen4 tensors.
+template<class Key,class Query,class Value>
+__global__ __launch_bounds__(256) void ple_gate_norm_hip_kernel(
+    const Key* key,const Query* query,const Value* value,const float* weight,
+    float* gated,float* normalized,int hidden,int streams,float eps) {
+    __shared__ float waves[8],factor,inverse;
+    const int row=blockIdx.x,tid=threadIdx.x,stream=row%streams;
+    const size_t base=size_t(row)*hidden,vbase=size_t(row/streams)*hidden;
+    float dot=0.f;
+    for(int c=tid;c<hidden;c+=256)
+        dot=__fadd_rn(dot,__fmul_rn(float(key[base+c]),float(query[base+c])));
+    const float sum=qwen4_block_sum(dot,waves);
+    if(tid==0) {
+        const float score=float(double(sum)/sqrt(double(hidden)));
+        const float signed_root=(float(score>0.f)-float(score<0.f))*sqrtf(fmaxf(fabsf(score),1e-6f));
+        factor=1.f/(1.f+expf(-signed_root));
+    }
+    __syncthreads();
+    float square=0.f;
+    for(int c=tid;c<hidden;c+=256) {
+        const float x=__fmul_rn(factor,float(value[vbase+c]));
+        gated[base+c]=x;square=__fadd_rn(square,__fmul_rn(x,x));
+    }
+    const float norm_sum=qwen4_block_sum(square,waves);
+    if(tid==0)inverse=1.f/sqrtf(norm_sum/hidden+eps);
+    __syncthreads();
+    for(int c=tid;c<hidden;c+=256)
+        normalized[base+c]=__fmul_rn(__fmul_rn(gated[base+c],inverse),1.f+weight[stream*hidden+c]);
+}
+
+// Reuse dilation-spaced PP tap windows and four adjacent channels.
+template<int Taps,int Tile>__global__ __launch_bounds__(256) void ple_conv_tiled_hip_kernel(
+ const float* input,const float* weight,const float* previous,const float* gated,
+ float* output,float* next,int tokens,int channels,int dilation) {
+ const int c=(blockIdx.x*256+threadIdx.x)*4;
+ if(c>=channels)return;
+ const int batch=blockIdx.z,history=(Taps-1)*dilation;
+ const int start=(blockIdx.y/dilation)*Tile*dilation+blockIdx.y%dilation;
+ if(start>=tokens)return;
+ const size_t base=size_t(batch)*tokens*channels,old_base=size_t(batch)*history*channels;
+ float4 weights[Taps],window[Taps];
+ #pragma unroll
+ for(int tap=0;tap<Taps;++tap) {
+  float4 w;
+  w.x=weight[c*Taps+tap];w.y=weight[(c+1)*Taps+tap];
+  w.z=weight[(c+2)*Taps+tap];w.w=weight[(c+3)*Taps+tap];weights[tap]=w;
+  if(tap<Taps-1){
+   const int t=start-history+tap*dilation;
+   window[tap]=t>=0?*reinterpret_cast<const float4*>(input+base+size_t(t)*channels+c):
+    previous?*reinterpret_cast<const float4*>(previous+old_base+size_t(t+history)*channels+c):float4{};
+  }
+ }
+ #pragma unroll
+ for(int step=0;step<Tile;++step) {
+  const int t=start+step*dilation;if(t>=tokens)break;
+  const size_t at=base+size_t(t)*channels+c;
+  window[Taps-1]=*reinterpret_cast<const float4*>(input+at);
+  float4 sum{};
+  #pragma unroll
+  for(int tap=0;tap<Taps;++tap) {
+   #define ACC(F) sum.F=__fadd_rn(sum.F,__fmul_rn(window[tap].F,weights[tap].F))
+   ACC(x);ACC(y);ACC(z);ACC(w);
+   #undef ACC
+  }
+  const auto g=*reinterpret_cast<const float4*>(gated+at);
+  float4 result;
+  #define FINISH(F) result.F=__fadd_rn(g.F,__fmul_rn(sum.F,1.f/(1.f+expf(-sum.F))))
+  FINISH(x);FINISH(y);FINISH(z);FINISH(w);
+  #undef FINISH
+  *reinterpret_cast<float4*>(output+at)=result;
+  if(t>=tokens-history)*reinterpret_cast<float4*>(next+old_base+size_t(t-(tokens-history))*channels+c)=window[Taps-1];
+  #pragma unroll
+  for(int tap=0;tap<Taps-1;++tap)window[tap]=window[tap+1];
+ }
+}
+
+// Read the causal history directly. Each element also writes its next-state
+// counterpart; no concatenation or intermediate tensor per convolution tap.
+template<class Input,class Output,bool Add>
+__global__ void ple_conv_hip_kernel(const Input* input,const float* weight,
+    const Input* previous,const float* gated,Output* output,Input* next,
+    int64_t batch,int64_t tokens,int64_t channels,int64_t taps,int64_t dilation) {
+    const int64_t history=(taps-1)*dilation;
+    const int64_t out_count=batch*tokens*channels,next_count=batch*history*channels;
+    const int64_t count=max(out_count,next_count);
+    for(int64_t at=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;at<count;at+=int64_t(blockDim.x)*gridDim.x) {
+        if(at<out_count) {
+            const int64_t c=at%channels,t=(at/channels)%tokens,b=at/(channels*tokens);
+            float sum=0.f;
+            for(int64_t tap=0;tap<taps;++tap) {
+                const int64_t p=t+tap*dilation;
+                const float x=p<history?(previous?float(previous[(b*history+p)*channels+c]):0.f):
+                    float(input[(b*tokens+p-history)*channels+c]);
+                sum=__fadd_rn(sum,__fmul_rn(x,weight[c*taps+tap]));
+            }
+            float result=__fmul_rn(sum,1.f/(1.f+expf(-sum)));
+            if constexpr(Add)result=__fadd_rn(gated[at],result);
+            output[at]=static_cast<Output>(result);
+        }
+        if(at<next_count) {
+            const int64_t c=at%channels,p=(at/channels)%history,b=at/(channels*history);
+            const int64_t position=tokens+p;
+            next[at]=position<history?(previous?previous[(b*history+position)*channels+c]:Input{}):
+                input[(b*tokens+position-history)*channels+c];
+        }
+    }
+}
+
+template<class Input,class Output,bool Add>
+void launch_ple_conv(const Tensor& input,const Tensor& weight,const Tensor& previous,
+    const Tensor& gated,Tensor& output,Tensor& next,int64_t dilation) {
+    if constexpr(std::is_same_v<Input,float> && std::is_same_v<Output,float> && Add) {
+        if(input.size(0)==1 && input.size(2)==10240 && weight.size(1)==4 && dilation==3 &&
+           (input.size(1)==2048 || input.size(1)==4096) && qsa_prefill_gfx942(input.get_device())) {
+            const int tokens=int(input.size(1));
+            if(tokens==2048)
+                ple_conv_tiled_hip_kernel<4,4><<<dim3(10,((tokens+11)/12)*3,1),256,0,mfq_current_cuda_stream()>>>(
+                    input.data_ptr<float>(),weight.data_ptr<float>(),previous.defined()?previous.data_ptr<float>():nullptr,
+                    gated.data_ptr<float>(),output.data_ptr<float>(),next.data_ptr<float>(),tokens,10240,3);
+            else
+                ple_conv_tiled_hip_kernel<4,8><<<dim3(10,((tokens+23)/24)*3,1),256,0,mfq_current_cuda_stream()>>>(
+                    input.data_ptr<float>(),weight.data_ptr<float>(),previous.defined()?previous.data_ptr<float>():nullptr,
+                    gated.data_ptr<float>(),output.data_ptr<float>(),next.data_ptr<float>(),tokens,10240,3);
+            MFQ_CUDA_CHECK(hipGetLastError());return;
+        }
+    }
+    const int64_t count=std::max(output.numel(),next.numel());
+    if(!count)return;
+    const int blocks=int(std::min<int64_t>((count+255)/256,65535));
+    hipLaunchKernelGGL((ple_conv_hip_kernel<Input,Output,Add>),dim3(blocks),dim3(256),0,
+        mfq_current_cuda_stream(),input.data_ptr<Input>(),weight.data_ptr<float>(),
+        previous.defined()?previous.data_ptr<Input>():nullptr,Add?gated.data_ptr<float>():nullptr,
+        output.data_ptr<Output>(),next.data_ptr<Input>(),input.size(0),input.size(1),input.size(2),
+        weight.size(1),dilation);
+    MFQ_CUDA_CHECK(hipGetLastError());
+}
+}
+
+std::vector<Tensor> ple_gate_norm_hip(const Tensor& key,const Tensor& query,const Tensor& value,
+    const Tensor& weight,int64_t hidden,int64_t streams,double eps) {
+    if(key.scalar_type()==tb::kBFloat16 || query.scalar_type()==tb::kBFloat16 || value.scalar_type()==tb::kBFloat16)
+        return ple_gate_norm_hip(key.to(tb::kFloat32),query.to(tb::kFloat32),value.to(tb::kFloat32),weight,hidden,streams,eps);
+    const auto valid=[](const Tensor& x){return x.is_cuda() && x.is_contiguous() &&
+        (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32);};
+    MFQ_RUNTIME_CHECK(valid(key) && valid(query) && valid(value) && key.sizes()==query.sizes() &&
+        hidden>0 && streams>0 && key.numel()==value.numel()*streams && value.numel()%hidden==0 &&
+        key.device()==query.device() && key.device()==value.device() && weight.is_cuda() &&
+        weight.device()==key.device() && weight.numel()==hidden*streams,"invalid PLE gate geometry");
+    MfqCudaGuard guard(key.device());
+    auto norm=weight.to(tb::kFloat32).contiguous();
+    auto gated=tb::empty(key.sizes(),key.options().dtype(tb::kFloat32));
+    auto normalized=tb::empty_like(gated);
+    if(!key.numel())return {gated,normalized};
+    const auto launch=[&](auto k,auto q,auto v) {
+        using K=decltype(k);using Q=decltype(q);using V=decltype(v);
+        hipLaunchKernelGGL((ple_gate_norm_hip_kernel<K,Q,V>),dim3(key.numel()/hidden),dim3(256),0,
+            mfq_current_cuda_stream(),key.data_ptr<K>(),query.data_ptr<Q>(),value.data_ptr<V>(),
+            norm.data_ptr<float>(),gated.data_ptr<float>(),normalized.data_ptr<float>(),int(hidden),int(streams),float(eps));
+    };
+    const auto kv=[&](auto k,auto q){if(value.scalar_type()==tb::kFloat16)launch(k,q,mfq_half{});else launch(k,q,float{});};
+    const auto kq=[&](auto k){if(query.scalar_type()==tb::kFloat16)kv(k,mfq_half{});else kv(k,float{});};
+    if(key.scalar_type()==tb::kFloat16)kq(mfq_half{});else kq(float{});
+    MFQ_CUDA_CHECK(hipGetLastError());return {gated,normalized};
+}
+
+std::vector<Tensor> ple_conv_add_hip(const Tensor& input,const Tensor& source_weight,
+    const std::optional<Tensor>& previous,int64_t dilation,const Tensor& gated,bool half_output) {
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.dim()==3 &&
+        input.scalar_type()==tb::kFloat32 && gated.is_contiguous() && gated.scalar_type()==tb::kFloat32 &&
+        gated.device()==input.device() && gated.sizes()==input.sizes() && dilation>0,"invalid PLE convolution input");
+    auto weight=source_weight;
+    if(weight.dim()==3 && weight.size(1)==1)weight=weight.select(1,0);
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.device()==input.device() && weight.dim()==2 &&
+        weight.size(0)==input.size(2) && weight.size(1)>0 && weight.size(1)-1<=
+        std::numeric_limits<int64_t>::max()/dilation,"invalid PLE convolution weights");
+    const auto history=(weight.size(1)-1)*dilation;
+    const std::vector<int64_t> shape{input.size(0),history,input.size(2)};
+    if(previous)MFQ_RUNTIME_CHECK(previous->is_cuda() && previous->device()==input.device() &&
+        previous->is_contiguous() && previous->scalar_type()==tb::kFloat32 && previous->sizes().vec()==shape,
+        "invalid PLE convolution state");
+    MfqCudaGuard guard(input.device());weight=weight.to(tb::kFloat32).contiguous();
+    auto output=tb::empty(input.sizes(),input.options().dtype(half_output?tb::kFloat16:tb::kFloat32));
+    auto next=tb::empty(shape,input.options());
+    if(half_output)launch_ple_conv<float,mfq_half,true>(input,weight,previous?*previous:Tensor{},gated,output,next,dilation);
+    else launch_ple_conv<float,float,true>(input,weight,previous?*previous:Tensor{},gated,output,next,dilation);
+    return {output,next};
 }
 
 std::vector<Tensor> ple_dilated_conv_silu(const Tensor& input,
@@ -304,6 +930,15 @@ std::vector<Tensor> ple_dilated_conv_silu(const Tensor& input,
         MFQ_RUNTIME_CHECK(state->sizes().vec() == state_shape, "Qwen4 PLE state shape disagrees");
     }
     MfqCudaGuard guard(input.device());
+    if(input.is_contiguous() && (input.scalar_type()==tb::kFloat16 || input.scalar_type()==tb::kFloat32)) {
+        auto previous=state?state->to(input.scalar_type()).contiguous():Tensor{};
+        auto weight=w.to(tb::kFloat32).contiguous();
+        auto output=tb::empty_like(input),next=tb::empty(state_shape,input.options());
+        if(input.scalar_type()==tb::kFloat16)
+            launch_ple_conv<mfq_half,mfq_half,false>(input,weight,previous,{},output,next,dilation);
+        else launch_ple_conv<float,float,false>(input,weight,previous,{},output,next,dilation);
+        return {output,next};
+    }
     auto previous = state ? state->to(input.scalar_type()) : tb::zeros(state_shape, input.options());
     auto combined = tb::cat({previous, input}, 1);
     auto output = tb::zeros(input.sizes(), input.options().dtype(tb::kFloat32));
@@ -327,14 +962,20 @@ Tensor sparse_gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         q, k, v, indices, 1.0 / std::sqrt(double(q.size(3))), false);
 }
 
+Tensor sparse_gqa_attention_gate(const Tensor& q,const Tensor& k,const Tensor& v,
+    const Tensor& indices,const Tensor& gate,bool half_output) {
+    return mfq_selected_attention::sparse_gated(q,k,v,indices,1.0/std::sqrt(double(q.size(3))),gate,half_output);
+}
+
 Tensor attention_gate(const Tensor& attended, const Tensor& gate, bool half_output) {
     return mfq_selected_attention::gated(attended, gate, half_output);
 }
 
 Tensor causal_gqa_attention_gate(const Tensor& q, const Tensor& k, const Tensor& v,
-    const Tensor& positions, const Tensor& gate, int64_t columns, bool half_output) {
+    const Tensor& positions, const Tensor& gate, int64_t columns, bool half_output,
+    bool consecutive_positions) {
     return mfq_selected_attention::causal_gated(q, k, v, positions, gate, columns,
-        1.0 / std::sqrt(double(q.size(3))), half_output);
+        1.0 / std::sqrt(double(q.size(3))), half_output,true,true,consecutive_positions);
 }
 
 } // namespace mfq_qwen4_exp

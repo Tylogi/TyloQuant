@@ -34,6 +34,10 @@ assert len(_ext._SOURCES) == 9
 for path in _ext._SOURCES:
     assert Path(path).is_file(), path
 assert (_ext._DIR/'nvq_chunk.h').is_file()
+for relative in ['kernels/hip/tq.py', 'kernels/hip/tq_ops.hip',
+                 'kernels/hip/mfq_hip_compat.h', 'quantize/hip/tq_encoder.hip',
+                 'quantize/hip/tq_fitter.hip']:
+    assert (Path(mfq.__file__).parent/relative).is_file(), relative
 recipes = list((Path(mfq.__file__).parent/'calibration/recipes').glob('*.json'))
 assert len(recipes) == 9
 for recipe in recipes:
@@ -46,7 +50,7 @@ config = dict(model_type='qwen4_exp_text', hidden_size=2560, num_hidden_layers=4
               num_experts=512, num_experts_per_tok=10, vocab_size=248320)
 assert automatic_recipe(config, 3.56583659).stem == 'Q2_K_XL'
 """
-    environment = {**os.environ, 'PYTHONPATH': str(installed), 'CUDA_VISIBLE_DEVICES': '-1'}
+    environment = {**os.environ, 'PYTHONPATH': str(installed), 'CUDA_VISIBLE_DEVICES': ''}
     result = subprocess.run([sys.executable, '-c', program], cwd=installed,
                             env=environment, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr

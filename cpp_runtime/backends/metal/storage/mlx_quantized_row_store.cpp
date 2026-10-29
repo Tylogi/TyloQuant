@@ -2,6 +2,7 @@
 #include "mlx_resource_telemetry.h"
 #include "mlx_nint_rows.h"
 #include "mfq/host_parallel.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -13,6 +14,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <unistd.h>
@@ -88,6 +90,7 @@ struct MlxQuantizedRowStore::Impl {
         std::vector<mlx::core::float16_t> values;
         std::list<std::int64_t>::iterator recency;
         mfq::NintRowBatch packed;
+        MlxTqRowBatch tq;
     };
 
     struct RequestedRow {
@@ -95,6 +98,7 @@ struct MlxQuantizedRowStore::Impl {
         std::vector<mlx::core::float16_t> values;
         bool cold = false;
         mfq::NintRowBatch packed;
+        MlxTqRowBatch tq;
     };
 
     Impl(
@@ -112,10 +116,42 @@ struct MlxQuantizedRowStore::Impl {
             throw std::invalid_argument("quantized row store requires a valid I/O worker count");
         }
         worker_count = static_cast<int>(io_workers);
-        const auto& entry = model.record(record);
-        if (entry.dtype == "NINT") {
+        std::vector<std::string> prepared_names;
+        const auto* entry = model.contains(record) ? &model.record(record) : nullptr;
+        if (!entry || entry->dtype == "TQ") {
+            std::vector<std::string> names;
+            const auto manifest = model.header().extra_json.find("tq_row_shards");
+            const auto tables = manifest == model.header().extra_json.end() ? nlohmann::json::object()
+                : nlohmann::json::parse(manifest->second);
+            if (!tables.is_object()) throw std::runtime_error("invalid TQ row-shard manifest");
+            if (entry) {
+                if (tables.contains(record)) throw std::runtime_error("ambiguous TQ row table: " + record);
+                names.push_back(record);
+            } else {
+                if (!tables.contains(record) || !tables.at(record).is_array() || tables.at(record).empty())
+                    throw std::runtime_error("missing TQ row table: " + record);
+                for (const auto& name : tables.at(record)) {
+                    if (!name.is_string()) throw std::runtime_error("TQ row shard must name a physical record");
+                    names.push_back(name.get<std::string>());
+                }
+            }
+            std::unordered_set<std::string> unique;
+            std::vector<MlxMappedTqRows> shards;
+            for (const auto& name : names) {
+                if (!unique.insert(name).second || model.record(name).dtype != "TQ")
+                    throw std::runtime_error("invalid TQ row table shard: " + name);
+                tq_mappings.push_back(model.map_record(name, true));
+                shards.emplace_back(tq_mappings.back().view(), expected_width);
+            }
+            tq = std::make_unique<MlxMappedTqTable>(std::move(shards));
+            if (tq->rows() != expected_rows || tq->width() != expected_width)
+                throw std::runtime_error("TQ row-store geometry disagrees: " + record);
+            rows = expected_rows; width = expected_width;
+            decoded_row_bytes = tq->selected_row_nbytes_bound();
+            prepared_names = std::move(names);
+        } else if (entry->dtype == "NINT") {
             nint = std::make_unique<mfq::NintRows>(
-                static_cast<std::size_t>(entry.nbytes),
+                static_cast<std::size_t>(entry->nbytes),
                 [this](std::size_t offset, std::uint8_t* output, std::size_t count) {
                     model.read_range_into(record, offset, std::as_writable_bytes(
                         std::span(output, count)));
@@ -130,12 +166,12 @@ struct MlxQuantizedRowStore::Impl {
             decoded_row_bytes = std::max(static_cast<std::size_t>(width) *
                 sizeof(mlx::core::float16_t), nint->selected_row_nbytes_bound() + 27);
             index_bytes = nint->index_nbytes();
-        } else if (entry.dtype != "MXFP8") {
+        } else if (entry->dtype != "MXFP8") {
             throw std::runtime_error(
-                "quantized row store requires MXFP8 or NINT: " +
+                "unsupported quantized row-store format: " +
                 record);
         } else {
-            initialize_mxfp8(entry, expected_rows, expected_width);
+            initialize_mxfp8(*entry, expected_rows, expected_width);
         }
         if (cache_capacity != 0 && decoded_row_bytes >
                 std::numeric_limits<std::size_t>::max() / cache_capacity) {
@@ -145,7 +181,8 @@ struct MlxQuantizedRowStore::Impl {
             std::lock_guard lock(mutex);
             return MlxResourceUsage{0, 0, index_bytes + resident_cache_bytes, 0, 0};
         });
-        model.record_prepared(record);
+        if (tq) for (const auto& name : prepared_names) model.record_prepared(name);
+        else model.record_prepared(record);
     }
 
     void initialize_mxfp8(const MfqRecord& entry, std::int64_t expected_rows,
@@ -316,15 +353,17 @@ struct MlxQuantizedRowStore::Impl {
             recency.pop_back();
             const auto& entry = cache.at(victim);
             resident_cache_bytes -= entry.values.size() * sizeof(mlx::core::float16_t)
-                + entry.packed.packed_nbytes() + entry.packed.descriptors().size() * 4;
+                + entry.packed.packed_nbytes() + entry.packed.descriptors().size() * 4
+                + entry.tq.packed_nbytes();
             cache.erase(victim);
         }
         recency.push_front(row.row);
         resident_cache_bytes += row.values.size() * sizeof(mlx::core::float16_t)
-            + row.packed.packed_nbytes() + row.packed.descriptors().size() * 4;
+            + row.packed.packed_nbytes() + row.packed.descriptors().size() * 4
+            + row.tq.packed_nbytes();
         cache.emplace(
             row.row,
-            CacheEntry{std::move(row.values), recency.begin(), std::move(row.packed)});
+            CacheEntry{std::move(row.values), recency.begin(), std::move(row.packed), std::move(row.tq)});
     }
 
     MlxQuantizedRowBatch prepare_rows(std::span<const std::int64_t> row_ids) const {
@@ -364,14 +403,23 @@ struct MlxQuantizedRowStore::Impl {
                     misses.push_back(index);
                 } else {
                     touch(found);
-                    requested.push_back({row, found->second.values, false, found->second.packed});
+                    requested.push_back({row, found->second.values, false, found->second.packed, found->second.tq});
                 }
             }
         }
 
         const auto io_begin = std::chrono::steady_clock::now();
         RowReadCounts read_counts;
-        if (nint) {
+        if (tq) {
+            workers.run(0, misses.size(), 1, worker_count,
+                [&](std::int64_t begin, std::int64_t end) {
+                    for (auto item = begin; item < end; ++item) {
+                        const auto index = misses[item];
+                        tq->append_row(requested[index].row, requested[index].tq);
+                    }
+                });
+            for (const auto index : misses) read_counts.bytes += requested[index].tq.source_bytes_read();
+        } else if (nint) {
             RowReadScope observation(read_counts);
             std::vector<std::int64_t> selected;
             selected.reserve(misses.size());
@@ -393,11 +441,16 @@ struct MlxQuantizedRowStore::Impl {
             std::chrono::steady_clock::now() - io_begin).count();
 
         MlxNintRowBatch packed_output;
-        std::vector<mlx::core::float16_t> output(nint ? 0 :
+        MlxTqRowBatch tq_output;
+        std::vector<mlx::core::float16_t> output(nint || tq ? 0 :
             row_ids.size() * static_cast<std::size_t>(width));
         for (std::size_t request = 0; request < request_sources.size();
              ++request) {
             const auto& selected = requested[request_sources[request]];
+            if (tq) {
+                tq_output.append_batch(selected.tq);
+                continue;
+            }
             if (nint) {
                 packed_output.append_batch(selected.packed);
                 continue;
@@ -410,8 +463,8 @@ struct MlxQuantizedRowStore::Impl {
         }
         {
             std::scoped_lock lock(mutex);
-            counters.bytes_read += nint ? read_counts.bytes : misses.size() * source_row_bytes;
-            counters.read_calls += nint ? read_counts.calls : misses.size() * 2;
+            counters.bytes_read += nint || tq ? read_counts.bytes : misses.size() * source_row_bytes;
+            counters.read_calls += nint || tq ? read_counts.calls : misses.size() * 2;
             for (const auto index : misses) {
                 admit(std::move(requested[index]));
             }
@@ -421,7 +474,7 @@ struct MlxQuantizedRowStore::Impl {
             counters.rows_loaded += misses.size();
             counters.io_seconds += io_seconds;
         }
-        return {width, std::move(output), std::move(packed_output)};
+        return {width, std::move(output), std::move(packed_output), std::move(tq_output)};
     }
 
     MfqContainer model;
@@ -437,6 +490,8 @@ struct MlxQuantizedRowStore::Impl {
     std::size_t index_bytes = 0;
     mutable std::size_t resident_cache_bytes = 0;
     std::unique_ptr<mfq::NintRows> nint;
+    std::vector<MfqMappedBytes> tq_mappings;
+    std::unique_ptr<MlxMappedTqTable> tq;
     std::array<mlx::core::float16_t, 1u << 16u> decode_lut{};
     mutable mfq::HostParallelPool workers;
     int worker_count;
@@ -475,6 +530,7 @@ MlxQuantizedRowBatch MlxQuantizedRowStore::prepare_rows(
 }
 
 mlx::core::array MlxQuantizedRowBatch::decode() const {
+    if (tq.rows()) return tq.decode();
     if (packed.rows()) return packed.decode(mlx::core::float16);
     if (width <= 0 || values.size() % static_cast<std::size_t>(width) != 0)
         throw std::invalid_argument("invalid quantized row batch");

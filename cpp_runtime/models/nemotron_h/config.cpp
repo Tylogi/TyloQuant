@@ -103,9 +103,22 @@ Config Config::from_json(std::string_view payload, const MfqModelGraph&) {
     // contract: the block schedule is authoritative for the layer count and
     // the mixer labels are the canonical names the backend dispatch uses.
     json normalized = text;
-    auto schedule = text.contains("layers_block_type")
-                        ? strings(text, "layers_block_type")
-                        : strings(text, "layer_types");
+    std::vector<std::string> schedule;
+    if(text.contains("layers_block_type"))schedule=strings(text,"layers_block_type");
+    else if(text.contains("layer_types"))schedule=strings(text,"layer_types");
+    else if(text.contains("hybrid_override_pattern")) {
+        if(!text.at("hybrid_override_pattern").is_string())
+            throw std::runtime_error("hybrid_override_pattern must be a string");
+        for(const char type:text.at("hybrid_override_pattern").get<std::string>()) {
+            switch(type) {
+                case 'M':schedule.emplace_back("linear_attention");break;
+                case '*':schedule.emplace_back("full_attention");break;
+                case '-':schedule.emplace_back("mlp");break;
+                case 'E':schedule.emplace_back("moe");break;
+                default:throw std::runtime_error("hybrid_override_pattern must contain only M, *, -, E");
+            }
+        }
+    }
     if (schedule.empty())
         throw std::runtime_error("Nemotron-H config requires a non-empty layer schedule");
 
@@ -182,10 +195,15 @@ Config Config::from_json(std::string_view payload, const MfqModelGraph&) {
         if (config.ssm_state_size % 32 != 0)
             throw std::runtime_error("Nemotron-H ssm_state_size must be a multiple of 32");
         const auto limit = text.find("time_step_limit");
-        if (limit == text.end() || !limit->is_array() || limit->size() != 2)
-            throw std::runtime_error("Nemotron-H config requires time_step_limit [low, high]");
-        config.time_step_limit_lo = number((*limit)[0], "time_step_limit[0]");
-        config.time_step_limit_hi = number((*limit)[1], "time_step_limit[1]");
+        if(limit==text.end()) {
+            config.time_step_limit_lo=0.0;
+            config.time_step_limit_hi=std::numeric_limits<double>::infinity();
+        } else {
+            if(!limit->is_array() || limit->size()!=2)
+                throw std::runtime_error("Nemotron-H config requires time_step_limit [low, high]");
+            config.time_step_limit_lo=number((*limit)[0],"time_step_limit[0]");
+            config.time_step_limit_hi=number((*limit)[1],"time_step_limit[1]");
+        }
         if (!(config.time_step_limit_lo <= config.time_step_limit_hi))
             throw std::runtime_error("Nemotron-H time_step_limit low must not exceed high");
     }

@@ -4,9 +4,27 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <cuda_runtime_api.h>
 
 namespace mfq::cuda {
+// Host registration changes may synchronize the device. Keep them outside
+// graph capture and replays that wait for CPU expert-loading callbacks.
+class HostRegistrationBlock {
+    std::shared_ptr<void> state_;
+public:
+    HostRegistrationBlock();
+};
+std::unique_lock<std::mutex> try_host_registration();
+struct HostRegistrationRetirement {
+    void* owner=nullptr;
+    void (*dispose)(void*) noexcept=nullptr;
+    HostRegistrationRetirement* next=nullptr;
+};
+// Intrusive retirement allocates nothing when optional cached RAM is evicted.
+void retire_host_registration(HostRegistrationRetirement*)noexcept;
+
 class CapturedGraph {
 public:
     ~CapturedGraph();
@@ -18,6 +36,7 @@ public:
     bool wait_ms(int timeout_ms) const;
     std::size_t nodes() const;
     bool valid() const;
+    void set_kernel_rows(cudaGraphNode_t node,unsigned rows)const;
 private:
     friend class GraphRegistry;
     CapturedGraph(void* stream, const std::function<void()>& body);

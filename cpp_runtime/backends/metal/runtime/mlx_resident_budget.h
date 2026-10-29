@@ -13,6 +13,8 @@ using MlxResidentBudgetExceeded = MfqResourceExhausted;
 template <typename Runtime>
 std::size_t mlx_trim_expert_residency(Runtime& runtime, std::size_t bytes) {
     if (runtime.reclaimable_expert_bytes() <= bytes) return 0;
+    if constexpr (requires { runtime.trim_preallocated_expert_cache(bytes); })
+        if (const auto released = runtime.trim_preallocated_expert_cache(bytes)) return *released;
     const auto full = runtime.resident_full_expert_bytes();
     const auto cache = runtime.expert_cache_limit_bytes();
     if (cache > std::numeric_limits<std::size_t>::max() - full)

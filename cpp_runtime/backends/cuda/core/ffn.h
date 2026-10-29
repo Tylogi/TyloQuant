@@ -28,6 +28,8 @@ struct FFN {
     MfeWeight moe_gate;
     MfeWeight moe_up;
     MfeWeight moe_down;
+    // Ordinary TQ row tables retain their own cache and never enter MFE pools.
+    std::shared_ptr<TqMoeBanks> moe_tq;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_gate_up;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_gate;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_up;
@@ -41,6 +43,7 @@ struct FFN {
     QuantLinear moe_latent_in;
     QuantLinear moe_latent_out;
     mfq_tensor_backend::Tensor moe_router;
+    std::shared_ptr<const QuantLinear> moe_router_projection;
     mfq_tensor_backend::Tensor moe_shared_gate;
     mfq_tensor_backend::Tensor moe_router_bias;
     mfq_tensor_backend::Tensor moe_hash_ids;
