@@ -68,7 +68,8 @@ public:
         int max_context,
         std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
         std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache = nullptr,
-        std::size_t expert_layer_base = 0);
+        std::size_t expert_layer_base = 0,
+        std::shared_ptr<MlxTqExpertCache> tq_expert_cache = nullptr);
 
     MlxDeepseekV41DSparkState make_state(
         int batch = 1,
@@ -105,6 +106,8 @@ public:
     std::size_t resident_routed_bytes() const noexcept;
     void validate_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) const;
     void use_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache);
+    void validate_tq_offload(const std::shared_ptr<MlxTqExpertCache>& cache) const;
+    void use_tq_offload(const std::shared_ptr<MlxTqExpertCache>& cache);
     void offload_until(const std::shared_ptr<MlxMfeOffloadCache>& cache,
         std::size_t& resident, std::size_t budget);
 

@@ -22,6 +22,7 @@ from mfq.architectures.tensor_schema import (
 )
 from mfq.formats.assets import is_asset_record, MODEL_CONFIG_ASSET, HF_TOKENIZER_CONFIG_ASSET
 from mfq.formats.compat import canonical_dtype
+from mfq.formats.header import MFQ_SUFFIXES
 from mfq.formats.io import open_mmap
 from mfq.formats.shards import matching_shard_paths, parse_shard_path
 from mfq.server.protocol.models import (
@@ -200,7 +201,7 @@ class ModelCatalog:
                     if first is not None:
                         inspect_path = first
             supported_path = (
-                inspect_path.is_file() and inspect_path.suffix.casefold() == ".mfq"
+                inspect_path.is_file() and inspect_path.suffix.casefold() in MFQ_SUFFIXES
             ) or (inspect_path.is_dir() and self._is_hf_model_directory(inspect_path))
             if supported_path:
                 direct = await asyncio.to_thread(self._inspect, privacy_root, inspect_path)
@@ -324,7 +325,7 @@ class ModelCatalog:
         try:
             mfq_models: set[Path] = set()
             for item in path.iterdir():
-                if not item.is_file() or item.suffix.casefold() != ".mfq":
+                if not item.is_file() or item.suffix.casefold() not in MFQ_SUFFIXES:
                     continue
                 try:
                     parsed = parse_shard_path(item)
@@ -375,7 +376,7 @@ class ModelCatalog:
         files = []
         for item in entries:
             with contextlib.suppress(OSError):
-                if item.is_file() and item.suffix.casefold() == ".mfq":
+                if item.is_file() and item.suffix.casefold() in MFQ_SUFFIXES:
                     files.append(ModelDirectoryFile(name=item.name, byte_size=item.stat().st_size))
         files.sort(key=lambda item: (item.name.casefold(), item.name))
         parent = current.parent if current.parent != current else None
@@ -395,7 +396,7 @@ class ModelCatalog:
     def _registration_paths(directory: Path) -> list[Path]:
         grouped: dict[Path, list[Path]] = {}
         try:
-            candidates = sorted(directory.rglob("*.[mM][fF][qQ]"))
+            candidates = sorted(path for path in directory.rglob("*") if path.suffix.casefold() in MFQ_SUFFIXES)
         except OSError as error:
             raise ModelRegistrationError("cannot scan selected model directory") from error
         for candidate in candidates:
@@ -586,7 +587,8 @@ class ModelCatalog:
             if not root.is_dir():
                 continue
             grouped: dict[Path, list[Path]] = {}
-            paths = {*root.rglob("*.[mM][fF][qQ]"), *self._registered_paths(root)}
+            paths = {path for path in root.rglob("*") if path.suffix.casefold() in MFQ_SUFFIXES}
+            paths.update(self._registered_paths(root))
             paths.update(
                 config.parent
                 for config in root.rglob("config.json")
@@ -662,7 +664,7 @@ class ModelCatalog:
             if resolved.is_dir() and ModelCatalog._is_hf_model_directory(resolved):
                 result.add(resolved)
                 continue
-            if resolved.suffix.casefold() != ".mfq":
+            if resolved.suffix.casefold() not in MFQ_SUFFIXES:
                 continue
             if resolved.is_file():
                 try:

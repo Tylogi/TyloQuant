@@ -49,6 +49,10 @@ QuantLinear TransformerWeightLoader::linear(const std::string& name) const {
 }
 bool TransformerWeightLoader::has(const std::string& name) const { return has_tensor(source, name); }
 mfq_tensor_backend::Tensor TransformerWeightLoader::router_parameter(const std::string& name) const {
+    if(keep_quantized_router && name.ends_with("router.weight") && require_tensor(source,name).dtype=="TQ") {
+        router_projection=std::make_shared<QuantLinear>(linear(name));
+        return {};
+    }
     return dense(name).to(mfq_tensor_backend::kFloat32).contiguous();
 }
 QuantLinearGroup TransformerWeightLoader::projections(const std::vector<std::string>& names) const {
@@ -82,6 +86,33 @@ void TransformerWeightLoader::important_neurons(int64_t hidden, int64_t intermed
 void TransformerWeightLoader::experts(FFN& ffn, mfq::models::ExpertProjection projection,
                                      const std::string& name, int layer) const {
     using Role = mfq::models::ExpertProjection;
+    const auto& record=require_tensor(source,name);
+    if(record.dtype=="TQ") {
+        MFQ_RUNTIME_CHECK(!cpu_offloaded && projection!=Role::gate_up,
+            "TQ routed weights require separate device Gate/Up/Down banks: ",name);
+        auto bank=load_tq_routed_weight(source,name,active_weight_load_device(execution),&execution);
+        if(!ffn.moe_tq)ffn.moe_tq=std::make_shared<TqMoeBanks>();
+        switch(projection) {
+            case Role::gate:ffn.moe_tq->gate=std::move(bank);break;
+            case Role::up:ffn.moe_tq->up=std::move(bank);break;
+            case Role::down:ffn.moe_tq->down=std::move(bank);break;
+            case Role::gate_up:break;
+        }
+        return;
+    }
+    if(record.dtype=="F32" || record.dtype=="F16" || record.dtype=="BF16") {
+        MFQ_RUNTIME_CHECK(!cpu_offloaded && projection!=Role::gate_up,
+            "dense routed weights require separate device Gate/Up/Down banks: ",name);
+        auto bank=load_dense_native_gpu(execution,source,name);
+        MFQ_RUNTIME_CHECK(bank.dim()==3,"dense expert bank must be [experts,out,in]: ",name);
+        switch(projection) {
+            case Role::gate:ffn.moe_dense_gate=std::move(bank);break;
+            case Role::up:ffn.moe_dense_up=std::move(bank);break;
+            case Role::down:ffn.moe_dense_down=std::move(bank);break;
+            case Role::gate_up:break;
+        }
+        return;
+    }
     MfeWeight* weight = nullptr;
     std::shared_ptr<MixedMoeRuntime>* cpu = nullptr;
     const char* role = nullptr;
@@ -104,9 +135,22 @@ MfeWeight TransformerWeightLoader::headwise(const std::string& name) const {
 FFN load_moe_weights(CudaExecutionContext& execution, const mfq::ModelSource& source,
                      std::string_view prefix, const MoeWeightLoadOptions& options) {
     TransformerWeightLoader loader{execution, source};
+    loader.keep_quantized_router=true;
     loader.cpu_offloaded = options.cpu_offloaded;
     loader.shared_gate_up_compatible_prefix = options.shared_gate_up_compatible_prefix;
-    return mfq::models::load_moe_weights<FFN>(
+    auto result=mfq::models::load_moe_weights<FFN>(
         loader, std::string(prefix), options.layer, options.router_bias_required,
         options.ungated_experts, options.ungated_shared);
+    if(result.moe_tq) {
+        const auto& banks=*result.moe_tq;
+        MFQ_RUNTIME_CHECK(banks.up && banks.down && (options.ungated_experts || banks.gate),
+            "TQ expert banks cannot be mixed with legacy routed formats");
+        MFQ_RUNTIME_CHECK(banks.up->experts==banks.down->experts &&
+            banks.up->out==banks.down->input && banks.up->input==banks.down->out &&
+            (!banks.gate || (banks.gate->experts==banks.up->experts &&
+                banks.gate->out==banks.up->out && banks.gate->input==banks.up->input)),
+            "TQ Gate/Up/Down expert dimensions disagree");
+    }
+    result.moe_router_projection=std::move(loader.router_projection);
+    return result;
 }

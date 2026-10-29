@@ -8,7 +8,7 @@ struct Qwen4BatchDecodeGraph::Impl {
     struct Layer {
         std::vector<std::unique_ptr<qwen4_exp::Gdn>> gdn;
         std::vector<std::unique_ptr<qwen4_exp::Ple>> ple;
-        std::vector<std::shared_ptr<NintRowStage>> embeddings;
+        std::vector<std::shared_ptr<RowStage>> embeddings;
         bool independent_gdn = false;
     };
     struct Prepared {
@@ -166,7 +166,8 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
         }
     }
     input.upload();
-    const bool external_pool = prepare_moe_graph_pool(execution.moe_expert_cache);
+    const bool external_pool = prepare_moe_graph_pool(execution.moe_expert_cache) ||
+        prepare_tq_graph_pool(execution.tq_expert_cache);
     owner.cache.prepare_pool(execution.tensor_parallel, execution.model_parallel_collectives, external_pool);
     BatchDecodeMaskScope mask_scope(execution, input.enabled());
     if (!graph.valid) {

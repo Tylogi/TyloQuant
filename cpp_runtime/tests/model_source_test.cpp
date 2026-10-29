@@ -4,12 +4,14 @@
 #include "mfq/mfq_model_source.h"
 #include "mfq/mapped_tensor_pages.h"
 #include "mfq/mapped_prefetch_scope.h"
+#include "mfq/tq_rows.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -171,13 +173,13 @@ void write_shared_fixture(const std::filesystem::path& path, int index,
     write_scalar<std::uint16_t>(stream, static_cast<std::uint16_t>(index + 10));
 }
 
-void test_shared_engram_shards(const std::filesystem::path& root) {
+void test_shared_engram_shards(const std::filesystem::path& root, const std::string& suffix) {
     const std::string table_name = "model.block.1.associative_memory.embedding.weight";
-    const auto shared = root / "Engram" / "model-EW-Engram-MXFP8-00002-of-00003.mfq";
+    const auto shared = root / "Engram" / ("model-EW-Engram-MXFP8-00002-of-00003" + suffix);
     write_shared_fixture(shared, 1, table_name);
     for (const std::string precision : {"Q2.5", "Q3"}) {
-        const auto first = root / precision / ("model-EW-" + precision + "-00001-of-00003.mfq");
-        const auto last = root / precision / ("model-EW-" + precision + "-00003-of-00003.mfq");
+        const auto first = root / precision / ("model-EW-" + precision + "-00001-of-00003" + suffix);
+        const auto last = root / precision / ("model-EW-" + precision + "-00003-of-00003" + suffix);
         write_shared_fixture(first, 0, "model.token_embedding.weight");
         write_shared_fixture(last, 2, "model.output.weight");
         for (auto mode : {mfq::FileReadMode::Buffered, mfq::FileReadMode::Direct}) {
@@ -189,12 +191,12 @@ void test_shared_engram_shards(const std::filesystem::path& root) {
                     "shared table read returned incorrect bytes");
         }
     }
-    const auto first = root / "Q3" / "model-EW-Q3-00001-of-00003.mfq";
+    const auto first = root / "Q3" / ("model-EW-Q3-00001-of-00003" + suffix);
     auto rejects = [&] {
         try { mfq::MfqModelSource source(first); return false; }
         catch (const std::runtime_error&) { return true; }
     };
-    const auto duplicate = root / "Engram" / "model-EW-Engram-MXFP4-00002-of-00003.mfq";
+    const auto duplicate = root / "Engram" / ("model-EW-Engram-MXFP4-00002-of-00003" + suffix);
     write_shared_fixture(duplicate, 1, table_name);
     require(rejects(), "ambiguous shared table precision was guessed");
     std::filesystem::remove(duplicate);
@@ -204,11 +206,38 @@ void test_shared_engram_shards(const std::filesystem::path& root) {
     require(rejects(), "shared table from incompatible architecture was accepted");
     std::filesystem::remove(shared);
     require(rejects(), "missing shared Engram table was accepted");
+    const auto other_suffix = suffix == ".mfq" ? ".tq" : ".mfq";
+    const auto other = root / "Engram" /
+        (std::string("model-EW-Engram-MXFP8-00002-of-00003") + other_suffix);
+    write_shared_fixture(other, 1, table_name);
+    require(rejects(), "shared shards from different container suffixes were mixed");
+    std::filesystem::remove(other);
     // An ordinary complete checkpoint remains loadable beside unusable tables.
-    write_shared_fixture(root / "Q3" / "model-EW-Q3-00002-of-00003.mfq", 1, table_name);
+    write_shared_fixture(root / "Q3" / ("model-EW-Q3-00002-of-00003" + suffix), 1, table_name);
     write_shared_fixture(shared, 1, "invalid.weight");
     mfq::MfqModelSource legacy(first);
     require(legacy.source_paths()[1].parent_path().filename() == "Q3", "legacy shard was replaced");
+}
+
+void test_tq_reserved_descriptor_bits() {
+    std::vector<std::uint8_t> payload(64 + 8 + 8 + 32);
+    std::memcpy(payload.data(), "RTRELL05", 8);
+    mfq::TqLayout::integer(payload.data() + 8, 5, 4);
+    mfq::TqLayout::integer(payload.data() + 12, 1, 4);
+    mfq::TqLayout::integer(payload.data() + 16, 256, 4);
+    mfq::TqLayout::integer(payload.data() + 24, 16, 4);
+    mfq::TqLayout::integer(payload.data() + 28, 32, 4);
+    mfq::TqRows rows(payload.size(), [&](auto offset, auto* output, auto bytes) {
+        std::memcpy(output, payload.data() + offset, bytes);
+    });
+    require(rows.slice_rows(0, 1) == payload, "valid TQ row changed");
+    for (const int bit : {35, 36, 37, 38, 39, 56, 63}) {
+        mfq::TqLayout::integer(payload.data() + 64, std::uint64_t(1) << bit, 8);
+        bool rejected = false;
+        try { rows.slice_rows(0, 1); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "reserved TQ descriptor bit was accepted");
+    }
 }
 
 } // namespace
@@ -219,7 +248,10 @@ int main() {
         ("mfq-model-source-test-" + std::to_string(nonce));
     try {
         std::filesystem::create_directories(root);
-        test_shared_engram_shards(root / "shared");
+        test_shared_engram_shards(root / "shared-mfq", ".mfq");
+        test_shared_engram_shards(root / "shared-tq", ".tq");
+        test_shared_engram_shards(root / "shared-tq-upper", ".TQ");
+        test_tq_reserved_descriptor_bits();
         const auto mfq_path = root / "model.mfq";
         const auto legacy_mfq_path = root / "legacy-model.mfq";
         const auto legacy_gguf_path = root / "legacy-gguf-model.mfq";

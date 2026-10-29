@@ -8,6 +8,7 @@
 #include "mlx_nint.h"
 #include "mlx_nint8_zero.h"
 #include "mlx_vq.h"
+#include "mlx_tq.h"
 
 #include <cstddef>
 #include <memory>
@@ -54,6 +55,7 @@ public:
     explicit MlxLinear(MlxFp8SqWeight weight);
     explicit MlxLinear(MlxMxWeight weight);
     explicit MlxLinear(MlxMxfp4SqWeight weight);
+    explicit MlxLinear(MlxTqWeight weight);
     explicit MlxLinear(mlx::core::array weight);
 
     mlx::core::array operator()(const mlx::core::array& input) const;
@@ -77,6 +79,7 @@ public:
     mlx::core::array grouped_row_matmul(
         const mlx::core::array& input,
         int group_count) const;
+    void prepare_grouped_row_matmul(int group_count) const;
 
     // Diagonal grouped projection whose input is still in adjacent-pair RoPE
     // space: value [...,heads,head_dim] -> output [...,groups,OUT/groups].
@@ -104,6 +107,7 @@ public:
     const MlxNintWeight* nint_weight_ref() const noexcept;
     const MlxNint8ZeroWeight* nint8_zero_weight_ref() const noexcept;
     const MlxMxWeight* mx_weight_ref() const noexcept;
+    const MlxTqWeight* tq_weight_ref() const noexcept;
     const mlx::core::array* dense_weight_ref() const noexcept;
 
     void materialize_fp16();
@@ -116,6 +120,7 @@ private:
         MlxFp8SqWeight,
         MlxMxWeight,
         MlxMxfp4SqWeight,
+        MlxTqWeight,
         mlx::core::array> weight_;
     int input_size_ = 0;
     int output_size_ = 0;
@@ -172,6 +177,7 @@ public:
     explicit MlxEmbedding(MlxNint8ZeroWeight weight);
     explicit MlxEmbedding(MlxVqWeight weight);
     explicit MlxEmbedding(MlxMxWeight weight);
+    explicit MlxEmbedding(MlxTqWeight weight);
     explicit MlxEmbedding(mlx::core::array weight);
 
     mlx::core::array operator()(
@@ -199,6 +205,7 @@ private:
         MlxNint8ZeroWeight,
         MlxVqWeight,
         MlxMxWeight,
+        MlxTqWeight,
         mlx::core::array> weight_;
     int vocabulary_size_ = 0;
     int hidden_size_ = 0;

@@ -246,11 +246,35 @@ configure_file(
     "${CMAKE_CURRENT_BINARY_DIR}/mfq_mfe_prefill_embedded.h"
     @ONLY)
 
+file(READ "${MFQ_REPOSITORY_ROOT}/mfq/kernels/metal/tq_decode.h" MFQ_TQ_DECODE_SOURCE)
+file(READ "${MFQ_REPOSITORY_ROOT}/mfq/kernels/metal/tq_matmul.h" MFQ_TQ_MATMUL_SOURCE)
+set(_MFQ_TQ_NAX_ENTRY "${CMAKE_CURRENT_BINARY_DIR}/mfq_tq_nax_entry.h")
+file(WRITE "${_MFQ_TQ_NAX_ENTRY}"
+    "#include \"mlx/backend/metal/kernels/steel/gemm/nax.h\"\n")
+execute_process(
+    COMMAND "${CMAKE_CXX_COMPILER}" -E -P -x c++
+        -D__METAL_VERSION__=320
+        "-I${MFQ_MLX_ROOT}/include"
+        "-I${_MFQ_STEEL_STUB_DIR}"
+        "${_MFQ_TQ_NAX_ENTRY}"
+    RESULT_VARIABLE _MFQ_TQ_NAX_EXPAND_RESULT
+    OUTPUT_VARIABLE MFQ_TQ_NAX_SOURCE
+    ERROR_VARIABLE _MFQ_TQ_NAX_EXPAND_ERROR)
+if(NOT _MFQ_TQ_NAX_EXPAND_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to embed TQ NAX headers: ${_MFQ_TQ_NAX_EXPAND_ERROR}")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${MFQ_REPOSITORY_ROOT}/mfq/kernels/metal/tq_decode.h"
+    "${MFQ_REPOSITORY_ROOT}/mfq/kernels/metal/tq_matmul.h")
+configure_file(kernels/mfq_tq_embedded.h.in mfq_tq_embedded.h @ONLY)
+
 add_library(mfq-metal-runtime STATIC
     storage/hf_safetensors_store.cpp
     storage/mfq_container.cpp
     storage/mfe_expert_store.cpp
     storage/mlx_quantized_row_store.cpp
+    runtime/mlx_tq_expert_cache.cpp
+    storage/mlx_tq_rows.cpp
     storage/compat/mlx_legacy_tensor_compat.cpp
     runtime/mlx_axial_patch_vision.cpp
     runtime/mlx_grid_vision.cpp
@@ -280,6 +304,7 @@ add_library(mfq-metal-runtime STATIC
     ops/mlx_mxfp4_sq.cpp
     ops/mlx_nint.cpp
     ops/mlx_nint_rows.cpp
+    ops/mlx_tq.cpp
     ops/mlx_nint8_zero.cpp
     ops/mlx_sparse_attention.cpp
     ops/mlx_csa2.cpp
@@ -348,6 +373,30 @@ target_compile_definitions(mfq-metal-runtime PUBLIC
     MFQ_NATIVE_MLX_RUNTIME=1
     MFQ_MLX_METALLIB_DEFAULT="${MFQ_MLX_METALLIB_DEFAULT}"
 )
+
+add_executable(mfq-metal-tq-test tests/mlx_tq_test.cpp)
+target_link_libraries(mfq-metal-tq-test PRIVATE mfq-metal-runtime)
+target_include_directories(mfq-metal-tq-test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_compile_features(mfq-metal-tq-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-tq-test PROPERTIES BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
+
+if(BUILD_TESTING)
+    add_test(NAME mfq-metal-tq-container-test COMMAND mfq-metal-tq-test unused --expert-containers)
+    add_test(NAME mfq-metal-tq-prefill-reduction-test COMMAND mfq-metal-tq-test --prefill-reduction)
+    add_test(NAME mfq-metal-tq-projection-cache-test COMMAND mfq-metal-tq-test --projection-cache)
+    add_test(NAME mfq-metal-tq-expansion-vector-test COMMAND mfq-metal-tq-test --expansion-vectors)
+    add_test(NAME mfq-metal-tq-column-input-test COMMAND mfq-metal-tq-test --column-inputs)
+    add_test(NAME mfq-metal-tq-compact-reuse-test COMMAND mfq-metal-tq-test --compact-reuse)
+    add_test(NAME mfq-metal-tq-streamed-experts-test COMMAND mfq-metal-tq-test --streamed-experts)
+    add_test(NAME mfq-metal-tq-routed-tiles-test COMMAND mfq-metal-tq-test unused --routed-tiles)
+endif()
+
+if(TARGET mfq-paged-prefix-cache)
+    add_executable(mfq-metal-tq-model-benchmark tests/mlx_tq_model_benchmark.cpp)
+    target_link_libraries(mfq-metal-tq-model-benchmark PRIVATE mfq-metal-runtime mfq-paged-prefix-cache)
+    target_compile_features(mfq-metal-tq-model-benchmark PRIVATE cxx_std_20)
+    set_target_properties(mfq-metal-tq-model-benchmark PROPERTIES BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
+endif()
 
 add_library(mfq-metal-engine STATIC
     runtime/mlx_engine.cpp

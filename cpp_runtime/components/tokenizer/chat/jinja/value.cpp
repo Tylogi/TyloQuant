@@ -350,6 +350,29 @@ static value default_value(const func_args & args) {
 
 const func_builtins & global_builtins() {
     static const func_builtins builtins = {
+        {"dict", [](const func_args & args) -> value {
+            auto out = mk_val<value_object>();
+            size_t index = 0;
+            for (const auto & arg : args.get_args()) {
+                if (is_val<value_kwarg>(arg)) {
+                    const auto * kwarg = cast_val<value_kwarg>(arg);
+                    out->insert(kwarg->key, kwarg->val);
+                } else {
+                    if (index != 0) throw raised_exception("dict() accepts at most one positional argument");
+                    if (is_val<value_object>(arg)) {
+                        for (const auto & [key, val] : arg->as_ordered_object()) out->insert(key, val);
+                    } else if (is_val<value_array>(arg) || is_val<value_tuple>(arg)) {
+                        for (const auto & item : arg->as_array()) {
+                            if ((!is_val<value_array>(item) && !is_val<value_tuple>(item)) || item->as_array().size() != 2)
+                                throw raised_exception("dict() entries must contain a key and value");
+                            out->insert(item->as_array()[0], item->as_array()[1]);
+                        }
+                    } else throw raised_exception("dict() requires a mapping or key/value pairs");
+                }
+                ++index;
+            }
+            return out;
+        }},
         {"raise_exception", [](const func_args & args) -> value {
             args.ensure_vals<value_string>();
             std::string msg = args.get_pos(0)->as_string().str();

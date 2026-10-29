@@ -23,7 +23,7 @@ MlxKernelPreparation::MlxKernelPreparation(int context, int chunk_size)
     : previous_(active_), context_(context) {
     if (context < 1 || chunk_size < 1)
         throw std::invalid_argument("invalid Metal kernel preparation geometry");
-    for (const int requested : {1, 2, 3, 4, 5, 6, 8, 25, 32, 128, chunk_size}) {
+    for (const int requested : {1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 25, 31, 32, 33, 64, 96, 128, chunk_size}) {
         const int rows = std::min(context, requested);
         if (std::find(rows_.begin(), rows_.end(), rows) == rows_.end()) rows_.push_back(rows);
     }

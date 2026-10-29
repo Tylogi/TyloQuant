@@ -4,9 +4,11 @@
 #include "mlx_grouped_linear.h"
 #include "mlx_moe.h"
 #include "mlx_ssd_expert_cache.h"
+#include "mlx_tq_expert_cache.h"
 #include "mlx_tensor.h"
 
 #include <cstddef>
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -31,7 +33,8 @@ public:
         bool predictor = false,
         std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache = nullptr,
         std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache = nullptr,
-        std::size_t expert_cache_layer = 0);
+        std::size_t expert_cache_layer = 0,
+        std::shared_ptr<MlxTqExpertCache> tq_expert_cache = nullptr);
 
     MlxDeepseekV41MoeResult forward(
         const mlx::core::array& input,
@@ -46,9 +49,12 @@ public:
     std::size_t resident_routed_bytes() const noexcept;
     void validate_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) const;
     void use_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache);
+    void validate_tq_offload(const std::shared_ptr<MlxTqExpertCache>& cache) const;
+    void use_tq_offload(const std::shared_ptr<MlxTqExpertCache>& cache);
     std::optional<MlxMfeCachedRoute> cached_route() const;
 
 private:
+    using TqWeights = MlxTqExpertWeights;
     MlxDeepseekV41Moe(
         int hidden,
         int intermediate,
@@ -72,7 +78,9 @@ private:
         std::string streamed_gate_up_name,
         std::optional<std::string> streamed_up_name,
         std::string streamed_down_name,
-        std::size_t expert_cache_layer);
+        std::size_t expert_cache_layer,
+        std::optional<TqWeights> tq = std::nullopt,
+        std::shared_ptr<MlxTqExpertCache> tq_expert_cache = nullptr);
 
     int hidden_;
     int intermediate_;
@@ -96,6 +104,8 @@ private:
     std::optional<MlxRoutedLinear> routed_gate_;
     std::optional<MlxRoutedLinear> routed_up_;
     std::optional<MlxRoutedLinear> routed_down_;
+    std::optional<TqWeights> tq_;
+    std::shared_ptr<MlxTqExpertCache> tq_expert_cache_;
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache_;
     std::string streamed_gate_up_name_;

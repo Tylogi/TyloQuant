@@ -362,6 +362,8 @@ struct MlxDeepseekV41DSpark::Impl {
                   selected_rope.second, mlx::core::float32)),
           } {
         validate();
+        for (const auto& stage : stages)
+            stage.attention.output_a.prepare_grouped_row_matmul(checked_int(config.o_groups, "output groups"));
     }
 
     void validate() const {
@@ -561,7 +563,8 @@ MlxDeepseekV41DSpark::load_if_present(
     int max_context,
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache,
-    std::size_t expert_layer_base) {
+    std::size_t expert_layer_base,
+    std::shared_ptr<MlxTqExpertCache> tq_expert_cache) {
     const bool root = model.contains(
         "predictor.stage.0.main_projection.weight");
     const bool any = root ||
@@ -604,7 +607,7 @@ MlxDeepseekV41DSpark::load_if_present(
                 true,
                 ssd_expert_cache,
                 mfe_offload_cache,
-                expert_layer_base + static_cast<std::size_t>(stage)),
+                expert_layer_base + static_cast<std::size_t>(stage), tq_expert_cache),
             static_cast<float>(config.rms_eps));
     }
     const auto first = std::string("predictor.stage.0");
@@ -867,6 +870,14 @@ void MlxDeepseekV41DSpark::offload_until(
             resident -= released;
         }
     }
+}
+
+void MlxDeepseekV41DSpark::validate_tq_offload(const std::shared_ptr<MlxTqExpertCache>& cache) const {
+    for (const auto& stage : impl_->stages) stage.moe.validate_tq_offload(cache);
+}
+
+void MlxDeepseekV41DSpark::use_tq_offload(const std::shared_ptr<MlxTqExpertCache>& cache) {
+    for (auto& stage : impl_->stages) stage.moe.use_tq_offload(cache);
 }
 
 } // namespace mfq::metal

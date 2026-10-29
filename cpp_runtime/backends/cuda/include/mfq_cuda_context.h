@@ -144,6 +144,7 @@ public:
     void replay();
     void reset() noexcept;
     bool valid() const noexcept { return executable_ != nullptr; }
+    cudaGraphExec_t native_executable()const noexcept{return executable_;}
     std::size_t nodes() const;
 
 private:

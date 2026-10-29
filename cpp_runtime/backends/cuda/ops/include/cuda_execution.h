@@ -42,6 +42,7 @@ namespace mfq::cuda { class KvOffloadStore; class KvMemoryManager; }
 #endif
 
 class MoeExpertCache;
+class TqExpertCache;
 
 namespace mfq::cuda::internal {
 
@@ -372,6 +373,7 @@ struct CudaExecutionContext {
     LayerPlacementConfig layer_placement;
     // Engine-owned load resource; cached model/MTP weights share its lifetime.
     std::shared_ptr<MoeExpertCache> moe_expert_cache;
+    std::shared_ptr<TqExpertCache> tq_expert_cache;
     std::shared_ptr<mfq::cuda::KvOffloadStore> qsa_kv_store;
     std::shared_ptr<mfq::cuda::KvMemoryManager> kv_memory;
     std::unordered_map<int, MoeRouteLayerStats> moe_route_stats;

@@ -3,10 +3,78 @@
 
 #include "nlohmann/json.hpp"
 #include "../../hip/diagnostics/generation_result.h"
+#include "models/qwen4_exp/ops.h"
 
 #include <cstdint>
 #include <utility>
 #include <vector>
+#include <type_traits>
+#include <cmath>
+
+template<class Model>
+static int check_qwen_tq_mtp_transactions(Model& model) {
+    if constexpr(!std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)return 0;
+    else {
+        namespace tb=mfq_tensor_backend;using Tensor=tb::Tensor;
+        const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64);
+        const auto ids=[&](const std::vector<int64_t>& values){return tb::tensor(values,options).reshape({1,-1});};
+        const auto eager=[&](const std::vector<int64_t>& values,Tensor* raw) {
+            model.reset(1);
+            return model.hidden_forward(ids(values),mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,raw);
+        };
+        const auto close=[](const Tensor& actual,const Tensor& expected) {
+            MFQ_RUNTIME_CHECK(actual.sizes()==expected.sizes(),"MTP graph output shape differs");
+            auto a=actual.to(tb::kFloat32).contiguous().cpu(),b=expected.to(tb::kFloat32).contiguous().cpu();
+            for(int64_t i=0;i<a.numel();++i) {
+                const auto x=a.template data_ptr<float>()[i],y=b.template data_ptr<float>()[i];
+                MFQ_RUNTIME_CHECK(std::isfinite(x) && std::abs(x-y)<=.002f+.002f*std::abs(y),
+                    "MTP graph output differs from eager target");
+            }
+        };
+        const std::vector<int64_t> prefix{1,2,3};Tensor probe_raw;
+        (void)eager(prefix,&probe_raw);
+        if(!mfq::cuda::qwen4_decode_graph_hidden(model,ids({4}),&probe_raw))return 0;
+        int transactions=0;
+        for(int tokens=2;tokens<=6;++tokens)for(int mode=0;mode<3;++mode) {
+            struct Replay {std::vector<int64_t> window;int accepted;int64_t next;Tensor hidden,raw,next_hidden,next_raw;};
+            std::vector<Replay> checks;auto committed=prefix;
+            for(int pass=0;pass<2;++pass) {
+                Replay row{};
+                for(int i=0;i<tokens;++i)row.window.push_back((i+pass*7+mode*3)%int(model.vocab_size()-1)+1);
+                auto full=committed;full.insert(full.end(),row.window.begin(),row.window.end());
+                Tensor raw;auto hidden=eager(full,&raw);
+                row.hidden=hidden.narrow(1,committed.size(),tokens).clone();
+                row.raw=raw.narrow(1,committed.size(),tokens).clone();
+                row.accepted=mode==0?tokens-1:(mode==1?0:std::max(1,(tokens-1)/2));
+                committed.insert(committed.end(),row.window.begin(),row.window.begin()+row.accepted+1);
+                row.next=(pass*11+7)%int(model.vocab_size()-1)+1;committed.push_back(row.next);
+                hidden=eager(committed,&raw);
+                row.next_hidden=hidden.narrow(1,hidden.size(1)-1,1).clone();
+                row.next_raw=raw.narrow(1,raw.size(1)-1,1).clone();
+                checks.push_back(std::move(row));
+            }
+            (void)eager(prefix,&probe_raw);
+            for(const auto& row:checks) {
+                Tensor raw;auto hidden=mfq::cuda::qwen4_decode_graph_hidden(model,ids(row.window),&raw,1);
+                MFQ_RUNTIME_CHECK(hidden.has_value(),"TQ MTP verification graph was not selected");
+                close(*hidden,row.hidden);close(raw,row.raw);
+                if(mode==0)model.commit_speculative();
+                else {
+                    model.rollback_speculative();
+                    if(row.accepted) {
+                        std::vector<int64_t> accepted(row.window.begin()+1,row.window.begin()+1+row.accepted);
+                        MFQ_RUNTIME_CHECK(mfq::cuda::qwen4_decode_graph_hidden(model,ids(accepted),&raw).has_value(),
+                            "TQ MTP retained-prefix replay graph was not selected");
+                    }
+                }
+                hidden=mfq::cuda::qwen4_decode_graph_hidden(model,ids({row.next}),&raw);
+                MFQ_RUNTIME_CHECK(hidden.has_value(),"TQ MTP continuation graph was not selected");
+                close(*hidden,row.next_hidden);close(raw,row.next_raw);++transactions;
+            }
+        }
+        return transactions;
+    }
+}
 
 // Architecture-specific CLI diagnostics. Production generation uses the
 // common MtpModule path and does not depend on these concrete types.
@@ -85,7 +153,11 @@ static int run_flash_next_mtp_check(Model& model, Predictor& mtp) {
         "Flash-Next MTP step emitted extra or incorrect tokens");
     sampling.max_tokens=8;sampling.temperature=.8;sampling.top_k=16;sampling.top_p=.95;
     sampling.presence_penalty=.2;sampling.frequency_penalty=.1;sampling.repetition_penalty=1.05;sampling.seed=20260907;
-    MFQ_RUNTIME_CHECK(mfq::cuda::diagnostics::check_mtp_steps(model,mtp,prompt,sampling).size()==8,
+    generated=mfq::cuda::diagnostics::check_mtp_steps(model,mtp,prompt,sampling);
+    MFQ_RUNTIME_CHECK(generated.size()==8,
         "Flash-Next stochastic MTP failed to generate requested tokens");
+    result["stochastic"]=generated;
+    result["predictor_graph_replays"]=mtp.graph_replay_count();
+    result["target_graph_transactions"]=check_qwen_tq_mtp_transactions(model);
     std::cout<<"flash_next_mtp_check "<<result.dump()<<'\n';return 0;
 }

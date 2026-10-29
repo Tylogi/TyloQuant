@@ -21,6 +21,12 @@ mfq_tensor_backend::Tensor output_projection(CudaExecutionContext &execution,
     const auto measure = [&](const char *name, auto &&operation) {
         return profile ? profiler.measure(name, operation) : operation();
     };
+    if(output_a.is_tq()) {
+        auto low_rank=measure("dsv4.output_a",[&] {return output_a.tq.forward_groupwise(grouped,groups);});
+        return measure("dsv4.output_b",[&] {
+            return output_b.forward(execution,low_rank).reshape({batch,tokens,output_b.out()});
+        });
+    }
     if (groupwise && output_a.is_nint() && output_a.nint.bits == 8 && output_a.nint.gs == 48 &&
         output_a.nint.out == groups * rank) {
         auto low_rank = measure("dsv4.output_a", [&]() {

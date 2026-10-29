@@ -1,5 +1,7 @@
 #include "mlx_quantized_row_store.h"
 #include "mlx_nint.h"
+#include "mlx_tq.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -82,6 +84,106 @@ void write_fixture(const std::filesystem::path& path,
     std::ofstream stream(path, std::ios::binary | std::ios::trunc);
     stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     require(static_cast<bool>(stream), "cannot write MXFP8 row fixture");
+}
+
+std::string tq_payload(int seed, bool columns) {
+    constexpr int rows = 4, width = 768;
+    const std::array<int, 4> bits{1, 3, 5, 8};
+    std::string result{"RTRELL05", 8};
+    for (const auto value : {5, rows, width, int(columns), columns ? 0 : 16,
+            width * (1 + 3 + 5 + 8) / 8}) append_little<std::uint32_t>(result, value);
+    result.append(32, '\0');
+    std::uint64_t words = 0;
+    for (int row = 0; row < rows; ++row) {
+        append_little<std::uint64_t>(result, words | (std::uint64_t(bits[row] - 1) << 32)
+            | (std::uint64_t(0x2800 + row * 0x100) << 40));
+        words += width * bits[row] / 32;
+    }
+    if (columns) for (int col = 0; col < width; ++col) append_little<std::uint16_t>(result, 0x3800 + col % 32);
+    else result.append(rows * (width / 16) / 2, char(0x87));
+    std::uint32_t state = seed;
+    for (std::size_t word = 0; word < words; ++word) {
+        state = state * 1664525u + 1013904223u;
+        append_little<std::uint32_t>(result, state);
+    }
+    return result;
+}
+
+void write_tq_shards(const std::filesystem::path& path, const nlohmann::json& manifest,
+        bool wrong_dtype = false, bool physical_alias = false) {
+    const std::array<std::string, 2> payloads{tq_payload(1, false), tq_payload(2, true)};
+    std::string bytes{"MFQ1", 4};
+    append_little<std::uint32_t>(bytes, 2);
+    append_string(bytes, "unit-test");
+    append_little<std::uint32_t>(bytes, 1);
+    append_string(bytes, "tq_row_shards"); append_string(bytes, manifest.dump());
+    append_little<std::uint32_t>(bytes, physical_alias ? 3 : 2);
+    for (int index = 0; index < (physical_alias ? 3 : 2); ++index) {
+        append_string(bytes, index == 2 ? "table.weight" : "table.weight.tq_row_shard.0000" + std::to_string(index));
+        append_string(bytes, wrong_dtype && index == 1 ? "F16" : "TQ");
+        append_little<std::uint64_t>(bytes, payloads[index % 2].size());
+    }
+    bytes += payloads[0]; bytes += payloads[1];
+    if (physical_alias) bytes += payloads[0];
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    stream.write(bytes.data(), bytes.size());
+    require(bool(stream), "cannot write TQ row shard fixture");
+}
+
+void test_tq_shards(const std::filesystem::path& root) {
+    using namespace mlx::core;
+    using namespace mfq::metal;
+    std::filesystem::create_directories(root);
+    const nlohmann::json manifest = {{"table.weight",
+        {"table.weight.tq_row_shard.00000", "table.weight.tq_row_shard.00001"}}};
+    const auto path = root / "rows.mfq";
+    write_tq_shards(path, manifest);
+    const MfqContainer model(path);
+    MlxQuantizedRowStore store(model, "table.weight", 8, 513, 3, 2);
+    std::vector<array> expected;
+    for (int index = 0; index < 2; ++index) {
+        const auto payload = tq_payload(index + 1, index == 1);
+        const auto blob = std::span(reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size());
+        expected.push_back(MlxTqWeight::from_blob(blob, 513).embedding(arange(4, int32)));
+    }
+    const std::array<std::int64_t, 6> requested{3, 4, 7, 0, 4, 3};
+    const auto reference = take(concatenate(expected, 0), array(requested.data(), {6}, int64), 0);
+    require(max(abs(astype(store.gather(requested), float32) - astype(reference, float32))).item<float>() == 0.f,
+        "TQ row shard boundaries or request order differ");
+    const auto before = store.stats();
+    require(before.rows_loaded == 4 && before.cache_hits == 2 && before.resident_rows == 3
+        && before.resident_payload_bytes <= before.cache_limit_bytes, "TQ row shard LRU accounting differs");
+    const std::array<std::int64_t, 1> cached{4};
+    store.gather(cached).eval();
+    require(store.stats().rows_loaded == before.rows_loaded, "TQ shard boundary row did not hit its cache");
+    store.clear();
+    const std::array<std::int64_t, 1> left{3}, right{4};
+    auto first = std::async(std::launch::async, [&] { return store.prepare_rows(left); });
+    auto second = std::async(std::launch::async, [&] { return store.prepare_rows(right); });
+    auto actual = concatenate({first.get().decode(), second.get().decode()}, 0);
+    require(max(abs(astype(actual, float32) - astype(take(concatenate(expected, 0), array({3, 4}), 0), float32))).item<float>() == 0.f,
+        "TQ asynchronous shard reads differ");
+    for (const auto invalid : {-1, 8}) {
+        bool rejected = false;
+        const std::array<std::int64_t, 1> ids{invalid};
+        try { store.prepare_rows(ids); } catch (const std::out_of_range&) { rejected = true; }
+        require(rejected, "TQ logical row bounds are not enforced");
+    }
+    const std::vector<nlohmann::json> invalid_manifests{
+        nlohmann::json::array(), {{"table.weight", nlohmann::json::array()}},
+        {{"table.weight", {"table.weight.tq_row_shard.00000", "table.weight.tq_row_shard.00000"}}},
+        {{"table.weight", {"missing"}}}, {{"table.weight", {1}}}};
+    for (std::size_t index = 0; index < invalid_manifests.size() + 3; ++index) {
+        const auto invalid_path = root / ("invalid-" + std::to_string(index) + ".mfq");
+        write_tq_shards(invalid_path, index < invalid_manifests.size() ? invalid_manifests[index] : manifest,
+            index == invalid_manifests.size(), index == invalid_manifests.size() + 1);
+        bool rejected = false;
+        try {
+            MlxQuantizedRowStore invalid(MfqContainer(invalid_path), "table.weight",
+                index == invalid_manifests.size() + 2 ? 7 : 8, 513, 3);
+        } catch (const std::exception&) { rejected = true; }
+        require(rejected, "TQ invalid row-shard manifest was accepted");
+    }
 }
 
 std::string nint_payload(bool adaptive, int rows = 4) {
@@ -316,6 +418,7 @@ int main() {
             std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
         std::filesystem::create_directories(root);
+        test_tq_shards(root / "tq");
         test_shared_engram_rows(root / "shared");
         const auto path = root / "fixture.mfq";
         write_fixture(path);
@@ -371,7 +474,7 @@ int main() {
         mlx::core::set_default_stream(previous_stream);
 
         std::filesystem::remove_all(root);
-        std::cout << "MXFP8/NINT row store passed\n";
+        std::cout << "MXFP8/NINT/TQ row store passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::error_code ignored;

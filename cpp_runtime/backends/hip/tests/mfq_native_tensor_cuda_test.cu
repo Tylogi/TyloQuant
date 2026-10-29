@@ -1,3 +1,4 @@
+#include "mfq_weight_memory.h"
 #include "mfq_cuda_context.h"
 #include "mfq_native_tensor.h"
 
@@ -56,6 +57,36 @@ void set_test_environment(const char* name, const char* value) {
 
 }  // namespace
 
+void check_weight_memory() {
+    using namespace mfq::cuda;
+    WeightMemoryLedger ledger,nested;
+    Tensor weight,view;
+    auto table=std::make_shared<int>(1);
+    {
+        const WeightMemoryLoadScope loading(ledger);
+        auto workspace=zeros({16384},TensorOptions{}.device(kCUDA));
+        {
+            const WeightAllocationScope weights;
+            weight=zeros({16},TensorOptions{}.dtype(kFloat32).device(kCUDA));
+            view=weight.narrow(0,0,4);
+            auto replaced=zeros({32},weight.options());
+            require(ledger.resident_bytes()==192,"weight ledger excludes unrelated workspace and shared views");
+            {
+                const WeightMemoryLoadScope inner(nested);
+                auto other=zeros({8},weight.options());
+                require(nested.resident_bytes()==32 && ledger.resident_bytes()==192,"nested weight ledger isolates engines");
+            }
+            require(nested.resident_bytes()==0,"weight ledger releases expired allocations");
+        }
+        observe_streamed_ple(table,4096);
+        require(ledger.resident_bytes()==64 && ledger.ple_bytes()==4096,"weight ledger drops replaced projections and counts PLE payload");
+    }
+    weight={};
+    require(ledger.resident_bytes()==64,"weight view retains its full allocation");
+    view={};table.reset();
+    require(ledger.resident_bytes()==0 && ledger.ple_bytes()==0,"telemetry must not retain weights or tables");
+}
+
 int main() try {
     int devices = 0;
     const auto device_status = cudaGetDeviceCount(&devices);
@@ -66,6 +97,7 @@ int main() try {
 
     using namespace mfq::cuda;
     const Device cuda_device{DeviceType::cuda, 0};
+    check_weight_memory();
 
     auto empty_host_blob = from_blob(
         static_cast<void*>(nullptr), {0}, TensorOptions{}.dtype(kFloat32));

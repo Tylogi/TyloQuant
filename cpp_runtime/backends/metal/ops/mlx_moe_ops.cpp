@@ -1243,7 +1243,8 @@ MlxMoeTopKResult moe_topk(
     const std::optional<array>& bias,
     const std::optional<array>& available,
     float norm_floor,
-    float scale) {
+    float scale,
+    bool route_groups) {
     auto values = floating_contiguous(logits);
     if (values.ndim() < 2 || values.shape(-1) <= 0) {
         throw std::invalid_argument(
@@ -1298,14 +1299,14 @@ MlxMoeTopKResult moe_topk(
         !bias.has_value() && !available.has_value() &&
         experts >= 32 && experts <= 4096 && experts % 32 == 0) {
         values = mlx::core::reshape(values, Shape{rows, experts});
-        const bool grouped = rows > 1;
+        const bool grouped = route_groups && rows > 1;
         std::vector<Shape> shapes{Shape{rows, top_k}, Shape{rows, top_k}};
         std::vector<mlx::core::Dtype> dtypes{mlx::core::int32, mlx::core::float32};
         if (grouped) {
             shapes.emplace_back(Shape{rows, top_k, 8});
             dtypes.push_back(mlx::core::int32);
         }
-        const auto& kernel = rows > 6 ? softmax_top_k_large_group_kernel(values.dtype())
+        const auto& kernel = grouped && rows > 6 ? softmax_top_k_large_group_kernel(values.dtype())
             : grouped ? softmax_top_k_group_kernel(values.dtype())
             : softmax_top_k_row_kernel(values.dtype());
         const int grouped_threads = rows > 6 ? 512 : 192;

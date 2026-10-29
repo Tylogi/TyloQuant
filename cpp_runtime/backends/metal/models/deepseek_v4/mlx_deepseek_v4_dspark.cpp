@@ -397,6 +397,8 @@ struct MlxDeepseekV4DSpark::Impl {
                 std::move(stage), static_cast<float>(config.rms_eps));
         }
         validate();
+        for (const auto& stage : stages)
+            stage.components.attention.wo_a.prepare_grouped_row_matmul(checked_int(config.o_groups, "output groups"));
     }
 
     void validate() const {

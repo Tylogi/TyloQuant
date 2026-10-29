@@ -6,7 +6,10 @@ import re
 from collections.abc import Sequence
 from pathlib import PurePosixPath
 
-_SHARD = re.compile(r"^(?P<stem>.+)-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})\.[mM][fF][qQ]$")
+_SHARD = re.compile(
+    r"^(?P<stem>.+)-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})(?P<suffix>\.mfq|\.tq)$",
+    re.IGNORECASE,
+)
 _ENGRAM = re.compile(r"^(.+)-Engram-.+$", re.IGNORECASE)
 
 
@@ -16,6 +19,9 @@ def is_engram_shard(name: str) -> bool:
 
 
 def is_engram_table(name: str) -> bool:
+    base, marker, index = name.rpartition('.tq_row_shard.')
+    if marker and index.isascii() and index.isdecimal():
+        name = base
     return name.endswith(('.associative_memory.embedding.weight', '.engram.embed.weight'))
 
 
@@ -27,7 +33,7 @@ def with_engram_shards(selected: Sequence[str], available: Sequence[str]) -> lis
     Multiple table precisions require an explicit choice, never a guessed one.
     """
     result = dict.fromkeys(selected)
-    groups: dict[tuple[PurePosixPath, str, int], set[int]] = {}
+    groups: dict[tuple[PurePosixPath, str, int, str], set[int]] = {}
     tables = []
     for name in available:
         path = PurePosixPath(name)
@@ -37,10 +43,11 @@ def with_engram_shards(selected: Sequence[str], available: Sequence[str]) -> lis
         index, count = int(match['index']), int(match['count'])
         if not 1 <= index <= count:
             continue
-        groups.setdefault((path.parent, match['stem'], count), set()).add(index)
+        suffix = match['suffix'].lower()
+        groups.setdefault((path.parent, match['stem'], count, suffix), set()).add(index)
         table = _ENGRAM.fullmatch(match['stem'])
         if table:
-            tables.append((name, path.parent, table[1], index, count))
+            tables.append((name, path.parent, table[1], index, count, suffix))
     visited = set()
     for name in selected:
         path = PurePosixPath(name)
@@ -48,15 +55,16 @@ def with_engram_shards(selected: Sequence[str], available: Sequence[str]) -> lis
         if not match or is_engram_shard(name):
             continue
         count = int(match['count'])
-        key = (path.parent, match['stem'], count)
+        suffix = match['suffix'].lower()
+        key = (path.parent, match['stem'], count, suffix)
         if key in visited:
             continue
         visited.add(key)
         local = groups.get(key, set())
         candidates: dict[int, list[str]] = {}
         directories = {path.parent, path.parent / 'Engram', path.parent.parent / 'Engram'}
-        for table_name, parent, family, index, table_count in tables:
-            if (parent in directories and table_count == count and index not in local
+        for table_name, parent, family, index, table_count, table_suffix in tables:
+            if (parent in directories and table_count == count and table_suffix == suffix and index not in local
                     and match['stem'].startswith(family + '-')):
                 candidates.setdefault(index, []).append(table_name)
         for index, names in candidates.items():

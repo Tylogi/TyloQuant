@@ -1,3 +1,5 @@
+#include "mfq_hip_kv_quantization.h"
+#include "models/nemotron_h/ops.h"
 #include "hip/hip_runtime.h"
 #include "storage/text_session_cache.h"
 #include "core/full_block.h"
@@ -32,9 +34,12 @@ static std::string cuda_prefix_cache_compatibility_key(
     const mfq::ModelSource &source, int64_t max_position_embeddings) {
     std::ostringstream key;
     key << "mfq-cuda-prefix-v1\n"
-        << "codec=cuda-full-attention-kv-v1\n"
+        << "codec=" << (source.architecture()=="qwen4_exp" ? "cuda-qwen4-session-v1" :
+            source.architecture()=="deepseek_v41" ? "cuda-deepseek-v41-session-v1" : "cuda-full-attention-kv-v1") << '\n'
         << "context=" << max_position_embeddings << '\n'
         << "architecture=" << source.architecture() << '\n';
+    const auto quantization=mfq::cuda::cuda_kv_quantization_tag();
+    if(!quantization.empty())key<<"kv="<<quantization<<'\n';
     for (std::size_t index = 0; index < source.source_paths().size(); ++index) {
         const auto &path = source.source_paths()[index];
         std::error_code error;
@@ -74,6 +79,7 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
     if (!source.source_paths().empty()) cache.model_path = source.source_paths().front();
     cache.compatibility_key = cuda_prefix_cache_compatibility_key(source, max_position_embeddings);
     cache.block_size_tokens = static_cast<size_t>(config.block_tokens);
+    cache.retain_tail_versions = 0;
     cache.max_disk_bytes = config.disk_bytes;
     cache.max_hot_bytes = config.hot_bytes;
     cache.max_pending_writes = config.pending_writes;
@@ -89,11 +95,28 @@ struct CudaSessionOps {
     template <class Payloads>
     static auto decode(
         const Payloads &payloads, const std::vector<int64_t> &tokens, size_t block_size) {
+        if(payloads.empty())throw CudaSessionStateError("empty HIP prefix chain");
+        if(payloads.front() && payloads.front()->size()>6 && (*payloads.front())[6]=='2')
+            return decode_cuda_qwen4_paged_session(payloads,tokens,block_size);
+        if(payloads.front() && payloads.front()->size()>6 && (*payloads.front())[6]=='3')
+            return decode_cuda_deepseek_v41_paged_session(payloads,tokens,block_size);
         return decode_cuda_paged_session(payloads, tokens, block_size);
     }
     static auto encode(const Snapshot &state, size_t block_size, size_t index) {
+        if(state.kind()==TextSessionStateKind::Qwen4)return encode_cuda_qwen4_paged_block(state,block_size,index);
+        if(state.kind()==TextSessionStateKind::DeepseekV41)return encode_cuda_deepseek_v41_paged_block(state,block_size,index);
         return encode_cuda_paged_block(state, block_size, index);
     }
+    static bool paged_mtp(const Snapshot& state) {
+        return state.kind()==TextSessionStateKind::Qwen4 || state.kind()==TextSessionStateKind::DeepseekV41;
+    }
+    static bool partial_blocks(const Snapshot& state) { return paged_mtp(state); }
+    static bool paged_media(const Snapshot& state) { return state.kind()==TextSessionStateKind::DeepseekV41; }
+    static bool checkpoint_needs_update(const CudaPagedPayload& payload,const Snapshot& state) {
+        return cuda_paged_checkpoint_needs_update(payload,state);
+    }
+    static size_t decodable_blocks(const std::vector<CudaPagedPayload>& payloads) { return cuda_paged_decodable_blocks(payloads); }
+    static size_t token_count(const CudaPagedPayload& payload) { return cuda_paged_payload_tokens(payload); }
     static void release_host_cache() { mfq_release_host_allocator_cache(); }
 };
 
@@ -161,6 +184,7 @@ MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::Glm5CausalLm)
 MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::Qwen4CausalLm)
 MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::DeepseekV4CausalLm)
 MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::DeepseekV41CausalLm)
+MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::NemotronHCausalLm)
 
 #undef MFQ_INSTANTIATE_SESSION_CACHE
 
@@ -177,10 +201,10 @@ void CudaPagedWriter::tensor(const mfq_tensor_backend::Tensor &source) {
     }
     const auto dtype = source.scalar_type();
     if (dtype != mfq_tensor_backend::kFloat16 && dtype != mfq_tensor_backend::kBFloat16 &&
-        dtype != mfq_tensor_backend::kFloat32) {
+        dtype != mfq_tensor_backend::kFloat32 && dtype != mfq_tensor_backend::kInt32 && dtype != mfq_tensor_backend::kInt64) {
         throw std::runtime_error("unsupported CUDA paged cache tensor dtype");
     }
-    const auto cpu = source.to(mfq_tensor_backend::kCPU).contiguous();
+    const auto cpu = source.contiguous().to(mfq_tensor_backend::kCPU);
     scalar<int32_t>(static_cast<int32_t>(dtype));
     scalar<int32_t>(source.get_device());
     scalar<uint32_t>(static_cast<uint32_t>(cpu.dim()));
@@ -214,7 +238,7 @@ std::pair<mfq_tensor_backend::Tensor, int> CudaPagedReader::tensor() {
     }
     const auto dtype = static_cast<mfq_tensor_backend::ScalarType>(dtype_value);
     if (dtype != mfq_tensor_backend::kFloat16 && dtype != mfq_tensor_backend::kBFloat16 &&
-        dtype != mfq_tensor_backend::kFloat32) {
+        dtype != mfq_tensor_backend::kFloat32 && dtype != mfq_tensor_backend::kInt32 && dtype != mfq_tensor_backend::kInt64) {
         throw CudaSessionStateError("invalid CUDA paged cache tensor dtype");
     }
     std::vector<int64_t> shape;
@@ -230,7 +254,8 @@ std::pair<mfq_tensor_backend::Tensor, int> CudaPagedReader::tensor() {
         elements *= static_cast<uint64_t>(dimension);
     }
     const auto bytes = scalar<uint64_t>("tensor size");
-    const uint64_t element_size = dtype == mfq_tensor_backend::kFloat32 ? 4 : 2;
+    const uint64_t element_size = dtype == mfq_tensor_backend::kInt64 ? 8 :
+        (dtype == mfq_tensor_backend::kFloat32 || dtype == mfq_tensor_backend::kInt32) ? 4 : 2;
     if (elements > std::numeric_limits<uint64_t>::max() / element_size ||
         bytes != elements * element_size || bytes > remaining()) {
         throw CudaSessionStateError("invalid CUDA paged cache tensor size");
@@ -239,6 +264,11 @@ std::pair<mfq_tensor_backend::Tensor, int> CudaPagedReader::tensor() {
         shape, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(dtype));
     raw(cpu.data_ptr(), static_cast<size_t>(bytes), "tensor");
     return {std::move(cpu), device};
+}
+
+void CudaPagedReader::skip(size_t bytes,const char* name) {
+    if(bytes>remaining())throw CudaSessionStateError(std::string("truncated HIP paged cache ")+name);
+    cursor_+=bytes;
 }
 
 void CudaPagedReader::expect_end() const {
@@ -280,7 +310,7 @@ std::vector<CudaPagedPayload> encode_cuda_paged_session(const TextSessionState &
         writer.scalar<uint32_t>(static_cast<uint32_t>(layers->size()));
         for (const auto &layer : *layers) {
             if (layer.ring || layer.capacity <= 0 || !layer.k.defined() || !layer.v.defined() ||
-                layer.k.dim() != 4 || layer.v.sizes() != layer.k.sizes() ||
+                !session_kv_geometry_matches(layer.k,layer.v) ||
                 layer.k.size(2) < start + static_cast<int64_t>(block_size)) {
                 throw std::runtime_error("CUDA session layer cannot be block-sliced");
             }
@@ -323,8 +353,7 @@ CudaDecodedPagedBlock decode_cuda_paged_block(const std::vector<uint8_t> &payloa
         layer.capacity = reader.scalar<int64_t>("capacity");
         auto key = reader.tensor();
         auto value = reader.tensor();
-        if (key.second != value.second || key.first.dim() != 4 ||
-            value.first.sizes() != key.first.sizes() ||
+        if (key.second != value.second || !session_kv_geometry_matches(key.first,value.first) ||
             key.first.size(2) != static_cast<int64_t>(block.count)) {
             throw CudaSessionStateError("invalid CUDA paged cache layer");
         }
@@ -447,8 +476,7 @@ void restore_session_prefix_tensor(mfq_tensor_backend::Tensor &target,
 
 FullBlockSessionState capture_full_attention_session_state(const FullBlock &block,
                                                            int64_t cache_pos, size_t &bytes) {
-    if (!block.cache.k.defined() || !block.cache.v.defined() || block.cache.k.dim() != 4 ||
-        block.cache.v.sizes() != block.cache.k.sizes() || block.cache.k.size(0) != 1) {
+    if (!block.cache.k.defined() || !block.cache.v.defined() || !session_kv_geometry_matches(block.cache.k,block.cache.v) || block.cache.k.size(0) != 1) {
         throw std::runtime_error("full-attention KV cache is unavailable");
     }
     FullBlockSessionState state;
@@ -465,11 +493,12 @@ FullBlockSessionState capture_full_attention_session_state(const FullBlock &bloc
 
 void restore_full_attention_session_state(FullBlock &block, const FullBlockSessionState &state) {
     if (!state.k.defined() || !state.v.defined() || state.capacity <= 0 || state.k.dim() != 4 ||
-        state.v.sizes() != state.k.sizes() || state.k.size(0) != 1 ||
+        !session_kv_geometry_matches(state.k,state.v) || state.k.size(0) != 1 ||
         state.k.size(2) > state.capacity) {
         throw CudaSessionStateError("full-attention session KV layout is invalid");
     }
     restore_session_prefix_tensor(block.cache.k, state.k, 2, state.capacity);
     restore_session_prefix_tensor(block.cache.v, state.v, 2, state.capacity);
     block.cache.ring = state.ring;
+    block.cache.quantization=block.kv_quantization;
 }

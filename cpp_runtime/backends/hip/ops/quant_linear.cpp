@@ -1,8 +1,10 @@
+#include "mfq_weight_memory.h"
 #include "hip/hip_runtime.h"
 #include "mfq_hip_activation_ops.h"
 #include "mfq_hip_quant_ops.h"
 #include "storage/weight_loader.h"
 #include "quant_linear.h"
+#include "tq_input_gate.h"
 
 #include "format.h"
 #include "fp8_sq.h"
@@ -153,6 +155,7 @@ mfq_tensor_backend::Tensor load_dense_gpu(
         CudaExecutionContext& execution,
         const mfq::ModelSource& mfq,
         const std::string& name) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     const bool cpu_layer = execution.loading_cpu_layer;
     MfqCudaGuard guard(active_weight_load_device(execution));
     const auto & rec = require_tensor(mfq, name);
@@ -795,6 +798,7 @@ mfq_tensor_backend::Tensor quant_embedding_lookup(
     MFQ_RUNTIME_CHECK(
         !embedding.tensor_parallel(),
         "quantized embedding does not support tensor-parallel shards");
+    if(embedding.is_tq())return embedding.tq.embedding(token_ids);
     if (embedding.is_dense()) {
         auto output_shape = token_ids.sizes().vec();
         output_shape.push_back(embedding.dense.size(1));
@@ -1057,6 +1061,7 @@ QuantLinear load_quant_linear(
         std::optional<TensorParallelAxis> axis_override,
         const std::vector<mfq::TensorParallelSlice> *
             slices_override) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     const bool cpu_layer = execution.loading_cpu_layer;
     const auto & dtype = require_tensor(mfq, name).dtype;
     QuantLinear result;
@@ -1094,6 +1099,15 @@ QuantLinear load_quant_linear(
         return slices;
     };
     result.tensor_parallel_axis = axis;
+    if (dtype == "TQ") {
+        if (cpu_layer || execution.tensor_parallel.enabled() || slices_override)
+            throw std::invalid_argument("TQ HIP currently requires a local GPU projection: " + name);
+        result.kind = QuantLinearKind::Tq;
+        result.tq = load_tq_weight(mfq, name, active_weight_load_device(execution));
+        result.logical_out = result.tq.out;
+        result.logical_neuron_len = result.tq.neuron_len;
+        return result;
+    }
     if (is_nint_linear_dtype(dtype)) {
         result.kind = QuantLinearKind::Nint;
         const auto blob = read_tensor(
@@ -1453,7 +1467,7 @@ QuantLinear load_quant_linear(
 }
 
 bool is_quant_dtype(const std::string & dtype) {
-    return is_nint_linear_dtype(dtype) ||
+    return dtype == "TQ" || is_nint_linear_dtype(dtype) ||
         is_nvq_linear_dtype(dtype) || dtype == "MXFP4-SQ" ||
         mfq::fp8sq::is_dtype(dtype) ||
         dtype == "MXFP4" || dtype == "MXFP8";
@@ -1463,6 +1477,7 @@ QuantLinearGroup make_quant_group(
         CudaExecutionContext& execution,
         std::vector<QuantLinear> layers,
         bool preserve_projection_boundaries) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     if (layers.empty()) throw std::runtime_error("empty quantized linear group");
     QuantLinearGroup result;
     result.decode_branch_parallel = !preserve_projection_boundaries;
@@ -1509,6 +1524,7 @@ static bool quant_linear_pair_compatible(const QuantLinear & a, const QuantLinea
                 b.tensor_parallel_shards.size();
     }
     if (a.kind != b.kind) return false;
+    if (a.is_tq()) return a.tq.neuron_len == b.tq.neuron_len;
     if (a.is_nvq()) return nvq_pair_compatible(a.nvq, b.nvq);
     if (a.is_mxfp8()) {
         return a.mxfp8.weight.neuron_len == b.mxfp8.weight.neuron_len;
@@ -1670,6 +1686,7 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(
         CudaExecutionContext& execution,
         const QuantLinear& linear) {
     if (!linear.tensor_parallel()) {
+        if (linear.is_tq()) return linear.tq.materialize(mfq_tensor_backend::kFloat32);
         if (linear.is_nint()) {
             return dequant_nint_dense_f32(linear.nint);
         }
@@ -1806,6 +1823,7 @@ DenseLinearGroup make_fp32_quant_group(
 
 mfq_tensor_backend::Tensor quant_linear_reference_weight(
         const QuantLinear& linear) {
+    if (linear.is_tq()) return linear.tq.materialize(mfq_tensor_backend::kFloat32);
     if (linear.is_nint()) {
         const auto& weight = linear.nint;
         return weight.q8_zero
@@ -1958,6 +1976,9 @@ mfq_tensor_backend::Tensor QuantLinear::forward_dense(mfq_tensor_backend::Tensor
 mfq_tensor_backend::Tensor QuantLinear::forward(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x) const {
+    if (is_tq()) return execution.profiler.measure("tq.projection", [&] {
+        return tq.forward(x);
+    });
     if (tensor_parallel() || is_nint() || is_nvq()) {
         auto shape = x.sizes().vec();
         auto flat = x.reshape({-1, x.size(-1)});
@@ -2023,6 +2044,7 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul(
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor gate,
         int mode) const {
+    if(is_tq())return forward(execution,tq_gate_input(x,gate,mode));
     if (tensor_parallel() || is_nint() || is_nvq()) {
         auto shape = x.sizes().vec();
         auto flat = x.reshape({-1, x.size(-1)});
@@ -2079,6 +2101,7 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul_f32_kld(
 }
 
 int64_t QuantLinear::out() const {
+    if (is_tq()) return tq.out;
     if (tensor_parallel()) return logical_out;
     if (is_nint()) return nint.out;
     if (is_nvq()) return nvq.out;
@@ -2090,6 +2113,7 @@ int64_t QuantLinear::out() const {
 }
 
 int64_t QuantLinear::neuron_len() const {
+    if (is_tq()) return tq.neuron_len;
     if (tensor_parallel()) return logical_neuron_len;
     if (is_nint()) return nint.neuron_len;
     if (is_nvq()) return nvq.neuron_len;
@@ -2141,6 +2165,13 @@ std::vector<mfq_tensor_backend::Tensor> QuantLinearGroup::forward(
     if (execution.config.tensor_parallel_grouped_projections &&
             tensor_parallel_output_compatible()) {
         return forward_tensor_parallel_output_group(execution, x);
+    }
+    if(default_mmq && !tq_q8_enabled() && layers.size()>1 && layers.size()<=4 &&
+       x.numel()==x.size(-1) && std::all_of(layers.begin(),layers.end(),
+           [](const QuantLinear& layer){return layer.is_tq() && !layer.tensor_parallel();})) {
+        std::vector<const TqWeight*> projections;
+        for(const auto& layer:layers)projections.push_back(&layer.tq);
+        return tq_forward_group(projections,x);
     }
     if (nint_grouped) {
         return nint.forward(
@@ -2213,6 +2244,11 @@ mfq_tensor_backend::Tensor QuantLinearGroup::forward_swiglu(
         mfq_tensor_backend::Tensor x) const {
     const bool default_mmq =
         execution.kl_mmq.mode == KlMmqMode::Default;
+    if(default_mmq && !tq_q8_enabled() && layers.size()==2 &&
+       layers[0].is_tq() && layers[1].is_tq() &&
+       !layers[0].tensor_parallel() && !layers[1].tensor_parallel() &&
+       x.is_cuda() && x.numel()==x.size(-1) && layers[0].tq.out>=x.size(-1))
+        return tq_swiglu(layers[0].tq,layers[1].tq,x);
     if (default_mmq && nint_grouped && nint.split_w.empty() &&
             x.numel() / x.size(-1) >= 1 && x.numel() / x.size(-1) <= 6) {
         return nint.forward_swiglu(execution.profiler, x);

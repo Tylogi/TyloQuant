@@ -14,6 +14,29 @@ bool g_jinja_debug = false;
 
 namespace jinja {
 
+static void append_call_argument(func_args & args, const statement_ptr & stmt, context & ctx) {
+    const auto append = [&](const value & arg) {
+        if (is_val<value_kwarg>(arg)) {
+            const auto & key = cast_val<value_kwarg>(arg)->key;
+            for (const auto & previous : args.get_args()) {
+                if (is_val<value_kwarg>(previous) && cast_val<value_kwarg>(previous)->key == key)
+                    throw std::runtime_error("Duplicate keyword argument: " + key);
+            }
+        }
+        args.push_back(arg);
+    };
+    if (const auto * spread = cast_stmt<spread_expression>(stmt); spread && spread->keywords) {
+        const auto object = spread->argument->execute(ctx);
+        if (!is_val<value_object>(object))
+            throw std::runtime_error("Keyword argument unpacking requires a mapping");
+        for (const auto & [key, val] : object->as_ordered_object()) {
+            if (!is_val<value_string>(key))
+                throw std::runtime_error("Keyword argument keys must be strings");
+            append(mk_val<value_kwarg>(key->as_string().str(), val));
+        }
+    } else append(stmt->execute(ctx));
+}
+
 void enable_debug(bool enable) {
     g_jinja_debug = enable;
 }
@@ -359,7 +382,7 @@ value filter_expression::execute_impl(context & ctx) {
         JJ_DEBUG("Applying filter '%s' with arguments to %s", filter_id.c_str(), input->type().c_str());
         func_args args(ctx);
         for (const auto & arg_expr : call->args) {
-            args.push_back(arg_expr->execute(ctx));
+            append_call_argument(args, arg_expr, ctx);
         }
 
         return try_builtin_func(ctx, filter_id, input)->invoke(args);
@@ -405,7 +428,7 @@ value test_expression::execute_impl(context & ctx) {
 
         JJ_DEBUG("Applying test '%s' with arguments to %s", test_id.c_str(), input->type().c_str());
         for (const auto & arg_expr : call->args) {
-            args.push_back(arg_expr->execute(ctx));
+            append_call_argument(args, arg_expr, ctx);
         }
 
     } else {
@@ -786,9 +809,7 @@ value call_statement::execute_impl(context & ctx) {
     func_args args(call_ctx);
 
     for (const auto & arg_expr : call_expr->args) {
-        auto arg_val = arg_expr->execute(ctx);
-        JJ_DEBUG("  Argument type: %s", arg_val->type().c_str());
-        args.push_back(arg_val);
+        append_call_argument(args, arg_expr, ctx);
     }
 
     JJ_DEBUG("Calling macro '%s' with %zu arguments", callee_func->name.c_str(), args.count());
@@ -926,9 +947,7 @@ value call_expression::execute_impl(context & ctx) {
     // gather arguments
     func_args args(ctx);
     for (auto & arg_stmt : this->args) {
-        auto arg_val = arg_stmt->execute(ctx);
-        JJ_DEBUG("  Argument type: %s", arg_val->type().c_str());
-        args.push_back(arg_val);
+        append_call_argument(args, arg_stmt, ctx);
     }
     // execute callee
     value callee_val = callee->execute(ctx);

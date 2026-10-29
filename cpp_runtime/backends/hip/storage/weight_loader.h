@@ -23,7 +23,7 @@ struct MfqDropFileCacheGuard {
 bool has_tensor(const mfq::ModelSource& source, std::string_view name) noexcept;
 
 std::shared_ptr<mfq::NintRows> load_nint_row_table(
-    const mfq::ModelSource& source, const std::string& name);
+    const mfq::ModelSource& source, const std::string& name, bool prefer_mapping=false);
 
 bool has_tensor_prefix(const mfq::ModelSource& source, std::string_view prefix);
 
@@ -116,6 +116,7 @@ struct Routed {
     using Function=std::function<Tensor(CudaExecutionContext&,const Tensor&,const Tensor&)>;
     Function function;
     std::vector<std::shared_ptr<MfeWeight>> projections;
+    std::vector<std::shared_ptr<TqRoutedWeight>> tq_projections;
     Routed()=default;
     template<class Callable, std::enable_if_t<!std::is_same_v<std::decay_t<Callable>,Routed>,int> =0>
     Routed(Callable&& call):function(std::forward<Callable>(call)) {}

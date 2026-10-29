@@ -68,11 +68,18 @@ struct EngramTable::Impl {
     std::unique_ptr<mfq::cuda::Event> nint_done;
     bool nint_pending=false;
     std::size_t nint_stage_rows=0;
+    std::shared_ptr<TqRowTable> tq_table;
 
     Impl(const mfq::ModelSource& data, std::string tensor, std::uint64_t count,
          int columns, std::uint64_t values, std::size_t cache_rows,std::shared_ptr<mfq::NintRows> nint)
         : source(data), name(std::move(tensor)), rows(count), value_bytes(values),
           width(columns), capacity(cache_rows), row_bytes(columns + columns / 32) {
+        if(is_tq_row_table(source,name)) {
+            tq_table=std::make_shared<TqRowTable>(source,name);
+            if(tq_table->rows()!=rows || tq_table->width()!=width)
+                throw std::invalid_argument("TQ Engram table shape differs");
+            return;
+        }
         if(nint) {
             nint_pipeline=std::make_shared<NintRowPipeline>(std::vector{std::move(nint)},
                 std::make_shared<mfq::NintRowCache>(cache_rows));
@@ -196,6 +203,7 @@ EngramTable::EngramTable(const mfq::ModelSource& source, std::string name, std::
 EngramTable::~EngramTable() = default;
 
 void EngramTable::prefetch(const std::int64_t* rows, std::size_t count) const {
+    if(impl_->tq_table)return;
     if(impl_->nint_pipeline) {
         if(!rows || !count)throw std::invalid_argument("DeepSeek-V4.1 Engram lookup is empty");
         for(std::size_t i=0;i<count;++i)if(rows[i]<0 || static_cast<std::uint64_t>(rows[i])>=impl_->rows)
@@ -212,6 +220,8 @@ EngramTensor EngramTable::gather(const std::int64_t* rows, int batch, int tokens
         throw std::invalid_argument("DeepSeek-V4.1 Engram lookup geometry disagrees");
     auto& s = *impl_;
     const auto count = std::size_t(batch) * tokens * columns;
+    if(s.tq_table)return s.tq_table->lookup(rows,count,device)
+        .reshape({batch,tokens,static_cast<int64_t>(columns)*s.width});
     if(s.nint_pipeline) {
         if(!rows)throw std::invalid_argument("DeepSeek-V4.1 Engram row IDs are missing");
         const MfqCudaGuard guard(device);
@@ -259,6 +269,8 @@ EngramTensor EngramTable::gather(const std::int64_t* rows, int batch, int tokens
 std::shared_ptr<EngramTable> EngramTable::load(const mfq::ModelSource &model, const std::string &name,
                                              std::int64_t expected_rows, int expected_width,
                                              std::size_t cache_capacity_rows) {
+        if(is_tq_row_table(model,name))return std::shared_ptr<EngramTable>(new EngramTable(model,name,0,
+            expected_rows,expected_width,0,cache_capacity_rows,{}));
         const auto record = require_tensor(model, name);
         if(record.dtype=="NINT") {
             auto table=load_nint_row_table(model,name,true);

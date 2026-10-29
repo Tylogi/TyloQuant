@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -53,6 +54,8 @@ struct MlxSsdExpertCacheStats {
     std::size_t resident_experts = 0;
     std::size_t resident_bytes = 0;
     std::size_t cache_slots = 0;
+    double routed_graph_seconds = 0.0;
+    std::optional<std::size_t> cached_payload_bytes, cache_metadata_bytes;
 
     double hit_rate() const noexcept {
         return requests == 0

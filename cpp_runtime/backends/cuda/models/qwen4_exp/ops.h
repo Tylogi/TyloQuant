@@ -9,8 +9,9 @@
 #include <memory>
 #include <functional>
 #include <iosfwd>
+#include <vector>
 
-namespace mfq::cuda::qwen4_exp { struct Gr; }
+namespace mfq::cuda::qwen4_exp { struct Gr; struct Qwen4Block; }
 struct MtpModule;
 
 namespace mfq::cuda {
@@ -143,6 +144,7 @@ struct Qwen4Model : CausalResources {
     // Bounded request lookahead, independent of the configured context ceiling.
     int64_t decode_reserve_until=0;
     bool speculative_prefix_retention=false;
+    std::vector<qwen4_exp::Qwen4Block*> loaded_blocks;
     std::function<void(std::size_t)> reserve_kv_workspace;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model& model,mfq_tensor_backend::Tensor ids,int kind) {

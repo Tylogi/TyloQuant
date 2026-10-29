@@ -54,7 +54,7 @@ struct CudaLoadOptions {
 
 struct CudaEngineOptions : CudaLoadOptions {
     int continuous_batching = 0;
-    int64_t prefill_chunk_size = 2048;
+    int64_t prefill_chunk_size = 8192;
 };
 
 std::unique_ptr<mfq::engine::Engine> load_cuda_engine(CudaEngineOptions options);

@@ -195,8 +195,53 @@ std::shared_ptr<const QuantLinear> linear_weight(const Linear& function) {
 
 LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>& functions,
                            std::size_t joined_prefix) {
-    if (functions.empty() || execution.loading_cpu_layer || !execution.config.diagnostic_nint_group) return {};
+    if (functions.empty() || execution.loading_cpu_layer) return {};
     MFQ_RUNTIME_CHECK(joined_prefix>=1 && joined_prefix<=functions.size(),"invalid grouped projection prefix");
+    // Small unquantized auxiliary projections must not disable fusion of the
+    // large TQ projections beside them. Preserve the caller's output order.
+    std::vector<QuantLinear> tq_weights;
+    std::vector<std::size_t> tq_indices;
+    for(std::size_t i=0;i<functions.size();++i) {
+        const auto weight=linear_weight(functions[i]);
+        if(!weight || !weight->is_tq() || weight->tensor_parallel() || !weight->tq.image.is_cuda())continue;
+        if(!tq_weights.empty() && (weight->neuron_len()!=tq_weights.front().neuron_len() ||
+            weight->tq.image.device()!=tq_weights.front().tq.image.device()))return {};
+        tq_weights.push_back(*weight);tq_indices.push_back(i);
+    }
+    if(tq_weights.size()>=2) {
+        auto group=std::make_shared<QuantLinearGroup>(make_quant_group(execution,tq_weights));
+        MFQ_RUNTIME_CHECK(group->tq.defined(),"TQ projection group was not constructed");
+        bool direct_join=joined_prefix>1 && tq_indices.size()>=joined_prefix;
+        for(std::size_t i=0;direct_join && i<joined_prefix;++i)direct_join=tq_indices[i]==i;
+        if(direct_join)group->tq.join_prefix(joined_prefix);
+        return [group=std::move(group),indices=std::move(tq_indices),separate=functions,joined_prefix,direct_join](
+                CudaExecutionContext& context,const Tensor& input) {
+            std::vector<Tensor> outputs(separate.size());
+            if(input.is_cuda()) {
+                auto grouped=group->forward(context,input);
+                for(std::size_t i=0,j=0;i<indices.size();++i) {
+                    outputs[indices[i]]=std::move(grouped[j++]);
+                    if(direct_join && i==0)i+=joined_prefix-1;
+                }
+                for(std::size_t i=0;i<separate.size();++i) {
+                    if(direct_join && i>0 && i<joined_prefix)continue;
+                    if(!outputs[i].defined())outputs[i]=separate[i](context,input);
+                }
+            }else for(std::size_t i=0;i<separate.size();++i)outputs[i]=separate[i](context,input);
+            if(direct_join && input.is_cuda()) {
+                outputs.erase(outputs.begin()+1,outputs.begin()+joined_prefix);
+                return outputs;
+            }
+            if(joined_prefix>1) {
+                const std::vector<Tensor> prefix(outputs.begin(),outputs.begin()+joined_prefix);
+                auto joined=tb::cat(prefix,-1);
+                outputs.erase(outputs.begin(),outputs.begin()+joined_prefix);
+                outputs.insert(outputs.begin(),std::move(joined));
+            }
+            return outputs;
+        };
+    }
+    if(!execution.config.diagnostic_nint_group)return {};
     std::vector<QuantLinear> weights;
     weights.reserve(functions.size());
     for (const auto& function : functions) {
@@ -276,8 +321,18 @@ LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>&
 ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
     const mfq::cuda::WeightAllocationScope weight_memory;
     auto weight = std::make_shared<QuantLinear>(load_quant_linear(execution, file, name));
-    MFQ_RUNTIME_CHECK(weight->is_dense() || weight->is_nint(),
-        "floating residual projection requires dense or NINT weights: ", name);
+    MFQ_RUNTIME_CHECK(weight->is_dense() || weight->is_nint() || weight->is_tq(),
+        "unsupported floating residual projection: ", name);
+    if(weight->is_tq()) {
+        Linear forward=[weight](CudaExecutionContext& context,const Tensor& input) {
+            // TQ reconstructs FP16 weights. A BF16/F32 activation therefore
+            // promotes residual projection math to FP32, as the dense path.
+            return context.profiler.measure("tq.residual",[&] {
+                return weight->tq.forward(input.scalar_type()==tb::kFloat16?input:input.to(tb::kFloat32));
+            });
+        };
+        return {std::move(forward),{},{},std::move(weight),{}};
+    }
     if(weight->is_dense()) {
         auto right=weight->dense.transpose(-1,-2);
         auto promoted=execution.config.gr_prepared_dense_projection?right.to(tb::kFloat32):Tensor{};
@@ -366,6 +421,14 @@ Tensor dense(CudaExecutionContext& execution, const mfq::ModelSource& file, cons
 Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name, int layer,
     int64_t experts, int64_t output, int64_t input, const std::string& role) {
     const auto& dtype=require_tensor(file, name).dtype;
+    if(dtype=="TQ") {
+        auto weight=std::make_shared<TqRoutedWeight>(execution,file,name,experts,output,input);
+        Routed result=[weight](CudaExecutionContext&,const Tensor& source,const Tensor& ids) {
+            return weight->forward(source,ids);
+        };
+        result.tq_projections.push_back(std::move(weight));
+        return result;
+    }
     if (dtype=="F32" || dtype=="F16" || dtype=="BF16") {
         MFQ_RUNTIME_CHECK(!moe_parallel_config(execution).enabled(),
             "expert parallelism requires packed routed tensors: ",name);
@@ -405,10 +468,13 @@ Routed routed_gate_up(CudaExecutionContext& execution, const mfq::ModelSource& f
     auto up=routed(execution,file,up_name,layer,experts,width,input,"up");
     auto projections=gate.projections;
     projections.insert(projections.end(),up.projections.begin(),up.projections.end());
+    auto tq_projections=gate.tq_projections;
+    tq_projections.insert(tq_projections.end(),up.tq_projections.begin(),up.tq_projections.end());
     Routed result=[gate=std::move(gate),up=std::move(up)](CudaExecutionContext& execution, const Tensor& x,const Tensor& ids) {
         return tb::cat({gate(execution,x,ids),up(execution,x,ids)},-1);
     };
     result.projections=std::move(projections);
+    result.tq_projections=std::move(tq_projections);
     return result;
 }
 

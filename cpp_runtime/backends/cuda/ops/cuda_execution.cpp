@@ -872,6 +872,7 @@ CudaExecutionContext::CudaExecutionContext()
 void CudaExecutionContext::reset() noexcept {
     profiler.reset();
     moe_expert_cache.reset();
+    tq_expert_cache.reset();
     model_parallel_collectives.reset();
     tensor_parallel = {};
     expert_parallel = {};

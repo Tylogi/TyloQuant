@@ -45,6 +45,8 @@ namespace mfq::models::minicpmo45 {
 template <class Backend> struct TtsCausalLm;
 }
 
+namespace mfq::models::nemotron_h { template<class Backend> struct CausalLm; }
+
 namespace mfq::cuda {
 
 struct CausalResources {
@@ -53,6 +55,7 @@ struct CausalResources {
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model&,mfq_tensor_backend::Tensor,int) {return {};}
 
+    bool adapter_needs_host_token_ids() const noexcept { return false; }
     void adapter_validate_load_options() const;
     bool adapter_uses_common_rope() const noexcept;
     void adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;
@@ -106,6 +109,7 @@ struct Glm5Model;
 struct Qwen4Model;
 struct DeepseekV4Model;
 struct DeepseekV41Model;
+struct NemotronHModel;
 
 template <typename Model> struct CudaCausalOps;
 template <typename Model>
@@ -156,6 +160,12 @@ template <typename Model> struct CudaCausalOps : Model {
         return value.narrow(0, start, count);
     }
     static Tensor concat_positions(Tensor first, Tensor second) {
+        // Text after an image advances each semantic position axis equally.
+        if(first.dim()>1 && second.dim()==1) {
+            auto shape=first.sizes().vec();shape.back()=second.size(0);
+            std::vector<int64_t> view(shape.size(),1);view.back()=second.size(0);
+            second=second.reshape(view).expand(shape);
+        }
         return mfq_tensor_backend::cat({first, second}, -1);
     }
     static int64_t rank(const Tensor &value) { return value.dim(); }
@@ -227,12 +237,12 @@ template <typename Model> struct CudaCausalOps : Model {
             return positions + delta;
         }
         Tensor prepare_hidden(int64_t B, int64_t T) {
-            if(model.execution->config.moe_pipeline) {
+            if(model.execution->config.moe_pipeline || model.adapter_needs_host_token_ids())
                 cpu_ids=ids.to(mfq_tensor_backend::kCPU,mfq_tensor_backend::kInt64).contiguous();
+            if(model.execution->config.moe_pipeline)
                 for(const auto& block:model.blocks)block->prefetch_token_ids(cpu_ids);
-            }
             if (model.execution->dense_cpu_layer_count > 0) {
-                cpu_ids = ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
+                if(!cpu_ids.defined())cpu_ids = ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
                 cpu_pos = pos.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
                 cpu_cache_positions =
                     cache_positions.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64)
@@ -349,5 +359,7 @@ using Glm5CausalLm = mfq::models::glm5_next::CausalLm<CudaCausalOps<Glm5Model>>;
 using Qwen4CausalLm = mfq::models::qwen4_exp::CausalLm<CudaCausalOps<Qwen4Model>>;
 using DeepseekV4CausalLm = mfq::models::deepseek_v4::CausalLm<CudaCausalOps<DeepseekV4Model>>;
 using DeepseekV41CausalLm = mfq::models::deepseek_v41::CausalLm<CudaCausalOps<DeepseekV41Model>>;
+
+using NemotronHCausalLm = mfq::models::nemotron_h::CausalLm<CudaCausalOps<NemotronHModel>>;
 
 } // namespace mfq::cuda

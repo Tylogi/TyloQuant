@@ -89,4 +89,16 @@ int main() {
     assert(tokenized.result.text == unchanged.result.text);
     assert(tokenized.result.finish_reason == unchanged.result.finish_reason);
     assert(tokenized.result.completion_tokens == unchanged.result.completion_tokens);
+    for(bool tokenized_mode:{false,true}) {
+        InferenceRequest fixed;
+        fixed.benchmark_fixed_tokens=true;fixed.chat=false;
+        fixed.sampling.max_tokens=4;fixed.stop_token_ids={5,7};
+        InferenceOutput bench(fixed,tokenized_mode?&tokenizer:nullptr,"fixed-benchmark");
+        const auto ids=bench.append({4,5,7,1,2}).token_ids;
+        if(ids!=std::vector<int64_t>{4,5,7,1} || !bench.stopped() || bench.result.completion_tokens!=4)
+            throw std::runtime_error("fixed benchmark stopped early at EOS or exceeded max_tokens");
+        bench.finish();
+        if(bench.result.finish_reason!="length")throw std::runtime_error("fixed benchmark finish reason differs");
+    }
+
 }

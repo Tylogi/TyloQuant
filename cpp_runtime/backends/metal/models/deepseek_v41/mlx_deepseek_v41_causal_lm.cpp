@@ -65,7 +65,8 @@ MlxDeepseekV41Layer MlxDeepseekV41Layer::load(
     std::pair<array, array> rope_base,
     std::pair<array, array> rope_compressed,
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache,
-    std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache) {
+    std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache,
+    std::shared_ptr<MlxTqExpertCache> tq_expert_cache) {
     config.validate();
     if (index < 0 || index >= config.n_layers) {
         throw std::out_of_range(
@@ -107,7 +108,7 @@ MlxDeepseekV41Layer MlxDeepseekV41Layer::load(
             false,
             std::move(ssd_expert_cache),
             std::move(mfe_offload_cache),
-            static_cast<std::size_t>(index)),
+            static_cast<std::size_t>(index), std::move(tq_expert_cache)),
         std::move(engram));
 }
 
@@ -308,6 +309,7 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         rope_scaling(config, true));
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache;
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache;
+    std::shared_ptr<MlxTqExpertCache> tq_expert_cache;
     if (expert_cache_bytes.has_value() && *expert_cache_bytes > 0) {
         std::vector<std::string> prefixes;
         std::vector<std::size_t> experts_per_layer;
@@ -319,7 +321,7 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
             experts_per_layer.push_back(
                 static_cast<std::size_t>(config.n_experts));
         }
-        if (config.has_dspark()) {
+        if (config.has_dspark() && model.contains("predictor.stage.0.main_projection.weight")) {
             for (std::int64_t stage = 0;
                  stage < config.n_mtp_layers; ++stage) {
                 prefixes.push_back(
@@ -330,7 +332,10 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         }
         constexpr std::size_t prefill_buffers_minimum =
             std::size_t{7} << 30;
-        try {
+        if (model.contains("model.block.0.mlp.experts.gate.weight")
+            && model.record("model.block.0.mlp.experts.gate.weight").dtype == "TQ") {
+            tq_expert_cache = std::make_shared<MlxTqExpertCache>(model, prefixes, *expert_cache_bytes, 8);
+        } else try {
             ssd_expert_cache = std::make_shared<MlxMoeSsdExpertCache>(
                 model,
                 std::move(prefixes),
@@ -356,7 +361,7 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
             base_rope,
             compressed_rope,
             ssd_expert_cache,
-            mfe_offload_cache));
+            mfe_offload_cache, tq_expert_cache));
     }
     auto embedding = MlxEmbedding::load(
         model, "model.token_embedding.weight");
@@ -373,7 +378,7 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         max_context,
         ssd_expert_cache,
         mfe_offload_cache,
-        static_cast<std::size_t>(config.n_layers));
+        static_cast<std::size_t>(config.n_layers), tq_expert_cache);
     return MlxDeepseekV41CausalLm(
         config,
         std::move(embedding),
@@ -386,7 +391,7 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         std::move(mfe_offload_cache),
         std::move(vision),
         std::move(dspark),
-        std::make_shared<MfqContainer>(model));
+        std::make_shared<MfqContainer>(model), std::move(tq_expert_cache));
 }
 
 MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
@@ -401,7 +406,8 @@ MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache,
     std::optional<MlxDeepseekV41Vision> vision,
     std::optional<MlxDeepseekV41DSpark> dspark,
-    std::shared_ptr<MfqContainer> source)
+    std::shared_ptr<MfqContainer> source,
+    std::shared_ptr<MlxTqExpertCache> tq_expert_cache)
     : config_(std::move(config)),
       embedding_(std::move(embedding)),
       layers_(std::move(layers)),
@@ -410,6 +416,7 @@ MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
       engram_hash_(std::move(engram_hash)),
       ssd_expert_cache_(std::move(ssd_expert_cache)),
       mfe_offload_cache_(std::move(mfe_offload_cache)),
+      tq_expert_cache_(std::move(tq_expert_cache)),
       source_(std::move(source)),
       vision_(std::move(vision)),
       dspark_(std::move(dspark)),
@@ -423,7 +430,7 @@ MlxDeepseekV41CausalLm::MlxDeepseekV41CausalLm(
         output_.output_size() != config_.vocab ||
         vision_.has_value() != config_.has_vision() ||
         (dspark_.has_value() && !config_.has_dspark()) ||
-        (ssd_expert_cache_ && mfe_offload_cache_) ||
+        (int(bool(ssd_expert_cache_)) + int(bool(mfe_offload_cache_)) + int(bool(tq_expert_cache_)) > 1) ||
         max_context_ <= 0 || max_context_ > config_.max_position_embeddings) {
         throw std::runtime_error(
             "DeepSeek-V4.1 text runtime geometry disagrees");
@@ -523,6 +530,7 @@ void materialize_deepseek_v41_dspark_state(
 
 std::size_t
 MlxDeepseekV41CausalLm::expert_cache_limit_bytes() const noexcept {
+    if (tq_expert_cache_) return tq_expert_cache_->limit_bytes();
     if (ssd_expert_cache_) {
         return ssd_expert_cache_->cache_limit_bytes();
     }
@@ -538,15 +546,18 @@ std::size_t MlxDeepseekV41CausalLm::resident_full_expert_bytes() const noexcept 
 }
 
 std::size_t MlxDeepseekV41CausalLm::dynamic_weight_bytes() const noexcept {
+    if (tq_expert_cache_) return tq_expert_cache_->resident_bytes();
     return mfe_offload_cache_ ? mfe_offload_cache_->resident_packed_bytes() : 0;
 }
 
 std::size_t MlxDeepseekV41CausalLm::reclaimable_expert_bytes() const noexcept {
+    if (tq_expert_cache_) return tq_expert_cache_->resident_bytes();
     return ssd_expert_cache_ ? ssd_expert_cache_->cache_limit_bytes()
         : resident_full_expert_bytes() + dynamic_weight_bytes();
 }
 
 std::size_t MlxDeepseekV41CausalLm::ssd_expert_payload_bytes() const noexcept {
+    if (tq_expert_cache_) return tq_expert_cache_->backing_bytes();
     if (mfe_offload_cache_) return mfe_offload_cache_->backing_payload_bytes();
     if (!ssd_expert_cache_ || !source_) return 0;
     std::size_t bytes = 0;
@@ -558,8 +569,37 @@ std::size_t MlxDeepseekV41CausalLm::ssd_expert_payload_bytes() const noexcept {
     return bytes;
 }
 
+std::optional<std::size_t> MlxDeepseekV41CausalLm::trim_preallocated_expert_cache(std::size_t bytes) {
+    if (tq_expert_cache_) return tq_expert_cache_->trim(bytes);
+    if (source_ && source_->contains("model.block.0.mlp.experts.gate.weight")
+        && source_->record("model.block.0.mlp.experts.gate.weight").dtype == "TQ")
+        return set_expert_cache_limit(bytes);
+    return std::nullopt;
+}
+
 std::size_t MlxDeepseekV41CausalLm::set_expert_cache_limit(std::size_t bytes) {
+    if (tq_expert_cache_) {
+        return tq_expert_cache_->set_limit(bytes);
+    }
     const auto before = mlx::core::get_active_memory();
+    if (!ssd_expert_cache_ && !mfe_offload_cache_ && source_
+        && source_->contains("model.block.0.mlp.experts.gate.weight")
+        && source_->record("model.block.0.mlp.experts.gate.weight").dtype == "TQ") {
+        if (resident_full_expert_bytes() <= bytes) return 0;
+        std::vector<std::string> prefixes;
+        for (std::size_t layer = 0; layer < layers_.size(); ++layer)
+            prefixes.push_back("model.block." + std::to_string(layer));
+        if (dspark_) for (std::size_t stage = 0; stage < dspark_->stage_count(); ++stage)
+            prefixes.push_back("predictor.stage." + std::to_string(stage));
+        auto cache = std::make_shared<MlxTqExpertCache>(*source_, prefixes, bytes);
+        for (const auto& layer : layers_) layer.validate_tq_offload(cache);
+        if (dspark_) dspark_->validate_tq_offload(cache);
+        for (auto& layer : layers_) layer.use_tq_offload(cache);
+        if (dspark_) dspark_->use_tq_offload(cache);
+        tq_expert_cache_ = std::move(cache);
+        const auto after = mlx::core::get_active_memory();
+        return before > after ? before - after : 0;
+    }
     if (!mfe_offload_cache_) {
         if (!ssd_expert_cache_ && resident_full_expert_bytes() <= bytes) return 0;
         if (!source_) throw std::runtime_error("DeepSeek-V4.1 expert backing is unavailable");
@@ -631,6 +671,23 @@ int MlxDeepseekV41CausalLm::preferred_prefill_chunk_size(
 
 std::optional<MlxSsdExpertCacheStats>
 MlxDeepseekV41CausalLm::ssd_expert_cache_stats() const {
+    if (tq_expert_cache_) {
+        const auto cache = tq_expert_cache_->stats();
+        MlxSsdExpertCacheStats result;
+        result.requests = cache.requests; result.hits = cache.hits;
+        result.misses = cache.misses; result.loads = cache.misses;
+        result.evictions = cache.evictions; result.bytes_read = cache.bytes_read;
+        result.read_calls = cache.read_calls; result.io_seconds = cache.io_seconds;
+        result.route_sync_seconds = cache.route_sync_seconds;
+        result.prepare_seconds = cache.prepare_seconds;
+        result.routed_graph_seconds = cache.graph_seconds;
+        result.overlapped_read_batches = cache.overlapped_read_batches;
+        result.resident_experts = cache.cached_experts;
+        result.resident_bytes = cache.allocated_bytes;
+        result.cached_payload_bytes = cache.cached_bytes;
+        result.cache_metadata_bytes = cache.metadata_bytes;
+        return result;
+    }
     if (ssd_expert_cache_) {
         return ssd_expert_cache_->stats();
     }
@@ -691,6 +748,7 @@ void MlxDeepseekV41CausalLm::prewarm_ssd_expert_arena() {
 }
 
 void MlxDeepseekV41CausalLm::clear_expert_cache() {
+    if (tq_expert_cache_) tq_expert_cache_->clear();
     if (ssd_expert_cache_) {
         ssd_expert_cache_->clear();
     }

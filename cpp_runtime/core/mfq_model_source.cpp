@@ -350,7 +350,7 @@ std::vector<std::filesystem::path> shard_paths(
     std::uint64_t split_no,
     std::uint64_t split_count) {
     static const std::regex pattern(
-        R"(^(.*)-([0-9]{5})-of-([0-9]{5})\.[mM][fF][qQ]$)");
+        R"(^(.*)-([0-9]{5})-of-([0-9]{5})(\.mfq|\.tq)$)", std::regex::icase);
     std::smatch match;
     const auto filename = path.filename().string();
     if (!std::regex_match(filename, match, pattern)) {
@@ -362,14 +362,21 @@ std::vector<std::filesystem::path> shard_paths(
         throw std::runtime_error("MFQ shard filename/metadata mismatch: " +
                                  path.string());
     }
+    auto suffix = match[4].str();
+    std::transform(suffix.begin(), suffix.end(), suffix.begin(), [](unsigned char c) { return std::tolower(c); });
+    const auto same_suffix = [&](const std::ssub_match& candidate) {
+        auto value = candidate.str();
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
+        return value == suffix;
+    };
     std::vector<std::filesystem::path> result(static_cast<std::size_t>(split_count));
     for (std::uint64_t index = 1; index <= split_count; ++index) {
         std::ostringstream name;
         name << match[1].str() << '-' << std::setfill('0') << std::setw(5)
-             << index << "-of-" << std::setw(5) << split_count << ".mfq";
+             << index << "-of-" << std::setw(5) << split_count << suffix;
         result[index - 1] = path.parent_path() / name.str();
     }
-    if (path.extension() == ".mfq" && std::all_of(result.begin(), result.end(),
+    if (std::all_of(result.begin(), result.end(),
             [](const auto& candidate) { return std::filesystem::is_regular_file(candidate); })) {
         for (auto& candidate : result) candidate = stable_path(candidate);
         return result;
@@ -379,7 +386,8 @@ std::vector<std::filesystem::path> shard_paths(
         std::smatch candidate;
         const auto candidate_name = entry.path().filename().string();
         if (!entry.is_regular_file() || !std::regex_match(candidate_name, candidate, pattern) ||
-            candidate[1].str() != match[1].str() || std::stoull(candidate[3].str()) != split_count) {
+            candidate[1].str() != match[1].str() || !same_suffix(candidate[4]) ||
+            std::stoull(candidate[3].str()) != split_count) {
             continue;
         }
         const auto index = std::stoull(candidate[2].str());
@@ -408,7 +416,7 @@ std::vector<std::filesystem::path> shard_paths(
             const auto stem = candidate[1].str();
             if (!std::regex_match(stem, family, engram_pattern) ||
                 match[1].str().compare(0, family[1].length() + 1, family[1].str() + "-") != 0 ||
-                std::stoull(candidate[3].str()) != split_count) continue;
+                std::stoull(candidate[3].str()) != split_count || !same_suffix(candidate[4])) continue;
             const auto index = std::stoull(candidate[2].str());
             if (index < 1 || index > split_count || found[index - 1]) continue;
             if (!shared.emplace(index, entry.path()).second)
@@ -473,6 +481,9 @@ ParsedFile parse_file(const std::filesystem::path& requested) {
         record.tensor.dtype = std::string(
             canonical_format_dtype(record.tensor.stored_dtype));
         record.tensor.nbytes = input.scalar<std::uint64_t>("record length");
+        constexpr std::string_view legacy_asset_prefix = "__tinfer_asset__/";
+        if (record.tensor.name.compare(0, legacy_asset_prefix.size(), legacy_asset_prefix) == 0)
+            record.tensor.name = std::string(kAssetPrefix) + record.tensor.name.substr(legacy_asset_prefix.size());
         record.asset = record.tensor.name.compare(
                            0, kAssetPrefix.size(), kAssetPrefix) == 0;
         record.source_path = path;
@@ -611,17 +622,24 @@ MfqModelSource::MfqModelSource(std::filesystem::path requested, FileReadMode mod
         impl_->source_paths.push_back(initial_path);
         append(std::move(initial));
     } else {
-        const auto paths = shard_paths(initial_path, split_no, split_count);
+        // A numbered entry may be a symlink to an unnumbered downloaded file.
+        // Discover siblings from the requested name before resolving each file.
+        const auto paths = shard_paths(std::filesystem::absolute(requested).lexically_normal(), split_no, split_count);
         std::uint64_t actual_records = 0;
         std::uint64_t actual_tensors = 0;
         auto expected_records = std::numeric_limits<std::uint64_t>::max();
         auto expected_tensors = std::numeric_limits<std::uint64_t>::max();
         for (std::uint64_t index = 0; index < split_count; ++index) {
             auto current = parse_file(paths[static_cast<std::size_t>(index)]);
-            static const std::regex shared_name(R"(^.*-Engram-.+-[0-9]{5}-of-[0-9]{5}\.[mM][fF][qQ]$)", std::regex::icase);
+            static const std::regex shared_name(R"(^.*-Engram-.+-[0-9]{5}-of-[0-9]{5}\.(mfq|tq)$)", std::regex::icase);
             if (std::regex_match(paths[index].filename().string(), shared_name)) {
                 const auto table = [](const MfqStoredRecord& record) {
-                    const auto& name = record.tensor.name;
+                    std::string_view name = record.tensor.name;
+                    constexpr std::string_view marker = ".tq_row_shard.";
+                    const auto shard = name.rfind(marker);
+                    if (shard != std::string_view::npos && shard + marker.size() < name.size()
+                        && std::all_of(name.begin() + shard + marker.size(), name.end(), [](char c) { return c >= '0' && c <= '9'; }))
+                        name = name.substr(0, shard);
                     for (const std::string_view suffix : {".associative_memory.embedding.weight", ".engram.embed.weight"})
                         if (name.size() >= suffix.size() &&
                             name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) return true;

@@ -425,7 +425,7 @@ template <class Backend> class SessionCache {
         }
         if (trace_) {
             std::cerr << "runtime_session_cache action=paged_store "
-                      << "session=" << session_id << " tokens=" << full_blocks * block_size
+                      << "session=" << session_id << " tokens=" << (partial ? state.tokens.size() : full_blocks * block_size)
                       << " blocks=" << full_blocks << std::endl;
         }
     }

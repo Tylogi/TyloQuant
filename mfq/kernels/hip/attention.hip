@@ -19,6 +19,48 @@
 
 #include "../hip/reduce.cuh"
 #include "mfq_hip_compat.h"
+#include "attention_prefill.h"
+
+mfq_tensor_backend::Tensor attention_cached_prefill_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k,
+    mfq_tensor_backend::Tensor v, double scale, int64_t prefix)
+{
+    namespace tb = mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() &&
+        q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
+        "attention_cached_prefill: contiguous GPU tensors required");
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.sizes() == k.sizes(),
+        "attention_cached_prefill: expected q[B,Hq,T,D], kv[B,Hk,capacity,D]");
+    MFQ_RUNTIME_CHECK(q.size(0) == k.size(0) && q.size(1) == 4 * k.size(1) &&
+        q.size(3) == 256 && k.size(3) == 256 && k.size(1) > 0,
+        "attention_cached_prefill: D=256 and GQA=4 required");
+    MFQ_RUNTIME_CHECK(q.size(2) > 0 && prefix >= 0 && prefix <= k.size(2) &&
+        q.size(2) <= k.size(2) - prefix && k.size(2) <= INT_MAX,
+        "attention_cached_prefill: invalid cache extent");
+    MFQ_RUNTIME_CHECK(k.scalar_type() == tb::kFloat16 && v.scalar_type() == tb::kFloat16 &&
+        (q.scalar_type() == tb::kFloat16 || q.scalar_type() == tb::kFloat32),
+        "attention_cached_prefill: FP16 KV and FP16/FP32 queries required");
+    auto out = tb::empty_like(q);
+    const int heads = q.size(1), kv_heads = k.size(1), tokens = q.size(2);
+    const dim3 grid((tokens + 15) / 16, q.size(0) * kv_heads);
+    const auto stream = mfq_current_cuda_stream();
+    const auto launch = [&]<class Scalar, int KeyTile>() {
+        hipLaunchKernelGGL((mfq_hip_attention::prefill_group4<Scalar, KeyTile>), grid, dim3(256),
+            0, stream, reinterpret_cast<const Scalar*>(q.data_ptr()),
+            reinterpret_cast<const __half*>(k.data_ptr<mfq_half>()),
+            reinterpret_cast<const __half*>(v.data_ptr<mfq_half>()), reinterpret_cast<Scalar*>(out.data_ptr()),
+            heads, kv_heads, tokens, int(k.size(2)), int(prefix), float(scale));
+    };
+    if (q.scalar_type() == tb::kFloat16) {
+        if (prefix + tokens >= 128) launch.template operator()<__half, 32>();
+        else launch.template operator()<__half, 16>();
+    } else {
+        if (prefix + tokens >= 128) launch.template operator()<float, 32>();
+        else launch.template operator()<float, 16>();
+    }
+    MFQ_RUNTIME_CHECK(hipGetLastError() == hipSuccess, "attention_cached_prefill: launch failed");
+    return out;
+}
 
 
 // Qwen3.5 full-attention prefill: FP16 GQA, head_dim=256, causal self-attention.
@@ -462,10 +504,10 @@ __device__ __forceinline__ int attention_decode_active_parts(
         return launch_parts;
     }
     const int cache_position = token_count > 0 ? token_count - 1 : 0;
-    if (cache_position < 192) {
+    if (cache_position < 16) {
         return 1;
     }
-    const int active = (cache_position + 127) / 128;
+    const int active = (token_count + 15) / 16;
     return active < launch_parts ? active : launch_parts;
 }
 
@@ -563,6 +605,9 @@ static bool attention_wave_decode_enabled(int dimension)
            !(flag && flag[0] == '0');
 }
 
+#include "attention_decode_half.h"
+#include <type_traits>
+
 template <typename scalar_t, bool Split>
 static void launch_attention_wave_decode(
     const mfq_tensor_backend::Tensor& q, const mfq_tensor_backend::Tensor& k,
@@ -570,11 +615,17 @@ static void launch_attention_wave_decode(
     scalar_t* output, float* partial_o, float* partial_m, float* partial_l,
     int parts, int workspace_parts, float scale, int dynamic_parts, hipStream_t stream)
 {
-#define WAVE_DECODE(D) hipLaunchKernelGGL((attention_cache_decode_wave_kernel<D, scalar_t, Split>), \
-    dim3(q.size(0) * q.size(1) * parts), dim3(64), 0, stream, \
-    q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(), \
-    lengths.data_ptr<int64_t>(), output, partial_o, partial_m, partial_l, \
-    int(q.size(1)), int(k.size(1)), int(k.size(2)), parts, workspace_parts, scale, dynamic_parts)
+#define WAVE_ARGS q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(), \
+    lengths.data_ptr<int64_t>(), output, partial_o, partial_m, partial_l,                 \
+    int(q.size(1)), int(k.size(1)), int(k.size(2)), parts, workspace_parts, scale, dynamic_parts
+#define WAVE_DECODE(D) do {                                                           \
+    const dim3 grid(q.size(0)*q.size(1)*parts);                                        \
+    if constexpr(std::is_same_v<scalar_t,mfq_half>) {                                  \
+        mfq_hip_attention::decode_half2<D,Split><<<grid,64,0,stream>>>(WAVE_ARGS);       \
+    } else {                                                                         \
+        attention_cache_decode_wave_kernel<D,scalar_t,Split><<<grid,64,0,stream>>>(WAVE_ARGS); \
+    }                                                                                \
+} while(0)
     switch (q.size(3)) {
         case 64: WAVE_DECODE(64); break;
         case 128: WAVE_DECODE(128); break;
@@ -582,6 +633,7 @@ static void launch_attention_wave_decode(
         case 512: WAVE_DECODE(512); break;
     }
 #undef WAVE_DECODE
+#undef WAVE_ARGS
 }
 
 template <int BD, typename scalar_t>
@@ -922,11 +974,38 @@ __global__ void attention_cache_decode_split_reduce_kernel(
     }
 }
 
+#include "attention_decode_reduce.h"
+#include "attention_decode_group.h"
+
+static int grouped_decode_parts(int groups, int tokens, int limit) {
+    struct DevicePlan { int device=-1, blocks=0, resident=0; };
+    static thread_local DevicePlan cached;
+    int device=0;
+    MFQ_RUNTIME_CHECK(hipGetDevice(&device)==hipSuccess,"grouped attention: device unavailable");
+    if(cached.device!=device) {
+        hipDeviceProp_t properties{};int resident=0;
+        MFQ_RUNTIME_CHECK(hipGetDeviceProperties(&properties,device)==hipSuccess &&
+            hipOccupancyMaxActiveBlocksPerMultiprocessor(&resident,
+                mfq_hip_attention::decode_group4<256>,256,0)==hipSuccess && resident>0,
+            "grouped attention: occupancy query failed");
+        cached={device,properties.multiProcessorCount*resident,resident};
+    }
+    const int maximum=std::min(limit,std::max(1,(tokens+63)/64));
+    int best=std::min(maximum,cached.resident),best_efficiency=0,best_waves=0;
+    for(int p=best;p<=maximum;++p) {
+        const int blocks=groups*p,waves=(blocks+cached.blocks-1)/cached.blocks;
+        if(best_efficiency>=95 && waves>best_waves)break;
+        const int efficiency=100*blocks/(waves*cached.blocks);
+        if(efficiency>best_efficiency){best=p;best_efficiency=efficiency;best_waves=waves;}
+    }
+    return best;
+}
+
 static mfq_tensor_backend::Tensor attention_cache_decode_split_impl_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale,
     mfq_tensor_backend::Tensor partial_o, mfq_tensor_backend::Tensor partial_m, mfq_tensor_backend::Tensor partial_l,
-    int64_t parts, bool dynamic_parts)
+    int64_t parts, bool dynamic_parts, int64_t grouped_length=0)
 {
     MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_decode_split: q must be cuda contiguous");
     MFQ_RUNTIME_CHECK(k_cache.is_cuda() && k_cache.is_contiguous(), "attention_cache_decode_split: k_cache must be cuda contiguous");
@@ -969,7 +1048,29 @@ static mfq_tensor_backend::Tensor attention_cache_decode_split_impl_cuda(
     const int shmem = D * (int)sizeof(float);
     const int rep = Hq / Hk;
     hipStream_t stream = mfq_current_cuda_stream();
+    if(grouped_length>0 && attention_wave_decode_enabled(D)) {
+        MFQ_RUNTIME_CHECK(q.scalar_type()==mfq_tensor_backend::kFloat16 && D==256 && rep==4 &&
+            grouped_length<=max_seq,"grouped attention: FP16 D256 GQA4 and valid length required");
+        parts=grouped_decode_parts(B*Hk,int(grouped_length),std::min(workspace_parts,256));
+        hipLaunchKernelGGL((mfq_hip_attention::decode_group4<256>),dim3(B*Hk*parts),dim3(256),0,stream,
+            reinterpret_cast<const __half*>(q.data_ptr<mfq_half>()),
+            reinterpret_cast<const __half*>(k_cache.data_ptr<mfq_half>()),
+            reinterpret_cast<const __half*>(v_cache.data_ptr<mfq_half>()),seq_len.data_ptr<int64_t>(),
+            partial_o.data_ptr<float>(),partial_m.data_ptr<float>(),partial_l.data_ptr<float>(),
+            Hq,Hk,max_seq,int(parts),workspace_parts,float(scale));
+        // Inactive parts are written as zero. Reducing the full fixed grid keeps
+        // graph replay valid as device-side sequence lengths change.
+        hipLaunchKernelGGL((mfq_hip_attention::split_reduce<mfq_half>),dim3(total,8),dim3(256),0,stream,
+            partial_o.data_ptr<float>(),partial_m.data_ptr<float>(),partial_l.data_ptr<float>(),
+            seq_len.data_ptr<int64_t>(),out.data_ptr<mfq_half>(),total,Hq,int(parts),workspace_parts,D,0);
+        MFQ_RUNTIME_CHECK(hipGetLastError()==hipSuccess,"grouped attention: launch failed");
+        return out;
+    }
     const bool wave_decode = attention_wave_decode_enabled(D);
+    // Keep short graph-captured sequences distributed across enough waves.
+    // The active-part count is derived from device sequence lengths.
+    if (wave_decode && dynamic_parts)
+        parts = std::min<int64_t>(workspace_parts, std::max<int64_t>(parts * 8, 32));
 #define ATT_CACHE_SPLIT(BD) do {                                                                    \
     if (wave_decode) {                                                                               \
         launch_attention_wave_decode<scalar_t, true>(q, k_cache, v_cache, seq_len, nullptr,            \
@@ -991,6 +1092,12 @@ static mfq_tensor_backend::Tensor attention_cache_decode_split_impl_cuda(
                 partial_l.data_ptr<float>(), B, Hq, Hk, max_seq, D, rep, (int)parts, workspace_parts, \
                 (float)scale, dynamic_parts ? 1 : 0);                                                 \
     }                                                                                                  \
+    if(wave_decode && parts<=256) {                                                               \
+        mfq_hip_attention::split_reduce<scalar_t><<<dim3(total,(D+31)/32),256,0,stream>>>(            \
+            partial_o.data_ptr<float>(),partial_m.data_ptr<float>(),partial_l.data_ptr<float>(),   \
+            seq_len.data_ptr<int64_t>(),out.data_ptr<scalar_t>(),total,Hq,int(parts),                \
+            workspace_parts,D,dynamic_parts?1:0);                                                  \
+    } else                                                                                        \
    hipLaunchKernelGGL(( attention_cache_decode_split_reduce_kernel<BD, scalar_t>), dim3(total), dim3(BD), 0, stream,                \
         partial_o.data_ptr<float>(), partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),          \
         seq_len.data_ptr<int64_t>(), out.data_ptr<scalar_t>(), total, Hq, (int)parts,                 \
@@ -1043,6 +1150,18 @@ mfq_tensor_backend::Tensor attention_cache_decode_dynamic_cuda(
         std::move(q), std::move(k_cache), std::move(v_cache),
         std::move(seq_len), scale, std::move(partial_o),
         std::move(partial_m), std::move(partial_l), max_parts, true);
+}
+
+mfq_tensor_backend::Tensor attention_cache_decode_grouped_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache,
+    mfq_tensor_backend::Tensor v_cache, mfq_tensor_backend::Tensor seq_len,
+    double scale, mfq_tensor_backend::Tensor partial_o,
+    mfq_tensor_backend::Tensor partial_m, mfq_tensor_backend::Tensor partial_l,
+    int64_t planned_length)
+{
+    MFQ_RUNTIME_CHECK(planned_length>0 && planned_length<=INT_MAX,"grouped attention: invalid planned length");
+    return attention_cache_decode_split_impl_cuda(q,k_cache,v_cache,seq_len,scale,
+        partial_o,partial_m,partial_l,2,false,planned_length);
 }
 
 template <int BD, typename scalar_t>

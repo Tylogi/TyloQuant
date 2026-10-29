@@ -114,6 +114,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.cpp
     ${MFQ_CUDA_KERNEL_ROOT}/mx_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/fp8_sq.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/tq_ops.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mxfp4_sq.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nepq.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nepq_residual.cu
@@ -412,6 +413,7 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/format.cpp
     ${MFQ_CUDA_ROOT}/ops/gated_residual.cpp
     ${MFQ_CUDA_ROOT}/ops/fp8_sq.cpp
+    ${MFQ_CUDA_ROOT}/ops/tq.cpp
     ${MFQ_CUDA_ROOT}/ops/mx.cpp
     ${MFQ_CUDA_ROOT}/ops/mxfp4_sq.cpp
     ${MFQ_CUDA_ROOT}/ops/dense_moe.cpp

@@ -1,3 +1,4 @@
+#include "runtime/routed_cache_resources.h"
 #include "generation.h"
 #include "token_row_prefetch.h"
 #include "speculative_sequence.h"
@@ -87,7 +88,7 @@ template <class Model> struct CudaMtpOps {
   }
   std::array<double,6> target_costs() const {
     std::array<double,6> result{};
-    for(const auto& [name,value]:moe_expert_memory_metrics(model.execution->moe_expert_cache)) {
+    for(const auto& [name,value]:mfq::cuda::routed_expert_memory_metrics(*model.execution)) {
       if(name=="expert_route_wait_ms")result[0]=value;
       else if(name=="expert_host_fetch_ms")result[1]=value;
       else if(name=="expert_host_copy_ms")result[2]=value;

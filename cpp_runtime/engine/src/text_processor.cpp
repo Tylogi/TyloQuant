@@ -498,6 +498,7 @@ InferenceRequest TextProcessor::prepare(
             "prompt tokenized to an empty sequence", "prompt");
     }
     if (input.benchmark_prompt_tokens) {
+        work.benchmark_fixed_tokens = true;
         const auto count = *input.benchmark_prompt_tokens;
         if (count > static_cast<std::size_t>(max_context) ||
             count + work.sampling.max_tokens > static_cast<std::size_t>(max_context)) {

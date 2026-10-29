@@ -22,6 +22,8 @@ namespace mfq::engine {
 std::unordered_set<std::int64_t> model_stop_token_ids(std::string_view config, std::int64_t vocabulary);
 
 struct InferenceRequest {
+    // Synthetic benchmark requests always execute the requested output length.
+    bool benchmark_fixed_tokens = false;
     bool chat = true;
     bool stream = false;
     bool include_usage = false;

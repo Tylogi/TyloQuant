@@ -86,6 +86,8 @@ Ffn load_moe_weights(Loader& ops, const std::string& prefix, int layer,
         }
     }
     result.moe_router = ops.router_parameter(prefix + "router.weight");
+    if constexpr(requires { result.moe_router_projection = ops.router_projection; })
+        result.moe_router_projection=ops.router_projection;
     if (router_bias_required || ops.has(prefix + "router.bias"))
         result.moe_router_bias = ops.router_parameter(prefix + "router.bias");
     result.shared = std::make_unique<Ffn>();

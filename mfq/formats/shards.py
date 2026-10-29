@@ -16,7 +16,7 @@ from typing import Protocol
 from mfq.formats.assets import is_asset_record
 from mfq.formats.compat import canonical_dtype
 from mfq.formats.companions import with_engram_shards
-from mfq.formats.header import MFQ_MAGIC, FileHeader
+from mfq.formats.header import MFQ_MAGIC, MFQ_SUFFIXES, FileHeader
 
 SPLIT_NO_KEY = "split.no"
 SPLIT_COUNT_KEY = "split.count"
@@ -31,7 +31,10 @@ SPLIT_KEYS = frozenset(
     }
 )
 
-_SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})\.[mM][fF][qQ]$")
+_SHARD_RE = re.compile(
+    r"^(?P<stem>.+)-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})(?P<suffix>\.mfq|\.tq)$",
+    re.IGNORECASE,
+)
 
 ShardFileVersions = tuple[tuple[str, int, int, int, int, int], ...]
 
@@ -53,8 +56,9 @@ def format_shard_path(path: str | Path, index: int, count: int) -> Path:
     source = Path(path)
     if not 1 <= index <= count <= 99999:
         raise ValueError(f"invalid MFQ shard index/count: {index}/{count}")
-    stem = source.name[:-4] if source.name.lower().endswith(".mfq") else source.name
-    return source.with_name(f"{stem}-{index:05d}-of-{count:05d}.mfq")
+    suffix = source.suffix.lower() if source.suffix.lower() in MFQ_SUFFIXES else ".mfq"
+    stem = source.stem if source.suffix.lower() in MFQ_SUFFIXES else source.name
+    return source.with_name(f"{stem}-{index:05d}-of-{count:05d}{suffix}")
 
 
 def parse_shard_path(path: str | Path) -> tuple[Path, int, int] | None:
@@ -68,7 +72,7 @@ def parse_shard_path(path: str | Path) -> tuple[Path, int, int] | None:
     index = int(match.group("index"))
     if count < 1 or index < 1 or index > count:
         raise ValueError(f"invalid MFQ shard file name: {source}")
-    base = source.with_name(f"{match.group('stem')}.mfq")
+    base = source.with_name(f"{match.group('stem')}{match.group('suffix').lower()}")
     return base, index, count
 
 
@@ -84,7 +88,7 @@ def shard_paths_from_any(path: str | Path, count: int) -> list[Path]:
             f"MFQ shard count mismatch in filename/metadata: {filename_count} != {count}: {path}"
         )
     expected = [format_shard_path(base, index, count) for index in range(1, count + 1)]
-    if Path(path).suffix == ".mfq" and all(candidate.is_file() for candidate in expected):
+    if Path(path).suffix in MFQ_SUFFIXES and all(candidate.is_file() for candidate in expected):
         return expected
     available: dict[int, Path] = {}
     for candidate in matching_shard_paths(base):

@@ -2,6 +2,7 @@
 
 #include "mfq_container.h"
 #include "mlx_nint_rows.h"
+#include "mlx_tq_rows.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +19,7 @@ struct MlxQuantizedRowBatch {
     int width = 0;
     std::vector<mlx::core::float16_t> values;
     MlxNintRowBatch packed;
+    MlxTqRowBatch tq;
     mlx::core::array decode() const;
 };
 

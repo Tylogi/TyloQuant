@@ -99,6 +99,7 @@ TokenOutput InferenceOutput::append(const std::vector<std::int64_t>& tokens) {
         ++result.completion_tokens;
         output.token_ids.push_back(token);
         if (tokenizer_ ? tokenizer_->is_eog(token) : request_.stop_token_ids.contains(token)) {
+            if (request_.benchmark_fixed_tokens) continue;
             stopped_ = true;
             result.finish_reason = "stop";
             break;

@@ -475,7 +475,9 @@ private:
             if (peek().t == token::multiplicative_binary_operator && peek().value == "*") {
                 size_t start_pos = current;
                 ++current; // consume *
-                arg = mk_stmt<spread_expression>(start_pos, parse_expression());
+                const bool keywords = is(token::multiplicative_binary_operator) && peek().value == "*";
+                if (keywords) ++current;
+                arg = mk_stmt<spread_expression>(start_pos, parse_expression(), keywords);
             } else {
                 arg = parse_expression();
                 if (is(token::equals)) {

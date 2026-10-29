@@ -1,4 +1,5 @@
 #include "mlx_deepseek_v41_mhc.h"
+#include "mlx_kernel_prepare.h"
 
 #include <algorithm>
 #include <cmath>
@@ -790,6 +791,18 @@ MlxDeepseekV41Mhc::MlxDeepseekV41Mhc(
         throw std::runtime_error(
             "DeepSeek-V4.1 Mega-mHC geometry disagrees");
     }
+    if (const auto* tq = function_.tq_weight_ref())
+        if (auto* preparation = MlxKernelPreparation::current()) preparation->collect([&] {
+            for (const auto rows : preparation->row_buckets()) if (rows <= 32)
+                for (auto dtype : {mlx::core::float16, mlx::core::float32})
+                    preparation->add(tq->rms_matmul(mlx::core::zeros(Shape{rows, function_.input_size()}, dtype),
+                        static_cast<float>(config_.rms_eps)));
+            for (const int requested : {32, 128, 256, 512, 1024, 2048, 4096}) {
+                const int rows = std::min(preparation->context(), requested);
+                preparation->add(tq->rms_matmul(mlx::core::zeros(Shape{rows, function_.input_size()}, mlx::core::float16),
+                    static_cast<float>(config_.rms_eps)));
+            }
+        });
 }
 
 MlxDeepseekV41MhcResult MlxDeepseekV41Mhc::collapse(
@@ -814,6 +827,9 @@ MlxDeepseekV41HcMetadataResult MlxDeepseekV41Mhc::metadata(const array& residual
     const int batch = residual.shape(0);
     const int tokens = residual.shape(1);
     auto mixes = [&]() {
+        if (const auto* tq = function_.tq_weight_ref())
+            return tq->rms_matmul(mlx::core::reshape(residual,
+                Shape{batch, tokens, static_cast<int>(4 * config_.hidden)}), static_cast<float>(config_.rms_eps));
         const auto* dense = function_.dense_weight_ref();
         if (dense && dense->dtype() == mlx::core::float32) {
             return deepseek_v41_hc_projection(residual, *dense,
