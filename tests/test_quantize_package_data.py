@@ -34,7 +34,11 @@ assert len(_ext._SOURCES) == 9
 for path in _ext._SOURCES:
     assert Path(path).is_file(), path
 assert (_ext._DIR/'nvq_chunk.h').is_file()
-for relative in ['kernels/hip/tq.py', 'kernels/hip/tq_ops.hip',
+for relative in ['kernels/hip/tq.py', 'kernels/hip/tq_projection.hip',
+                 'kernels/hip/tq_projection.h', 'kernels/hip/tq_vector.h',
+                 'kernels/hip/tq_float_tokens.h', 'kernels/hip/tq_materialize.h',
+                 'kernels/hip/tq_fused.h', 'kernels/hip/tq_q8.hip',
+                 'kernels/hip/tq_q8.h', 'kernels/hip/tq_residual.h',
                  'kernels/hip/mfq_hip_compat.h', 'quantize/hip/tq_encoder.hip',
                  'quantize/hip/tq_fitter.hip']:
     assert (Path(mfq.__file__).parent/relative).is_file(), relative
