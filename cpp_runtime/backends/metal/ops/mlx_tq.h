@@ -16,6 +16,10 @@ struct MlxTqRoutePlan {
     mlx::core::array block_meta, block_count;
     int max_blocks, block_rows, route_count, experts;
 };
+struct MlxTqFfnIntermediate {
+    mlx::core::array values;
+    bool column_prepared = false;
+};
 std::optional<mlx::core::array> make_tq_reuse_plan(std::span<const int> ids,
     int tokens, int routes, int experts);
 std::optional<mlx::core::array> make_tq_reuse_plan(const mlx::core::array& ids, int experts);
@@ -51,6 +55,14 @@ public:
     mlx::core::array swiglu(const MlxTqWeight& up, const mlx::core::array& input,
         const mlx::core::array& ids, float limit = 0.f, bool gelu = false,
         const mlx::core::array* reuse = nullptr) const;
+    MlxTqFfnIntermediate swiglu_for_down(const MlxTqWeight& up, const MlxTqWeight& down,
+        const mlx::core::array& input, const mlx::core::array& ids,
+        float limit = 0.f, bool gelu = false, const mlx::core::array* reuse = nullptr) const;
+    mlx::core::array routed_down(const MlxTqFfnIntermediate& intermediate,
+        const mlx::core::array& ids, const mlx::core::array& weights,
+        const mlx::core::array* reuse = nullptr) const;
+    mlx::core::array routed_down_pairs(const MlxTqFfnIntermediate& intermediate,
+        const mlx::core::array& ids, const mlx::core::array* reuse = nullptr) const;
     mlx::core::array swiglu_split(const mlx::core::array& input,
         const mlx::core::array& ids, float limit = 0.f, bool gelu = false) const;
     mlx::core::array embedding(const mlx::core::array& ids,

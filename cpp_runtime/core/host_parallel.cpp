@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <exception>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -44,7 +45,8 @@ public:
 
     void run(std::int64_t begin, std::int64_t end, std::int64_t grain,
              int threads, const std::function<void(std::int64_t, std::int64_t)>& function,
-             HostParallelProfile* profile) {
+             HostParallelProfile* profile, std::int64_t ready_end = 0,
+             const std::function<void()>* ready = nullptr) {
         // Own the callback until every participant has acknowledged completion.
         const auto started=profile ? ProfileClock::now() : ProfileClock::time_point{};
         std::unique_lock<std::mutex> dispatch(dispatch_mutex_);
@@ -57,7 +59,7 @@ public:
         const auto partitions = static_cast<std::int64_t>(participants) *
             (wait_idle_workers_ ? 1 : 4);
         const auto balanced = 1 + (end - begin - 1) / partitions;
-        const auto chunk = std::max(grain, balanced);
+        const auto chunk = ready ? 1 : std::max(grain, balanced);
         {
             std::unique_lock<std::mutex> lock(mutex_);
             // Each new worker starts before the current epoch is published.
@@ -74,6 +76,9 @@ public:
             next_.store(begin, std::memory_order_relaxed);
             end_ = end;
             chunk_ = chunk;
+            stage_end_ = ready_end;
+            stage_remaining_.store(ready ? ready_end - begin : 0, std::memory_order_relaxed);
+            staged_ = ready != nullptr;
             active_workers_ = participants - 1;
             remaining_ = active_workers_;
             failure_ = nullptr;
@@ -88,7 +93,24 @@ public:
         }
         const auto setup_ns=profile ? elapsed_ns(setup_started) : 0;
         ready_.notify_all();
-        const auto caller_work=drain(); // The caller contributes compute.
+        auto caller_work=drain(ready != nullptr); // The caller contributes compute.
+        if (ready) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            done_.wait(lock, [&] { return stage_remaining_.load(std::memory_order_acquire) == 0 || failure_; });
+            if (!failure_) {
+                lock.unlock();
+                try {
+                    WorkerScope scope;
+                    (*ready)();
+                } catch (...) {
+                    cancelled_.store(true, std::memory_order_relaxed);
+                    lock.lock();
+                    if (!failure_) failure_ = std::current_exception();
+                    lock.unlock();
+                }
+            } else lock.unlock();
+            caller_work += drain();
+        }
         const auto wait_started=profile ? ProfileClock::now() : ProfileClock::time_point{};
         std::unique_lock<std::mutex> lock(mutex_);
         if(!wait_idle_workers_) {
@@ -117,12 +139,18 @@ public:
     }
 
 private:
-    std::uint64_t drain() {
+    std::uint64_t drain(bool prefix_only = false) {
         WorkerScope scope;
         std::uint64_t work=0, callbacks=0, rows=0;
         try {
             while (!cancelled_.load(std::memory_order_relaxed)) {
-                const auto begin = next_.fetch_add(chunk_, std::memory_order_relaxed);
+                std::int64_t begin;
+                if (prefix_only) {
+                    begin = next_.load(std::memory_order_relaxed);
+                    while (begin < stage_end_ && !next_.compare_exchange_weak(
+                            begin, begin + 1, std::memory_order_relaxed)) {}
+                    if (begin >= stage_end_) break;
+                } else begin = next_.fetch_add(chunk_, std::memory_order_relaxed);
                 if (begin >= end_) break;
                 const auto end=begin+std::min(chunk_,end_-begin);
                 if(profiling_) {
@@ -132,11 +160,17 @@ private:
                     catch(...) { work+=elapsed_ns(started); throw; }
                     work+=elapsed_ns(started); rows+=end-begin;
                 } else (*function_)(begin,end);
+                if (staged_ && begin < stage_end_ && stage_remaining_.fetch_sub(
+                        end - begin, std::memory_order_acq_rel) == end - begin) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    done_.notify_all();
+                }
             }
         } catch (...) {
             cancelled_.store(true, std::memory_order_relaxed);
             std::lock_guard<std::mutex> lock(mutex_);
             if (!failure_) failure_ = std::current_exception();
+            done_.notify_all();
         }
         if(profiling_) {
             work_ns_.fetch_add(work,std::memory_order_relaxed);
@@ -187,6 +221,9 @@ private:
     std::atomic<std::int64_t> next_{0};
     std::atomic<bool> cancelled_{false};
     std::int64_t end_ = 0, chunk_ = 1;
+    std::int64_t stage_end_ = 0;
+    std::atomic<std::int64_t> stage_remaining_{0};
+    bool staged_ = false;
     std::uint64_t epoch_ = 0;
     int active_workers_ = 0, remaining_ = 0;
     int running_workers_=0;
@@ -205,6 +242,18 @@ private:
 HostParallelPool::HostParallelPool(std::function<void(std::size_t)> initialize,bool wait_idle)
     : impl_(std::make_unique<Impl>(std::move(initialize),wait_idle)) {}
 HostParallelPool::~HostParallelPool() = default;
+
+void HostParallelPool::run_staged(std::int64_t end, std::int64_t ready_end, int threads,
+    const std::function<void(std::int64_t, std::int64_t)>& function,
+    const std::function<void()>& ready) {
+    if (ready_end < 0 || end < ready_end) throw std::invalid_argument("invalid staged host work range");
+    if (threads <= 1 || inside_host_work || end <= 1) {
+        WorkerScope scope;
+        if (ready_end) function(0, ready_end);
+        ready();
+        if (ready_end < end) function(ready_end, end);
+    } else impl_->run(0, end, 1, threads, function, nullptr, ready_end, &ready);
+}
 
 void HostParallelPool::run(std::int64_t begin, std::int64_t end,
     std::int64_t grain, int threads,

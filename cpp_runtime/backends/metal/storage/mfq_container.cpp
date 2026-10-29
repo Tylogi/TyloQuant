@@ -3,6 +3,8 @@
 #include "mlx_legacy_tensor_compat.h"
 
 #include "mfq/mfq_model_source.h"
+#include "mfq/tq_rows.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cerrno>
@@ -44,6 +46,26 @@ std::uint64_t checked_file_size(
 }
 
 } // namespace
+
+std::vector<std::int64_t> MfqContainer::tq_shape(const std::string& name) const {
+    const auto& entry = record(name);
+    if (entry.dtype != "TQ") throw std::invalid_argument("tensor is not TQ: " + name);
+    std::vector<std::int64_t> logical;
+    for (const auto* key : {"tq_shapes", "tensor_shapes"}) {
+        const auto found = header_.extra_json.find(key);
+        if (found == header_.extra_json.end()) continue;
+        const auto shapes = nlohmann::json::parse(found->second);
+        if (!shapes.is_object()) throw std::invalid_argument("invalid TQ shape map");
+        if (shapes.contains(name)) {
+            logical = shapes.at(name).get<std::vector<std::int64_t>>();
+            break;
+        }
+    }
+    return mfq::tq_tensor_shape(entry.nbytes,
+        [&](std::uint64_t offset, std::byte* output, std::size_t size) {
+            read_range_into(name, offset, {output, size});
+        }, std::move(logical));
+}
 
 struct MfqContainer::RandomAccessFiles : std::enable_shared_from_this<RandomAccessFiles> {
     struct File {

@@ -7,10 +7,11 @@ inline half4 tq_book(uint4 state) {
         half4(as_type<half>(ushort(0xc931u))));
 }
 
-template <bool POOLED, typename Descriptors>
-inline device const uint* tq_words(device const uint* words, Descriptors descriptors, uint rows, uint expert) {
-    if constexpr (POOLED) return words + descriptors[rows + expert];
-    else return words;
+template <uint POOLED, typename Words, typename Descriptors>
+inline device const uint* tq_words(Words words, Descriptors descriptors, uint rows, uint expert) {
+    if constexpr (POOLED == 2u) return reinterpret_cast<device const uint*>(descriptors[rows + expert]);
+    else if constexpr (POOLED == 1u) return reinterpret_cast<device const uint*>(words) + descriptors[rows + expert];
+    else return reinterpret_cast<device const uint*>(words);
 }
 
 template <typename ScalePtr>
@@ -138,12 +139,9 @@ struct TqDecoded8 {
 };
 
 template <uint COLUMNS, uint WIDTH, uint GS, typename ScalePtr>
-inline TqDecoded8 tq_decode8(device const uint* words, ulong descriptor,
+inline TqDecoded8 tq_decode8_planned(device const uint* ring, float anchor, TqWindow plan,
         ScalePtr scales, device const half* relative, uint row, uint col) {
-    uint bits = (uint(descriptor >> 32) & 7u) + 1u;
-    float anchor = float(as_type<half>(ushort(descriptor >> 40)));
-    TqWindow plan = tq_window(bits, col);
-    device const uint* ring = words + uint(descriptor) + (col >> 8u) * plan.ring_words;
+    uint bits = plan.bits;
     uint a = ring[plan.first], b = ring[plan.second], c = ring[plan.third];
     ulong low = ulong(a) | (ulong(b) << 32), high = ulong(b) | (ulong(c) << 32);
     uint first = uint((plan.high.x ? high : low) >> plan.shifts.x);
@@ -161,6 +159,17 @@ inline TqDecoded8 tq_decode8(device const uint* words, ulong descriptor,
         scale0 = scale1 = float4(tq_group_scale(scales, relative, group, anchor));
     }
     return {half4(float4(tq_book(states0)) * scale0), half4(float4(tq_book(states1)) * scale1)};
+}
+
+template <uint COLUMNS, uint WIDTH, uint GS, typename ScalePtr>
+inline TqDecoded8 tq_decode8(device const uint* words, ulong descriptor,
+        ScalePtr scales, device const half* relative, uint row, uint col) {
+    uint bits = (uint(descriptor >> 32) & 7u) + 1u;
+    float anchor = float(as_type<half>(ushort(descriptor >> 40)));
+    TqWindow plan = tq_window(bits, col);
+    device const uint* ring = words + uint(descriptor) + (col >> 8u) * plan.ring_words;
+    return tq_decode8_planned<COLUMNS, WIDTH, GS>(ring, anchor,
+        plan, scales, relative, row, col);
 }
 
 template <uint LANES>
@@ -286,11 +295,7 @@ inline void tq_dot_batch_accumulate(device const uint* words, ulong descriptor, 
         uint begin = 0u, uint end = K) {
     #pragma unroll
     for (uint m = 0u; m < BM; ++m) acc[m] = 0.f;
-    for (uint col = begin + lane * 8u; col < end; col += LANES * 8u) {
-        TqDecoded8 decoded;
-        if constexpr (K >= 1024u) decoded = tq_decode8<COLUMNS, WIDTH, GS>(words, descriptor, scales, relative, row, col);
-        else decoded = {tq_decode4<COLUMNS, WIDTH, GS>(words, descriptor, scales, relative, row, col),
-            tq_decode4<COLUMNS, WIDTH, GS>(words, descriptor, scales, relative, row, col + 4u)};
+    const auto accumulate = [&](uint col, TqDecoded8 decoded) {
         float4 first = float4(decoded.first), second = float4(decoded.second);
         #pragma unroll
         for (uint m = 0u; m < BM; ++m) {
@@ -308,6 +313,32 @@ inline void tq_dot_batch_accumulate(device const uint* words, ulong descriptor, 
                 }
             }
         }
+    };
+    if constexpr (BM <= 4u && K >= 1024u && K % 256u == 0u && (LANES == 16u || LANES == 32u)) {
+        if ((begin & 255u) == 0u && (end & 255u) == 0u) {
+            const uint bits = (uint(descriptor >> 32u) & 7u) + 1u;
+            const float anchor = float(as_type<half>(ushort(descriptor >> 40u)));
+            const TqWindow first_plan = tq_window(bits, lane * 8u);
+            const TqWindow second_plan = tq_window(bits, lane * 8u + 128u);
+            auto ring = words + uint(descriptor) + (begin >> 8u) * first_plan.ring_words;
+            for (uint col = begin + lane * 8u; col < end; col += 256u) {
+                accumulate(col, tq_decode8_planned<COLUMNS, WIDTH, GS>(ring, anchor,
+                    first_plan, scales, relative, row, col));
+                if constexpr (LANES == 16u) {
+                    accumulate(col + 128u, tq_decode8_planned<COLUMNS, WIDTH, GS>(ring, anchor,
+                        second_plan, scales, relative, row, col + 128u));
+                }
+                ring += first_plan.ring_words;
+            }
+            return;
+        }
+    }
+    for (uint col = begin + lane * 8u; col < end; col += LANES * 8u) {
+        TqDecoded8 decoded;
+        if constexpr (K >= 1024u) decoded = tq_decode8<COLUMNS, WIDTH, GS>(words, descriptor, scales, relative, row, col);
+        else decoded = {tq_decode4<COLUMNS, WIDTH, GS>(words, descriptor, scales, relative, row, col),
+            tq_decode4<COLUMNS, WIDTH, GS>(words, descriptor, scales, relative, row, col + 4u)};
+        accumulate(col, decoded);
     }
 }
 

@@ -200,12 +200,93 @@ void callback_lifetime_checks() {
     require(rejected,"retired pool ignored worker initialization failure");
     std::cout<<"Host pool retired workers: callback lifetime, coverage, nested work and failures PASS\n";
 }
+
+void staged_checks() {
+    for (bool wait_idle : {false, true}) {
+        mfq::HostParallelPool pool({}, wait_idle);
+        const auto caller = std::this_thread::get_id();
+        for (int threads : {1, 3, 8}) for (int count : {0, 1, 3, 18, 97})
+            for (int prefix : {0, count / 2, count}) for (int repeat = 0; repeat < 10; ++repeat) {
+                std::vector<std::atomic<int>> visits(count);
+                std::atomic<int> completed{0};
+                int ready_calls = 0;
+                pool.run_staged(count, prefix, threads, [&](auto begin, auto end) {
+                    for (auto i = begin; i < end; ++i) {
+                        ++visits[i];
+                        if (i < prefix) ++completed;
+                    }
+                }, [&] {
+                    require(std::this_thread::get_id() == caller, "staged callback moved off the caller");
+                    require(completed == prefix, "staged callback observed incomplete prefix writes");
+                    ++ready_calls;
+                    pool.run(0, 3, 1, threads, [](auto, auto) {});
+                });
+                require(ready_calls == 1, "staged callback omitted or duplicated");
+                for (const auto& visit : visits) require(visit == 1, "staged work omitted or duplicated");
+            }
+        std::atomic<bool> tail_started{false}, release_tail{false};
+        pool.run_staged(3, 2, 3, [&](auto begin, auto end) {
+            for (auto i = begin; i < end; ++i) if (i == 2) {
+                tail_started = true;
+                while (!release_tail.load()) std::this_thread::yield();
+            }
+        }, [&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!tail_started.load() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+            release_tail = true;
+            require(tail_started, "staged tail did not overlap the ready callback");
+        });
+        for (int failure : {0, 1, 2}) {
+            std::atomic<int> active{0};
+            bool rejected = false;
+            try {
+                pool.run_staged(18, 12, 8, [&](auto begin, auto end) {
+                    ++active;
+                    struct ActiveScope {
+                        std::atomic<int>& count;
+                        ~ActiveScope() { --count; }
+                    } scope{active};
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    if ((failure == 0 && begin == 0) || (failure == 1 && end == 18))
+                        throw std::runtime_error("staged read failure");
+                }, [&] {
+                    if (failure == 2) throw std::runtime_error("staged ready failure");
+                });
+            } catch (const std::runtime_error&) { rejected = true; }
+            require(rejected && active == 0, "staged failure escaped before workers stopped");
+            pool.run_staged(18, 12, 8, [](auto, auto) {}, [] {});
+        }
+        std::atomic<int> work_count{0}, ready_count{0};
+        const auto client = [&] {
+            for (int repeat = 0; repeat < 100; ++repeat)
+                pool.run_staged(18, 12, 6, [&](auto begin, auto end) {
+                    work_count += int(end - begin);
+                    pool.run_staged(2, 1, 6, [](auto, auto) {}, [] {});
+                }, [&] { ++ready_count; });
+        };
+        std::thread first(client), second(client);
+        first.join(); second.join();
+        require(work_count == 3600 && ready_count == 200, "concurrent staged calls changed coverage");
+        mfq::HostParallelPool broken([](auto) { throw std::runtime_error("staged initialization failure"); }, wait_idle);
+        bool initialization_failed = false;
+        try { broken.run_staged(18, 12, 6, [](auto, auto) {}, [] {}); }
+        catch (const std::runtime_error&) { initialization_failed = true; }
+        require(initialization_failed, "staged work lost worker initialization failure");
+        bool rejected = false;
+        try { pool.run_staged(3, 4, 8, [](auto, auto) {}, [] {}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "staged work accepted an invalid prefix");
+    }
+    std::cout << "Host pool staged work: prefix visibility, overlap, caller affinity and failures PASS\n";
+}
 } // namespace
 
 int main(int argc, char**) {
     try {
         profile_checks();
         callback_lifetime_checks();
+        staged_checks();
         for (int repeat=0; repeat<100; ++repeat)
             for (int threads=1; threads<=12; ++threads) coverage(threads, 37+repeat);
         std::vector<std::thread> callers;

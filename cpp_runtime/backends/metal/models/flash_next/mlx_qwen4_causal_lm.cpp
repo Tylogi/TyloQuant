@@ -987,6 +987,12 @@ public:
             if (tq_expert_cache_) {
                 routed_is_reduced = tokens <= 6;
                 if (routed_is_reduced) parallel_shared = shared_(source);
+                if (tokens == 1) {
+                    auto output = tq_expert_cache_->apply_ffn(expert_cache_layer_, source,
+                        routes.ids, routes.weights, 0.f, false, parallel_shared ? &*parallel_shared : nullptr);
+                    detail::profile_eval("qwen4.moe.routed_ffn", output);
+                    return output;
+                }
                 return tq_expert_cache_->apply(expert_cache_layer_, routes.ids, [&](const auto& weights, const array* reuse) {
                     auto intermediate = weights.gate.swiglu(weights.up, source, routes.ids, 0.f, false, reuse);
                     detail::profile_eval("qwen4.moe.routed_gate_up", intermediate);
