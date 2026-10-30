@@ -66,6 +66,20 @@ def test_routed_pair_and_down(columns, gelu, limit, width):
     np.testing.assert_allclose(result, expected, rtol=.01, atol=.002)
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("width", [320, 640])
+@pytest.mark.parametrize("tokens", [1, 6])
+def test_compact_projection_and_pair_match_padded(dtype, width, tokens):
+    source = fixture(16, width, True)
+    compact = source.compact_tail(width)
+    old, new = Projection(source, input_columns=width, experts=2), Projection(compact, experts=2)
+    x = mx.array(np.random.default_rng(15).normal(0, .2, (tokens, width)).astype(np.float32), dtype)
+    ids = mx.array(np.tile([0, 1, -1], (tokens, 1)).astype(np.int32))
+    for expected, actual in ((old(x, ids), new(x, ids)),
+                             (old.swiglu(old, x, ids), new.swiglu(new, x, ids))):
+        np.testing.assert_array_equal(np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32)))
+
+
 def test_reject_wrong_geometry():
     op = Projection(fixture(8, 37), input_columns=37, experts=2)
     with pytest.raises(ValueError, match="IDs"):

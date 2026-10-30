@@ -192,8 +192,7 @@ public:
         for(std::size_t row=0;row<m.rows;++row) {
             const auto descriptor=TqLayout::integer(descriptors.data()+row*8,8);
             const auto bits=((descriptor>>32)&7)+1;
-            if((descriptor & ~0x00ffff07ffffffffULL) || ((descriptor>>40)&0xffff)>0x7bff ||
-               std::uint32_t(descriptor)!=expected)
+            if(!m.valid_descriptor(descriptor) || m.offset(descriptor)!=expected)
                 throw std::invalid_argument("invalid TQ row descriptor");
             expected+=std::uint64_t(m.width)*bits/32;
             packed_bytes+=std::uint64_t(width)*bits/8;
@@ -201,6 +200,8 @@ public:
         if(expected*4!=m.packed_bytes)throw std::invalid_argument("TQ row payload range differs");
         std::vector<std::uint8_t> result(64+descriptors.size()+scale_bytes+packed_bytes);
         std::memcpy(result.data(),header_.data(),64);
+        std::memcpy(result.data(),"RTRELL05",8);
+        TqLayout::integer(result.data()+8,5,4);
         TqLayout::integer(result.data()+16,width,4);
         TqLayout::integer(result.data()+24,gs,4);
         TqLayout::integer(result.data()+28,packed_bytes,4);
@@ -211,14 +212,14 @@ public:
         for(std::size_t row=0;row<m.rows;++row) {
             const auto descriptor=TqLayout::integer(descriptors.data()+row*8,8);
             const auto bits=((descriptor>>32)&7)+1;
-            TqLayout::integer(result.data()+64+row*8,(descriptor & 0xffffffff00000000ULL)|(cursor/4),8);
+            TqLayout::integer(result.data()+64+row*8,(descriptor & 0x00ffff0700000000ULL)|(cursor/4),8);
             if(!m.columns)for(std::size_t group=0;group<groups;++group) {
                 const auto source=row*m.groups+(begin+group*gs)/m.gs;
                 const auto target=row*groups+group;
                 target_scales[target/2]|=((scales[source/2]>>((source&1)*4))&15)<<((target&1)*4);
             }
             const auto bytes=std::size_t(width)*bits/8;
-            read_(m.packed+std::uint32_t(descriptor)*4+begin*bits/8,
+            read_(m.packed+std::size_t(m.offset(descriptor))*4+begin*bits/8,
                 reinterpret_cast<std::byte*>(target_words+cursor),bytes);
             cursor+=bytes;
         }

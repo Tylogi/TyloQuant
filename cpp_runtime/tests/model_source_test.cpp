@@ -240,6 +240,60 @@ void test_tq_reserved_descriptor_bits() {
     }
 }
 
+void test_tq_compact_rows() {
+    for (const unsigned width : {320u, 640u}) {
+        const std::size_t packed_bytes = std::size_t(width) * 36 / 8;
+        std::vector<std::uint8_t> payload(64 + 64 + width * 2 + packed_bytes);
+        std::memcpy(payload.data(), "RTRELL06", 8);
+        mfq::TqLayout::integer(payload.data() + 8, 6, 4);
+        mfq::TqLayout::integer(payload.data() + 12, 8, 4);
+        mfq::TqLayout::integer(payload.data() + 16, width, 4);
+        mfq::TqLayout::integer(payload.data() + 20, 1, 4);
+        mfq::TqLayout::integer(payload.data() + 24, 512, 4);
+        mfq::TqLayout::integer(payload.data() + 28, packed_bytes, 4);
+        for (unsigned col = 0; col < width; ++col)
+            mfq::TqLayout::integer(payload.data() + 128 + col * 2, 0x3c00, 2);
+        std::size_t word = 0;
+        for (unsigned bits = 1; bits <= 8; ++bits) {
+            const std::uint64_t seed = (1u << (16 - bits)) - 1;
+            const auto d = word | (std::uint64_t(bits - 1) << 32) | (std::uint64_t(0x3c00) << 40)
+                | ((seed & 31) << 35) | (((seed >> 5) & 255) << 56)
+                | ((seed >> 13) & 1) | (((seed >> 14) & 1) << 31);
+            mfq::TqLayout::integer(payload.data() + 64 + (bits - 1) * 8, d, 8);
+            word += width * bits / 32;
+        }
+        const mfq::TqLayout layout(payload.data(), payload.size());
+        for (std::size_t i = layout.packed; i < payload.size(); ++i) payload[i] = std::uint8_t(i * 17);
+        const mfq::TqRows rows(payload.size(), [&](auto at, auto* out, auto size) {
+            require(at <= payload.size() && size <= payload.size() - at, "compact row read escaped payload");
+            std::memcpy(out, payload.data() + at, size);
+        });
+        for (unsigned row = 0; row < 8; ++row) {
+            auto one = rows.slice_rows(row, row + 1);
+            std::vector<std::uint8_t> staged(one.size());
+            require(rows.slice_row_into(row, staged.data(), staged.size()) == one.size() && staged == one,
+                "compact single-row staging differs");
+            const mfq::TqLayout selected(one.data(), one.size());
+            const auto d = mfq::TqLayout::integer(one.data() + 64, 8);
+            require(selected.offset(d) == 0 && mfq::TqLayout::tail_seed(d) == (1u << (15 - row)) - 1,
+                "compact row staging lost its boundary");
+        }
+        const unsigned begin = width == 640 ? 256 : 0;
+        const auto columns = rows.slice_columns(begin, begin + 256);
+        const mfq::TqLayout sliced(columns.data(), columns.size());
+        require(!sliced.compact && sliced.width == 256, "complete-ring slice kept compact header");
+        for (unsigned row = 0; row < 8; ++row) {
+            const auto original = mfq::TqLayout::integer(payload.data() + 64 + row * 8, 8);
+            const auto d = mfq::TqLayout::integer(columns.data() + 64 + row * 8, 8);
+            require(sliced.valid_descriptor(d), "complete-ring slice retained boundary bits");
+            require(std::equal(columns.begin() + sliced.packed + sliced.offset(d) * 4,
+                columns.begin() + sliced.packed + sliced.offset(d) * 4 + 32 * (row + 1),
+                payload.begin() + layout.packed + layout.offset(original) * 4 + begin * (row + 1) / 8),
+                "complete-ring slice changed packed codes");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -252,6 +306,7 @@ int main() {
         test_shared_engram_shards(root / "shared-tq", ".tq");
         test_shared_engram_shards(root / "shared-tq-upper", ".TQ");
         test_tq_reserved_descriptor_bits();
+        test_tq_compact_rows();
         const auto mfq_path = root / "model.mfq";
         const auto legacy_mfq_path = root / "legacy-model.mfq";
         const auto legacy_gguf_path = root / "legacy-gguf-model.mfq";
