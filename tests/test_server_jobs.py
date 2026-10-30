@@ -391,6 +391,31 @@ def test_job_manager_completes_and_cancels_registered_handlers(tmp_path: Path) -
     asyncio.run(run())
 
 
+def test_cancel_during_claim_cannot_leave_a_job_cancelling(tmp_path, monkeypatch):
+    async def run():
+        store = make_store(tmp_path)
+        claim = store.claim_job
+
+        def claim_and_cancel(job_id):
+            claim(job_id)
+            return store.request_job_cancel(job_id)
+
+        async def handler(context, payload):
+            pytest.fail("a cancelled claim must not enter the handler")
+
+        monkeypatch.setattr(store, "claim_job", claim_and_cancel)
+        manager = JobManager(store, {"test.claim": handler})
+        try:
+            job = await manager.submit(CreateJobRequest(kind="test.claim"))
+            task = manager._tasks[job.id]
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+            assert store.get_job(job.id).status == JobStatus.CANCELLED
+        finally:
+            await manager.close()
+
+    asyncio.run(run())
+
+
 def test_job_api_streams_persisted_events_and_rejects_unknown_kinds(tmp_path: Path) -> None:
     async def run() -> None:
         store = make_store(tmp_path)

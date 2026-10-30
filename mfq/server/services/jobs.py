@@ -31,6 +31,10 @@ from mfq.server.protocol.models import (
 from mfq.server.state.storage import InvalidJobStateError, JobNotFoundError, SessionStore
 
 
+# How long close() waits for user cancellations to record their final state.
+_CANCEL_UNWIND_SECONDS = 5.0
+
+
 class JobCancelledError(asyncio.CancelledError):
     """Raised by a cooperative handler after a cancellation request."""
 
@@ -262,6 +266,15 @@ class JobManager:
         async with self._lifecycle_lock:
             if not self._started:
                 return
+            # A user cancellation that is already unwinding records CANCELLED
+            # after its slot is released. Cancelling it again here could
+            # interrupt that write and leave the job CANCELLING.
+            unwinding = [
+                task for job_id, task in self._tasks.items()
+                if (event := self._cancel_events.get(job_id)) is not None and event.is_set()
+            ]
+            if unwinding:
+                await asyncio.wait(unwinding, timeout=_CANCEL_UNWIND_SECONDS)
             self._closing = True
             tasks = list(self._tasks.values())
             for task in tasks:
@@ -350,6 +363,8 @@ class JobManager:
                 semaphore = self._semaphore
             async with semaphore:
                 job = await asyncio.to_thread(self.store.get_job, job_id)
+                if job.status == JobStatus.CANCELLING:
+                    raise JobCancelledError()
                 if job.status != JobStatus.QUEUED:
                     return
                 handler = self.handlers.get(job.kind)
@@ -365,6 +380,8 @@ class JobManager:
                     )
                     return
                 job = await asyncio.to_thread(self.store.claim_job, job_id)
+                if job.status == JobStatus.CANCELLING:
+                    raise JobCancelledError()
                 if job.status != JobStatus.RUNNING:
                     return
                 result = await handler(context, dict(job.payload))
