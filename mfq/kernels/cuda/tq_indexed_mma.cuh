@@ -7,12 +7,12 @@
 template<bool Columns>
 __device__ __forceinline__ uint32_t tq_mma_pair(TrellisProjectionView m,uint64_t d,int row,int col,float scale) {
     if(row>=m.rows || col>=m.input_columns)return 0;
-    const int bits=int((d>>32)&7)+1,words=8*bits;
+    const int bits=int((d>>32)&7)+1;
     const int pos=(254-(col&255))*bits,first=pos>>5;
 
-    const uint32_t lo=tq_ring_word(m.words,d,m.stored_columns,col,bits,first),
-        hi=tq_ring_word(m.words,d,m.stored_columns,col,bits,first+1==words?0:first+1);
-    const uint32_t window=__funnelshift_r(lo,hi,pos&31);
+    uint32_t values[2];
+    tq_ring_window<2>(m.words,d,m.stored_columns,col,bits,first,values);
+    const uint32_t window=__funnelshift_r(values[0],values[1],pos&31);
     const uint32_t a=__dp4a(((window>>bits)&65535)*0x83dcd12du,0x01010101u,0x6400u);
     const uint32_t b=__dp4a((window&65535)*0x83dcd12du,0x01010101u,0x6400u);
     const half2 gaussian=__hfma2(__halves2half2(__ushort_as_half(uint16_t(a)),__ushort_as_half(uint16_t(b))),

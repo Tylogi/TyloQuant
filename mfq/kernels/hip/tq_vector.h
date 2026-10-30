@@ -30,7 +30,6 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
         int row,int col,int width,int gslog,Consumer& consumer,U4 raw={},U4 column_pairs={}) {
     int bits=Bits?Bits:int((descriptor>>32)&7)+1;
     float anchor=__half2float(__ushort_as_half(uint16_t(descriptor>>40)));
-    int ringwords=8*bits;
     static_assert(V>0 && 256%V==0,"Decode vectors must divide an independent ring");
     static_assert(!Prepared || (V==8 && !RawBook && HalfOutput==2),
                   "Prepared tiles contain eight aligned half weights");
@@ -43,14 +42,10 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
     constexpr int MAX_SHIFT=Bits?(ALIGN<32?32-ALIGN:0):(Prepared?(32-V):31);
     constexpr int NW=(MAX_SHIFT+(V-1)*(Bits?Bits:8)+16+31)/32;
     uint32_t chunks[NW]={};
-    #pragma unroll
-    for(int j=0;j<NW;++j) {
-        int at=first+j;
-        if constexpr(Bits>0 && (Bits&(Bits-1))==0)at&=8*Bits-1;
-        else if(at>=ringwords)at-=ringwords;
-        if constexpr(Prepared)chunks[j]=raw[j];
-        else chunks[j]=tq_ring_word(words,descriptor,width,col,bits,at);
-    }
+    if constexpr(Prepared) {
+        #pragma unroll
+        for(int j=0;j<NW;++j)chunks[j]=raw[j];
+    } else tq_ring_window<NW,Bits>(words,descriptor,width,col,bits,first,chunks);
     #ifdef TRELLIS_NORMALIZED_WINDOW
     constexpr int NORM=((V-1)*(Bits?Bits:8)+16+31)/32;
     uint32_t normalized[NORM];
