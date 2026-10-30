@@ -1,5 +1,6 @@
 
 #pragma once
+#include "tq_compact.cuh"
 #include <climits>
 
 // The fixed book before its final FP16 rounding is affine in the byte sum
@@ -16,12 +17,12 @@ __device__ __forceinline__ void q8_integer_book(TrellisProjectionView m,uint64_t
     constexpr int Words=(MaxShift+(V-1)*Bits+16+31)/32;
     constexpr int Normalized=((V-1)*Bits+16+31)/32;
     const int minimum=(15-(col/16)%16)*Step,first=minimum/32;
-    const auto* ring=m.words+uint32_t(d)+(col/256)*(8*Bits);
+
     uint32_t chunks[Words],normalized[Normalized];
     #pragma unroll
     for(int j=0;j<Words;++j) {
         int at=first+j;if(at>=8*Bits)at-=8*Bits;
-        chunks[j]=__ldg(ring+at);
+        chunks[j]=tq_ring_word(m.words,d,m.stored_columns,col,Bits,at);
     }
     #pragma unroll
     for(int j=0;j<Normalized;++j)normalized[j]=__funnelshift_r(chunks[j],j+1<Words?chunks[j+1]:0,minimum&31);
@@ -214,7 +215,7 @@ extern "C" int mfq_tq_q8_tokens(TrellisProjectionView m,const void* x,void* y,
         int tokens,int groups,int dtype,void* scratch,uint64_t bytes,cudaStream_t stream) {
     if(!x || !y || x==y || tokens<1 || tokens>4 || groups<1 || groups>65535 || (dtype!=0 && dtype!=2) ||
        m.rows<1 || m.rows%groups || m.input_columns<1 || m.input_columns>INT_MAX-511 ||
-       m.input_columns>INT_MAX/groups || m.input_columns>m.stored_columns || m.stored_columns%256 ||
+       m.input_columns>INT_MAX/groups || m.input_columns>m.stored_columns || m.stored_columns%32 ||
        !m.words || !m.descriptors || !m.scales || !m.relative ||
        (!m.columns && (m.gslog<4 || m.gslog>20)))return -1;
     const int qc=int((uint64_t(m.input_columns)+511)/512*512);

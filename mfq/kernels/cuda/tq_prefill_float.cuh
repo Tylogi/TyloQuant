@@ -113,7 +113,7 @@ extern "C" int mfq_tq_float_gemm(TrellisProjectionView m,const void* x,void* y,i
         int groups,int dtype,void* workspace,uint64_t bytes,void* blas,cudaStream_t stream) {
     if(!x || !y || !workspace || !blas || x==y || workspace==x || workspace==y || tokens<1 ||
        m.rows<1 || groups<1 || m.rows%groups || m.input_columns<1 || m.input_columns>INT_MAX/groups ||
-       m.input_columns>m.stored_columns || m.stored_columns%256 ||
+       m.input_columns>m.stored_columns || m.stored_columns%32 ||
        !m.words || !m.descriptors || !m.scales || !m.relative ||
        (!m.columns && (m.gslog<4 || m.gslog>20)) || (dtype!=1 && dtype!=2) ||
        (reinterpret_cast<uintptr_t>(workspace)&15))return -1;

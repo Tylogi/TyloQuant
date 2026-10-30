@@ -165,7 +165,7 @@ int tq_prefill_gemm(TrellisProjectionView m,const void* x,void* y,int tokens,
         void* workspace,uint64_t workspace_bytes,void* blas,cudaStream_t stream,int groups) {
     if(!x || !y || !workspace || !blas || x==y || workspace==x || workspace==y || tokens<1 ||
        m.rows<1 || groups<1 || m.rows%groups || m.input_columns<1 || m.input_columns>2147483647/groups ||
-       m.input_columns>m.stored_columns || m.stored_columns%256 ||
+       m.input_columns>m.stored_columns || m.stored_columns%32 ||
        !m.words || !m.descriptors || !m.scales || !m.relative ||
        (!m.columns && (m.gslog<4 || m.gslog>20)))return -1;
     const uint64_t per_row=uint64_t(m.input_columns)*sizeof(half)+(m.bias?uint64_t(tokens)*sizeof(float):0);
@@ -236,7 +236,7 @@ void tq_grouped_projection_kernel(TrellisProjectionView m,const Scalar<DT>* inpu
 extern "C" int mfq_tq_grouped_tokens(TrellisProjectionView m,const void* x,void* y,
         int tokens,int groups,int dtype,cudaStream_t stream) {
     if(!x || !y || x==y || tokens<1 || tokens>65535 || m.rows<1 || groups<1 || m.rows%groups ||
-       m.input_columns<1 || m.input_columns>2147483647/groups || m.input_columns>m.stored_columns || m.stored_columns%256 ||
+       m.input_columns<1 || m.input_columns>2147483647/groups || m.input_columns>m.stored_columns || m.stored_columns%32 ||
        !m.words || !m.descriptors || !m.scales || !m.relative ||
        (!m.columns && (m.gslog<4 || m.gslog>20)))return -1;
     if(tokens>1 && (dtype==1 || dtype==2))

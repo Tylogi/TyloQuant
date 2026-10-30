@@ -1,4 +1,4 @@
-"""Metal projections over the shared RTRELL05 TQ payload."""
+"""Metal projections over the shared TQ payload."""
 
 from functools import lru_cache
 from pathlib import Path

@@ -21,6 +21,17 @@ template <typename T> T load(std::span<const std::uint8_t> bytes, std::size_t of
     return result;
 }
 
+std::uint64_t offset_mask(int width) { return width%256?0x7ffffffeULL:0xffffffffULL; }
+std::uint64_t word_offset(std::uint64_t d,int width) { return d&offset_mask(width); }
+std::uint32_t boundary_seed(std::uint64_t d) {
+    return ((d>>35)&31)|(((d>>56)&255)<<5)|((d&1)<<13)|(((d>>31)&1)<<14);
+}
+std::uint64_t rebase(std::uint64_t d,std::uint64_t words,int width) {
+    const auto mask=offset_mask(width);
+    if(words&~mask)throw std::overflow_error("TQ destination word offset exceeds capacity");
+    return (d&~mask)|words;
+}
+
 const std::array<float, 16>& relative_scales() {
     static const auto values = [] {
         std::array<float, 16> result;
@@ -51,7 +62,7 @@ MlxMappedTqRows::MlxMappedTqRows(std::span<const std::uint8_t> blob, int width)
             const auto offset = load<std::uint64_t>(blob, 64 + index * 16),
                 size = load<std::uint64_t>(blob, 72 + index * 16);
             if (offset != end || offset > blob.size() || size < 64 || size > blob.size() - offset
-                || std::memcmp(blob.data() + offset, "RTRELL05", 8))
+                || (std::memcmp(blob.data() + offset, "RTRELL05", 8) && std::memcmp(blob.data() + offset, "RTRELL06", 8)))
                 throw std::runtime_error("invalid TQ expert container span");
             experts_.emplace_back(blob.subspan(offset, size), logical);
             if (experts_.back().rows() != out || (index && experts_.back().stored_width() != experts_.front().stored_width()))
@@ -66,8 +77,10 @@ MlxMappedTqRows::MlxMappedTqRows(std::span<const std::uint8_t> blob, int width)
         groups_ = scales_offset_ = packed_offset_ = 0;
         return;
     }
-    if (blob.size() < 64 || std::memcmp(blob.data(), "RTRELL05", 8)
-        || load<std::uint32_t>(blob, 8) != 5)
+    if (blob.size() < 64) throw std::runtime_error("truncated TQ row table header");
+    const bool compact=!std::memcmp(blob.data(), "RTRELL06", 8) && load<std::uint32_t>(blob, 8)==6;
+    if (!compact && (std::memcmp(blob.data(), "RTRELL05", 8)
+        || load<std::uint32_t>(blob, 8) != 5))
         throw std::runtime_error("invalid TQ row table header");
     const auto rows = load<std::uint32_t>(blob, 12);
     const auto stored_width = load<std::uint32_t>(blob, 16);
@@ -75,7 +88,8 @@ MlxMappedTqRows::MlxMappedTqRows(std::span<const std::uint8_t> blob, int width)
     const auto gs = load<std::uint32_t>(blob, 24);
     const auto packed = load<std::uint32_t>(blob, 28);
     if (!rows || rows > INT_MAX || !stored_width || stored_width > INT_MAX
-        || stored_width % 256 || columns > 1 || width < 0 || width > int(stored_width)
+        || stored_width % 32 || (compact?(!columns || stored_width%256==0):stored_width%256!=0)
+        || columns > 1 || width < 0 || width > int(stored_width)
         || (!columns && (gs < 16 || gs > (1u << 20) || (gs & (gs - 1))))
         || std::any_of(blob.begin() + 32, blob.begin() + 64, [](auto b) { return b != 0; }))
         throw std::runtime_error("invalid TQ row table geometry");
@@ -117,8 +131,10 @@ std::uint64_t MlxMappedTqRows::descriptor(std::int64_t row) const {
     const auto descriptor = load<std::uint64_t>(blob_, 64 + std::size_t(row) * 8);
     const auto anchor = std::uint16_t(descriptor >> 40);
     const std::size_t bytes = std::size_t(stored_width_) * (((descriptor >> 32) & 7) + 1) / 8;
-    const std::size_t begin = std::uint32_t(descriptor) * 4ull;
-    if ((descriptor & ~std::uint64_t(0x00FFFF07FFFFFFFF)) || (anchor & 0x8000)
+    const std::size_t begin = word_offset(descriptor,stored_width_) * 4ull;
+    if ((stored_width_%256==0 && (descriptor & ~std::uint64_t(0x00FFFF07FFFFFFFF)))
+        || (stored_width_%256 && ((bytes/4&1) || boundary_seed(descriptor)>=(1u<<(16-(((descriptor>>32)&7)+1)))))
+        || (anchor & 0x8000)
         || (anchor & 0x7c00) == 0x7c00 || begin > blob_.size() - packed_offset_
         || bytes > blob_.size() - packed_offset_ - begin)
         throw std::runtime_error("invalid TQ selected row descriptor");
@@ -135,11 +151,11 @@ MlxMappedTqRows::PackedRows MlxMappedTqRows::packed_rows(std::int64_t first, std
         result.offset += expert_offsets_[index];
         return result;
     }
-    const auto begin = std::uint32_t(descriptor(first)) * 4ull;
+    const auto begin = word_offset(descriptor(first),stored_width_) * 4ull;
     auto end = begin;
     for (std::size_t row = 0; row < count; ++row) {
         const auto current = descriptor(first + row);
-        if (std::uint32_t(current) * 4ull != end)
+        if (word_offset(current,stored_width_) * 4ull != end)
             throw std::runtime_error("TQ selected row span is not contiguous");
         end += std::size_t(stored_width_) * (((current >> 32) & 7) + 1) / 8;
     }
@@ -162,8 +178,7 @@ void MlxMappedTqRows::write_descriptors(std::int64_t first, std::uint32_t word_b
     const auto source_base = (range.offset - packed_offset_) / 4;
     for (std::size_t row = 0; row < destination.size(); ++row) {
         const auto current = load<std::uint64_t>(blob_, 64 + std::size_t(first + row) * 8);
-        destination[row] = (current & 0xffffffff00000000ull)
-            | (std::uint32_t(current) - source_base + word_base);
+        destination[row] = rebase(current,word_offset(current,stored_width_)-source_base+word_base,stored_width_);
     }
 }
 
@@ -176,16 +191,16 @@ void MlxMappedTqRows::append_row(std::int64_t row, MlxTqRowBatch& batch) const {
     }
     const auto descriptor = this->descriptor(row);
     const std::size_t bytes = std::size_t(stored_width_) * (((descriptor >> 32) & 7) + 1) / 8;
-    const std::size_t begin = std::uint32_t(descriptor) * 4ull;
-    if (batch.rows() && batch.width_ != width_)
+    const std::size_t begin = word_offset(descriptor,stored_width_) * 4ull;
+    if (batch.rows() && (batch.width_ != width_ || batch.stored_width_ != stored_width_))
         throw std::invalid_argument("TQ selected row widths differ");
     const std::size_t factors = columns_ ? stored_width_ : groups_;
     if (batch.rows() >= std::size_t(INT_MAX) / 2
         || bytes / 4 > std::size_t(INT_MAX) - batch.packed_.size()
         || factors > std::size_t(INT_MAX) - batch.scales_.size())
         throw std::overflow_error("TQ selected row batch is too large");
-    batch.width_ = width_;
-    batch.descriptors_.push_back((descriptor & 0xffffffff00000000ull) | batch.packed_.size());
+    batch.width_ = width_;batch.stored_width_=stored_width_;
+    batch.descriptors_.push_back(rebase(descriptor,batch.packed_.size(),stored_width_));
     batch.layouts_.push_back(batch.scales_.size());
     batch.layouts_.push_back(columns_ ? 0u : std::countr_zero(unsigned(group_size_)));
     for (std::size_t group = 0; group < factors; ++group) {
@@ -228,15 +243,14 @@ void MlxTqRowBatch::append_batch(const MlxTqRowBatch& other) {
     if (other.rows() == 0) return;
     if (this == &other) throw std::invalid_argument("TQ row batch cannot append itself");
     if (rows() == 0) { *this = other; return; }
-    if (width_ != other.width_) throw std::invalid_argument("TQ selected row widths differ");
+    if (width_ != other.width_ || stored_width_ != other.stored_width_) throw std::invalid_argument("TQ selected row widths differ");
     if (other.rows() > std::size_t(INT_MAX) / 2 - rows()
         || other.packed_.size() > std::size_t(INT_MAX) - packed_.size()
         || other.scales_.size() > std::size_t(INT_MAX) - scales_.size())
         throw std::overflow_error("TQ selected row batch is too large");
     const auto word_base = packed_.size(), scale_base = scales_.size();
     for (const auto descriptor : other.descriptors_)
-        descriptors_.push_back((descriptor & 0xffffffff00000000ull)
-            | (std::uint32_t(descriptor) + word_base));
+        descriptors_.push_back(rebase(descriptor,word_offset(descriptor,stored_width_)+word_base,stored_width_));
     for (std::size_t i = 0; i < other.rows(); ++i) {
         layouts_.push_back(other.layouts_[i * 2] + scale_base);
         layouts_.push_back(other.layouts_[i * 2 + 1]);
@@ -255,7 +269,7 @@ mlx::core::array MlxTqRowBatch::decode() const {
 uint col = thread_position_in_grid.x * 4u, row = thread_position_in_grid.y;
 if (col >= K) return;
 TqSelectedRowScales<decltype(scales)> factors{scales, layouts[row * 2u], layouts[row * 2u + 1u]};
-half4 value = tq_decode4<true, 256, 512>(words, descriptors[row], factors, relative, 0u, col);
+half4 value = tq_decode4<true, WIDTH, 512>(words, descriptors[row], factors, relative, 0u, col);
 tq_store4<K>(y, row, col, value);
 )METAL", std::string(kTqDecode) + R"METAL(
 template <typename P> struct TqSelectedRowScales {
@@ -272,7 +286,7 @@ template <typename P> struct TqSelectedRowScales {
         array(descriptors_.data(), Shape{int(rows())}), array(scales_.data(), Shape{int(scales_.size())}),
         array(layouts_.data(), Shape{int(layouts_.size())}), unused_relative},
         {Shape{int(rows()), width_}}, {float16}, {(width_ + 3) / 4, int(rows()), 1}, {128, 1, 1},
-        {{"K", width_}}, std::nullopt, false, {}).front();
+        {{"K", width_}, {"WIDTH", stored_width_}}, std::nullopt, false, {}).front();
 }
 
 } // namespace mfq::metal
