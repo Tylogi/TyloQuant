@@ -7,6 +7,7 @@
 #include "mlx_platform.h"
 #include "mlx_eval_timing.h"
 #include "mlx_tq_rows.h"
+#include "mfq/tq_rows.h"
 
 #include <mlx/allocator.h>
 #include <nlohmann/json.hpp>
@@ -199,7 +200,14 @@ if (expert >= 0 && expert < EXPERTS) {
     auto packed_u = tq_words<POOLED_U>(words_u, desc_u, EXPERTS * OUT, uint(expert));
     ulong descriptor = descriptors[wr];
     auto input = (upper ? prepared_u : prepared_g) + route * K;
-    value = tq_dot<float, 16, 0, K, K, 512>(upper ? packed_u : packed_g, descriptor, TqUnitScale{}, relative, wr, input, lane & 15u);
+    if constexpr (WIDTH_G == WIDTH_U)
+        value = tq_dot<float, 16, 0, WIDTH_G, K, 512>(upper ? packed_u : packed_g, descriptor,
+            TqUnitScale{}, relative, wr, input, lane & 15u);
+    else if (upper)
+        value = tq_dot<float, 16, 0, WIDTH_U, K, 512>(packed_u, descriptor,
+            TqUnitScale{}, relative, wr, input, lane & 15u);
+    else value = tq_dot<float, 16, 0, WIDTH_G, K, 512>(packed_g, descriptor,
+        TqUnitScale{}, relative, wr, input, lane & 15u);
     anchor = float(as_type<half>(ushort(descriptor >> 40u)));
 }
 for (uint step = 8u; step; step >>= 1u) value += simd_shuffle_down(value, step);
@@ -242,6 +250,7 @@ auto packed = words0;
 auto input = x;
 ulong descriptor = 0ul;
 uint local = 0u;
+float value = 0.f;
 )METAL";
     for (std::size_t p = 0; p < count; ++p) {
         const auto suffix = std::to_string(p);
@@ -254,14 +263,14 @@ uint local = 0u;
                 "local = row - BEGIN" + suffix + ";\n"
                 "packed = tq_words<POOLED" + suffix + ">(words" + suffix + ", descriptors" + suffix
                 + ", END" + suffix + " - BEGIN" + suffix + ", 0u);\n"
-                "descriptor = descriptors" + suffix + "[local];\ninput = x + " + suffix + "u * K;\n}\n";
+                "descriptor = descriptors" + suffix + "[local];\ninput = x + " + suffix + "u * K;\n"
+                "value = tq_dot<float, 16, 0, WIDTH" + suffix + ", K, 512>(packed, descriptor, TqUnitScale{}, relative, local, input, lane);\n}\n";
         }
     }
     source += prepare ? R"METAL(
 value *= factor;
 for (uint j = 0u; j < 4u; ++j) if (col + j < K) y[projection * K + col + j] = value[j];
 )METAL" : R"METAL(
-float value = tq_dot<float, 16, 0, K, K, 512>(packed, descriptor, TqUnitScale{}, relative, local, input, lane);
 for (uint step = 8u; step; step >>= 1u) value += simd_shuffle_down(value, step);
 if (lane == 0u) y[row] = half(value * float(as_type<half>(ushort(descriptor >> 40u))));
 )METAL";
@@ -464,7 +473,7 @@ if constexpr (COLUMN_SINGLE) {
             auto packed_u = tq_words<POOLED_U>(words_u, descriptors_u, EXPERTS * OUT, uint(expert));
             ulong descriptor = upper ? descriptors_u[wr] : descriptors_g[wr];
             auto prepared = (upper ? prepared_u : prepared_g) + destination * K;
-            result = tq_dot<float, 16, 0, K, K, 512>(upper ? packed_u : packed_g,
+            result = tq_dot<float, 16, 0, WIDTH_G, K, 512>(upper ? packed_u : packed_g,
                 descriptor, TqUnitScale{}, relative, wr, prepared, lane & 15u);
             anchor = float(as_type<half>(ushort(descriptor >> 40u)));
         }
@@ -1425,12 +1434,11 @@ MlxTqWeight MlxTqWeight::from_blob_impl(std::span<const std::uint8_t> blob,
         int input_columns, int experts, const array* word_pool, std::span<const std::uint64_t> expert_offsets) {
     if (blob.size() >= 8 && !std::memcmp(blob.data(), "RTQEXP01", 8))
         return from_expert_blob(blob, input_columns, experts, word_pool, expert_offsets);
-    if (blob.size() < 64 || std::memcmp(blob.data(), "RTRELL05", 8) || load_le<std::uint32_t>(blob, 8) != 5)
-        throw std::runtime_error("invalid TQ RTRELL05 header");
+    const mfq::TqLayout layout(blob.data(), blob.size());
     auto rows = load_le<std::uint32_t>(blob, 12), width = load_le<std::uint32_t>(blob, 16);
     auto columns = load_le<std::uint32_t>(blob, 20), gs = load_le<std::uint32_t>(blob, 24);
     auto packed = load_le<std::uint32_t>(blob, 28);
-    if (!rows || rows > INT_MAX || !width || width > INT_MAX || width % 256 || columns > 1
+    if (!rows || rows > INT_MAX || !width || width > INT_MAX || width % 32 || columns > 1
         || (!columns && (gs < 16 || gs > (1u << 20) || (gs & (gs - 1))))
         || experts <= 0 || rows % experts || input_columns < 0 || input_columns > int(width))
         throw std::runtime_error("invalid TQ geometry");
@@ -1445,7 +1453,7 @@ MlxTqWeight MlxTqWeight::from_blob_impl(std::span<const std::uint8_t> blob,
     for (std::size_t row = 0; row < rows; ++row) {
         auto d = load_le<std::uint64_t>(blob, 64 + row * 8);
         auto anchor = std::uint16_t(d >> 40);
-        if ((d & ~std::uint64_t(0x00FFFF07FFFFFFFF)) || std::uint32_t(d) != offset
+        if (!layout.valid_descriptor(d) || layout.offset(d) != offset
             || (anchor & 0x8000) || (anchor & 0x7c00) == 0x7c00)
             throw std::runtime_error("invalid TQ row descriptor");
         offset += std::uint64_t(width) * (((d >> 32) & 7) + 1) / 32;
@@ -1465,16 +1473,15 @@ MlxTqWeight MlxTqWeight::from_blob_impl(std::span<const std::uint8_t> blob,
         std::vector<std::uint64_t> descriptors(rows + experts);
         for (int expert = 0; expert < experts; ++expert) {
             const auto first_row = std::size_t(expert) * expert_rows;
-            const auto source_base = std::uint32_t(load_le<std::uint64_t>(blob, 64 + first_row * 8));
+            const auto source_base = layout.offset(load_le<std::uint64_t>(blob, 64 + first_row * 8));
             const auto source_end = expert + 1 == experts ? packed / 4
-                : std::uint32_t(load_le<std::uint64_t>(blob, 64 + (first_row + expert_rows) * 8));
+                : layout.offset(load_le<std::uint64_t>(blob, 64 + (first_row + expert_rows) * 8));
             const auto target = expert_offsets[expert];
             if (target > word_pool->size() || source_end - source_base > word_pool->size() - target)
                 throw std::out_of_range("TQ expert exceeds the word pool");
             for (std::size_t row = first_row; row < first_row + expert_rows; ++row) {
                 const auto descriptor = load_le<std::uint64_t>(blob, 64 + row * 8);
-                descriptors[row] = (descriptor & 0xffffffff00000000ull)
-                    | (std::uint32_t(descriptor) - source_base);
+                descriptors[row] = layout.rebase(descriptor, layout.offset(descriptor) - source_base);
             }
             descriptors[rows + expert] = target;
         }
@@ -1553,6 +1560,7 @@ MlxTqWeight MlxTqWeight::concatenate(const std::vector<MlxTqWeight>& weights, bo
     auto descriptors = array(allocator::malloc(rows * 8), Shape{int(rows)}, uint64);
     auto scales = first.columns_ ? first.scales_
         : array(allocator::malloc(scale_bytes), Shape{int(scale_count)}, first.scales_.dtype());
+    mfq::TqLayout layout; layout.compact = first.width_ % 256 != 0;
     auto* target_desc = descriptors.data<std::uint64_t>();
     std::size_t word_base = 0, row_base = 0, projection_base = 0;
     for (std::size_t p = 0; p < weights.size(); ++p) {
@@ -1567,8 +1575,7 @@ MlxTqWeight MlxTqWeight::concatenate(const std::vector<MlxTqWeight>& weights, bo
             const std::size_t to = projections
                 ? std::size_t(e) * outputs + projection_base : row_base;
             for (int r = 0; r < block_rows; ++r)
-                target_desc[to + r] = (source[from + r] & 0xffffffff00000000ull)
-                    | (std::uint32_t(source[from + r]) + std::uint32_t(word_base));
+                target_desc[to + r] = layout.rebase(source[from + r], std::uint64_t(layout.offset(source[from + r])) + word_base);
             if (!first.columns_) std::memcpy(scales.data<std::uint8_t>() + to * scale_stride,
                 weight.scales_.data<std::uint8_t>() + from * scale_stride, block_rows * scale_stride);
         }
@@ -1603,7 +1610,8 @@ array MlxTqWeight::project_column_inputs(const array& input, const array& ids,
         return column_pair_kernel()({words_, descriptors_, up->words_, up->descriptors_, relative_table(),
                 prepared[0], prepared[1], canonical, array({limit}), scales_}, {Shape{tokens, routes, output_size()}}, {float16},
             {((output_size() + 3) / 4) * 128, total, 1}, {128, 1, 1},
-            {{"K", input_columns_}, {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
+            {{"K", input_columns_}, {"WIDTH_G", width_}, {"WIDTH_U", up->width_},
+             {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
              {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(up->pooled_,up->words_)}, {"PREPARE_DOWN", false},
              {"DOWN_COLUMN", 0}, {"DOWN_WIDTH", 0}}, std::nullopt, false, {}).front();
     }
@@ -1673,6 +1681,7 @@ std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> we
             total += weight.output_size();
             templates.emplace_back("END" + suffix, total);
             templates.emplace_back("POOLED" + suffix, pool_kind(weight.pooled_,weight.words_));
+            templates.emplace_back("WIDTH" + suffix, weight.width_);
         }
         record_dispatch(input, total, 1, "dense_column_inputs");
         auto values = column_batch_kernel(weights.size(), false)(inputs, {Shape{1, total}}, {float16},
@@ -2264,7 +2273,8 @@ MlxTqFfnIntermediate MlxTqWeight::swiglu_for_down(const MlxTqWeight& up, const M
                 prepared[0], prepared[1], canonical, array({limit}), down.scales_},
             {Shape{1, ids.shape(1), output_size()}}, {float32},
             {((output_size() + 3) / 4) * 128, ids.shape(1), 1}, {128, 1, 1},
-            {{"K", input_columns_}, {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
+            {{"K", input_columns_}, {"WIDTH_G", width_}, {"WIDTH_U", up.width_},
+             {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
              {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(up.pooled_,up.words_)}, {"PREPARE_DOWN", true},
              {"DOWN_COLUMN", down.columns_}, {"DOWN_WIDTH", down.width_}}, std::nullopt, false, {}).front();
         return {std::move(values), true};

@@ -251,7 +251,7 @@ std::vector<std::uint8_t> join_rows(const std::vector<std::vector<std::uint8_t>>
         const mfq::TqLayout m(blob.data(),blob.size());
         for(std::size_t row=0;row<m.rows;++row) {
             auto descriptor=mfq::TqLayout::integer(blob.data()+64+row*8,8);
-            descriptor+=byte_offset/4;
+            descriptor=m.rebase(descriptor,std::uint64_t(m.offset(descriptor))+byte_offset/4);
             mfq::TqLayout::integer(result.data()+64+(row_offset+row)*8,descriptor,8);
         }
         if(!m.columns)for(std::size_t i=0;i<std::size_t(m.rows)*m.groups;++i) {

@@ -128,7 +128,7 @@ include = ["mfq*"]
 "mfq.calibration" = ["recipes/*.json", "recipes/*/*.json"]
 "mfq.quantize.cuda" = ["*.cu", "*.cpp", "*.h"]
 "mfq.kernels.cuda" = ["tq_ops.cu", "tq_ops.h", "tq_*.cuh"]
-"mfq.kernels.hip" = ["tq_projection.hip", "tq_q8.hip", "tq_projection.h", "tq_vector.h", "tq_float_tokens.h", "tq_materialize.h", "tq_fused.h", "tq_residual.h", "tq_q8.h", "mfq_hip_compat.h"]
+"mfq.kernels.hip" = ["tq_compact.h", "tq_projection.hip", "tq_q8.hip", "tq_projection.h", "tq_vector.h", "tq_float_tokens.h", "tq_materialize.h", "tq_fused.h", "tq_residual.h", "tq_q8.h", "mfq_hip_compat.h"]
 "mfq.quantize.hip" = ["*.hip", "*.cpp", "*.h"]
 "mfq.server" = [
     "protocol/*.json",

@@ -58,9 +58,9 @@ __device__ __forceinline__ PreparedWeight prefetch_weight(ProjectionView m,uint6
  if(row>=m.rows || col>=m.input_columns)return data;
  const int bits=int((descriptor>>32)&7)+1,ringwords=8*bits;
  const int first=((31-(col/8)%32)*(8*bits))>>5;
- const auto* ring=m.words+uint32_t(descriptor)+(col>>8)*ringwords;
+
  #pragma unroll
- for(int j=0;j<3;++j){int at=first+j;if(at>=ringwords)at-=ringwords;data.raw[j]=__ldg(ring+at);}
+ for(int j=0;j<3;++j){int at=first+j;if(at>=ringwords)at-=ringwords;data.raw[j]=tq_ring_word(m.words,descriptor,m.stored_columns,col,bits,at);}
  if(m.columns) {
   const auto* source=reinterpret_cast<const uint32_t*>(static_cast<const half*>(m.scales)+col);
   #pragma unroll

@@ -53,10 +53,10 @@ __device__ __forceinline__ void pp_runtime_values(TrellisProjectionView m,
         uint64_t d,int row,int col,half* out) {
     const int bits=int((d>>32)&7)+1,ringwords=8*bits;
     const int bit=(256-V-(col&255))*bits,at=bit>>5,shift=bit&31;
-    const auto* ring=m.words+uint32_t(d)+(col>>8)*ringwords;
-    const uint32_t w0=__ldg(ring+at);
-    const uint32_t w1=__ldg(ring+(at+1<ringwords?at+1:at+1-ringwords));
-    const uint32_t w2=__ldg(ring+(at+2<ringwords?at+2:at+2-ringwords));
+
+    const uint32_t w0=tq_ring_word(m.words,d,m.stored_columns,col,bits,at);
+    const uint32_t w1=tq_ring_word(m.words,d,m.stored_columns,col,bits,at+1<ringwords?at+1:at+1-ringwords);
+    const uint32_t w2=tq_ring_word(m.words,d,m.stored_columns,col,bits,at+2<ringwords?at+2:at+2-ringwords);
     const uint32_t n0=__funnelshift_r(w0,w1,shift);
     const uint32_t n1=__funnelshift_r(w1,w2,shift);
     const uint32_t n2=w2>>shift;

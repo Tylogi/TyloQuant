@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include "tq_compact.cuh"
 
 template<class Kernel> int launchable(Kernel kernel,int threads) {
     int resident=0;cudaError_t e=cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident,kernel,threads,0);
@@ -22,25 +23,17 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
         int row,int col,int width,int gslog,Consumer& consumer) {
     int bits=Bits?Bits:int((descriptor>>32)&7)+1;
     float anchor=__half2float(__ushort_as_half(uint16_t(descriptor>>40)));
-    int ringwords=8*bits;
     static_assert(V>0 && 256%V==0,"Decode vectors must divide an independent ring");
     // Callers assign aligned V-weight vectors. Their bit offsets cannot have
     // every possible low five bits: even precisions with V=16 are word-aligned.
     int minimum=((256/V-1)-((col/V)%(256/V)))*(V*bits);
     int first=minimum>>5;
-    const uint32_t* ring=words+uint32_t(descriptor)+(col>>8)*ringwords;
     constexpr int STEP=V*(Bits?Bits:8);
     constexpr int ALIGN=STEP&-STEP;
     constexpr int MAX_SHIFT=Bits?(ALIGN<32?32-ALIGN:0):31;
     constexpr int NW=(MAX_SHIFT+(V-1)*(Bits?Bits:8)+16+31)/32;
     uint32_t chunks[NW]={};
-    #pragma unroll
-    for(int j=0;j<NW;++j) {
-        int at=first+j;
-        if constexpr(Bits>0 && (Bits&(Bits-1))==0)at&=8*Bits-1;
-        else if(at>=ringwords)at-=ringwords;
-        chunks[j]=__ldg(ring+at);
-    }
+    tq_ring_window<NW,Bits>(words,descriptor,width,col,bits,first,chunks);
     #ifdef TRELLIS_NORMALIZED_WINDOW
     constexpr int NORM=((V-1)*(Bits?Bits:8)+16+31)/32;
     uint32_t normalized[NORM];
@@ -57,7 +50,7 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
     float column_scales[V];
     if constexpr(!RawBook && Columns) {
         uint32_t packed_scale[V/2];
-        // A compact RTRELL05 image aligns column scales to eight bytes;
+        // TQ images align column scales to eight bytes;
         // pairs need four-byte alignment and also cover the compact tail.
         #pragma unroll
         for(int j=0;j<V/2;++j)packed_scale[j]=__ldg(

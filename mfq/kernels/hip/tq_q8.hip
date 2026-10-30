@@ -3,6 +3,7 @@
 #include <climits>
 #include <hip/hip_bf16.h>
 #include "tq_projection.h"
+#include "tq_compact.h"
 #include "tq_vector.h"
 namespace mfq_tq_q8 {
 template<int DT>using S=std::conditional_t<DT==2,float,uint16_t>;
@@ -28,12 +29,12 @@ __device__ __forceinline__ void q8_integer_book(ProjectionView m,uint64_t d,int 
     constexpr int Words=(MaxShift+(V-1)*Bits+16+31)/32;
     constexpr int Normalized=((V-1)*Bits+16+31)/32;
     const int minimum=(15-(col/16)%16)*Step,first=minimum/32;
-    const auto* ring=m.words+uint32_t(d)+(col/256)*(8*Bits);
+
     uint32_t chunks[Words],normalized[Normalized];
     #pragma unroll
     for(int j=0;j<Words;++j) {
         int at=first+j;if(at>=8*Bits)at-=8*Bits;
-        chunks[j]=__ldg(ring+at);
+        chunks[j]=tq_ring_word(m.words,d,m.stored_columns,col,Bits,at);
     }
     #pragma unroll
     for(int j=0;j<Normalized;++j)normalized[j]=__funnelshift_r(chunks[j],j+1<Words?chunks[j+1]:0,minimum&31);
@@ -176,7 +177,7 @@ extern "C" int mfq_tq_q8_tokens(ProjectionView m,const void* x,void* y,int token
         int dtype,void* scratch,uint64_t bytes,hipStream_t stream) {
     if(!x || !y || x==y || tokens<1 || tokens>4 || (dtype!=0 && dtype!=2) ||
        m.rows<1 || m.input_columns<1 || m.input_columns>INT_MAX-511 ||
-       m.input_columns>m.stored_columns || m.stored_columns%256 ||
+       m.input_columns>m.stored_columns || m.stored_columns%32 ||
        !m.words || !m.descriptors || !m.scales || !m.relative ||
        (!m.columns && (m.gslog<4 || m.gslog>20)))return -1;
     const int qc=int((uint64_t(m.input_columns)+511)/512*512);
@@ -230,7 +231,7 @@ template<int DT>__global__ __launch_bounds__(256) void swiglu_product(
 }
 static bool valid(ProjectionView m) {
     return m.rows>0 && m.input_columns>0 && m.input_columns<=INT_MAX-511 &&
-        m.input_columns<=m.stored_columns && m.stored_columns%256==0 &&
+        m.input_columns<=m.stored_columns && m.stored_columns%32==0 &&
         m.words && m.descriptors && m.scales && m.relative && (m.columns || (m.gslog>=4 && m.gslog<=20));
 }
 template<int DT>int launch_group(TqProjectionPlan plan,const void* x,int qc,int blocks,
