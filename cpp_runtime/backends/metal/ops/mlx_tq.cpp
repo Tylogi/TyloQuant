@@ -200,7 +200,14 @@ if (expert >= 0 && expert < EXPERTS) {
     auto packed_u = tq_words<POOLED_U>(words_u, desc_u, EXPERTS * OUT, uint(expert));
     ulong descriptor = descriptors[wr];
     auto input = (upper ? prepared_u : prepared_g) + route * K;
-    value = tq_dot<float, 16, 0, K, K, 512>(upper ? packed_u : packed_g, descriptor, TqUnitScale{}, relative, wr, input, lane & 15u);
+    if constexpr (WIDTH_G == WIDTH_U)
+        value = tq_dot<float, 16, 0, WIDTH_G, K, 512>(upper ? packed_u : packed_g, descriptor,
+            TqUnitScale{}, relative, wr, input, lane & 15u);
+    else if (upper)
+        value = tq_dot<float, 16, 0, WIDTH_U, K, 512>(packed_u, descriptor,
+            TqUnitScale{}, relative, wr, input, lane & 15u);
+    else value = tq_dot<float, 16, 0, WIDTH_G, K, 512>(packed_g, descriptor,
+        TqUnitScale{}, relative, wr, input, lane & 15u);
     anchor = float(as_type<half>(ushort(descriptor >> 40u)));
 }
 for (uint step = 8u; step; step >>= 1u) value += simd_shuffle_down(value, step);
@@ -243,6 +250,7 @@ auto packed = words0;
 auto input = x;
 ulong descriptor = 0ul;
 uint local = 0u;
+float value = 0.f;
 )METAL";
     for (std::size_t p = 0; p < count; ++p) {
         const auto suffix = std::to_string(p);
@@ -255,14 +263,14 @@ uint local = 0u;
                 "local = row - BEGIN" + suffix + ";\n"
                 "packed = tq_words<POOLED" + suffix + ">(words" + suffix + ", descriptors" + suffix
                 + ", END" + suffix + " - BEGIN" + suffix + ", 0u);\n"
-                "descriptor = descriptors" + suffix + "[local];\ninput = x + " + suffix + "u * K;\n}\n";
+                "descriptor = descriptors" + suffix + "[local];\ninput = x + " + suffix + "u * K;\n"
+                "value = tq_dot<float, 16, 0, WIDTH" + suffix + ", K, 512>(packed, descriptor, TqUnitScale{}, relative, local, input, lane);\n}\n";
         }
     }
     source += prepare ? R"METAL(
 value *= factor;
 for (uint j = 0u; j < 4u; ++j) if (col + j < K) y[projection * K + col + j] = value[j];
 )METAL" : R"METAL(
-float value = tq_dot<float, 16, 0, K, K, 512>(packed, descriptor, TqUnitScale{}, relative, local, input, lane);
 for (uint step = 8u; step; step >>= 1u) value += simd_shuffle_down(value, step);
 if (lane == 0u) y[row] = half(value * float(as_type<half>(ushort(descriptor >> 40u))));
 )METAL";
@@ -465,7 +473,7 @@ if constexpr (COLUMN_SINGLE) {
             auto packed_u = tq_words<POOLED_U>(words_u, descriptors_u, EXPERTS * OUT, uint(expert));
             ulong descriptor = upper ? descriptors_u[wr] : descriptors_g[wr];
             auto prepared = (upper ? prepared_u : prepared_g) + destination * K;
-            result = tq_dot<float, 16, 0, K, K, 512>(upper ? packed_u : packed_g,
+            result = tq_dot<float, 16, 0, WIDTH_G, K, 512>(upper ? packed_u : packed_g,
                 descriptor, TqUnitScale{}, relative, wr, prepared, lane & 15u);
             anchor = float(as_type<half>(ushort(descriptor >> 40u)));
         }
@@ -1602,7 +1610,8 @@ array MlxTqWeight::project_column_inputs(const array& input, const array& ids,
         return column_pair_kernel()({words_, descriptors_, up->words_, up->descriptors_, relative_table(),
                 prepared[0], prepared[1], canonical, array({limit}), scales_}, {Shape{tokens, routes, output_size()}}, {float16},
             {((output_size() + 3) / 4) * 128, total, 1}, {128, 1, 1},
-            {{"K", input_columns_}, {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
+            {{"K", input_columns_}, {"WIDTH_G", width_}, {"WIDTH_U", up->width_},
+             {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
              {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(up->pooled_,up->words_)}, {"PREPARE_DOWN", false},
              {"DOWN_COLUMN", 0}, {"DOWN_WIDTH", 0}}, std::nullopt, false, {}).front();
     }
@@ -1672,6 +1681,7 @@ std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> we
             total += weight.output_size();
             templates.emplace_back("END" + suffix, total);
             templates.emplace_back("POOLED" + suffix, pool_kind(weight.pooled_,weight.words_));
+            templates.emplace_back("WIDTH" + suffix, weight.width_);
         }
         record_dispatch(input, total, 1, "dense_column_inputs");
         auto values = column_batch_kernel(weights.size(), false)(inputs, {Shape{1, total}}, {float16},
@@ -2263,7 +2273,8 @@ MlxTqFfnIntermediate MlxTqWeight::swiglu_for_down(const MlxTqWeight& up, const M
                 prepared[0], prepared[1], canonical, array({limit}), down.scales_},
             {Shape{1, ids.shape(1), output_size()}}, {float32},
             {((output_size() + 3) / 4) * 128, ids.shape(1), 1}, {128, 1, 1},
-            {{"K", input_columns_}, {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
+            {{"K", input_columns_}, {"WIDTH_G", width_}, {"WIDTH_U", up.width_},
+             {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
              {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(up.pooled_,up.words_)}, {"PREPARE_DOWN", true},
              {"DOWN_COLUMN", down.columns_}, {"DOWN_WIDTH", down.width_}}, std::nullopt, false, {}).front();
         return {std::move(values), true};
