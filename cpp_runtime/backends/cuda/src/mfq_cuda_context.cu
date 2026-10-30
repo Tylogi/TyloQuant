@@ -208,7 +208,7 @@ Event::~Event() noexcept {
 }
 
 Event::Event(Event&& other) noexcept
-    : device_(other.device_), event_(std::exchange(other.event_, nullptr)) {}
+    : device_(other.device_), event_(std::exchange(other.event_, nullptr)), stream_(other.stream_) {}
 
 Event& Event::operator=(Event&& other) noexcept {
     if (this != &other) {
@@ -217,6 +217,7 @@ Event& Event::operator=(Event&& other) noexcept {
         }
         device_ = other.device_;
         event_ = std::exchange(other.event_, nullptr);
+        stream_ = other.stream_;
     }
     return *this;
 }
@@ -224,12 +225,17 @@ Event& Event::operator=(Event&& other) noexcept {
 void Event::record(cudaStream_t stream) {
     DeviceGuard guard(device_);
     MFQ_NATIVE_CUDA_CHECK(cudaEventRecord(event_, stream));
+    stream_ = stream;
 }
 
 bool Event::ready() const {
     DeviceGuard guard(device_);
     const auto status = cudaEventQuery(event_);
     if (status == cudaSuccess) {
+        const auto progress = cudaStreamQuery(stream_);
+        if (progress == cudaSuccess) default_context(device_)->check_input_error(stream_);
+        else if (progress == cudaErrorNotReady) (void)cudaGetLastError();
+        else MFQ_NATIVE_CUDA_CHECK(progress);
         return true;
     }
     if (status == cudaErrorNotReady) {
@@ -243,6 +249,10 @@ bool Event::ready() const {
 void Event::synchronize() const {
     DeviceGuard guard(device_);
     MFQ_NATIVE_CUDA_CHECK(cudaEventSynchronize(event_));
+    const auto progress = cudaStreamQuery(stream_);
+    if (progress == cudaSuccess) default_context(device_)->check_input_error(stream_);
+    else if (progress == cudaErrorNotReady) (void)cudaGetLastError();
+    else MFQ_NATIVE_CUDA_CHECK(progress);
 }
 
 Stream::Stream(int device, unsigned flags) : device_(device) {
@@ -600,6 +610,7 @@ void Graph::reset() noexcept {
 void Stream::synchronize() const {
     DeviceGuard guard(device_);
     MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    default_context(device_)->check_input_error(stream_);
 }
 
 void Stream::wait(const Event& event) const {
@@ -656,9 +667,40 @@ Context::Context(int device)
     blas_.set_stream(stream_.get());
 }
 
+Context::~Context() noexcept {
+    on_device_noexcept(device_, [] { (void)cudaDeviceSynchronize(); });
+}
+
 DeviceMemoryStats Context::memory_stats() const noexcept {
     return {allocation_budget_->limit,allocation_budget_->allocated.load(std::memory_order_relaxed),
         allocation_budget_->peak.load(std::memory_order_relaxed)};
+}
+
+DeviceInputError* Context::input_error(cudaStream_t stream) {
+    std::lock_guard lock(input_error_mutex_);
+    if (const auto it = input_errors_.find(stream); it != input_errors_.end()) return it->second.device;
+    DeviceGuard guard(device_);
+    DeviceInputError* host = nullptr;
+    MFQ_NATIVE_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&host), sizeof(*host), cudaHostAllocMapped));
+    InputErrorStorage storage;
+    storage.host = std::shared_ptr<DeviceInputError>(host, [](DeviceInputError* value) { (void)cudaFreeHost(value); });
+    *host = {};
+    MFQ_NATIVE_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&storage.device), host, 0));
+    return input_errors_.emplace(stream, std::move(storage)).first->second.device;
+}
+
+void Context::check_input_error(cudaStream_t stream) const {
+    std::lock_guard lock(input_error_mutex_);
+    const auto it = input_errors_.find(stream);
+    if (it == input_errors_.end()) return;
+    const auto error = *it->second.host;
+    if (!error.operation) return;
+    *it->second.host = {};
+    constexpr const char* operations[] = {
+        "unknown", "index_select", "gather", "scatter", "index_copy", "index_fill", "exclusive KV append"};
+    const auto operation = error.operation > 0 && error.operation < 7 ? operations[error.operation] : operations[0];
+    throw std::out_of_range(std::string(operation) + ": index " + std::to_string(error.index) +
+        " is out of range [0, " + std::to_string(error.extent) + ")");
 }
 
 std::size_t Context::local_memory_usage() const {
@@ -761,6 +803,12 @@ void Context::reclaim_idle_memory() {
     // Phase transitions must retire frees on all compute/transfer streams.
     // Trimming unused pages leaves live graph-pool allocations untouched.
     MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<cudaStream_t> checked_streams;
+    {
+        std::lock_guard lock(input_error_mutex_);
+        for (const auto& [stream, storage] : input_errors_) checked_streams.push_back(stream);
+    }
+    for (const auto stream : checked_streams) check_input_error(stream);
     trim_pool_pages();
     if(const auto* trace=std::getenv("MFQ_TRACE_RESIDENCY_MEMORY");trace && trace[0]=='1') {
         std::lock_guard lock(graph_pool_mutex_);

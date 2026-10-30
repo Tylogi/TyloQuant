@@ -17,6 +17,7 @@ public:
     void update_rows(const std::vector<BatchDecodeRow>&);
     void row(int64_t index, int64_t token, int64_t position, int64_t slot = -1, bool enabled = true);
     void state(int64_t row, int64_t field, const Tensor& value, int64_t axis = -1);
+    void validate_position(int64_t row, int64_t maximum) const;
     void upload();
     void copy_from(const BatchDecodeInputs&);
     int64_t rows() const { return rows_; }

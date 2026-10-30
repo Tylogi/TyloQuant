@@ -30,6 +30,8 @@ struct HotKvCache {
     bool defined() const { return mapping.defined(); }
     bool exclusive() const { return cold_mapping.defined(); }
     void set_cold_storage(const mfq_tensor_backend::Tensor& keys, const mfq_tensor_backend::Tensor& values);
+    // Physical tiers and allocation tables must cover exactly the logical capacity.
+    void validate_exclusive_capacity() const;
     void append(const mfq_tensor_backend::Tensor& keys, const mfq_tensor_backend::Tensor& values,
         const mfq_tensor_backend::Tensor& positions);
     // Short contiguous appends: reserve/evict/write in one CTA, optionally

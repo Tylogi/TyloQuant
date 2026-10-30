@@ -465,12 +465,13 @@ template <class Model> struct CudaGenerationContext {
         auto available=mfq::engine::prefill_budget_add(
             mfq::engine::prefill_budget_add(context->available_memory(),context->workspace_available()),
             budget.lendable_bytes);
-        const auto row_bytes=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float)*8;
+        const auto row_bytes=mfq::engine::prefill_workspace_row_bytes(
+            model.hidden_size(),model.hc_mult(),model.num_attention_heads(),model.head_dim());
         const auto sequence_bytes=allow_borrow
             ? std::size_t(tokens<=16384?tokens:std::min<std::size_t>(tokens,limit))*row_bytes*3/8 : 0;
+        const auto headroom=mfq::engine::prefill_workspace_headroom(context->memory_stats().limit,row_bytes);
         const auto reserve=moe_expert_cache_ssd_experts(model.execution->moe_expert_cache)
-            ? std::max(std::size_t(1)<<30,mfq::cuda::runtime_options::workspace_reserve_bytes())
-            : std::size_t(1)<<30;
+            ? std::max(headroom,mfq::cuda::runtime_options::workspace_reserve_bytes()) : headroom;
         const auto fixed=mfq::engine::prefill_budget_add(reserve+sequence_bytes,budget.transfer_bytes);
         const auto wanted=std::min<int64_t>({int64_t(tokens),limit,mfq::engine::max_prefill_compute_chunk});
         const auto required=mfq::engine::prefill_budget_add(fixed,std::size_t(wanted)*row_bytes);
