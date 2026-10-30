@@ -18,7 +18,7 @@ public:
 
 private:
     friend class MlxMappedTqRows;
-    int width_ = 0;
+    int width_ = 0,stored_width_ = 0;
     std::size_t source_bytes_ = 0;
     std::vector<std::uint64_t> descriptors_;
     std::vector<std::uint32_t> layouts_, packed_;

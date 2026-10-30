@@ -7,6 +7,7 @@
 #include "mlx_platform.h"
 #include "mlx_eval_timing.h"
 #include "mlx_tq_rows.h"
+#include "mfq/tq_rows.h"
 
 #include <mlx/allocator.h>
 #include <nlohmann/json.hpp>
@@ -1425,12 +1426,11 @@ MlxTqWeight MlxTqWeight::from_blob_impl(std::span<const std::uint8_t> blob,
         int input_columns, int experts, const array* word_pool, std::span<const std::uint64_t> expert_offsets) {
     if (blob.size() >= 8 && !std::memcmp(blob.data(), "RTQEXP01", 8))
         return from_expert_blob(blob, input_columns, experts, word_pool, expert_offsets);
-    if (blob.size() < 64 || std::memcmp(blob.data(), "RTRELL05", 8) || load_le<std::uint32_t>(blob, 8) != 5)
-        throw std::runtime_error("invalid TQ RTRELL05 header");
+    const mfq::TqLayout layout(blob.data(), blob.size());
     auto rows = load_le<std::uint32_t>(blob, 12), width = load_le<std::uint32_t>(blob, 16);
     auto columns = load_le<std::uint32_t>(blob, 20), gs = load_le<std::uint32_t>(blob, 24);
     auto packed = load_le<std::uint32_t>(blob, 28);
-    if (!rows || rows > INT_MAX || !width || width > INT_MAX || width % 256 || columns > 1
+    if (!rows || rows > INT_MAX || !width || width > INT_MAX || width % 32 || columns > 1
         || (!columns && (gs < 16 || gs > (1u << 20) || (gs & (gs - 1))))
         || experts <= 0 || rows % experts || input_columns < 0 || input_columns > int(width))
         throw std::runtime_error("invalid TQ geometry");
@@ -1445,7 +1445,7 @@ MlxTqWeight MlxTqWeight::from_blob_impl(std::span<const std::uint8_t> blob,
     for (std::size_t row = 0; row < rows; ++row) {
         auto d = load_le<std::uint64_t>(blob, 64 + row * 8);
         auto anchor = std::uint16_t(d >> 40);
-        if ((d & ~std::uint64_t(0x00FFFF07FFFFFFFF)) || std::uint32_t(d) != offset
+        if (!layout.valid_descriptor(d) || layout.offset(d) != offset
             || (anchor & 0x8000) || (anchor & 0x7c00) == 0x7c00)
             throw std::runtime_error("invalid TQ row descriptor");
         offset += std::uint64_t(width) * (((d >> 32) & 7) + 1) / 32;
@@ -1465,16 +1465,15 @@ MlxTqWeight MlxTqWeight::from_blob_impl(std::span<const std::uint8_t> blob,
         std::vector<std::uint64_t> descriptors(rows + experts);
         for (int expert = 0; expert < experts; ++expert) {
             const auto first_row = std::size_t(expert) * expert_rows;
-            const auto source_base = std::uint32_t(load_le<std::uint64_t>(blob, 64 + first_row * 8));
+            const auto source_base = layout.offset(load_le<std::uint64_t>(blob, 64 + first_row * 8));
             const auto source_end = expert + 1 == experts ? packed / 4
-                : std::uint32_t(load_le<std::uint64_t>(blob, 64 + (first_row + expert_rows) * 8));
+                : layout.offset(load_le<std::uint64_t>(blob, 64 + (first_row + expert_rows) * 8));
             const auto target = expert_offsets[expert];
             if (target > word_pool->size() || source_end - source_base > word_pool->size() - target)
                 throw std::out_of_range("TQ expert exceeds the word pool");
             for (std::size_t row = first_row; row < first_row + expert_rows; ++row) {
                 const auto descriptor = load_le<std::uint64_t>(blob, 64 + row * 8);
-                descriptors[row] = (descriptor & 0xffffffff00000000ull)
-                    | (std::uint32_t(descriptor) - source_base);
+                descriptors[row] = layout.rebase(descriptor, layout.offset(descriptor) - source_base);
             }
             descriptors[rows + expert] = target;
         }
@@ -1553,6 +1552,7 @@ MlxTqWeight MlxTqWeight::concatenate(const std::vector<MlxTqWeight>& weights, bo
     auto descriptors = array(allocator::malloc(rows * 8), Shape{int(rows)}, uint64);
     auto scales = first.columns_ ? first.scales_
         : array(allocator::malloc(scale_bytes), Shape{int(scale_count)}, first.scales_.dtype());
+    mfq::TqLayout layout; layout.compact = first.width_ % 256 != 0;
     auto* target_desc = descriptors.data<std::uint64_t>();
     std::size_t word_base = 0, row_base = 0, projection_base = 0;
     for (std::size_t p = 0; p < weights.size(); ++p) {
@@ -1567,8 +1567,7 @@ MlxTqWeight MlxTqWeight::concatenate(const std::vector<MlxTqWeight>& weights, bo
             const std::size_t to = projections
                 ? std::size_t(e) * outputs + projection_base : row_base;
             for (int r = 0; r < block_rows; ++r)
-                target_desc[to + r] = (source[from + r] & 0xffffffff00000000ull)
-                    | (std::uint32_t(source[from + r]) + std::uint32_t(word_base));
+                target_desc[to + r] = layout.rebase(source[from + r], std::uint64_t(layout.offset(source[from + r])) + word_base);
             if (!first.columns_) std::memcpy(scales.data<std::uint8_t>() + to * scale_stride,
                 weight.scales_.data<std::uint8_t>() + from * scale_stride, block_rows * scale_stride);
         }

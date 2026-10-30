@@ -1,4 +1,4 @@
-"""Bounded row reads from ordinary RTRELL05 tensors.
+"""Bounded row reads from ordinary TQ tensors.
 
 Embedding tables and routed projection banks share this reader. It does not
 own a cache or read the full packed stream when only a row range is needed.
@@ -20,10 +20,14 @@ class TQRows:
         magic, version, self.rows, self.width, columns, self.gs, packed_bytes = (
             struct.unpack_from('<8s6I', header)
         )
-        if magic != b'RTRELL05' or version != 5 or columns not in (0, 1):
-            raise ValueError('Invalid RTRELL05 header')
-        if not self.rows or not self.width or self.width % 256 or any(header[32:64]):
-            raise ValueError('Invalid RTRELL05 geometry or reserved bytes')
+        self.compact = magic == b'RTRELL06' and version == 6
+        if not (self.compact or (magic == b'RTRELL05' and version == 5)) or columns not in (0, 1):
+            raise ValueError('Invalid TQ header')
+        if (not self.rows or not self.width or self.width % 32 or any(header[32:64])
+                or (self.compact and (not columns or self.width % 256 == 0))
+                or (not self.compact and self.width % 256)):
+            raise ValueError('Invalid TQ geometry or reserved bytes')
+        self._offset_mask = np.uint64(0x7ffffffe if self.compact else 0xffffffff)
         self.columns = bool(columns)
         if not self.columns and (not 16 <= self.gs <= 2**20 or self.gs & (self.gs-1)):
             raise ValueError('Invalid TQ subgroup size')
@@ -49,14 +53,14 @@ class TQRows:
             raise ValueError('Invalid TQ row range')
         count = end-begin
         descriptors = np.frombuffer(self._range(64+begin*8, count*8), '<u8').copy()
-        offsets = descriptors & np.uint64(0xffffffff)
+        offsets = descriptors & self._offset_mask
         bits = ((descriptors >> np.uint64(32)) & np.uint64(7))+1
         first = int(offsets[0])*4
         finish = int(offsets[-1])*4+self.width*int(bits[-1])//8
         if finish > self._packed_bytes or first > finish:
             raise ValueError('TQ row payload is out of bounds')
         packed = np.frombuffer(self._range(self._packed_offset+first, finish-first), 'u1')
-        descriptors = ((descriptors & np.uint64(0xffffffff00000000)) |
+        descriptors = ((descriptors & ~self._offset_mask) |
                        (offsets-offsets[0]))
         if self.columns:
             scales = np.frombuffer(self._range(self._scale_offset, self._scale_bytes), '<f2')
@@ -86,7 +90,7 @@ class TQRows:
         selections = {}
         for run in runs:
             chunk = self.slice_rows(int(run[0]), int(run[-1])+1)
-            offsets = chunk.descriptors & np.uint64(0xffffffff)
+            offsets = chunk.word_offsets
             if not self.columns:
                 selectors = np.stack((chunk.scales & 15, chunk.scales >> 4), axis=1).reshape(-1)
                 selectors = selectors[:chunk.rows*self.groups].reshape(chunk.rows, self.groups)
@@ -99,7 +103,7 @@ class TQRows:
         words = 0
         for row in requested:
             descriptor, stream, scale = selections[int(row)]
-            descriptors.append((int(descriptor) & 0xffffffff00000000) | words)
+            descriptors.append((int(descriptor) & (0xffffffffffffffff ^ int(self._offset_mask))) | words)
             words += len(stream)//4
             packed.append(stream)
             selectors.append(scale)

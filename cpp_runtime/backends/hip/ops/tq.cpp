@@ -165,9 +165,8 @@ TqWeight to_device_tq(const std::vector<std::uint8_t>& blob,std::int64_t columns
     std::uint64_t expected=0;
     for(std::size_t row=0;row<m.rows;++row) {
         const auto descriptor=mfq::TqLayout::integer(blob.data()+64+row*8,8);
-        const auto bits=((descriptor>>32)&7)+1,anchor=(descriptor>>40)&0xffff;
-        if((descriptor & ~0x00ffff07ffffffffULL) || anchor>0x7bff ||
-           std::uint32_t(descriptor)!=expected)
+        const auto bits=((descriptor>>32)&7)+1;
+        if(!m.valid_descriptor(descriptor) || m.offset(descriptor)!=expected)
             throw std::invalid_argument("invalid TQ row descriptor");
         expected+=std::uint64_t(m.width)*bits/32;
     }
@@ -385,9 +384,9 @@ static TqWeight load_tq_expert_pool(const mfq::ModelSource& source,const std::st
         uint64_t expected=0;
         for(int64_t row=0;row<outputs;++row) {
             const auto descriptor=mfq::TqLayout::integer(child+64+row*8,8);
-            if((descriptor & ~0x00ffff07ffffffffULL) || ((descriptor>>40)&0xffff)>0x7bff || uint32_t(descriptor)!=expected)
+            if(!layout.valid_descriptor(descriptor) || layout.offset(descriptor)!=expected)
                 throw std::invalid_argument("invalid TQ expert row descriptor");
-            const auto normalized=(descriptor & 0xffffffff00000000ULL)|(uint64_t(base_words)+expected);
+            const auto normalized=layout.rebase(descriptor,uint64_t(base_words)+expected);
             mfq::TqLayout::integer(image.data()+64+(size_t(expert)*outputs+row)*8,normalized,8);
             expected+=uint64_t(stored_width)*(((descriptor>>32)&7)+1)/32;
         }
@@ -656,7 +655,7 @@ std::vector<std::int64_t> logical_shape(const mfq::ModelSource& source,const std
         std::array<uint8_t,64> header{};source.tensor_reader(name)(0,reinterpret_cast<std::byte*>(header.data()),header.size());
         if(!std::memcmp(header.data(),"RTQEXP01",8))shape={int64_t(mfq::TqLayout::integer(header.data()+12,4)),
             int64_t(mfq::TqLayout::integer(header.data()+16,4)),int64_t(mfq::TqLayout::integer(header.data()+20,4))};
-        else if(!std::memcmp(header.data(),"RTRELL05",8))shape={int64_t(mfq::TqLayout::integer(header.data()+12,4)),
+        else if(!std::memcmp(header.data(),"RTRELL05",8) || !std::memcmp(header.data(),"RTRELL06",8))shape={int64_t(mfq::TqLayout::integer(header.data()+12,4)),
             int64_t(mfq::TqLayout::integer(header.data()+16,4))};
     }
     if(shape.size()!=2 && shape.size()!=3)
@@ -707,7 +706,7 @@ std::vector<std::uint8_t> join_rows(const std::vector<std::vector<std::uint8_t>>
         const mfq::TqLayout m(blob.data(),blob.size());
         for(std::size_t row=0;row<m.rows;++row) {
             auto descriptor=mfq::TqLayout::integer(blob.data()+64+row*8,8);
-            descriptor+=byte_offset/4;
+            descriptor=m.rebase(descriptor,std::uint64_t(m.offset(descriptor))+byte_offset/4);
             mfq::TqLayout::integer(result.data()+64+(row_offset+row)*8,descriptor,8);
         }
         if(!m.columns)for(std::size_t i=0;i<std::size_t(m.rows)*m.groups;++i) {

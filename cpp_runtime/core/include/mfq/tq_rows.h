@@ -34,7 +34,7 @@ inline TqRowSelection select_tq_rows(const std::vector<std::int64_t>& ids,
 
 struct TqLayout {
     std::uint32_t rows=0,width=0,gs=0,packed_bytes=0;
-    bool columns=false;
+    bool columns=false,compact=false;
     std::size_t groups=0,scales=0,packed=0,scale_bytes=0,bytes=0;
     static std::uint64_t integer(const std::uint8_t* p,int bytes) {
         std::uint64_t value=0;
@@ -44,14 +44,33 @@ struct TqLayout {
     static void integer(std::uint8_t* p,std::uint64_t value,int bytes) {
         for(int i=0;i<bytes;++i)p[i]=std::uint8_t(value>>(8*i));
     }
+    std::uint32_t offset(std::uint64_t descriptor)const noexcept {
+        return std::uint32_t(descriptor)&(compact?0x7ffffffeU:0xffffffffU);
+    }
+    static std::uint32_t tail_seed(std::uint64_t d)noexcept {
+        return ((d>>35)&31)|(((d>>56)&255)<<5)|((d&1)<<13)|(((d>>31)&1)<<14);
+    }
+    bool valid_descriptor(std::uint64_t d)const noexcept {
+        const auto bits=((d>>32)&7)+1;
+        if(((d>>40)&0xffff)>0x7bff)return false;
+        if(!compact)return !(d&~0x00ffff07ffffffffULL);
+        return !(std::uint64_t(width)*bits/32&1) && tail_seed(d)<(1U<<(16-bits));
+    }
+    std::uint64_t rebase(std::uint64_t d,std::uint64_t words)const {
+        const std::uint64_t mask=compact?0x7ffffffeULL:0xffffffffULL;
+        if(words&~mask)throw std::overflow_error("TQ row word offset exceeds format capacity");
+        return (d&~mask)|words;
+    }
     TqLayout()=default;
     TqLayout(const std::uint8_t* p,std::size_t size) {
-        if(size<64 || std::memcmp(p,"RTRELL05",8) || integer(p+8,4)!=5 || integer(p+20,4)>1)
-            throw std::invalid_argument("invalid RTRELL05 header");
+        if(size<64)throw std::invalid_argument("truncated TQ header");
+        compact=!std::memcmp(p,"RTRELL06",8) && integer(p+8,4)==6;
+        if((!compact && (std::memcmp(p,"RTRELL05",8) || integer(p+8,4)!=5)) || integer(p+20,4)>1)
+            throw std::invalid_argument("invalid TQ header");
         rows=std::uint32_t(integer(p+12,4));width=std::uint32_t(integer(p+16,4));
         columns=integer(p+20,4)!=0;gs=std::uint32_t(integer(p+24,4));
         packed_bytes=std::uint32_t(integer(p+28,4));
-        if(!rows || !width || width%256 ||
+        if(!rows || !width || width%32 || (compact?(!columns || width%256==0):width%256!=0) ||
            (!columns && (gs<16 || gs>(1u<<20) || (gs&(gs-1)))))
             throw std::invalid_argument("invalid TQ row geometry");
         for(int i=32;i<64;++i)if(p[i])throw std::invalid_argument("nonzero TQ reserved coefficients");
@@ -75,7 +94,7 @@ public:
         layout_=TqLayout(header_.data(),bytes);
     }
     const TqLayout& layout()const noexcept{return layout_;}
-    // Write one ordinary RTRELL05 row into caller-owned staging storage.
+    // Write one ordinary TQ row into caller-owned staging storage.
     // This avoids temporary descriptor/payload vectors for sparse CPU tables.
     std::size_t slice_row_into(std::uint64_t row,std::uint8_t* target,std::size_t capacity)const {
         const auto& m=layout_;
@@ -83,10 +102,10 @@ public:
         std::array<std::uint8_t,8> record{};
         read_(64+row*8,reinterpret_cast<std::byte*>(record.data()),record.size());
         const auto descriptor=TqLayout::integer(record.data(),8);
-        const auto first=std::uint32_t(descriptor);
+        const auto first=m.offset(descriptor);
         const auto bits=((descriptor>>32)&7)+1;
         const auto packed_bytes=std::size_t(m.width)*bits/8;
-        if((descriptor & ~0x00ffff07ffffffffULL) || ((descriptor>>40)&0xffff)>0x7bff ||
+        if(!m.valid_descriptor(descriptor) ||
            std::uint64_t(first)*4+packed_bytes>m.packed_bytes ||
            (!row && first) || (row+1==m.rows && std::uint64_t(first)*4+packed_bytes!=m.packed_bytes))
             throw std::invalid_argument("invalid TQ row descriptor or payload range");
@@ -95,7 +114,7 @@ public:
         if(capacity<bytes)throw std::overflow_error("TQ row staging capacity is too small");
         std::memcpy(target,header_.data(),64);
         TqLayout::integer(target+12,1,4);TqLayout::integer(target+28,packed_bytes,4);
-        TqLayout::integer(target+64,descriptor&0xffffffff00000000ULL,8);
+        TqLayout::integer(target+64,m.rebase(descriptor,0),8);
         auto* scales=target+72;
         if(m.columns)read_(m.scales,reinterpret_cast<std::byte*>(scales),scale_bytes);
         else if(m.groups==1) {
@@ -122,17 +141,15 @@ public:
         const auto count=std::size_t(end-begin);
         std::vector<std::uint8_t> descriptors(count*8);
         read_(64+begin*8,reinterpret_cast<std::byte*>(descriptors.data()),descriptors.size());
-        const auto first=TqLayout::integer(descriptors.data(),4);
+        const auto first=m.offset(TqLayout::integer(descriptors.data(),8));
         auto expected=first;
         for(std::size_t row=0;row<count;++row) {
             auto* record=descriptors.data()+row*8;
             const auto descriptor=TqLayout::integer(record,8);
             const auto bits=((descriptor>>32)&7)+1;
-            const auto anchor=(descriptor>>40)&0xffff;
-            if((descriptor & ~0x00ffff07ffffffffULL) || anchor>0x7bff ||
-               TqLayout::integer(record,4)!=expected)
+            if(!m.valid_descriptor(descriptor) || m.offset(descriptor)!=expected)
                 throw std::invalid_argument("invalid TQ row descriptor");
-            TqLayout::integer(record,expected-first,4);
+            TqLayout::integer(record,m.rebase(descriptor,expected-first),8);
             expected+=std::uint64_t(m.width)*bits/32;
         }
         if(first*4>m.packed_bytes || expected*4>m.packed_bytes ||

@@ -158,12 +158,12 @@ class Projection:
         if isinstance(data, (str, Path)):
             data = TQTensor.load(data)
         if not isinstance(data, TQTensor):
-            raise TypeError('Expected a TQTensor or RTRELL05 path')
+            raise TypeError('Expected a TQTensor or TQ payload path')
         data = data.components()
         self.rows, self.stored_columns = int(data['rows']), int(data['width'])
         self.input_columns = self.stored_columns if input_columns is None else int(input_columns)
         gs, columns = int(data['gs']), bool(data['columns'])
-        if (self.rows <= 0 or self.stored_columns % 256 or
+        if (self.rows <= 0 or self.stored_columns % 32 or
                 not 0 < self.input_columns <= self.stored_columns or
                 (not columns and (gs < 16 or gs > 2**20 or gs & (gs - 1)))):
             raise ValueError('Invalid projection geometry or subgroup size')
