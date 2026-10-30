@@ -26,6 +26,7 @@ struct QwenBatchRequest : mfq::engine::BatchRequest {
     qwen35::QwenBatchRequestState cache;
     std::unique_ptr<BatchMtpRow> mtp;
     int64_t decode_row = -1;
+    int64_t prefill_retry_width = 0;
 };
 
 // Native operations consumed directly by engine::ContinuousBatch.
@@ -59,6 +60,8 @@ class QwenBatchOperations {
     void release_idle_buffers();
     mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     Sample prefill(const std::shared_ptr<Request> &, mfq::engine::PrefillChunk);
+    Sample prefill_once(const std::shared_ptr<Request> &, mfq::engine::PrefillChunk);
+    static constexpr bool isolate_prefill_failures = true;
     void activate(const std::shared_ptr<Request> &, const Sample &);
     void resume_decode(int64_t cache_position);
     void discard_prefill(const std::shared_ptr<Request> &);
@@ -105,6 +108,7 @@ struct FlashNextBatchRequest : mfq::engine::BatchRequest {
     std::unique_ptr<BatchMtpRow> mtp;
     int64_t decode_row = -1;
     double packed_prefill_ms = 0;
+    int64_t prefill_retry_width = 0;
 };
 class FlashNextBatchOperations {
   public:
@@ -127,6 +131,7 @@ class FlashNextBatchOperations {
     void release_idle_buffers();
     mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     Sample prefill(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
+    Sample prefill_once(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     std::size_t prefill_batch_limit() const;
     int64_t prefill_batch_token_budget() const;
     std::vector<mfq::engine::PrefillBatchResult<Sample>> prefill_batch(

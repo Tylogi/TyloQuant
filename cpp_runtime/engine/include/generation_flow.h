@@ -21,8 +21,25 @@ Generation generate_prepared(Ops &ops, InferenceRequest &input, InferenceOutput 
     std::optional<typename Ops::Prepared> prepared;
     if (input.vision && !output.stopped()) {
         auto preparation = ops.prepare(input);
+        bool reclaimed=false;
         while (!output.stopped()) {
-            auto [step, elapsed] = ops.advance_preparation(preparation);
+            mfq::StepResult<typename Ops::Prepared> step;
+            double elapsed=0;
+            std::exception_ptr failure;
+            try {
+                auto result=ops.advance_preparation(preparation);
+                step=std::move(result.first);
+                elapsed=result.second;
+            } catch(...) { failure=std::current_exception(); }
+            if(failure) {
+                preparation={};
+                if constexpr(requires { ops.recover_preparation(failure,reclaimed); }) {
+                    ops.recover_preparation(failure,reclaimed);
+                    reclaimed=true;
+                    preparation=ops.prepare(input);
+                    continue;
+                } else std::rethrow_exception(failure);
+            }
             output.metrics.multimodal_ms += elapsed;
             if (step.value) {
                 prepared = std::move(*step.value);
@@ -92,7 +109,11 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
     ExecutionCleanup cleanup{output.cleanup_failure, [&] { ops.release(); }};
     if constexpr(requires { ops.prepare_request(request); })ops.prepare_request(request);
     typename Ops::Restore restored;
-    if (caching && (!use_mtp || mtp->supports_session_state()))
+    const bool restore_prefix=[&] {
+        if constexpr(requires { ops.allow_prefix_restore(); })return ops.allow_prefix_restore();
+        return true;
+    }();
+    if (caching && restore_prefix && (!use_mtp || mtp->supports_session_state()))
         restored = session_cache.restore_best(model,
             use_mtp ? mtp : nullptr,
             cache_plan.session_id,

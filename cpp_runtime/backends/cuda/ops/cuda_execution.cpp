@@ -892,6 +892,7 @@ void CudaExecutionContext::reset() noexcept {
     force_moe_unfused_reduce = false;
     force_moe_materialized_swiglu = false;
     force_moe_prefill_mma_off = false;
+    prefill_moe_route_bytes = 0;
     moe_cache_registration_min_slots = 8;
     gemma_trace_layer = -1;
     gemma_stage_trace = nullptr;

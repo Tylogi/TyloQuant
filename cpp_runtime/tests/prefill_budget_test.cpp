@@ -22,6 +22,11 @@ int main() {
     assert(select_prefill_chunk(8192,8192,memory(8192),fixed,row)==8192);
     const auto maximum=std::numeric_limits<std::size_t>::max();
     assert(prefill_budget_add(maximum-100,101)==maximum);
+    assert(prefill_budget_multiply(maximum,2)==maximum);
+    assert((PrefillMoeGeometry{8,4096,128}.activation_bytes_per_token()==8*(4096+32*4)));
+    assert((PrefillMoeGeometry{2,65,32}.activation_bytes_per_token()==2*(3*32+3*4)));
+    assert(pressure_prefill_chunk(8192,8192,128*row,0,row)==128);
+    assert(pressure_prefill_chunk(8192,8192,0,fixed,row)==1);
     assert(select_prefill_chunk(8192,8192,maximum,maximum,row)==0);
     for(int rows=0;rows<10000;++rows) {
         const auto result=select_prefill_chunk(8192,8192,memory(rows),fixed,row);

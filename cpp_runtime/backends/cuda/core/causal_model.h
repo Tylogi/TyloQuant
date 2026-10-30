@@ -54,6 +54,7 @@ struct CausalResources {
     mfq::models::CausalLmMetadata metadata;
     CudaExecutionContext *execution = nullptr;
     std::function<void()> restore_decode_workspace;
+    std::function<void()> reclaim_prefill_workspace;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model&,mfq_tensor_backend::Tensor,int) {return {};}
 
