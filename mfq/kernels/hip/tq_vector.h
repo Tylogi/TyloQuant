@@ -2,6 +2,7 @@
 #pragma once
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include "tq_compact.h"
 namespace mfq_tq_vector {
 using U4=uint32_t __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ uint32_t dot_bytes(uint32_t a,uint32_t b,uint32_t c) {
@@ -37,7 +38,6 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
     // every possible low five bits: even precisions with V=16 are word-aligned.
     int minimum=((256/V-1)-((col/V)%(256/V)))*(V*bits);
     int first=minimum>>5;
-    const uint32_t* ring=words+uint32_t(descriptor)+(col>>8)*ringwords;
     constexpr int STEP=V*(Bits?Bits:8);
     constexpr int ALIGN=STEP&-STEP;
     constexpr int MAX_SHIFT=Bits?(ALIGN<32?32-ALIGN:0):(Prepared?(32-V):31);
@@ -49,7 +49,7 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
         if constexpr(Bits>0 && (Bits&(Bits-1))==0)at&=8*Bits-1;
         else if(at>=ringwords)at-=ringwords;
         if constexpr(Prepared)chunks[j]=raw[j];
-        else chunks[j]=__ldg(ring+at);
+        else chunks[j]=tq_ring_word(words,descriptor,width,col,bits,at);
     }
     #ifdef TRELLIS_NORMALIZED_WINDOW
     constexpr int NORM=((V-1)*(Bits?Bits:8)+16+31)/32;
@@ -67,7 +67,7 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
     float column_scales[V];
     if constexpr(!RawBook && Columns && !Prepared) {
         uint32_t packed_scale[V/2];
-        // A compact RTRELL05 image aligns column scales to eight bytes;
+        // TQ images align column scales to eight bytes;
         // pairs need four-byte alignment and also cover the compact tail.
         #pragma unroll
         for(int j=0;j<V/2;++j)packed_scale[j]=__ldg(

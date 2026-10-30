@@ -1,4 +1,4 @@
-"""TQ: fixed-book, row-dynamic Trellis quantization (RTRELL05 payload).
+"""TQ: fixed-book, row-dynamic Trellis quantization.
 
 Each row selects 1..8 bits per weight. Independent 256-element tail-biting
 rings address a procedural 65536-state Gaussian book. A row has an FP16
@@ -6,8 +6,8 @@ anchor and either 4-bit subgroup selectors or shared FP16 column scales.
 No rotation is applied. Model containers store this payload as ``TQ``;
 their ``tq_shapes`` metadata retains logical 2-D or expert-bank dimensions.
 
-The payload stores the padded width; callers retain the logical input width
-in their model metadata and pass it to ``Projection(input_columns=...)``.
+RTRELL05 stores complete rings. RTRELL06 stores a short final ring without
+padding, retaining its boundary state in the existing row descriptor.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def unpack_states(packed: np.ndarray, bits: int) -> np.ndarray:
 
 @dataclass(frozen=True)
 class TQTensor:
-    """Validated RTRELL05 components in host memory, independent of PyTorch."""
+    """Validated compressed components, independent of PyTorch."""
 
     rows: int
     width: int
@@ -67,8 +67,10 @@ class TQTensor:
     packed: np.ndarray
 
     def __post_init__(self):
-        if self.rows <= 0 or self.width <= 0 or self.width % 256:
-            raise ValueError("Expected positive rows and a width divisible by 256")
+        if self.rows <= 0 or self.width <= 0 or self.width % 32:
+            raise ValueError("Expected positive rows and a width divisible by 32")
+        if self.compact and not self.columns:
+            raise ValueError("Compact tails require shared column scales")
         if not self.columns and (
             self.gs < 16 or self.gs > 2**20 or self.gs & (self.gs - 1)
         ):
@@ -85,16 +87,20 @@ class TQTensor:
             raise ValueError("Row descriptor count differs")
         # Book IDs are reserved; the fixed book is shared by all precisions.
         allowed = np.uint64(0x00FFFF07FFFFFFFF)
-        if np.any(self.descriptors & ~allowed):
+        if not self.compact and np.any(self.descriptors & ~allowed):
             raise ValueError("Reserved row descriptor bits must be zero")
         bits = self.bits.astype(np.uint64)
         lengths = self.width * bits // 32
-        offsets = self.descriptors & np.uint64(0xFFFFFFFF)
+        offsets = self.word_offsets
         expected = np.r_[np.uint64(0), np.cumsum(lengths[:-1], dtype=np.uint64)]
         if not np.array_equal(offsets, expected) or int(lengths.sum()) * 4 != len(self.packed):
             raise ValueError("Row offsets or packed payload length differ")
         if int(lengths.sum()) > 2**32:
             raise ValueError("Packed tensor exceeds 32-bit word offsets")
+        if self.compact and (np.any(lengths & 1) or int(lengths.sum()) >= 2**31):
+            raise ValueError("Compact rows require even word offsets below 2**31")
+        if self.compact and np.any(self.tail_seeds.astype(np.uint32) >= (1 << (16 - bits))):
+            raise ValueError("Invalid compact tail boundary state")
         nscale = self.width if self.columns else (self.rows * self.groups + 1) // 2
         if len(self.scales) != nscale:
             raise ValueError("Scale payload length differs")
@@ -106,6 +112,22 @@ class TQTensor:
     @property
     def bits(self) -> np.ndarray:
         return (((self.descriptors >> 32) & 7) + 1).astype(np.uint8)
+
+    @property
+    def compact(self) -> bool:
+        return bool(self.width % 256)
+
+    @property
+    def word_offsets(self) -> np.ndarray:
+        return self.descriptors & np.uint64(0x7FFFFFFE if self.compact else 0xFFFFFFFF)
+
+    @property
+    def tail_seeds(self) -> np.ndarray:
+        d = self.descriptors
+        return (((d >> np.uint64(35)) & 31)
+                | (((d >> np.uint64(56)) & 255) << np.uint64(5))
+                | ((d & 1) << np.uint64(13))
+                | (((d >> np.uint64(31)) & 1) << np.uint64(14))).astype(np.uint16)
 
     @property
     def anchors(self) -> np.ndarray:
@@ -132,7 +154,8 @@ class TQTensor:
 
     def to_bytes(self) -> bytes:
         header = _HEADER.pack(
-            b"RTRELL05", 5, self.rows, self.width, int(self.columns), self.gs, len(self.packed)
+            b"RTRELL06" if self.compact else b"RTRELL05", 6 if self.compact else 5,
+            self.rows, self.width, int(self.columns), self.gs, len(self.packed)
         )
         # Reserved polynomial coefficients are zero for the fixed-book format.
         return b"".join((header, bytes(32), self.descriptors.tobytes(),
@@ -146,9 +169,12 @@ class TQTensor:
         if len(payload) < 64:
             raise ValueError("Truncated Trellis header")
         magic, version, rows, width, columns, gs, nbytes = _HEADER.unpack_from(payload)
-        if magic != b"RTRELL05" or version != 5 or columns not in (0, 1):
-            raise ValueError("Invalid RTRELL05 header")
-        if rows <= 0 or width <= 0 or width % 256 or (not columns and gs <= 0):
+        compact = magic == b"RTRELL06" and version == 6
+        if not (compact or (magic == b"RTRELL05" and version == 5)) or columns not in (0, 1):
+            raise ValueError("Invalid TQ header")
+        if (rows <= 0 or width <= 0 or width % 32
+                or (compact and (not columns or width % 256 == 0))
+                or (not compact and width % 256) or (not columns and gs <= 0)):
             raise ValueError("Invalid Trellis geometry")
         if any(payload[32:64]):
             raise ValueError("Fixed-book tensors require zero polynomial coefficients")
@@ -168,6 +194,64 @@ class TQTensor:
     def load(cls, path: str | Path) -> TQTensor:
         return cls.from_bytes(Path(path).read_bytes())
 
+    def compact_tail(self, logical_width: int) -> TQTensor:
+        """Remove padding without changing any real decoded weight or refitting."""
+        if logical_width == self.width:
+            return self
+        if (self.compact or not self.columns or logical_width <= 0 or logical_width % 32
+                or logical_width % 256 == 0
+                or self.width != (logical_width + 255) // 256 * 256):
+            raise ValueError("Invalid compact tail source geometry")
+        bits = self.bits.astype(np.uint64)
+        lengths = logical_width * bits // 32
+        if np.any(lengths & 1):
+            raise ValueError("Compact rows require even word lengths")
+        offsets = np.r_[np.uint64(0), np.cumsum(lengths[:-1], dtype=np.uint64)]
+        if int(lengths.sum()) >= 2**31:
+            raise ValueError("Compact row offsets exceed their storage limit")
+        descriptors = (self.descriptors & np.uint64(0x00FFFF0700000000)) | offsets
+        output = np.empty(int(lengths.sum()) * 4, np.uint8)
+        full, tail = divmod(logical_width, 256)
+        source_offsets = self.word_offsets.astype(np.int64) * 4
+        for k in range(1, 9):
+            ids = np.flatnonzero(bits == k)
+            if not len(ids):
+                continue
+            # Work on real physical matrices; group rows only for byte copies.
+            raw = self.packed[source_offsets[ids, None] + np.arange(self.width * k // 8)]
+            ring = raw[:, full * 32 * k:]
+            at, shift = divmod(255 * k, 8)
+            positions = np.arange(at, at + 3) % (32 * k)
+            words = ring[:, positions].astype(np.uint32)
+            state = ((words[:, 0] | (words[:, 1] << 8) | (words[:, 2] << 16)) >> shift) & 65535
+            seed = (state >> k).astype(np.uint64)
+            descriptors[ids] |= ((seed & 31) << np.uint64(35)
+                | ((seed >> np.uint64(5)) & 255) << np.uint64(56)
+                | ((seed >> np.uint64(13)) & 1)
+                | ((seed >> np.uint64(14)) & 1) << np.uint64(31))
+            kept = np.concatenate((raw[:, :full * 32 * k], ring[:, (256 - tail) * k // 8:]), axis=1)
+            output[offsets[ids, None].astype(np.int64) * 4 + np.arange(logical_width * k // 8)] = kept
+        return TQTensor(self.rows, logical_width, self.gs, True, descriptors,
+                        self.scales[:logical_width], output)
+
+    def states(self, row: int) -> np.ndarray:
+        """Read one row's exact states, including a compact boundary."""
+        if not 0 <= row < self.rows:
+            raise IndexError(row)
+        bits = int(self.bits[row])
+        start = int(self.word_offsets[row]) * 4
+        raw = self.packed[start:start + self.width * bits // 8]
+        if not self.compact:
+            return unpack_states(raw.reshape(-1, 32 * bits), bits).reshape(-1)
+        full, tail = divmod(self.width, 256)
+        prefix = unpack_states(raw[:full * 32 * bits].reshape(full, 32 * bits), bits).reshape(-1)
+        seed = int(self.tail_seeds[row])
+        stream = np.r_[raw[full * 32 * bits:], np.array([seed & 255, seed >> 8], np.uint8)].astype(np.uint32)
+        pos = (tail - 1 - np.arange(tail)) * bits
+        byte = pos // 8
+        word = stream[byte] | stream[byte + 1] << 8 | stream[byte + 2] << 16
+        return np.r_[prefix, ((word >> (pos % 8)) & 65535).astype(np.uint16)]
+
     def dequantize(self, input_columns: int | None = None) -> np.ndarray:
         """Slow CPU reference, reconstructing weights with one FP16 rounding."""
         logical = self.width if input_columns is None else input_columns
@@ -179,9 +263,7 @@ class TQTensor:
             selectors = np.stack((self.scales & 15, self.scales >> 4), axis=1).reshape(-1)
             selectors = selectors[:self.rows * self.groups].reshape(self.rows, self.groups)
         for row, bits in enumerate(self.bits):
-            start = int(self.descriptors[row] & np.uint64(0xFFFFFFFF)) * 4
-            size = self.width * int(bits) // 8
-            states = unpack_states(self.packed[start:start + size].reshape(-1, 32 * int(bits)), int(bits))
+            states = self.states(row)
             relative = self.scales if self.columns else np.repeat(RELATIVE[selectors[row]], self.gs)[:self.width]
             scale = np.float32(self.anchors[row]) * relative.astype(np.float32)
             output[row] = (lut[states.reshape(-1)].astype(np.float32) * scale).astype(np.float16)

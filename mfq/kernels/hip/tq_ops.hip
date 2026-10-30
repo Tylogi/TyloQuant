@@ -299,7 +299,7 @@ int geometry(TrellisProjectionView g,TrellisProjectionView u,const void* x,void*
 }
 
 extern "C" int mfq_tq_gemv(TrellisProjectionView g,const void* x,void* y,int dtype,int w,int r,hipStream_t s) {
-    if(g.input_columns<=0 || g.input_columns>g.stored_columns || g.rows<=0 || g.stored_columns%256 ||
+    if(g.input_columns<=0 || g.input_columns>g.stored_columns || g.rows<=0 || g.stored_columns%32 ||
        !g.words || !g.descriptors || !g.scales || !g.relative || !x || !y ||
        (!g.columns && (g.gslog<4 || g.gslog>20)))return -1;
     if(w==0) {
@@ -317,7 +317,7 @@ extern "C" int mfq_tq_gemv(TrellisProjectionView g,const void* x,void* y,int dty
 extern "C" int mfq_tq_swiglu(TrellisProjectionView g,TrellisProjectionView u,const void* x,void* h,int dtype,int w,int r,hipStream_t s) {
     if(g.rows!=u.rows || g.input_columns!=u.input_columns || g.rows<=0 || g.input_columns<=0 ||
        g.stored_columns<g.input_columns || u.stored_columns<u.input_columns ||
-       g.stored_columns%256 || u.stored_columns%256 || !g.words || !u.words ||
+       g.stored_columns%32 || u.stored_columns%32 || !g.words || !u.words ||
        !g.descriptors || !u.descriptors || !g.scales || !u.scales || !g.relative || !u.relative || !x || !h ||
        (!g.columns && (g.gslog<4 || g.gslog>20)) || (!u.columns && (u.gslog<4 || u.gslog>20)))return -1;
     if(w==0){w=4;r=1;}
@@ -369,7 +369,7 @@ extern "C" int mfq_tq_swiglu_batch(const TrellisProjectionView* gate,const Trell
 extern "C" int mfq_tq_gemv_tokens(TrellisProjectionView g,const void* x,void* y,int tokens,int dtype,hipStream_t s) {
     if(tokens<1 || tokens>65535)return -1;
     if(tokens==1)return mfq_tq_gemv(g,x,y,dtype,0,0,s);
-    if(g.input_columns<=0 || g.input_columns>g.stored_columns || g.rows<=0 || g.stored_columns%256 ||
+    if(g.input_columns<=0 || g.input_columns>g.stored_columns || g.rows<=0 || g.stored_columns%32 ||
        !g.words || !g.descriptors || !g.scales || !g.relative || !x || !y ||
        (!g.columns && (g.gslog<4 || g.gslog>20)))return -1;
     if(dtype==0) {
@@ -389,7 +389,7 @@ extern "C" int mfq_tq_swiglu_tokens(TrellisProjectionView g,TrellisProjectionVie
         const void* x,void* y,int tokens,int dtype,hipStream_t s) {
     if(tokens<1 || tokens>65535 || g.rows!=u.rows || g.input_columns!=u.input_columns ||
        g.rows<=0 || g.input_columns<=0 || g.stored_columns<g.input_columns ||
-       u.stored_columns<u.input_columns || g.stored_columns%256 || u.stored_columns%256 ||
+       u.stored_columns<u.input_columns || g.stored_columns%32 || u.stored_columns%32 ||
        !g.words || !u.words || !g.descriptors || !u.descriptors || !g.scales || !u.scales ||
        !g.relative || !u.relative || !x || !y ||
        (!g.columns && (g.gslog<4 || g.gslog>20)) || (!u.columns && (u.gslog<4 || u.gslog>20)))return -1;
@@ -470,7 +470,7 @@ __global__ void embedding_kernel(TrellisProjectionView m,const int64_t* ids,Scal
 
 extern "C" int mfq_tq_embedding(TrellisProjectionView m,const int64_t* ids,int count,void* output,int dtype,hipStream_t s) {
     if(count<1 || count>65535 || (!ids && count>m.rows) || m.rows<1 || m.input_columns<1 ||
-       m.input_columns>m.stored_columns || m.stored_columns%256 || !m.words || !m.descriptors ||
+       m.input_columns>m.stored_columns || m.stored_columns%32 || !m.words || !m.descriptors ||
        !m.scales || !m.relative || !output || (!m.columns && (m.gslog<4 || m.gslog>20)))return -1;
     const dim3 grid((m.input_columns+511)/512,count);
     if(dtype=hipLaunchKernelGGL((=0)embedding_kernel<0>), dim3(grid),dim3(32),0,s, m,ids,static_cast<Scalar<0>*>(output));

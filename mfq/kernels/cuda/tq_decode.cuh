@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include "tq_compact.cuh"
 
 template<class Kernel> int launchable(Kernel kernel,int threads) {
     int resident=0;cudaError_t e=cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident,kernel,threads,0);
@@ -28,7 +29,6 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
     // every possible low five bits: even precisions with V=16 are word-aligned.
     int minimum=((256/V-1)-((col/V)%(256/V)))*(V*bits);
     int first=minimum>>5;
-    const uint32_t* ring=words+uint32_t(descriptor)+(col>>8)*ringwords;
     constexpr int STEP=V*(Bits?Bits:8);
     constexpr int ALIGN=STEP&-STEP;
     constexpr int MAX_SHIFT=Bits?(ALIGN<32?32-ALIGN:0):31;
@@ -39,7 +39,7 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
         int at=first+j;
         if constexpr(Bits>0 && (Bits&(Bits-1))==0)at&=8*Bits-1;
         else if(at>=ringwords)at-=ringwords;
-        chunks[j]=__ldg(ring+at);
+        chunks[j]=tq_ring_word(words,descriptor,width,col,bits,at);
     }
     #ifdef TRELLIS_NORMALIZED_WINDOW
     constexpr int NORM=((V-1)*(Bits?Bits:8)+16+31)/32;
@@ -57,7 +57,7 @@ __device__ __forceinline__ void visit_values(const uint32_t* words,uint64_t desc
     float column_scales[V];
     if constexpr(!RawBook && Columns) {
         uint32_t packed_scale[V/2];
-        // A compact RTRELL05 image aligns column scales to eight bytes;
+        // TQ images align column scales to eight bytes;
         // pairs need four-byte alignment and also cover the compact tail.
         #pragma unroll
         for(int j=0;j<V/2;++j)packed_scale[j]=__ldg(

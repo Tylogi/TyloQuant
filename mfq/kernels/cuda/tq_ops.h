@@ -17,7 +17,7 @@ struct TrellisProjectionView {
     const void* relative;
     const float* bias;
     int rows;
-    int stored_columns;  // Independent 256-element encoded rings, padded at tail.
+    int stored_columns;  // Encoded width; RTRELL06 retains a short final ring.
     int input_columns;   // Logical input width; padding is masked in the kernel.
     int gslog;
     int columns;         // 0: subgroup selectors; 1: FP16 input-column scales.

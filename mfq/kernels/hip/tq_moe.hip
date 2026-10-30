@@ -348,9 +348,9 @@ template<int Bits>__device__ __forceinline__ U4 prefetch_row(ProjectionView m,ui
     U4 output{};
     const int bits=Bits?Bits:int((descriptor>>32)&7)+1,ringwords=8*bits;
     const int minimum=(31-(col/8)%32)*(8*bits),first=minimum>>5;
-    const auto* ring=m.words+uint32_t(descriptor)+(col>>8)*ringwords;
+
     #pragma unroll
-    for(int j=0;j<(Bits?2:3);++j){int at=first+j;if(at>=ringwords)at-=ringwords;output[j]=__ldg(ring+at);}
+    for(int j=0;j<(Bits?2:3);++j){int at=first+j;if(at>=ringwords)at-=ringwords;output[j]=tq_ring_word(m.words,descriptor,m.stored_columns,col,bits,at);}
     return output;
 }
 __device__ __forceinline__ void prefetch_tile(ProjectionView m,int expert,int kb,int tid,int choice,const uint64_t* descriptors,PreparedTile& tile) {

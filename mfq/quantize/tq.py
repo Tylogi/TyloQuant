@@ -37,11 +37,12 @@ def quantize(
     Adaptive subgroup fitting screens the retained scale grid on sampled rows.
     ``column_scaling=False, search="full"`` retains the FP32 all-row scale search.
     ``search="fast"`` uses one sampled scale candidate without re-encoding.
-    All paths retain the complete 16-bit state space and RTRELL05 payloads.
+    All paths retain the complete 16-bit state space.
     ``column_scaling=True`` shares one FP16 input scale vector across all
     row precisions; it is prepared independently of the selected precisions.
-    Logical widths are padded to whole rings and subgroups; retain the
-    original width when constructing the CUDA ``Projection``.
+    Fitting pads logical widths to complete rings; supported shared-column
+    tails are serialized without padding. Retain the original logical width
+    when constructing the CUDA ``Projection``.
     """
     if not weight.is_cuda or weight.ndim != 2 or min(weight.shape) <= 0:
         raise ValueError("Expected a nonempty CUDA 2D weight tensor")
@@ -163,6 +164,10 @@ def quantize(
             if len(selectors) & 1:
                 selectors = np.pad(selectors, (0, 1))
             scales = selectors[::2] | (selectors[1::2] << 4)
-        return TQTensor(
+        result = TQTensor(
             rows, width, groupsize, column_scaling, descriptors, scales, np.concatenate(row_payloads) if isinstance(row_payloads, list) else row_payloads
         )
+        if column_scaling and logical % 256 and logical % 32 == 0:
+            if np.all((logical * widths.astype(np.uint64) // 32) % 2 == 0):
+                result = result.compact_tail(logical)
+        return result

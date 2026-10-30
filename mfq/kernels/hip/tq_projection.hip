@@ -29,11 +29,11 @@ __device__ float weight(ProjectionView m, int row, int col) {
     const uint64_t descriptor = m.descriptors[row];
     const int bits = int((descriptor >> 32) & 7) + 1;
     const int ring_words = bits * 8;
-    const uint32_t* ring = m.words + uint32_t(descriptor) + (col / 256) * ring_words;
+
     const int position = (255 - col % 256) * bits;
     const int word = position / 32, shift = position % 32;
-    uint32_t state = ring[word] >> shift;
-    if (shift > 16) state |= ring[word + 1 == ring_words ? 0 : word + 1] << (32 - shift);
+    uint32_t state = tq_ring_word(m.words,descriptor,m.stored_columns,col,bits,word) >> shift;
+    if (shift > 16) state |= tq_ring_word(m.words,descriptor,m.stored_columns,col,bits,word + 1 == ring_words ? 0 : word + 1) << (32 - shift);
     const uint32_t product = (state & 65535) * 0x83dcd12du;
 #if defined(__HIP_DEVICE_COMPILE__) && __has_builtin(__builtin_amdgcn_udot4)
     const int sum = __builtin_amdgcn_udot4(product, 0x01010101u, 0u, false);
