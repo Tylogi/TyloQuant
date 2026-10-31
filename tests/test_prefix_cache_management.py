@@ -16,6 +16,7 @@ from mfq.server.state.catalog import ModelCatalog
 from mfq.server.state.storage import SessionStore
 from tests.test_prefix_disk_budget import block
 from tests.test_runtime_memory_policy import cached_instance
+from tests.platform_helpers import symlink_or_skip
 
 
 def text_record(path, namespace, digest, tokens):
@@ -226,7 +227,7 @@ def test_text_sidecar_symlink_is_neither_read_nor_deleted(tmp_path):
     external = tmp_path / 'private.txt'
     external.write_text('keep')
     sidecar = path.with_name(path.name + '.tokens')
-    sidecar.symlink_to(external)
+    symlink_or_skip(sidecar, external)
     assert read_prefix_cache_tokens(tmp_path, 'a' * 64, '1' * 64)['reason'] == 'text_not_saved'
     purge_prefix_cache(tmp_path)
     assert external.read_text() == 'keep' and sidecar.is_symlink()

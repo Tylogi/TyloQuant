@@ -17,7 +17,7 @@ def test_model_activation_is_published_only_after_the_load_transaction(tmp_path,
     async def run():
         _model(tmp_path / "activating.mfq", architecture="qwen35")
         executable = tmp_path / "fake-runtime"
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         pool = RuntimePool(ModelCatalog([tmp_path], cache_seconds=0), executable, startup_timeout_seconds=5)
         pool.memory_policy = RuntimeMemoryPolicy(prefix_directory=str(tmp_path / "prefix-cache"))
         entered, release = asyncio.Event(), asyncio.Event()

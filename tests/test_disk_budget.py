@@ -107,7 +107,32 @@ def test_sparse_partial_file_does_not_release_unwritten_download_space(budget, t
         directory.mkdir()
         size = 10 << 20
         with (directory / 'weights.incomplete').open('wb') as stream:
-            stream.truncate(size)
+            if os.name == 'nt':
+                import ctypes
+                import msvcrt
+                from ctypes import wintypes
+
+                kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+                control = kernel.DeviceIoControl
+                control.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                    wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+                control.restype = wintypes.BOOL
+                returned = wintypes.DWORD()
+                handle = msvcrt.get_osfhandle(stream.fileno())
+                # NTFS truncate alone allocates space; FSCTL_SET_SPARSE creates real holes.
+                if not control(handle, 0x900C4, None, 0, None, 0, ctypes.byref(returned), None):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                seek = kernel.SetFilePointerEx
+                seek.argtypes = [wintypes.HANDLE, ctypes.c_longlong, ctypes.c_void_p, wintypes.DWORD]
+                seek.restype = wintypes.BOOL
+                extend = kernel.SetEndOfFile
+                extend.argtypes = [wintypes.HANDLE]
+                extend.restype = wintypes.BOOL
+                # The CRT truncate implementation writes zeros when extending a file.
+                if not seek(handle, size, None, 0) or not extend(handle):
+                    raise ctypes.WinError(ctypes.get_last_error())
+            else:
+                stream.truncate(size)
         handlers = ToolJobHandlers(ModelCatalog([]), ToolJobPaths(tmp_path, Path(sys.executable), None, None, None, None))
         async def transfer(*args, **kwargs):
             assert budget.reserved(directory) >= size + (512 << 20) - 4096

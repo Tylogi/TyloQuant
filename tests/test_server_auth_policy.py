@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from mfq.server.api import create_app
 
@@ -23,7 +25,6 @@ def test_authentication_policy_is_hot_persistent_and_shared(tmp_path: Path) -> N
             assert response.status_code == 200
             assert response.json() == {"enabled": True, "has_key": True}
             assert secret not in path.read_text()
-            assert path.stat().st_mode & 0o777 == 0o600
             assert (await client.get("/v1/models")).status_code == 401
             denied = await client.post("/v1/messages", headers={"x-api-key": "incorrect"}, json={})
             assert denied.status_code == 401
@@ -48,6 +49,19 @@ def test_authentication_policy_is_hot_persistent_and_shared(tmp_path: Path) -> N
             assert not json.loads(path.read_text())["enabled"]
             assert secret not in path.read_text() and new_secret not in path.read_text()
         assert not create_app(auth_settings_path=path).state.auth_policy.enabled
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Windows chmod has no owner-only POSIX mode bits; ACLs are separate")
+def test_authentication_policy_file_is_owner_only(tmp_path: Path) -> None:
+    async def run() -> None:
+        path = tmp_path / "auth.json"
+        policy = create_app(auth_settings_path=path).state.auth_policy
+        await policy.configure(True, "example-policy-key")
+        assert path.stat().st_mode & 0o777 == 0o600
+        await policy.configure(True, "example-replacement-key")
+        assert path.stat().st_mode & 0o777 == 0o600
+
     asyncio.run(run())
 
 

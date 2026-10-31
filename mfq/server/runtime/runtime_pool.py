@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 from uuid import UUID, uuid4
 
+import psutil
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
 from mfq.server.state.catalog import DiscoveredModel, ModelArtifactNotFoundError, ModelCatalog
@@ -5385,11 +5386,6 @@ class RuntimePool:
     @staticmethod
     def _process_resident_bytes(pid: int) -> int | None:
         try:
-            output = subprocess.check_output(
-                ["ps", "-o", "rss=", "-p", str(pid)],
-                text=True,
-                timeout=1,
-            ).strip()
-            return int(output) * 1024 if output else None
-        except (OSError, ValueError, subprocess.SubprocessError):
+            return psutil.Process(pid).memory_info().rss
+        except (psutil.Error, OSError, ValueError):
             return None

@@ -10,6 +10,9 @@ import pytest
 
 
 def test_built_wheel_contains_all_offline_cuda_sources_and_alphaq_recipes(tmp_path):
+    pytest.importorskip('pip', reason='offline wheel build requires optional pip')
+    pytest.importorskip('setuptools', reason='offline wheel build requires setuptools')
+    pytest.importorskip('wheel', reason='offline wheel build requires wheel')
     if int(version('setuptools').split('.')[0]) < 61:
         pytest.skip('wheel build needs setuptools>=61, as declared in pyproject.toml')
     source = Path(__file__).resolve().parents[1]

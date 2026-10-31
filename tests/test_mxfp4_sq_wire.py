@@ -16,8 +16,10 @@ class SqWireTest(unittest.TestCase):
         spec.loader.exec_module(module)
         extension = types.ModuleType("torch.utils.cpp_extension")
         extension.load = mock.Mock(return_value=object())
+        torch = types.ModuleType("torch")
+        torch.version = types.SimpleNamespace(hip=None)
         with mock.patch.object(module, "_ensure_msvc"), mock.patch.dict(sys.modules, {
-            "torch": types.ModuleType("torch"),
+            "torch": torch,
             "torch.utils": types.ModuleType("torch.utils"),
             "torch.utils.cpp_extension": extension,
         }):
