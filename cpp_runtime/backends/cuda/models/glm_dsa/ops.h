@@ -97,6 +97,10 @@ struct GlmDsaSharedState {
 };
 
 struct GlmDsaBlock : Block {
+    struct Projection {
+        mfq_tensor_backend::Tensor query, rotary, rows;
+    };
+
     mfq::cuda::glm_dsa::Config config;
     int layer = -1;
     bool full_indexer = false;
@@ -280,9 +284,6 @@ struct GlmDsaBlock : Block {
             },
             [&](mfq_tensor_backend::Tensor xn) {
                 using Tensor = mfq_tensor_backend::Tensor;
-                struct Projection {
-                    Tensor query, rotary, rows;
-                };
                 return mfq::models::glm_dsa::attention(
                     full_indexer,
                     [&] {

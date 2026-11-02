@@ -624,7 +624,13 @@ int main(int argc,char** argv)try {
             body(fused);
             if((norm_fixed_sweep || norm_many_sweep || down_fused_mma_sweep || up_four_sweep || up_half_fused_sweep || up_vector_sweep || norm_slices_sweep || up_int_mma_sweep || norm_fast_sweep || up_fast_sigmoid_sweep || down_split_sweep || norm_stats_sweep || norm_threads_sweep || up_direct_stats_sweep || fused_unsigned_sweep || up_fused_split_sweep || up_split_major_sweep || up_parts_vector_sweep || up_fused_direct_sweep || up_half_unroll_sweep || up_half_register_sweep || up_direct_s16_sweep || metadata_sweep || unroll_sweep || norm_sweep || two_plane_sweep || three_plane_sweep || integer16_sweep || up_integer_sweep || integer_best_sweep || up_mix_sweep || up_prepare_sweep || up_mma_sweep || up_mma_uniform_sweep || up_mma_half_sweep || up_mma_m1_half_sweep || up_coefficient_sweep || down_mma_sweep || norm_quant_sweep || capacity_sweep || int_pair_sweep || uniform_prepare_sweep) && std::getenv("MFQ_GR_PROBE_RESOURCES")) {
                 cudaStreamCaptureStatus status;unsigned long long capture_id;cudaGraph_t captured;
+#if CUDART_VERSION >= 13000
+                fb::check(cudaStreamGetCaptureInfo(stream.stream(),&status,&capture_id,&captured,nullptr,nullptr,nullptr));
+#elif CUDART_VERSION >= 12000
+                fb::check(cudaStreamGetCaptureInfo(stream.stream(),&status,&capture_id,&captured,nullptr,nullptr));
+#else
                 fb::check(cudaStreamGetCaptureInfo_v2(stream.stream(),&status,&capture_id,&captured,nullptr,nullptr));
+#endif
                 size_t count=0;fb::check(cudaGraphGetNodes(captured,nullptr,&count));
                 std::vector<cudaGraphNode_t> nodes(count);fb::check(cudaGraphGetNodes(captured,nodes.data(),&count));
                 std::unordered_set<void*> seen;

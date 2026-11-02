@@ -170,7 +170,7 @@ mfq_tensor_backend::Tensor gr_prefill_fused_mix(const NintWeight& weight,
     const auto typed=[&](auto input_tag,auto value_tag,auto aligned_tag,auto zero_tag,auto swizzle_tag) {
         using Input=decltype(input_tag);using Value=decltype(value_tag);
         using Output=std::conditional_t<std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
-        constexpr bool aligned=decltype(aligned_tag)::value,zero=decltype(zero_tag)::value,swizzle=decltype(swizzle_tag)::value;
+        static constexpr bool aligned=decltype(aligned_tag)::value,zero=decltype(zero_tag)::value,swizzle=decltype(swizzle_tag)::value;
         {
             const auto* pipeline_option=std::getenv("MFQ_GR_PREFILL_FUSED_MIX");
             if((!pipeline_option || std::atoi(pipeline_option)==10 || std::atoi(pipeline_option)==12) && gr_prefill_pipeline_supported(input)) {

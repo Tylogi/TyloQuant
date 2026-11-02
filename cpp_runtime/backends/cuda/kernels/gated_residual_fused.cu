@@ -1299,7 +1299,7 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
         }
         const auto launch=[&](auto triple,auto unsigned_low,auto group) {
         if(norm_group_quant) {
-            constexpr int planes=decltype(triple)::value?3:decltype(unsigned_low)::value?4:2;
+            static constexpr int planes=decltype(triple)::value?3:decltype(unsigned_low)::value?4:2;
             const auto launch_group_norm=[&](auto inline_boundary) {
             const auto run_slices=[&](auto slices,auto threads) {
             gated_residual_norm_wide_kernel<decltype(group)::value,planes,decltype(inline_boundary)::value,decltype(threads)::value,false,decltype(slices)::value><<<
@@ -1468,7 +1468,7 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
             reinterpret_cast<int4*>(uniform_up_sums.data_ptr<int32_t>())};
     }
     const auto launch_down=[&](auto group) {
-        constexpr int fixed=decltype(group)::value;
+        static constexpr int fixed=decltype(group)::value;
         if constexpr(fixed==48) {
             if(down_mma_candidate && two_plane && (plane_count==3 || plane_count==4) &&
                 (dense_warp || (!dense_injection.defined() && i.aligned && !i.zero))) {
@@ -1552,7 +1552,7 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
                 const auto packed=[&](auto vector_layout) {
                   const auto run=[&](auto cooperative) {
                     const auto launch_plane=[&](auto plane) {
-                    constexpr int planes=decltype(plane)::value;
+                    static constexpr int planes=decltype(plane)::value;
                     constexpr bool quantized=planes>0;
                     const int capacity=quantized?0:down_capacity;
                     const size_t shared_bytes=quantized?size_t(inject_capacity)*sizeof(float):shared;
@@ -1917,10 +1917,10 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
         MFQ_CUDA_CHECK(cudaGetLastError());return {mixed,updated,next_injection};
     }
     const auto launch_up=[&](auto group) {
-        constexpr int fixed=decltype(group)::value;
+        static constexpr int fixed=decltype(group)::value;
         const auto launch=[&](auto width) {
             const auto run=[&](auto capacity) {
-                constexpr int count=decltype(capacity)::value;
+                static constexpr int count=decltype(capacity)::value;
                 // The paired accumulator crosses the 64-register occupancy
                 // boundary at 512 threads on Ampere. Keep four 256-thread
                 // blocks resident, with the fixed-width specialization bounded

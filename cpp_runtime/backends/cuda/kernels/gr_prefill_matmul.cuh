@@ -168,7 +168,7 @@ mfq_tensor_backend::Tensor gr_prefill_matmul(const NintWeight& weight,
     auto shape=input.sizes().vec();shape.back()=weight.out;
     auto output=tb::empty(shape,input.options().dtype(tb::kFloat32));
     const auto typed=[&](auto tag,auto aligned_tag,auto zero_tag) {
-        using Input=decltype(tag);constexpr bool aligned=decltype(aligned_tag)::value,zero=decltype(zero_tag)::value;
+        using Input=decltype(tag);constexpr bool aligned=decltype(aligned_tag)::value;static constexpr bool zero=decltype(zero_tag)::value;
         if(pipeline_mode && rows>=128 && gr_prefill_pipeline_supported(x)) {
             launch_gr_prefill_pipeline<false,Input,float,aligned,zero>(weight,x,{},output);return;
         }

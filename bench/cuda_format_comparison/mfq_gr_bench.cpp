@@ -116,9 +116,20 @@ void profile_stages(cudaGraph_t captured,cudaStream_t stream,std::size_t calls,
         if(type!=cudaGraphNodeTypeKernel)throw std::runtime_error("GR stage graph contains a non-kernel node");
         cudaKernelNodeParams p{};fb::check(cudaGraphKernelNodeGetParams(node,&p));
         stages[index++%3].push_back(p);
-        std::size_t children=0;fb::check(cudaGraphNodeGetDependentNodes(node,nullptr,&children));
+        std::size_t children=0;
+#if CUDART_VERSION >= 13000
+        fb::check(cudaGraphNodeGetDependentNodes(node,nullptr,nullptr,&children));
+#else
+        fb::check(cudaGraphNodeGetDependentNodes(node,nullptr,&children));
+#endif
         if(children>1)throw std::runtime_error("GR stage graph contains a branch");
-        if(children)fb::check(cudaGraphNodeGetDependentNodes(node,&node,&children));
+        if(children) {
+#if CUDART_VERSION >= 13000
+            fb::check(cudaGraphNodeGetDependentNodes(node,&node,nullptr,&children));
+#else
+            fb::check(cudaGraphNodeGetDependentNodes(node,&node,&children));
+#endif
+        }
         else node=nullptr;
     }
     if(index!=3*calls)throw std::runtime_error("GR stage profiling requires three kernels per bank");
@@ -220,7 +231,13 @@ int main(int argc,char** argv) try {
             cudaGraph_t captured=nullptr;
             if(stage_mode) {
                 cudaStreamCaptureStatus capture_status;
+#if CUDART_VERSION >= 13000
+                fb::check(cudaStreamGetCaptureInfo(mfq_current_cuda_stream(),&capture_status,nullptr,&captured,nullptr,nullptr,nullptr));
+#elif CUDART_VERSION >= 12000
+                fb::check(cudaStreamGetCaptureInfo(mfq_current_cuda_stream(),&capture_status,nullptr,&captured,nullptr,nullptr));
+#else
                 fb::check(cudaStreamGetCaptureInfo_v2(mfq_current_cuda_stream(),&capture_status,nullptr,&captured,nullptr,nullptr));
+#endif
             }
             graph.capture_end();
             for(int step=0;step<3;++step) {
