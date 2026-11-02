@@ -76,7 +76,13 @@ public:
         operator_graph_.capture_begin();
         for(std::size_t i=0;i<calls;++i)outputs_.push_back(weights[i%count]->run());
         cudaGraph_t captured=nullptr;cudaStreamCaptureStatus status;
+#if CUDART_VERSION >= 13000
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamGetCaptureInfo(stream_.stream(),&status,nullptr,&captured,nullptr,nullptr,nullptr));
+#elif CUDART_VERSION >= 12000
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamGetCaptureInfo(stream_.stream(),&status,nullptr,&captured,nullptr,nullptr));
+#else
         MFQ_NATIVE_CUDA_CHECK(cudaStreamGetCaptureInfo_v2(stream_.stream(),&status,nullptr,&captured,nullptr,nullptr));
+#endif
         if(status!=cudaStreamCaptureStatusActive || !captured)throw std::runtime_error("benchmark capture unavailable");
         operator_graph_.capture_end();operator_graph_.replay();
         MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_.stream()));

@@ -234,7 +234,7 @@ bool nvq_launch_routed_reuse(const NvqRoutedReuseParams& args,cudaStream_t strea
     const bool narrow=narrow_requested && !args.pointers &&
         nvq_e8_narrow_eligible(args.weight,args.rows,args.local_experts,args.format);
     const auto launch=[&](auto format,auto l,auto r,auto heterogeneous,auto warps) {
-        constexpr int per_block=decltype(l)::value>32?decltype(r)::value:decltype(warps)::value*(32/decltype(l)::value)*decltype(r)::value;
+        static constexpr int per_block=decltype(l)::value>32?decltype(r)::value:decltype(warps)::value*(32/decltype(l)::value)*decltype(r)::value;
         if constexpr(!decltype(heterogeneous)::value && decltype(l)::value==16 && decltype(r)::value==1 &&
                 (decltype(format)::value==5 || decltype(format)::value==13 || decltype(format)::value==14)) {
             if(static_signs) {

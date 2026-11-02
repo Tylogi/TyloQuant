@@ -2017,7 +2017,7 @@ static void nint_moe_grouped_matmul_dispatch_cuda(
     if((!grouped || grouped[0]!='0') && (!hint || hint[0]!='0') &&
             (group_hint==24 || group_hint==28) && bits_hint>=4 && bits_hint<=6) {
         const auto hinted_warps=[&](auto gs,auto bits,auto warps) {
-            constexpr int rows_per_block=decltype(warps)::value==4?4:8;
+            static constexpr int rows_per_block=decltype(warps)::value==4?4:8;
             const auto launch_scale=[&](auto late) {
             nint_mixed_routes_hinted_kernel<decltype(gs)::value,decltype(bits)::value,decltype(warps)::value,false,decltype(late)::value>
                 <<<dim3(unsigned((output.size(2)+rows_per_block-1)/rows_per_block),unsigned(ids.numel())),dim3(32,4),0,mfq_current_cuda_stream()>>>(

@@ -84,7 +84,13 @@ struct Replay {
         for(std::size_t i=0;i<calls;++i)outputs.push_back(run(banks[i%banks.size()]));
         if(std::getenv("MFQ_BENCH_GRAPH_DOT")) {
             cudaStreamCaptureStatus status;unsigned long long id;cudaGraph_t captured=nullptr;
+#if CUDART_VERSION >= 13000
+            fb::check(cudaStreamGetCaptureInfo(mfq_current_cuda_stream(),&status,&id,&captured,nullptr,nullptr,nullptr));
+#elif CUDART_VERSION >= 12000
+            fb::check(cudaStreamGetCaptureInfo(mfq_current_cuda_stream(),&status,&id,&captured,nullptr,nullptr));
+#else
             fb::check(cudaStreamGetCaptureInfo_v2(mfq_current_cuda_stream(),&status,&id,&captured,nullptr,nullptr));
+#endif
             if(std::getenv("MFQ_BENCH_GRAPH_DOT"))
                 fb::check(cudaGraphDebugDotPrint(captured,std::getenv("MFQ_BENCH_GRAPH_DOT"),cudaGraphDebugDotFlagsKernelNodeParams));
         }

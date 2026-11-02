@@ -348,7 +348,7 @@ bool nint_launch_fixed_decode(NintWholeArgs args,int group_size,int uniform_bits
             " exact="+std::to_string(exact_rows && args.activation_rows==RowCount::value)+
             " output_narrow="+std::to_string(output && output_narrow):std::string{};
         const auto launch_exact=[&](auto shape) {
-        constexpr bool Exact=decltype(shape)::value;
+        static constexpr bool Exact=decltype(shape)::value;
         const auto launch_sum=[&](auto sums) {
             using Sums=decltype(sums);
             if(output) {
@@ -356,7 +356,7 @@ bool nint_launch_fixed_decode(NintWholeArgs args,int group_size,int uniform_bits
                     using GroupSize=decltype(gs);
                     using BitWidth=decltype(bits);
                 const auto launch_offset=[&](auto narrow) {
-                constexpr bool Narrow=decltype(narrow)::value;
+                static constexpr bool Narrow=decltype(narrow)::value;
                 const auto launch_proof=[&](auto proof) {
                 const auto* dual_setting=std::getenv("MFQ_NINT_OUTPUT_DUAL_GROUP");
                 if(dual_setting && dual_setting[0]=='1' && args.rows%2==0 && args.activation_rows<=6) {
@@ -411,9 +411,9 @@ bool nint_launch_fixed_decode(NintWholeArgs args,int group_size,int uniform_bits
                 return;
             }
             const auto launch_columns=[&](auto columns) {
-                constexpr bool Interleaved=decltype(columns)::value;
+                static constexpr bool Interleaved=decltype(columns)::value;
                 const auto launch_offset=[&](auto narrow) {
-                constexpr bool Narrow=decltype(narrow)::value;
+                static constexpr bool Narrow=decltype(narrow)::value;
                 const auto* row_pairs=std::getenv("MFQ_NINT_ROW_PAIRS");
                 if constexpr(!Interleaved) {
                     if(args.rows%2==0 && row_pairs && row_pairs[0]=='1') {

@@ -117,7 +117,13 @@ struct Replay {
         fb::check(cudaStreamSynchronize(mfq_current_cuda_stream()));output.clear();
         graph.capture_begin();for(size_t i=0;i<calls;++i)output.push_back(run(i));
         cudaStreamCaptureStatus status;
+#if CUDART_VERSION >= 13000
+        fb::check(cudaStreamGetCaptureInfo(mfq_current_cuda_stream(),&status,nullptr,&captured,nullptr,nullptr,nullptr));
+#elif CUDART_VERSION >= 12000
+        fb::check(cudaStreamGetCaptureInfo(mfq_current_cuda_stream(),&status,nullptr,&captured,nullptr,nullptr));
+#else
         fb::check(cudaStreamGetCaptureInfo_v2(mfq_current_cuda_stream(),&status,nullptr,&captured,nullptr,nullptr));
+#endif
         graph.capture_end();
         graph.replay();fb::check(cudaStreamSynchronize(mfq_current_cuda_stream()));
     }

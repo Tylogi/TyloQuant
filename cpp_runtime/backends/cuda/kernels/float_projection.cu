@@ -331,8 +331,8 @@ mfq_tensor_backend::Tensor float_projection_impl(
     const int splits=int(std::min<int64_t>(weight.ng,std::max<int64_t>(1,(target+blocks-1)/blocks)));
     auto partial=splits>1?tb::empty({rows,weight.out,splits},result.options().dtype(tb::kFloat32)):result;
     const auto launch=[&](auto input_tag,auto aligned_tag,auto group_tag) {
-        using Input=decltype(input_tag);constexpr bool aligned=decltype(aligned_tag)::value;
-        constexpr int group=decltype(group_tag)::value;
+        using Input=decltype(input_tag);static constexpr bool aligned=decltype(aligned_tag)::value;
+        static constexpr int group=decltype(group_tag)::value;
         const auto invoke=[&](auto output_tag,auto activation_tag,const tb::Tensor& target) {
         using Output=decltype(output_tag);constexpr int action=decltype(activation_tag)::value;
         affine_projection<Input,aligned,group,Output,action><<<dim3(unsigned((weight.out + 3) / 4), unsigned(rows),unsigned(splits)), 128, 0,
@@ -534,7 +534,7 @@ mfq_tensor_backend::Tensor nint_float_projection_mix_cuda(const NintWeight& weig
         using Input=decltype(input_tag);
         using Output=std::conditional_t<std::is_same_v<Gate,float> || std::is_same_v<Value,float>,float,__half>;
         constexpr bool aligned=decltype(aligned_tag)::value;
-        constexpr int group=decltype(group_tag)::value;
+        static constexpr int group=decltype(group_tag)::value;
         if constexpr(aligned && group>0) {
             if(compact && (streams==3 || streams==4)) {
                 const auto warp_launch=[&](auto stream_tag) {
