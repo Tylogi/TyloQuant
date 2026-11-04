@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 from uuid import UUID, uuid4
 
+import psutil
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
 from mfq.server.state.catalog import DiscoveredModel, ModelArtifactNotFoundError, ModelCatalog
@@ -164,6 +165,7 @@ _TIMEOUT_ERROR_CODES = frozenset({
     "runtime_maintenance_timeout",
     "runtime_queue_timeout",
 })
+_RUNTIME_FATAL_ERROR_CODES = frozenset({"backend_failure", "runtime_unhealthy", "backend_unhealthy"})
 
 
 @dataclass(frozen=True)
@@ -243,6 +245,7 @@ class _RequestSlotGate:
         self.capacity = capacity
         self._granted = 0
         self._waiters: list[_SlotWaiter] = []
+        self._error: BackendError | None = None
 
     @property
     def available(self) -> int:
@@ -251,6 +254,8 @@ class _RequestSlotGate:
     async def acquire(self, priority: int = 0) -> None:
         """Take one slot, waiting in priority order behind earlier arrivals."""
 
+        if self._error is not None:
+            raise self._error
         if self._granted < self.capacity and not self._waiters:
             self._granted += 1
             return
@@ -271,6 +276,14 @@ class _RequestSlotGate:
             elif waiter in self._waiters:
                 self._waiters.remove(waiter)
             raise
+
+    def close(self, error: BackendError) -> None:
+        """Reject pending and future admissions when this runtime is retired."""
+        self._error = error
+        for waiter in self._waiters:
+            if not waiter.granted.done():
+                waiter.granted.set_exception(error)
+        self._waiters.clear()
 
     def release(self) -> None:
         if self._granted <= 0:
@@ -544,6 +557,7 @@ class RuntimePool:
         self._load_errors: dict[str, ErrorDetail] = {}
         self._load_failures: dict[str, _CachedLoadFailure] = {}
         self._runtime_revival_at: dict[str, float] = {}
+        self._recovering_runtimes: dict[str, _Runtime] = {}
         self._loading_artifact_ids: dict[str, str] = {}
         self._load_requests: dict[str, ModelLoadRequest] = {}
         self._reserved_ports: set[int] = set()
@@ -1077,7 +1091,7 @@ class RuntimePool:
             )
         )
         runtime_client = (
-            StdioRuntimeClient(process)
+            StdioRuntimeClient(process, capture_stderr=False)
             if self.transport == "stdio"
             else HttpRuntimeClient(f"http://127.0.0.1:{port}")
         )
@@ -2268,6 +2282,8 @@ class RuntimePool:
             if self._closed or self._instances.get(instance.id) is not instance or instance.state not in {
                 RuntimeInstanceState.READY, RuntimeInstanceState.BUSY,
             } or instance.process.returncode is not None:
+                if instance.error is not None and instance.error.code == "runtime_unhealthy":
+                    raise self._runtime_restarting_error(instance)
                 raise BackendError("model_not_ready", f"model runtime is {instance.state.value}",
                     retryable=True, status_code=503)
             if self._memory_configuration_job is None and (
@@ -2480,6 +2496,9 @@ class RuntimePool:
         except BackendError as error:
             result = "timeout" if error.code in _TIMEOUT_ERROR_CODES else "error"
             instance.request_metrics.record_request(result, performance, usage)
+            if await self._runtime_error_requires_recovery(instance, error):
+                await self._recover_unhealthy_runtime(instance, str(error))
+                raise self._runtime_restarting_error(instance) from error
             raise
         except Exception:
             instance.request_metrics.record_request("error", performance, usage)
@@ -2798,7 +2817,10 @@ class RuntimePool:
                     "total_completion_tokens": 0,
                     "reloading": False,
                 }
-            status = dict(await backend.runtime_status())
+            status = await self._managed_runtime_status(backend)
+            if instance is not None and self._unhealthy_status(status):
+                await self._recover_unhealthy_runtime(instance, f"runtime status: {status}")
+                raise self._runtime_restarting_error(instance)
             status.update(memory_status)
             if instance is not None:
                 status["instance_id"] = str(instance.id)
@@ -3372,6 +3394,10 @@ class RuntimePool:
     async def _select(self, model: str, *, session_id: UUID | None) -> _Runtime | None:
         stale_backend: ChatBackend | None = None
         async with self._lock:
+            recovering = next((item for item in self._recovering_runtimes.values()
+                               if self._matches_model(item, model)), None)
+            if recovering is not None:
+                raise self._runtime_restarting_error(recovering)
             if session_id is not None:
                 instance_id = self._session_routes.get(session_id)
                 if instance_id is not None:
@@ -3440,6 +3466,107 @@ class RuntimePool:
         self._runtime_revival_at[model] = now
         return True
 
+    @staticmethod
+    def _unhealthy_status(status: dict[str, Any]) -> bool:
+        """Only explicit engine health/fatal signals poison a managed runtime."""
+        return status.get("healthy") in (False, 0) or any(
+            str(status.get(key, "")).lower() in {"unhealthy", "failed", "backend_failure"}
+            for key in ("state", "runtime_state", "status")
+        )
+
+    async def _runtime_error_requires_recovery(self, instance: _Runtime, error: BackendError) -> bool:
+        if instance.error is not None and instance.error.code == "runtime_unhealthy":
+            return True
+        if error.code not in _RUNTIME_FATAL_ERROR_CODES:
+            return False
+        if error.code == "backend_failure":
+            try:
+                status = await self._managed_runtime_status(instance.backend)
+            except Exception:
+                return True
+            if status.get("healthy") is True and not self._unhealthy_status(status):
+                return False
+        return True
+
+    async def _managed_runtime_status(self, backend: ChatBackend) -> dict[str, Any]:
+        status = dict(await backend.runtime_status())
+        # Master transports expose scheduler health through /health even when
+        # /status contains only request metrics. Newer status fields work too.
+        health = getattr(backend, "runtime_health", None)
+        if callable(health) and not self._unhealthy_status(status):
+            value = await health()
+            if isinstance(value, dict) and self._unhealthy_status(value):
+                status.update(value)
+        return status
+
+    @staticmethod
+    def _runtime_restarting_error(instance: _Runtime) -> BackendError:
+        return BackendError(
+            "runtime_restarting",
+            f"model runtime {instance.artifact.resource.name} is unhealthy and restarting; retry after recovery",
+            retryable=True,
+            status_code=503,
+        )
+
+    async def _recover_unhealthy_runtime(self, instance: _Runtime, reason: str) -> None:
+        """Close admission once, then retire and reload using the saved load request."""
+        async with self._lock:
+            model = instance.artifact.resource.name
+            if (self._closed or self._instances.get(instance.id) is not instance
+                    or instance.state not in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
+                    or model in self._recovering_runtimes):
+                return
+            instance.error = ErrorDetail(code="runtime_unhealthy", message=reason, retryable=True)
+            instance.state = RuntimeInstanceState.FAILED
+            self._recovering_runtimes[model] = instance
+            self._unroute_instance_locked(instance)
+            if instance.request_slots is not None:
+                instance.request_slots.close(self._runtime_restarting_error(instance))
+            self._request_state_changed.notify_all()
+            request = self._load_requests.get(model, ModelLoadRequest(model=model)).model_copy(deep=True)
+            request = request.model_copy(update={"artifact_uri": f"mfq://{instance.artifact.resource.id}"})
+            task = asyncio.create_task(self._restart_unhealthy_runtime(instance, request),
+                                       name=f"mfq-server-runtime-recover-{instance.id}")
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_task_done)
+        logger.error("Restarting unhealthy runtime %s: %s", model, reason)
+
+    async def _restart_unhealthy_runtime(self, instance: _Runtime, request: ModelLoadRequest) -> None:
+        model = instance.artifact.resource.name
+        context = _RuntimeLoadContext()
+        try:
+            # Never launch a replacement until teardown has actually succeeded.
+            while True:
+                try:
+                    await self._retire_instance(instance)
+                    break
+                except Exception:
+                    await asyncio.sleep(min(30.0, 0.25 * 2**min(instance.retirement_failures, 7)))
+            if not self._begin_runtime_revival(model):
+                remaining = (self._runtime_revival_at[model] + self.load_failure_cooldown_seconds
+                             - time.monotonic())
+                await asyncio.sleep(max(0.0, remaining))
+                self._begin_runtime_revival(model)
+            async with self._lock:
+                if self._closed:
+                    return
+                self._load_failures.pop(model, None)
+                self._load_errors.pop(model, None)
+            await self.load(context, request.model_dump(mode="python"))
+        except Exception as error:
+            detail = self._runtime_load_error(error)
+            async with self._lock:
+                self._load_errors[model] = detail
+                self._load_failures[model] = _CachedLoadFailure(
+                    artifact_id=instance.artifact.resource.id, detail=detail, failed_at=time.monotonic())
+            logger.exception("Could not restart unhealthy runtime %s", model)
+        finally:
+            await context.cleanup()
+            async with self._lock:
+                if self._recovering_runtimes.get(model) is instance:
+                    self._recovering_runtimes.pop(model)
+                self._request_state_changed.notify_all()
+
     async def _ensure_model_loaded_with_revival(
         self,
         model: str,
@@ -3468,6 +3595,9 @@ class RuntimePool:
         async with self._lock:
             if self._closed:
                 return None
+            recovering = self._recovering_runtimes.get(model_name)
+            if recovering is not None:
+                raise self._runtime_restarting_error(recovering)
             ready = next(
                 (
                     item
@@ -3669,6 +3799,11 @@ class RuntimePool:
                     instance.read_control_leases += 1
         try:
             yield instance, backend
+        except BackendError as error:
+            if instance is not None and await self._runtime_error_requires_recovery(instance, error):
+                await self._recover_unhealthy_runtime(instance, str(error))
+                raise self._runtime_restarting_error(instance) from error
+            raise
         finally:
             if leased and instance is not None:
                 await self._release_control_lease(instance, read_only=read_only)
@@ -4650,6 +4785,9 @@ class RuntimePool:
         if stream is None:
             return
         async for line in self._log_lines(stream):
+            runtime_client = getattr(instance.backend, "_runtime", None)
+            if isinstance(runtime_client, StdioRuntimeClient):
+                runtime_client.record_stderr(line.rstrip(b"\r\n") + b"\n")
             job_context = instance.context_job if isinstance(instance.context_job, JobContext) else context
             message = line.decode("utf-8", errors="replace").rstrip()
             normalized = message.casefold()
@@ -4711,6 +4849,10 @@ class RuntimePool:
                     },
                 )
 
+        runtime_client = getattr(instance.backend, "_runtime", None)
+        if isinstance(runtime_client, StdioRuntimeClient):
+            runtime_client.finish_stderr()
+
     async def _monitor(self, instance: _Runtime) -> None:
         process = instance.process
         status = (
@@ -4726,6 +4868,7 @@ class RuntimePool:
         async with self._lock:
             if (
                 instance.state == RuntimeInstanceState.UNLOADING
+                or instance.artifact.resource.name in self._recovering_runtimes
                 or self._closed
                 or self._instances.get(instance.id) is not instance
             ):
@@ -4782,9 +4925,14 @@ class RuntimePool:
         try:
             if callable(runtime_status):
                 try:
-                    value = await asyncio.wait_for(runtime_status(), timeout=1.0)
+                    value = await asyncio.wait_for(self._managed_runtime_status(instance.backend), timeout=1.0)
                     if isinstance(value, dict):
                         status = value
+                        if self._unhealthy_status(status):
+                            await self._recover_unhealthy_runtime(instance, f"runtime status: {status}")
+                except BackendError as error:
+                    if error.code in _RUNTIME_FATAL_ERROR_CODES:
+                        await self._recover_unhealthy_runtime(instance, str(error))
                 except Exception:
                     pass
             resident = await resident_task if resident_task is not None else None
@@ -4945,7 +5093,8 @@ class RuntimePool:
         instance.realtime_gateway = None
         process = instance.process
         first_error: Exception | None = None
-        if (instance.memory and instance.memory.prefix_cache_ram_limit_bytes is not None
+        if (instance.artifact.resource.name not in self._recovering_runtimes
+                and instance.memory and instance.memory.prefix_cache_ram_limit_bytes is not None
                 and getattr(instance, "prefix_dynamic_budget", False)):
             # Finish RAM -> SSD demotion while the native worker can still
             # process controls; Windows terminate does not run destructors.
@@ -5385,11 +5534,6 @@ class RuntimePool:
     @staticmethod
     def _process_resident_bytes(pid: int) -> int | None:
         try:
-            output = subprocess.check_output(
-                ["ps", "-o", "rss=", "-p", str(pid)],
-                text=True,
-                timeout=1,
-            ).strip()
-            return int(output) * 1024 if output else None
-        except (OSError, ValueError, subprocess.SubprocessError):
+            return psutil.Process(pid).memory_info().rss
+        except (psutil.Error, OSError, ValueError):
             return None

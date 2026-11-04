@@ -1,6 +1,7 @@
 #pragma once
 
 #include "generation_step.h"
+#include "mfq/fatal_diagnostics.h"
 
 #include <memory>
 #include <unordered_map>
@@ -125,7 +126,16 @@ class RequestExecutor {
     template <class Ops> EngineStepResult step(const std::vector<RequestId> &eligible, Ops &ops) {
         try {
             ops.execute(eligible);
+        } catch (const std::exception& error) {
+            mfq::log_runtime_error("execution", error.what());
+            const bool backend_failure = dynamic_cast<const MfqBackendFailure*>(&error) != nullptr;
+            healthy_ &= !backend_failure;
+            for (auto& [id, request] : requests_)
+                if (backend_failure || std::find(eligible.begin(), eligible.end(), id) != eligible.end())
+                    request->complete(std::current_exception());
         } catch (...) {
+            // Unknown failures leave the device state unknown: fail every request.
+            mfq::log_runtime_error("execution", "unknown execution failure");
             healthy_ = false;
             for (auto& [id, request] : requests_)
                 request->complete(std::current_exception());

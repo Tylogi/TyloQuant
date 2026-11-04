@@ -123,15 +123,45 @@ struct CacheView {
     const int32_t* cold_mapping=nullptr;
     IndirectKvView indirect{};
     int indirect_offset = 0;
+    // Bind once per CTA; packed dimensions share the same request allocations.
+    __device__ int64_t bind_indirect_row(int batch) {
+        if (!indirect.active(batch) || !indirect.address(batch, indirect_offset))
+            return 0;
+        const auto logical = indirect.capacity(batch, indirect_offset);
+        auto extent = logical;
+        data = static_cast<const uint32_t*>(indirect.address(batch, indirect_offset));
+        hot_mapping = nullptr;
+        cold_mapping = nullptr;
+        if (indirect.exclusive(batch)) {
+            const int hot = indirect_offset ? HotKvStateFields::Values : HotKvStateFields::Keys;
+            const int cold = indirect_offset ? HotKvStateFields::ColdValues : HotKvStateFields::ColdKeys;
+            data = static_cast<const uint32_t*>(indirect.tier_address(batch, cold));
+            hot_data = static_cast<const uint32_t*>(indirect.tier_address(batch, hot));
+            hot_mapping = static_cast<const int32_t*>(indirect.tier_address(batch, HotKvStateFields::Mapping));
+            cold_mapping = static_cast<const int32_t*>(indirect.tier_address(batch, HotKvStateFields::ColdMapping));
+            hot_cells = indirect.tier_capacity(batch, hot);
+            extent = cold_cells = indirect.tier_capacity(batch, cold);
+        }
+        batch_stride = 0;
+        head_stride = extent * packed;
+        token_stride = packed;
+        indirect = {};
+        return logical;
+    }
     template<bool use_hot=false> __device__ const uint32_t* row(int batch,int head,int token) const {
         if (indirect.states) {
-            if (!indirect.active(batch) || token >= indirect.capacity(batch, indirect_offset))
-                return nullptr;
-            return static_cast<const uint32_t*>(indirect.address(batch, indirect_offset)) +
-                (int64_t(head) * indirect.capacity(batch, indirect_offset) + token) * packed;
+            return indirect.resolve<const uint32_t>(batch, token, head, packed, indirect_offset);
         }
-        if constexpr(use_hot) {const int slot=hot_mapping[token];if(slot>=0)return hot_data+(int64_t(head)*hot_cells+slot)*token_stride;
-            if(cold_mapping)return data+(int64_t(head)*cold_cells+cold_mapping[token])*token_stride;}
+        if constexpr(use_hot) {
+            if(hot_mapping) {
+                const int slot=hot_mapping[token];
+                if(slot>=0)return hot_data+(int64_t(head)*hot_cells+slot)*token_stride;
+                if(cold_mapping) {
+                    const int cold=cold_mapping[token];
+                    return cold>=0 && cold<cold_cells?data+(int64_t(head)*cold_cells+cold)*token_stride:nullptr;
+                }
+            }
+        }
         if(!page_size)return data+int64_t(batch)*batch_stride+int64_t(head)*head_stride+int64_t(token)*token_stride;
         const int physical=table[int64_t(batch)*table_width+token/page_size];
         if(physical<0)return nullptr;
@@ -149,18 +179,26 @@ __global__ void paged_write_kernel(CacheView view,const uint32_t* source,const i
 }
 __device__ float warp_sum(float x){for(int i=16;i;i/=2)x+=__shfl_xor_sync(0xffffffff,x,i);return x;}
 __device__ float warp_max(float x){for(int i=16;i;i/=2)x=fmaxf(x,__shfl_xor_sync(0xffffffff,x,i));return x;}
+__host__ __device__ constexpr int attention_tile(int width) {
+    return width<=256?8:width<=512?4:2;
+}
 template<int W,bool use_hot=false> __global__ void attention_kernel(const float* query,CacheView keys,CacheView values,
         const float* kc,const float* vc,const float* signs,const int32_t* selected,const int64_t* positions,
         const int64_t* lengths,const float* mask,int mask_width,float* partial,float* stats,
         int heads,int kv_heads,int tokens,int d,int capacity,int slots,int parts,int span,
         int offset,int position_batches,int bk,int bv,float scale) {
-    constexpr int SG=4,TILE=W<=256?8:W<=512?4:2,N=(W+31)/32;
+    constexpr int SG=4,TILE=attention_tile(W),N=(W+31)/32;
     const int lane=threadIdx.x%32,sg=threadIdx.x/32,tid=threadIdx.x;
     const int part=blockIdx.x,group=blockIdx.y,bt=blockIdx.z,batch=bt/tokens,token=bt%tokens;
     const int gqa=heads/kv_heads,groups=(gqa+SG-1)/SG,kh=group/groups,local=(group%groups)*SG+sg,head=kh*gqa+local;
     const bool active=local<gqa;
     const int boundary=positions?int(positions[(position_batches?int64_t(batch)*tokens:0)+token]):offset+token;
-    const int visible=min(capacity,min(boundary+1,lengths?int(lengths[batch]):capacity));
+    int visible=min(capacity,min(boundary+1,lengths?int(lengths[batch]):capacity));
+    if(keys.indirect.states) {
+        const auto key_capacity=keys.bind_indirect_row(batch);
+        const auto value_capacity=values.bind_indirect_row(batch);
+        visible=int(min(int64_t(visible),min(key_capacity,value_capacity)));
+    }
     const int64_t qrow=(int64_t(batch)*heads+head)*tokens+token;
     __shared__ float kt[TILE*W],vt[TILE*W];
     __shared__ int ids[TILE];
@@ -316,13 +354,23 @@ tb::Tensor cuda_kv_attention(const tb::Tensor& query,const tb::Tensor& keys,cons
     if(hot.mapping){kv.hot_data=static_cast<const uint32_t*>(hot.keys);vv.hot_data=static_cast<const uint32_t*>(hot.values);kv.hot_mapping=vv.hot_mapping=hot.mapping;kv.hot_cells=vv.hot_cells=hot.cells;kv.cold_mapping=vv.cold_mapping=hot.cold_mapping;kv.cold_cells=vv.cold_cells=hot.cold_cells;}
     // Prefill already has enough query rows to fill the GPU. Splitting those rows
     // multiplies scratch storage without adding useful parallelism (GiB at 8K).
-    const int parts=b*h*t>=1024?1:std::min(16,(slots+255)/256);
+    const int groups=kh*((h/kh+3)/4);
+    int parts=b*h*t>=1024?1:std::min(16,(slots+255)/256);
+    if(indirect.states) {
+        cudaDeviceProp properties{};
+        MFQ_CUDA_CHECK(cudaGetDeviceProperties(&properties,query.get_device()));
+        const int64_t blocks_per_part=int64_t(b)*t*groups;
+        const int parallel_parts=int((properties.multiProcessorCount+blocks_per_part-1)/blocks_per_part);
+        const int tiles=(slots+attention_tile(w)-1)/attention_tile(w);
+        // Split independent tiles across SMs before serializing mapped-RAM reads.
+        parts=std::min(16,std::min(tiles,std::max(parts,parallel_parts)));
+    }
     const int span=((slots+parts*8-1)/(parts*8))*8;
     auto partial=tb::empty({b,h,t,parts,w},q.options()),stats=tb::empty({b,h,t,parts,2},q.options());
     auto output=tb::empty({b,t,h,d},q.options());
-    const dim3 grid(parts,kh*((h/kh+3)/4),b*t);
+    const dim3 grid(parts,groups,b*t);
     #define TQ_LAUNCH_H(W,H) attention_kernel<W,H><<<grid,128,0,mfq_get_current_cuda_stream()>>>(q.data_ptr<float>(),kv,vv,kt.centers.data_ptr<float>(),vt.centers.data_ptr<float>(),kt.signs.data_ptr<float>(),ids.defined()?ids.data_ptr<int32_t>():nullptr,pos.defined()?pos.data_ptr<int64_t>():nullptr,len.defined()?len.data_ptr<int64_t>():nullptr,valid.defined()?valid.data_ptr<float>():nullptr,valid.defined()?int(valid.size(1)):0,partial.data_ptr<float>(),stats.data_ptr<float>(),h,kh,t,d,int(capacity),slots,parts,span,int(offset),pos.defined()&&pos.dim()==2,quant.key_bits(),quant.value_bits(),float(scale>0?scale:1/std::sqrt(double(d))))
-    #define TQ_LAUNCH(W) if(hot.mapping){TQ_LAUNCH_H(W,true);}else{TQ_LAUNCH_H(W,false);}
+    #define TQ_LAUNCH(W) if(hot.mapping || indirect.states){TQ_LAUNCH_H(W,true);}else{TQ_LAUNCH_H(W,false);}
     switch(w){case 1:TQ_LAUNCH(1);break;case 2:TQ_LAUNCH(2);break;case 4:TQ_LAUNCH(4);break;case 8:TQ_LAUNCH(8);break;case 16:TQ_LAUNCH(16);break;case 32:TQ_LAUNCH(32);break;case 64:TQ_LAUNCH(64);break;case 128:TQ_LAUNCH(128);break;case 256:TQ_LAUNCH(256);break;case 512:TQ_LAUNCH(512);break;case 1024:TQ_LAUNCH(1024);break;}
     #undef TQ_LAUNCH
     #undef TQ_LAUNCH_H

@@ -163,6 +163,7 @@ bool gdn_independent_batch() {
     return !value || value[0]!='0';
 }
 bool gdn_independent_batch_trace() { return exact_one("MFQ_TRACE_GDN_BATCH"); }
+bool qsa_independent_batch_trace() { return exact_one("MFQ_TRACE_QSA_BATCH"); }
 bool batch_packed_prefill() {
     const auto* value=std::getenv("MFQ_BATCH_PACKED_PREFILL");
     return !value || value[0]!='0';
@@ -892,6 +893,7 @@ void CudaExecutionContext::reset() noexcept {
     force_moe_unfused_reduce = false;
     force_moe_materialized_swiglu = false;
     force_moe_prefill_mma_off = false;
+    prefill_moe_route_bytes = 0;
     moe_cache_registration_min_slots = 8;
     gemma_trace_layer = -1;
     gemma_stage_trace = nullptr;

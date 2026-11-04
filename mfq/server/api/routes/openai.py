@@ -15,23 +15,39 @@ from mfq.server.api.openai_compat import (
     backend_error_status,
     collect_chat_completion,
     parse_chat_request,
+    require_json_content_type,
     stream_chat_completion,
 )
 from mfq.server.api.openai_compat import (
     error_body as openai_error_body,
 )
 from mfq.server.runtime.backend import BackendError, preflight_backend_request
+from mfq.server.services.service import ServiceError
 
 router = APIRouter()
 
 
 @router.get("/health", include_in_schema=False)
-async def health() -> dict[str, str]:
-    return {
+async def health(request: Request) -> Any:
+    body = {
         "status": "ok",
         "service": "mfq-server",
         "protocol_version": "1.0",
     }
+    service = request.app.state.service
+    if service is not None and callable(getattr(service, "runtime_status", None)):
+        try:
+            status = await service.runtime_status()
+        except (BackendError, ServiceError) as error:
+            # Contract-only backends may not expose runtime status. Real
+            # transport/status failures must remain visible to health checks.
+            if getattr(error, "code", None) != "runtime_control_unavailable":
+                return JSONResponse({**body, "status": "unhealthy", "error": str(error)}, status_code=503)
+            status = {}
+        if (status.get("status") == "unhealthy" or status.get("healthy") is False or
+                status.get("runtime_state") == "failed"):
+            return JSONResponse({**body, "status": "unhealthy"}, status_code=503)
+    return body
 
 
 @router.get("/v1", include_in_schema=False)
@@ -93,7 +109,13 @@ async def openai_models(
 @router.post("/v1/chat/completions", include_in_schema=False)
 async def openai_chat_completions(service: ServiceDependency, request: Request) -> Response:
     try:
+        require_json_content_type(request.headers.get("content-type", ""))
         body = await request.json()
+    except OpenAIRequestError as error:
+        return JSONResponse(
+            status_code=error.status_code,
+            content=openai_error_body(str(error), param=error.param),
+        )
     except ValueError as error:
         return JSONResponse(
             status_code=400,
@@ -155,3 +177,14 @@ async def openai_chat_completions(service: ServiceDependency, request: Request) 
             ),
         )
     return JSONResponse(content=result)
+
+
+@router.post("/v1/completions", include_in_schema=False)
+async def unsupported_completions() -> Response:
+    return JSONResponse(
+        status_code=404,
+        content=openai_error_body(
+            "Legacy /v1/completions is not supported. Use /v1/chat/completions or /v1/messages.",
+            code="unsupported_endpoint",
+        ),
+    )

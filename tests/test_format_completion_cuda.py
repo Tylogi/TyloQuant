@@ -83,6 +83,20 @@ def _mxfp8() -> tuple[MxTensor, np.ndarray]:
     return _mxfp8_shape(11, 128, 608)
 
 
+def _assert_half_accumulation(actual, left, right):
+    expected = left.double() @ right.double()
+    assert actual.shape == expected.shape
+    unit_roundoff = torch.finfo(torch.float16).eps / 2
+    operations = left.shape[-1] + 1
+    gamma = operations * unit_roundoff / (1 - operations * unit_roundoff)
+    # FP16 GEMM accumulates in half; cancellation needs an absolute dot-product bound.
+    bound = gamma * (left.double().abs() @ right.double().abs())
+    bound += operations * torch.finfo(torch.float16).smallest_normal * unit_roundoff
+    error = (actual.double() - expected).abs()
+    assert torch.isfinite(actual).all()
+    assert (error <= bound).all(), f"FP16 dot-product error/bound: {(error / bound).max().item()}"
+
+
 @pytest.mark.parametrize("activation_rows", [1, 16, 65])
 def test_mxfp4_native_matmul_matches_packed_reference(activation_rows: int):
     tensor, dense = _mxfp4()
@@ -134,13 +148,13 @@ def test_mx_packed_backward_and_autograd_match_dequant(factory, rows):
     output_gradient = torch.randn(
         rows, tensor.shape[0], device="cuda", dtype=torch.float16
     )
-    expected = output_gradient.float() @ torch.as_tensor(dense, device="cuda")
-    torch.testing.assert_close(
-        mx_backward_input(weight, output_gradient).float(),
-        expected,
-        rtol=0.006,
-        atol=0.03,
-    )
+    dense_reference = torch.as_tensor(dense, device="cuda")
+    expected = output_gradient.float() @ dense_reference
+    actual = mx_backward_input(weight, output_gradient).float()
+    if rows > 8:
+        _assert_half_accumulation(actual, output_gradient, dense_reference.half())
+    else:
+        torch.testing.assert_close(actual, expected, rtol=0.006, atol=0.03)
     source = torch.randn(
         rows,
         tensor.shape[1],
@@ -149,9 +163,10 @@ def test_mx_packed_backward_and_autograd_match_dequant(factory, rows):
         requires_grad=True,
     )
     (mx_matmul(weight, source) * output_gradient).sum().backward()
-    torch.testing.assert_close(
-        source.grad.float(), expected, rtol=0.006, atol=0.03
-    )
+    if rows > 8:
+        _assert_half_accumulation(source.grad, output_gradient, dense_reference.half())
+    else:
+        torch.testing.assert_close(source.grad.float(), expected, rtol=0.006, atol=0.03)
 
 
 @pytest.mark.parametrize("rows", [5, 8])
@@ -234,7 +249,7 @@ def test_mxfp8_native_fp32_output_matches_packed_reference(activation_rows: int)
     torch.testing.assert_close(actual, expected, rtol=0.006, atol=0.03)
 
 
-@pytest.mark.parametrize("activation_rows", [1, 16, 65])
+@pytest.mark.parametrize("activation_rows", [1, 8, 9, 16, 65])
 def test_nint8_zero_native_matmul_matches_packed_reference(
     activation_rows: int,
 ):
@@ -252,7 +267,7 @@ def test_nint8_zero_native_matmul_matches_packed_reference(
     source = torch.randn(activation_rows, width, device="cuda", dtype=torch.float16)
     dense = nint8_zero_dequantize(weight)
     actual = nint8_zero_matmul(weight, source).float()
-    if activation_rows <= 64:
+    if activation_rows <= 8:
         grouped = source.float().reshape(activation_rows, width // 32, 32)
         activation_scale = grouped.abs().amax(dim=-1) / 127.0
         activation_scale = torch.where(

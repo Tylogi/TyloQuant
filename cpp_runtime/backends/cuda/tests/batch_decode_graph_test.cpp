@@ -1,6 +1,8 @@
 #include "runtime/batch_decode_graph.h"
 #include "mfq_cuda_kv_hot_cache.h"
+#include "batch_selected_attention.h"
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -13,43 +15,64 @@ static void check(bool value, const char* message) {
         throw std::runtime_error(message);
 }
 
-static void check_exclusive_tiers() {
+static void check_exclusive_tiers(bool independent) {
     const auto options = tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt32);
     const auto integers = options.dtype(tb::kInt64);
     BatchDecodeGraphCache graphs;
     MfqCudaStreamGuard guard(graphs.stream());
     std::vector<HotKvCache> caches;
     for (int request = 0; request < 4; ++request) {
-        auto cache = HotKvCache::allocate(2, 8, 3, 4, 4, options);
-        cache.set_cold_storage(tb::zeros({1, 2, 5, 4}, options), tb::zeros({1, 2, 5, 4}, options));
+        auto cache = HotKvCache::allocate(2, 8, request % 2 ? 5 : 3, 4, 6, options);
+        const int cold = 8 - int(cache.keys.size(2));
+        cache.set_cold_storage(tb::zeros({1, 2, cold, 4}, options), tb::zeros({1, 2, cold, 6}, options));
         auto keys = tb::full({1, 2, 6, 4}, 10 + request, options);
-        cache.append(keys, keys + 100, tb::arange(6, integers));
+        auto values = tb::full({1, 2, 6, 6}, 110 + request, options);
+        cache.append(keys, values, tb::arange(6, integers));
         caches.push_back(std::move(cache));
     }
-    auto& graph = graphs.get({4, 8, 8, {}}, 2 + HotKvStateFields::Count, 0);
+    auto& graph = graphs.get({4, 8, 8, {}}, 4 + HotKvStateFields::Count, 0);
     auto& inputs = *graph.inputs;
     std::vector<tb::Tensor> outputs;
     for (const auto members : {std::vector<int>{0, 1, 2}, std::vector<int>{3, 2, 0}}) {
         const auto position = graphs.has_graphs() ? 7 : 6;
         inputs.update_rows({{20, position, members[0]}, {21, position, members[1]}, {22, position, members[2]}});
-        for (int row = 0; row < 3; ++row) {
-            auto& cache = caches[members[row]];
+        int inactive = 0;
+        while (std::find(members.begin(), members.end(), inactive) != members.end())
+            ++inactive;
+        auto& disabled = caches[inactive];
+        const std::vector<tb::Tensor> disabled_state{disabled.keys, disabled.values, disabled.cold_keys,
+            disabled.cold_values, disabled.mapping, disabled.cold_mapping, disabled.slot_ids,
+            disabled.epochs, disabled.free_cold, disabled.free_gpu, disabled.cold_control, disabled.control};
+        std::vector<tb::Tensor> before;
+        for (const auto& tensor : disabled_state)
+            before.push_back(tensor.cpu());
+        for (int row = 0; row < 4; ++row) {
+            auto& cache = caches[row < 3 ? members[row] : inactive];
             // The gather's logical extent is eight; each physical tier is smaller.
             inputs.state(row, 0, cache.mapping);
             inputs.state(row, 1, cache.mapping);
-            cache.bind_decode_state(inputs, 2, row);
+            cache.bind_decode_state(inputs, 4, row);
         }
         inputs.upload();
         const auto body = [&] {
             outputs.clear();
+            if (independent) {
+                auto keys = (tb::ones({4, 1, 2, 4}, options) *
+                    inputs.ids().to(tb::kInt32).reshape({4, 1, 1, 1})).contiguous();
+                auto values = (tb::ones({4, 1, 2, 6}, options) *
+                    (inputs.ids().to(tb::kInt32) + 100).reshape({4, 1, 1, 1})).contiguous();
+                batch_attention_store(inputs, 0, keys, values);
+            }
             for (int row = 0; row < 4; ++row) {
                 auto value = inputs.ids().narrow(0, row, 1).to(tb::kInt32).reshape({1, 1, 1, 1});
                 auto keys = (tb::ones({1, 2, 1, 4}, options) * value).contiguous();
+                auto values = (tb::ones({1, 2, 1, 6}, options) * (value + 100)).contiguous();
                 auto positions = inputs.positions().narrow(0, row, 1);
-                check(caches.front().append_decode(keys, keys + 100, positions, {}, {}, false, &inputs, 2, row),
+                check(independent || caches.front().append_decode(
+                    keys, values, positions, {}, {}, false, &inputs, 4, row),
                       "exclusive indirect append was rejected");
-                outputs.push_back(batch_state_gather(inputs, 0, row, tb::arange(8, integers), 2, 4, options, 2));
-                outputs.push_back(batch_state_gather(inputs, 1, row, tb::arange(8, integers), 2, 4, options, 2, true));
+                outputs.push_back(batch_state_gather(inputs, 0, row, tb::arange(8, integers), 2, 4, options, 4));
+                outputs.push_back(batch_state_gather(inputs, 1, row, tb::arange(8, integers), 2, 6, options, 4, true));
             }
         };
         if (!graph.valid) {
@@ -60,6 +83,11 @@ static void check_exclusive_tiers() {
         }
         graph.window->run();
         graphs.replayed(graph);
+        for (std::size_t index = 0; index < disabled_state.size(); ++index) {
+            auto after = disabled_state[index].cpu();
+            check(std::memcmp(after.data_ptr(), before[index].data_ptr(), after.nbytes()) == 0,
+                  "disabled row modified exclusive KV state");
+        }
         for (int row = 0; row < 4; ++row) {
             for (int value = 0; value < 2; ++value) {
                 auto actual = outputs[2 * row + value].cpu();
@@ -75,8 +103,9 @@ static void check_exclusive_tiers() {
                             else if (token == 6 && position == 7 && request != 3)
                                 expected = (request == 0 ? 20 : 22) + value * 100;
                         }
-                        for (int column = 0; column < 4; ++column)
-                            check(actual.data_ptr<int32_t>()[(head * 8 + token) * 4 + column] == expected,
+                        const int width = value ? 6 : 4;
+                        for (int column = 0; column < width; ++column)
+                            check(actual.data_ptr<int32_t>()[(head * 8 + token) * width + column] == expected,
                                   "exclusive gather read the wrong physical row");
                     }
                 }
@@ -84,7 +113,19 @@ static void check_exclusive_tiers() {
         }
     }
     check(graphs.captures == 1 && graphs.bucket_reuses == 1, "exclusive tiers captured membership changes");
-    std::cout << "batch_decode_exclusive_tiers PASS eviction=1 cold_reads=1 reorder=1 padding=1 captures=1\n";
+    for (const auto& cache : caches) {
+        auto hot = cache.mapping.cpu(), cold = cache.cold_mapping.cpu();
+        int hot_rows = 0, cold_rows = 0;
+        for (int token = 0; token < 8; ++token) {
+            hot_rows += hot.data_ptr<int32_t>()[token] >= 0;
+            cold_rows += cold.data_ptr<int32_t>()[token] >= 0;
+            check(hot.data_ptr<int32_t>()[token] < 0 || cold.data_ptr<int32_t>()[token] < 0,
+                  "logical row occupies both KV tiers");
+        }
+        check(hot_rows == cache.keys.size(2) && cold_rows >= 1, "exclusive rows did not occupy both physical tiers");
+    }
+    std::cout << "batch_decode_exclusive_tiers PASS eviction=1 cold_reads=1 reorder=1 padding=1 captures=1"
+              << " independent=" << independent << '\n';
 }
 
 int main() {
@@ -93,7 +134,8 @@ int main() {
         MFQ_CUDA_CHECK(cudaGetDeviceCount(&devices));
         if (!devices)
             return 77;
-        check_exclusive_tiers();
+        check_exclusive_tiers(false);
+        check_exclusive_tiers(true);
         for (int maximum : {1, 2, 3, 6, 16, 32}) {
             for (int rows = 1; rows <= maximum; ++rows) {
                 const auto bucket = batch_decode_row_bucket(rows, maximum);

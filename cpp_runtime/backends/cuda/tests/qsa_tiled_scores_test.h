@@ -2,6 +2,11 @@
 
 #include "qsa_scores.h"
 
+#include <algorithm>
+#include <cmath>
+#include <functional>
+#include <vector>
+
 // Modes: original small GEMMs, legacy large GEMMs, tiled default.
 class QsaScoreSetting {
     const char* names_[2] = {"MFQ_QSA_PREFILL_TILED_SCORES", "MFQ_QSA_PREFILL_SCORE_GEMM"};
@@ -62,9 +67,96 @@ void qsa_score_exact_indices(const Tensor& actual, const Tensor& expected, const
     }
 }
 
-void qsa_check_score_selection(const Tensor& actual, const Tensor& expected) {
+// FP32 dot products summed in different orders differ by up to about
+// width * 2^-24 of the summed product magnitudes on each side. The error
+// follows that magnitude, not the score, so cancelled scores legitimately
+// differ by much more than their own relative tolerance.
+Tensor qsa_score_tolerance(const Tensor& query, const Tensor& keys) {
+    Tensor magnitude;
+    {
+        QsaScoreSetting setting(0);
+        magnitude = qsa_block_scores(query.to(tb::kFloat32).abs(), keys.to(tb::kFloat32).abs());
+    }
+    return magnitude * (2.0 * double(query.size(-1)) / 16777216.0) + 1e-7;
+}
+
+float qsa_element_tolerance(const Tensor& tolerance, int64_t index, float value) {
+    return tolerance.defined() ? tolerance.data_ptr<float>()[index] : 1e-7f + 1e-5f * std::abs(value);
+}
+
+void qsa_equal_within(const Tensor& actual, const Tensor& expected, const Tensor& tolerance, const char* label) {
+    auto a = actual.to(tb::kFloat32).contiguous().cpu();
+    auto b = expected.to(tb::kFloat32).contiguous().cpu();
+    auto t = tolerance.to(tb::kFloat32).contiguous().cpu();
+    if (a.sizes() != b.sizes() || a.sizes() != t.sizes()) throw std::runtime_error(std::string(label) + " shape mismatch");
+    for (int64_t i = 0; i < a.numel(); ++i) {
+        const float x = a.data_ptr<float>()[i], y = b.data_ptr<float>()[i], bound = t.data_ptr<float>()[i];
+        if (!(std::abs(x - y) <= bound))
+            throw std::runtime_error(std::string(label) + " differs at " + std::to_string(i) + " actual=" +
+                std::to_string(x) + " expected=" + std::to_string(y) + " tolerance=" + std::to_string(bound));
+    }
+}
+
+// A top-k may swap candidates whose reference scores lie within tolerance of
+// the cutoff. Anything clearly above the cutoff must be selected and nothing
+// clearly below it.
+void qsa_score_selection_matches(const Tensor& scores, const Tensor& reference, int selected, const char* label,
+    const Tensor& tolerance = {}) {
+    auto chosen = std::get<1>(tb::topk(scores, selected, -1, true, true)).to(tb::kInt64).contiguous().cpu();
+    auto expected = reference.to(tb::kFloat32).contiguous().cpu();
+    auto bounds = tolerance.defined() ? tolerance.to(tb::kFloat32).contiguous().cpu() : Tensor{};
+    const auto count = expected.size(-1), rows = expected.numel() / count;
+    for (int64_t row = 0; row < rows; ++row) {
+        const float* values = expected.data_ptr<float>() + row * count;
+        std::vector<int64_t> order(count);
+        for (int64_t index = 0; index < count; ++index) order[index] = index;
+        std::nth_element(order.begin(), order.begin() + (selected - 1), order.end(),
+            [&](int64_t x, int64_t y) { return values[x] > values[y]; });
+        const auto cut = order[selected - 1];
+        const float cutoff = values[cut];
+        const float cutoff_bound = qsa_element_tolerance(bounds, row * count + cut, cutoff);
+        std::vector<bool> picked(count, false);
+        for (int64_t slot = 0; slot < selected; ++slot) {
+            const auto index = chosen.data_ptr<int64_t>()[row * selected + slot];
+            picked[index] = true;
+            if (values[index] < cutoff - cutoff_bound - qsa_element_tolerance(bounds, row * count + index, values[index]))
+                throw std::runtime_error(std::string(label) + " selected a score below the cutoff at row " +
+                    std::to_string(row) + " index=" + std::to_string(index));
+        }
+        for (int64_t index = 0; index < count; ++index)
+            if (!picked[index] &&
+                values[index] > cutoff + cutoff_bound + qsa_element_tolerance(bounds, row * count + index, values[index]))
+                throw std::runtime_error(std::string(label) + " missed a score above the cutoff at row " +
+                    std::to_string(row) + " index=" + std::to_string(index));
+    }
+}
+
+// Rows whose top-k block cutoff is closer than the score tolerance may select
+// either candidate. Exact token and output comparisons use the other rows.
+std::vector<bool> qsa_separated_rows(const Tensor& scores, const Tensor& tolerance, int64_t selected, int64_t pool) {
+    auto s = scores.to(tb::kFloat32).contiguous().cpu();
+    auto t = tolerance.to(tb::kFloat32).contiguous().cpu();
+    const auto rows = s.size(1), pools = s.size(2);
+    std::vector<bool> separated(s.size(0) * rows, true);
+    for (int64_t index = 0; index < s.size(0) * rows; ++index) {
+        const auto row = index % rows;
+        std::vector<std::pair<float, float>> visible;
+        for (int64_t block = 0; block < pools; ++block)
+            if (block * pool + pool - 1 <= row)
+                visible.push_back({s.data_ptr<float>()[index * pools + block], t.data_ptr<float>()[index * pools + block]});
+        if (int64_t(visible.size()) <= selected) continue;
+        std::partial_sort(visible.begin(), visible.begin() + selected + 1, visible.end(),
+            [](const auto& x, const auto& y) { return x.first > y.first; });
+        separated[index] = visible[selected - 1].first - visible[selected].first >
+            visible[selected - 1].second + visible[selected].second;
+    }
+    return separated;
+}
+
+void qsa_check_score_selection(const Tensor& actual, const Tensor& expected, const Tensor& tolerance = {}) {
     if (actual.scalar_type() != tb::kFloat32) throw std::runtime_error("QSA scores must remain FP32");
-    equal(actual, expected, "QSA tiled FP32 scores", 1e-7f, 1e-5f);
+    if (tolerance.defined()) qsa_equal_within(actual, expected, tolerance, "QSA tiled FP32 scores");
+    else equal(actual, expected, "QSA tiled FP32 scores", 1e-7f, 1e-5f);
     const auto rows = actual.size(1), pools = actual.size(2);
     if (!pools) return;
     const auto options = actual.options().dtype(tb::kInt64);
@@ -73,15 +165,13 @@ void qsa_check_score_selection(const Tensor& actual, const Tensor& expected) {
     auto visible = ends <= positions;
     auto masked = tb::where(visible, actual, tb::full_like(actual, -1e30));
     auto oracle = tb::where(visible, expected, tb::full_like(expected, -1e30));
-    equal(masked, oracle, "QSA tiled causal visibility", 1e-7f, 1e-5f);
+    if (tolerance.defined()) qsa_equal_within(masked, oracle, tolerance, "QSA tiled causal visibility");
+    else equal(masked, oracle, "QSA tiled causal visibility", 1e-7f, 1e-5f);
     for (int count : {1, 17, 64}) {
         const int selected = std::min<int64_t>(count, pools);
-        // QSA requests sorted=false: the exact selected IDs define the cutoff,
-        // while the order of scores inside that selection is unspecified.
-        qsa_score_exact_indices(std::get<1>(tb::topk(masked, selected, -1, true, true)),
-            std::get<1>(tb::topk(oracle, selected, -1, true, true)), "QSA causal top-k indices", true);
-        qsa_score_exact_indices(std::get<1>(tb::topk(actual, selected, -1, true, true)),
-            std::get<1>(tb::topk(expected, selected, -1, true, true)), "QSA unmasked top-k indices", true);
+        // QSA requests sorted=false, so only the selected set matters.
+        qsa_score_selection_matches(masked, oracle, selected, "QSA causal top-k", tolerance);
+        qsa_score_selection_matches(actual, expected, selected, "QSA unmasked top-k", tolerance);
     }
 }
 
@@ -183,13 +273,24 @@ void qsa_score_attention_case() {
             }
             std::cout << "qsa_normalized_dtype_score_check dtype=" << int(dtype) << " max_abs="
                 << (tiled - reference).abs().max().item<float>() << std::endl;
-            qsa_check_score_selection(tiled, reference);
+            qsa_check_score_selection(tiled, reference, qsa_score_tolerance(query, pooled));
         }
-        equal(new_trace[0], old_trace[0], "QSA model scores", 1e-7f, 1e-5f);
-        qsa_score_exact_indices(new_trace[1], old_trace[1], "QSA model selected token indices", true);
-        qsa_score_exact_indices(new_trace[1].narrow(-1, budget, pool - 1),
-            old_trace[1].narrow(-1, budget, pool - 1), "QSA model partial pool tail");
-        equal(result, expected, "QSA tiled final attention");
+        const auto tolerance = qsa_score_tolerance(old_trace[2], old_trace[3]);
+        qsa_check_score_selection(new_trace[0], old_trace[0], tolerance);
+        const auto separated = qsa_separated_rows(old_trace[0], tolerance, budget / pool, pool);
+        int ties = 0;
+        for (int row = 0; row < rows; ++row) {
+            if (!separated[row]) {
+                ++ties;
+                continue;
+            }
+            qsa_score_exact_indices(new_trace[1].narrow(1, row, 1), old_trace[1].narrow(1, row, 1),
+                "QSA model selected token indices", true);
+            qsa_score_exact_indices(new_trace[1].narrow(1, row, 1).narrow(-1, budget, pool - 1),
+                old_trace[1].narrow(1, row, 1).narrow(-1, budget, pool - 1), "QSA model partial pool tail");
+            equal(result.narrow(1, row, 1), expected.narrow(1, row, 1), "QSA tiled final attention");
+        }
+        std::cout << "qsa_model_selection_check rows=" << rows << " near_tie_rows=" << ties << std::endl;
         auto selected = new_trace[1].cpu().contiguous();
         const int count = int(selected.size(2));
         for (int row = 0; row < rows; ++row) for (int i = 0; i < count; ++i)
@@ -224,13 +325,13 @@ void qsa_prefill_scores_case() {
         }
         std::cout << "qsa_tiled_check rows=" << g.rows << " pools=" << g.pools << " heads=" << g.heads
             << " width=" << g.width << " dtype=" << int(dtype) << std::endl;
-        qsa_check_score_selection(actual, expected);
+        qsa_check_score_selection(actual, expected, qsa_score_tolerance(query, keys));
         qsa_score_scalar_oracle(query, keys, actual);
         if (g.rows == 65 && g.heads == 3) qsa_score_selected_attention(actual, expected, dtype);
         ++cases;
         if (g.rows == 33 && g.heads == 1) {
             QsaScoreSetting setting(1);
-            qsa_check_score_selection(qsa_block_scores(query, keys), expected);
+            qsa_check_score_selection(qsa_block_scores(query, keys), expected, qsa_score_tolerance(query, keys));
             ++cases;
         }
     }
@@ -244,7 +345,8 @@ void qsa_prefill_scores_case() {
             expected = mfq_qwen4_exp::block_scores(query, keys);
         }
         QsaScoreSetting setting(2);
-        qsa_check_score_selection(mfq_qwen4_exp::block_scores(query, keys), expected);
+        qsa_check_score_selection(mfq_qwen4_exp::block_scores(query, keys), expected,
+            qsa_score_tolerance(query, keys));
         ++cases;
     }
     // Exact duplicates and sub-BF16 FP32 differences straddle the top-k cutoff.
@@ -287,7 +389,7 @@ void qsa_prefill_scores_case() {
         query.copy_(qsa_score_data({1, 65, 3, 37}, salt, tb::kBFloat16));
         graph.replay();
         QsaScoreSetting setting(0);
-        qsa_check_score_selection(output, qsa_block_scores(query, keys));
+        qsa_check_score_selection(output, qsa_block_scores(query, keys), qsa_score_tolerance(query, keys));
         ++cases;
     }
     qsa_score_attention_case();

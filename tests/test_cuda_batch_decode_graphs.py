@@ -72,6 +72,17 @@ def _mtp_recurrent_model(path):
     ("flash_next_cached", False, 4), ("flash_next_cached", False, 32),
 ])
 def test_uniform_width_batched_mtp_matches_ordinary_greedy(tmp_path, family, paged, requests):
+    metrics = _batched_mtp_check(tmp_path, family, paged, requests)
+    lifecycle = "0" if family == "qwen35_homogeneous" else "1"
+    assert metrics["paused"] == metrics["cancelled"] == lifecycle
+    if family == "qwen35_homogeneous":
+        assert int(metrics["tokens"]) == 32 * 48
+    assert metrics["grammar"] == "1"
+    assert int(metrics["drafted"]) > 0
+
+
+def _batched_mtp_check(tmp_path, family, paged, requests):
+    """Run the diagnostic batched-MTP greedy oracle and return its metrics."""
     executable = os.environ.get("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS")
     if not executable:
         pytest.skip("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS must point to CUDA mfq-diagnostics")
@@ -82,6 +93,8 @@ def test_uniform_width_batched_mtp_matches_ordinary_greedy(tmp_path, family, pag
     environment = dict(os.environ, MFQ_CONTINUOUS_PAGED_KV=str(int(paged)),
                        MFQ_BATCH_MTP_TEST_TOKENIZER=str(tokenizer), MFQ_BATCH_MTP_CHECK="1",
                        MFQ_CONTINUOUS_BATCH_MTP="1")
+    # Let every row speculate unless a test fixes a smaller checkpoint budget.
+    environment.setdefault("MFQ_BATCH_MTP_CHECKPOINTS", str(requests))
     if family.startswith("qwen35"):
         _mtp_recurrent_model(model)
         if family == "qwen35_homogeneous":
@@ -125,17 +138,19 @@ def test_uniform_width_batched_mtp_matches_ordinary_greedy(tmp_path, family, pag
     metrics = dict(field.split("=", 1) for field in line.split()[1:])
     assert metrics["greedy"] == "PASS"
     assert metrics["mtp"] == "1"
-    lifecycle = "0" if family == "qwen35_homogeneous" else "1"
-    assert metrics["paused"] == metrics["cancelled"] == lifecycle
-    if family == "qwen35_homogeneous":
-        assert int(metrics["tokens"]) == 32 * 48
-    assert metrics["grammar"] == "1"
-    assert int(metrics["drafted"]) > 0
+    return metrics
 
 def test_flash_next_batched_mtp_drafts_within_fixed_checkpoints(tmp_path, monkeypatch):
     # One checkpoint slot for 32 rows: drafts shrink, memory and outputs do not change.
-    monkeypatch.setenv("MFQ_BATCH_MTP_DRAFT_TOKENS", "1")
+    monkeypatch.setenv("MFQ_BATCH_MTP_CHECKPOINTS", "1")
     test_uniform_width_batched_mtp_matches_ordinary_greedy(tmp_path, "flash_next", False, 32)
+
+@pytest.mark.parametrize("family", ["qwen35", "flash_next"])
+def test_batched_mtp_without_checkpoints_stays_greedy(tmp_path, monkeypatch, family):
+    # A zero budget keeps batched MTP enabled but never speculates.
+    monkeypatch.setenv("MFQ_BATCH_MTP_CHECKPOINTS", "0")
+    metrics = _batched_mtp_check(tmp_path, family, False, 4)
+    assert int(metrics["drafted"]) == 0
 
 @pytest.mark.parametrize("opt_in", [True, False])
 @pytest.mark.parametrize("family", ["qwen35", "flash_next"])
@@ -360,6 +375,7 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells,
                        MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_HOST_CACHE_BYTES="8388608",
                        MFQ_MEMORY_ARCHITECTURE="discrete", MFQ_KV_RAM_PREALLOCATED="1",
                        MFQ_QSA_INDEPENDENT_BATCH="1", MFQ_KV_TURBOQUANT_BITS=kv_bits,
+                       MFQ_TRACE_QSA_BATCH="1",
                        MFQ_KV_GPU_BUDGET_BYTES=str(98304 + cells * cell_bytes))
     # A small GPU tier exercises eviction and cold reads; a small RAM tier
     # exposes writes through the logical [heads, 512, width] view immediately.
@@ -378,10 +394,10 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells,
             try:
                 await client.status()
 
-                async def generate(prompt):
+                async def generate(prompt, max_tokens=32):
                     async with client.generate({"messages": [{"role": "user", "content": prompt}],
                             "mfq_preformatted_prompt": prompt, "temperature": 0,
-                            "top_k": 1, "max_tokens": 32, "enable_mtp": False, "stream": True}) as events:
+                            "top_k": 1, "max_tokens": max_tokens, "enable_mtp": False, "stream": True}) as events:
                         output = [event async for event in events if event is not None]
                     return "".join(choice.get("delta", {}).get("content", "")
                                    for event in output for choice in event.get("choices", []))
@@ -389,14 +405,24 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells,
                 single = await generate(prompts[0])
                 outputs = (await asyncio.gather(*(generate(prompt) for prompt in prompts)) if capacity > 1
                            else [await generate(prompt) for prompt in prompts])
+                cold_outputs = []
+                if cells == 496:
+                    # The tokenizer merges each "ab" into one token. These prompts fill
+                    # both tiers before decode, even with only 16 physical RAM cells.
+                    cold_prompts = ["ab" * count for count in (497, 499, 501)]
+                    cold_outputs = (await asyncio.gather(*(generate(prompt, 8) for prompt in cold_prompts))
+                                    if capacity > 1 else [await generate(prompt, 8) for prompt in cold_prompts])
+                    assert all(cold_outputs)
                 status = await _fresh_idle_status(client)
                 assert status["kv_memory_resident_cells"] == cells
                 assert status["kv_memory_ram_bytes"] > 0
                 if capacity > 1:
                     assert status["continuous_batching_cuda_graph_captures"] > 0
                     assert status["continuous_batching_cuda_graph_bucket_reuses"] > 0
+                    trace = log_path.read_text(errors="replace")
+                    assert any(f"qsa_independent_batch rows={rows}" in trace for rows in (2, 4))
                 assert "exclusive=1" in log_path.read_text(errors="replace")
-                return single, outputs
+                return single, outputs, cold_outputs
             finally:
                 with suppress(Exception):
                     await client.aclose()

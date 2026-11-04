@@ -1,4 +1,5 @@
 #include "mfq_container.h"
+#include "mfq/fatal_diagnostics.h"
 #include "mlx_deepseek_v4_causal_lm.h"
 #include "mlx_deepseek_v41_causal_lm.h"
 #include "mlx_legacy_tensor_compat.h"
@@ -3509,6 +3510,7 @@ int run_native_runtime(
 } // namespace
 
 int main(int argc, char** argv) {
+    mfq::install_fatal_diagnostics();
     try {
         const auto arguments = parse_arguments(argc, argv);
 #ifdef MFQ_METAL_RUNTIME_COMMUNICATION

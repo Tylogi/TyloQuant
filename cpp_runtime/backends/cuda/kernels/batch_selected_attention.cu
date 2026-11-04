@@ -11,31 +11,6 @@ IndirectKvView view(const BatchDecodeInputs& inputs, int64_t field) {
             int(inputs.rows()), int(field)};
 }
 
-template<class Value>
-__global__ void store_kv(IndirectKvView cache, const int64_t* positions,
-        const Value* keys, const Value* values, int heads, int key_width, int value_width) {
-    const int row = blockIdx.y;
-    if (!cache.active(row))
-        return;
-    const int64_t position = positions[row];
-    const int width = key_width > value_width ? key_width : value_width;
-    for (int index = int(blockIdx.x) * blockDim.x + threadIdx.x;
-            index < heads * width; index += gridDim.x * blockDim.x) {
-        const int head = index / width;
-        const int column = index % width;
-        if (column < key_width && position >= 0 && position < cache.capacity(row)) {
-            auto* target = static_cast<Value*>(cache.address(row));
-            target[(head * cache.capacity(row) + position) * key_width + column] =
-                keys[(int64_t(row) * heads + head) * key_width + column];
-        }
-        if (column < value_width && position >= 0 && position < cache.capacity(row, 1)) {
-            auto* target = static_cast<Value*>(cache.address(row, 1));
-            target[(head * cache.capacity(row, 1) + position) * value_width + column] =
-                values[(int64_t(row) * heads + head) * value_width + column];
-        }
-    }
-}
-
 __global__ void store_index_pool(IndirectKvView cache, const int64_t* positions,
         const mfq_half* raw, mfq_half* pooled, int width, int pool) {
     const int row = blockIdx.x;
@@ -125,28 +100,6 @@ __global__ void select_tokens(IndirectKvView cache, const int64_t* positions, co
 }
 
 } // namespace
-
-void batch_attention_store(const BatchDecodeInputs& inputs, int64_t field,
-        const tb::Tensor& keys, const tb::Tensor& values) {
-    MFQ_RUNTIME_CHECK(keys.dim() == 4 && values.dim() == 4 && keys.size(0) == inputs.rows() &&
-        values.size(0) == inputs.rows() && keys.size(1) == 1 && values.size(1) == 1 &&
-        keys.size(2) == values.size(2) && keys.scalar_type() == values.scalar_type(),
-        "invalid independent KV update geometry");
-    auto key = keys.contiguous(), value = values.contiguous();
-    const dim3 grid(unsigned((keys.size(2) * std::max(keys.size(3), values.size(3)) + 127) / 128),
-                    unsigned(inputs.rows()));
-    const auto launch = [&](auto* k, auto* v) {
-        store_kv<<<grid, 128, 0, mfq_current_cuda_stream()>>>(view(inputs, field),
-            inputs.positions().data_ptr<int64_t>(), k, v, int(keys.size(2)), int(keys.size(3)), int(values.size(3)));
-    };
-    if (key.scalar_type() == tb::kInt32)
-        launch(key.data_ptr<int32_t>(), value.data_ptr<int32_t>());
-    else {
-        MFQ_RUNTIME_CHECK(key.scalar_type() == tb::kFloat16, "independent KV requires F16 or packed I32");
-        launch(key.data_ptr<mfq_half>(), value.data_ptr<mfq_half>());
-    }
-    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
-}
 
 tb::Tensor batch_index_pool(const BatchDecodeInputs& inputs, int64_t field,
         const tb::Tensor& raw, int64_t pool) {

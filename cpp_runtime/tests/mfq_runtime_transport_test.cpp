@@ -51,7 +51,8 @@ struct FakeEngine final : Engine {
                 blocked = true;
                 while (!resume) std::this_thread::sleep_for(1ms);
             }
-            if (work.request.token_ids == std::vector<int64_t>{63}) throw std::runtime_error("device failure");
+            if (work.request.token_ids == std::vector<int64_t>{63}) throw MfqBackendFailure("device failure");
+            if (work.request.token_ids == std::vector<int64_t>{58}) throw std::runtime_error("request failure");
             ++advances.at(std::stoi(id));
             ++work.steps;
             result.advanced.push_back(id);
@@ -181,6 +182,26 @@ void test_benchmark_input_contract() {
         assert(rejected);
     }
 }
+
+void test_zero_nucleus_contract() {
+    using namespace mfq::transport_detail;
+    for (int top_k : {0, 1, 20}) {
+        const auto input = parse_input({{"messages", {{{"role", "user"}, {"content", "hello"}}}},
+            {"temperature", 1.0}, {"top_p", 0.0}, {"top_k", top_k}}, true, {});
+        assert(input.sampling.top_p == 0.0 && input.sampling.top_k == top_k);
+    }
+    for (double top_p : {-0.1, 1.1}) {
+        bool rejected = false;
+        try {
+            parse_input({{"messages", {{{"role", "user"}, {"content", "hello"}}}}, {"top_p", top_p}}, true, {});
+        } catch (const ApiError& error) { rejected = error.status == 400; }
+        assert(rejected);
+    }
+    // The native transport keeps its wider temperature range.
+    const auto internal = parse_input({{"messages", {{{"role", "user"}, {"content", "hello"}}}},
+        {"temperature", 3.0}}, true, {});
+    assert(internal.sampling.temperature == 3.0);
+}
 void test_probability_contract() {
     using namespace mfq::transport_detail;
     const auto request = parse_score_request({{"prompt", "Q:\nA:"}, {"continuations", {"A", "B"}}, {"mode", "next_token"}});
@@ -263,6 +284,7 @@ void test_completion_stream_passes_schedule() {
 }
 
 int main() {
+    test_zero_nucleus_contract();
     test_live_request_metrics();
     test_request_schedule_contract();
     test_completion_stream_passes_schedule();
@@ -349,6 +371,16 @@ int main() {
         auto second = scheduler.submit(bad);
         drain(first, false, true); drain(second, false, true);
         assert(!scheduler.status().healthy);
+        assert(engine.active.empty());
+    }
+    {
+        // An ordinary engine error fails the pending requests but keeps serving.
+        FakeEngine engine;
+        MfqScheduler scheduler(engine);
+        auto bad = request(1); bad.token_ids = {58};
+        drain(scheduler.submit(bad), false, true);
+        assert(scheduler.status().healthy);
+        drain(scheduler.submit(request(2, 100)));
         assert(engine.active.empty());
     }
     {

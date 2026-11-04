@@ -28,6 +28,16 @@ void check(cudaError_t status, const char* expression, const char* file, int lin
 void check(cublasStatus_t status, const char* expression, const char* file, int line);
 void record_gpu_timestamp(uint64_t* timestamps, std::size_t index, cudaStream_t stream);
 
+// Fault injection is opt-in through MFQ_TEST_CUDA_PREFILL_FAIL_AFTER and counts
+// only allocations within prefill, including nested predictor/vision work.
+class PrefillAllocationScope final {
+public:
+    PrefillAllocationScope();
+    ~PrefillAllocationScope();
+    PrefillAllocationScope(const PrefillAllocationScope&)=delete;
+    PrefillAllocationScope& operator=(const PrefillAllocationScope&)=delete;
+};
+
 #define MFQ_NATIVE_CUDA_CHECK(expression) \
     ::mfq::cuda::check((expression), #expression, __FILE__, __LINE__)
 
@@ -62,6 +72,7 @@ public:
 private:
     int device_ = 0;
     cudaEvent_t event_ = nullptr;
+    cudaStream_t stream_ = nullptr;
 };
 
 class Stream final {
@@ -183,9 +194,16 @@ struct DeviceMemoryStats {
     std::size_t peak = 0;
 };
 
+// Written only on invalid device inputs; checked after the owning stream completes.
+struct DeviceInputError {
+    int operation = 0;
+    std::int64_t index = 0, extent = 0;
+};
+
 class Context final : public std::enable_shared_from_this<Context> {
 public:
     explicit Context(int device);
+    ~Context() noexcept;
 
     int device() const noexcept { return device_; }
     Stream& stream() noexcept { return stream_; }
@@ -194,10 +212,14 @@ public:
     bool supports_async_allocations() const noexcept { return async_allocations_; }
     DeviceMemoryStats memory_stats() const noexcept;
     std::pair<std::uint64_t,std::uint64_t> pool_memory_stats() const;
+    // Graph memory pool handles held by this device, live or kept for reuse.
+    std::size_t graph_memory_pool_count() const;
     std::size_t local_memory_usage() const;
     // Process-owned pages, including idle allocator pages and CUDA libraries.
     std::size_t resident_memory_usage() const;
     std::size_t available_memory() const;
+    DeviceInputError* input_error(cudaStream_t stream);
+    void check_input_error(cudaStream_t stream) const;
     void reclaim_idle_memory();
     // Temporarily reuse already charged expert-cache storage on one ordered
     // compute stream. Graph/resident allocations never enter this workspace.
@@ -253,6 +275,12 @@ private:
     };
     std::unique_ptr<WorkspaceLoan> workspace_loan_;
     std::unordered_map<cudaStream_t, GraphPool> graph_pools_;
+    mutable std::mutex input_error_mutex_;
+    struct InputErrorStorage {
+        std::shared_ptr<DeviceInputError> host;
+        DeviceInputError* device = nullptr;
+    };
+    std::unordered_map<cudaStream_t, InputErrorStorage> input_errors_;
 };
 
 std::shared_ptr<Context> default_context(int device = 0);

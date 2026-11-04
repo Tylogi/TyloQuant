@@ -9,6 +9,7 @@
 #include "storage/moe_expert_cache.h"
 #include "runtime/execution_options.h"
 #include "prefill_budget.h"
+#include "prefill_recovery.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -32,13 +33,15 @@ static mfq::engine::PrefillChunk budget_batch_prefill(Model& model,
         CudaExecutionContext& execution,mfq::engine::PrefillChunk chunk,std::size_t growth=0) {
     const auto context=default_context(execution.layer_placement.primary_device());
     const auto transfer=moe_prefill_workspace_budget(execution.moe_expert_cache,false).transfer_bytes;
-    const auto fixed=mfq::engine::prefill_budget_add((std::size_t(1)<<30)+growth,transfer);
-    const auto available=context->available_memory()+context->workspace_available();
-    const auto row_bytes=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float)*8;
-    const auto selected=mfq::engine::select_prefill_chunk(chunk.count,chunk.count,available,fixed,row_bytes);
-    if(!selected)throw mfq::engine::InferenceInputError(
-        mfq::engine::InferenceInputErrorCode::ContextLength,
-        "insufficient CUDA workspace for batched prefill; reduce concurrent requests");
+    const auto row_bytes=mfq::engine::prefill_budget_add(mfq::engine::prefill_workspace_row_bytes(
+        model.hidden_size(),model.hc_mult(),model.num_attention_heads(),model.head_dim()),
+        internal::prefill_moe_row_bytes(model));
+    const auto headroom=mfq::engine::prefill_workspace_headroom(context->memory_stats().limit,row_bytes);
+    const auto fixed=mfq::engine::prefill_budget_add(mfq::engine::prefill_budget_add(headroom,growth),transfer);
+    const auto available=mfq::engine::prefill_budget_add(context->available_memory(),context->workspace_available());
+    auto selected=mfq::engine::select_prefill_chunk(chunk.count,chunk.count,available,fixed,row_bytes);
+    if(!selected)selected=mfq::engine::pressure_prefill_chunk(chunk.count,chunk.count,available,
+        mfq::engine::prefill_budget_add(growth,transfer),row_bytes);
     chunk.count=selected;
     return chunk;
 }
@@ -54,8 +57,8 @@ mfq::engine::PrefillChunk FlashNextBatchOperations::prefill_chunk(
         const std::shared_ptr<Request>& request,mfq::engine::PrefillChunk chunk) {
     MfqCudaGuard guard(execution_.layer_placement.primary_device());
     reclaim_prefill_memory(request);
-    initialize_prefill(request,chunk);
-    return budget_batch_prefill(model_,execution_,chunk,request->cache->prefill_growth_bytes(chunk.count));
+    return budget_batch_prefill(model_,execution_,chunk,
+        request->cache?request->cache->prefill_growth_bytes(chunk.count):0);
 }
 
 bool qwen_continuous_batch_cuda_graph_enabled(const Qwen35CausalLm &model,
@@ -77,6 +80,9 @@ QwenBatchOperations::QwenBatchOperations(Qwen35CausalLm &model, CudaExecutionCon
     MFQ_RUNTIME_CHECK(config_.max_sequences > 0 && config_.max_sequences <= config_.sequence_limit &&
                       config_.sequence_limit <= mfq::engine::ContinuousBatchConfig::validated_max_sequences,
                       "continuous batching capacity exceeds the configured or validated sequence limit");
+    // Each slot holds one row's recurrent state from before a speculative window.
+    if (batch_mtp_enabled() && predictor_ && predictor_->supports_batch())
+        mtp_checkpoints_ = batch_mtp_checkpoints(*predictor_);
 }
 
 QwenBatchOperations::~QwenBatchOperations() = default;
@@ -91,6 +97,7 @@ std::vector<std::pair<std::string, double>> QwenBatchOperations::metrics() const
         {"continuous_batching_mtp_supported", double(batch_mtp_enabled() && predictor_ && predictor_->supports_batch())},
         {"continuous_batching_mtp_stochastic_supported", 0.0},
         {"continuous_batching_mtp_graph_supported", 0.0},
+        {"continuous_batching_mtp_checkpoints", double(mtp_checkpoints_)},
         {"continuous_batching_mtp_batches", double(mtp_batches_)},
         {"continuous_batching_mtp_drafted_tokens", double(mtp_drafted_)},
         {"continuous_batching_mtp_accepted_tokens", double(mtp_accepted_)},
@@ -143,6 +150,15 @@ void QwenBatchOperations::release_idle_buffers() {
 
 QwenBatchOperations::Sample QwenBatchOperations::prefill(
     const std::shared_ptr<Request> &request, mfq::engine::PrefillChunk chunk) {
+    return internal::retry_batch_prefill(*this,request,chunk,[&] {
+        invalidate_decode_graph();
+        internal::reclaim_prefill_memory(model_);
+    });
+}
+
+QwenBatchOperations::Sample QwenBatchOperations::prefill_once(
+    const std::shared_ptr<Request> &request, mfq::engine::PrefillChunk chunk) {
+    PrefillAllocationScope allocation_scope;
     const int primary = execution_.layer_placement.primary_device();
     MfqCudaGuard guard(primary);
     state_adapter_.prepare_prefill(request->cache, chunk.offset, request->prompt.size());
@@ -226,6 +242,8 @@ void QwenBatchOperations::discard_prefill(const std::shared_ptr<Request> &reques
     state_adapter_.discard_prefill(request->cache);
     request->prefill_timers.clear();
     request->prefill_ids = Tensor();
+    request->counts = {};
+    request->sampler.reset();
 }
 
 void QwenBatchOperations::retire(const std::vector<std::shared_ptr<Request>> &retired,
@@ -288,12 +306,9 @@ FlashNextBatchOperations::FlashNextBatchOperations(Qwen4CausalLm& model,
     model_.reset(1);
     admission_base_kv_bytes_ = managed_kv_bytes();
     if (config_.cuda_graph) graph_ = std::make_unique<Qwen4BatchDecodeGraph>(model_);
-    if (batch_mtp_enabled() && predictor_ && predictor_->supports_batch()) {
-        // As many draft tokens as one exclusive MTP window, unless overridden.
-        int64_t tokens = predictor_->maximum_draft_depth();
-        if (const auto* value = std::getenv("MFQ_BATCH_MTP_DRAFT_TOKENS")) tokens = std::max(0, std::atoi(value));
-        mtp_checkpoints_ = std::make_shared<Qwen4BatchCheckpointPool>(tokens);
-    }
+    // Each slot holds the recurrent state after one drafted token.
+    if (batch_mtp_enabled() && predictor_ && predictor_->supports_batch())
+        mtp_checkpoints_ = std::make_shared<Qwen4BatchCheckpointPool>(batch_mtp_checkpoints(*predictor_));
 }
 FlashNextBatchOperations::~FlashNextBatchOperations() = default;
 int64_t FlashNextBatchOperations::vocab_size() const { return model_.vocab_size(); }
@@ -307,7 +322,7 @@ mfq::engine::Metrics FlashNextBatchOperations::metrics() const {
     return {{"continuous_batching_mtp_supported", double(batch_mtp_enabled() && predictor_ && predictor_->supports_batch())},
         {"continuous_batching_mtp_stochastic_supported", 0.0},
         {"continuous_batching_mtp_graph_supported", 0.0},
-        {"continuous_batching_mtp_checkpoint_tokens", double(mtp_checkpoints_ ? mtp_checkpoints_->tokens() : 0)},
+        {"continuous_batching_mtp_checkpoints", double(mtp_checkpoints_ ? mtp_checkpoints_->tokens() : 0)},
         {"continuous_batching_mtp_batches", double(mtp_batches_)},
         {"continuous_batching_mtp_drafted_tokens", double(mtp_drafted_)},
         {"continuous_batching_mtp_accepted_tokens", double(mtp_accepted_)},
@@ -335,13 +350,11 @@ static std::exception_ptr flash_next_prefill_failure(std::exception_ptr failure)
     try {std::rethrow_exception(failure);}
     catch(const std::exception& error) {
         const std::string message=error.what();
-        if(dynamic_cast<const MfqResourceExhausted*>(&error) ||
+        if(mfq::engine::prefill_resource_failure(failure) ||
            message.starts_with("CUDA process VRAM limit exceeded:") ||
            message.starts_with("CUDA VRAM limit exceeded:") ||
            message.starts_with("CUDA pinned allocation failed:"))
-            return std::make_exception_ptr(mfq::engine::InferenceInputError(
-                mfq::engine::InferenceInputErrorCode::ContextLength,
-                "insufficient GPU or pinned RAM for prefill workspace; reduce concurrent requests or the packed prefill token budget"));
+            return std::make_exception_ptr(MfqResourceExhausted(message));
     } catch(...) {}
     return failure;
 }
@@ -386,6 +399,14 @@ FlashNextBatchOperations::Sample FlashNextBatchOperations::finish_prefill(
 }
 FlashNextBatchOperations::Sample FlashNextBatchOperations::prefill(
         const std::shared_ptr<Request>& request, mfq::engine::PrefillChunk chunk) {
+    return internal::retry_batch_prefill(*this,request,chunk,[&] {
+        if(graph_)graph_->clear();
+        internal::reclaim_prefill_memory(model_);
+    });
+}
+FlashNextBatchOperations::Sample FlashNextBatchOperations::prefill_once(
+        const std::shared_ptr<Request>& request, mfq::engine::PrefillChunk chunk) {
+    PrefillAllocationScope allocation_scope;
     try {
     MfqCudaGuard guard(execution_.layer_placement.primary_device());
     initialize_prefill(request,chunk);
@@ -438,7 +459,15 @@ FlashNextBatchOperations::prefill_batch(
     std::vector<std::size_t> ready;
     for (std::size_t row=0;row<items.size();++row) {
         try { initialize_prefill(items[row].first,items[row].second); ready.push_back(row); }
-        catch (...) { result[row].failure=flash_next_prefill_failure(std::current_exception()); }
+        catch (...) {
+            const auto failure=flash_next_prefill_failure(std::current_exception());
+            try {
+                result[row].sample=internal::retry_batch_prefill(*this,items[row].first,items[row].second,[&] {
+                    if(graph_)graph_->clear();
+                    internal::reclaim_prefill_memory(model_);
+                },failure);
+            } catch(...) {result[row].failure=std::current_exception();}
+        }
     }
     const auto execute=[&](auto&& self,const std::vector<std::size_t>& rows)->void {
         if (rows.empty()) return;
@@ -468,6 +497,7 @@ FlashNextBatchOperations::prefill_batch(
                 chunks.push_back(request->prefill_ids.narrow(1,chunk.offset,chunk.count).contiguous());
                 tokens+=chunk.count;
             }
+            PrefillAllocationScope allocation_scope;
             PrefillCudaTimer timer;
             auto hidden=qwen4_batch_prefill(model_,caches,chunks);
             std::vector<Tensor> last;
@@ -494,10 +524,24 @@ FlashNextBatchOperations::prefill_batch(
             }
             ++packed_prefill_batches_;packed_prefill_requests_+=rows.size();packed_prefill_tokens_+=tokens;
         } catch (...) {
-            // Kernels may have advanced attention state. Fail this group;
-            // splitting/retrying is allowed only before numerical execution.
             const auto error=flash_next_prefill_failure(std::current_exception());
-            for(const auto row:rows)result[row].failure=error;
+            if(rows.size()==1 || !mfq::engine::prefill_resource_failure(error)) {
+                for(const auto row:rows)result[row].failure=error;
+                return;
+            }
+            // Every row in the failed packed call may have partial KV writes.
+            // Drop those rows before replaying them; established rows stay live.
+            for(const auto row:rows)discard_prefill(items[row].first);
+            if(graph_)graph_->clear();
+            internal::reclaim_prefill_memory(model_);
+            for(const auto row:rows) {
+                const auto& [request,chunk]=items[row];
+                try {
+                    result[row].sample=internal::retry_batch_prefill(*this,request,chunk,[&] {
+                        internal::reclaim_prefill_memory(model_);
+                    },error);
+                } catch(...) {result[row].failure=std::current_exception();}
+            }
         }
     };
     execute(execute,ready);
@@ -515,6 +559,7 @@ void FlashNextBatchOperations::discard_prefill(const std::shared_ptr<Request>& r
     if (request->mtp) request->mtp->discard();
     request->mtp.reset();
     request->cache.reset(); request->prefill_ids = {}; request->prefill_timers.clear(); request->packed_prefill_ms=0;
+    request->counts={};request->sampler.reset();
 }
 void FlashNextBatchOperations::retire(const std::vector<std::shared_ptr<Request>>& retired,int64_t) {
     for (const auto& request : retired) discard_prefill(request);

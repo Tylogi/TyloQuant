@@ -1,6 +1,7 @@
 """Retained decode graphs must survive reset, prefix restore and eager prefill."""
 import asyncio
 import os
+import re
 from contextlib import suppress
 
 import numpy as np
@@ -73,7 +74,13 @@ def test_conversation_graph_reuse(tmp_path, allocation, kv_bits, drafts):
                 await client.status()
                 initial_log = log_path.read_text(errors="replace")
                 if reuse:
-                    assert "runtime_qwen4_graph_warmup target_captures=6 predictor_captures=8" in initial_log
+                    # Startup warms graphs up to the budgeted initial draft depth;
+                    # deeper windows are captured on first use.
+                    depth = int(re.search(r"runtime_mtp_flexible_budget .*initial_depth=(\d+)", initial_log)[1])
+                    warmup = re.search(r"runtime_qwen4_graph_warmup target_captures=(\d+) "
+                                       r"maximum_draft_depth=(\d+) predictor_captures=(\d+)", initial_log)
+                    assert warmup and int(warmup[2]) == depth and int(warmup[1]) == depth + 1
+                    assert int(warmup[3]) > depth
                     if not streamed:
                         assert "runtime_qwen4_mtp_warmup tokens=64" in initial_log
                     else:

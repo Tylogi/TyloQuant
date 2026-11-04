@@ -161,6 +161,10 @@ void run(bool dspark,bool metal_policy=false,bool inherited_park=false) {
     struct PolicyOps : Ops {
         bool metal_policy;
         bool metal_mtp_policy() const {return metal_policy;}
+        Head predictor_step(Tensor hidden,Tensor ids,Tensor positions) {
+            if(!mtp.legacy)std::this_thread::sleep_for(std::chrono::milliseconds(32));
+            return Ops::predictor_step(hidden,ids,positions);
+        }
     };
     Model model;
     Predictor mtp;
@@ -194,7 +198,9 @@ void run(bool dspark,bool metal_policy=false,bool inherited_park=false) {
         throw std::runtime_error("inherited Metal park was omitted from a short response's metrics");
     if (dspark ? stats.park_count != 0 || stats.standard_tokens != 0 :
         stats.park_count == 0 || stats.standard_tokens == 0)
-        throw std::runtime_error("shared MTP policy dispatch mismatch");
+        throw std::runtime_error("shared MTP policy dispatch mismatch: dspark="+std::to_string(dspark)+
+            " metal="+std::to_string(metal_policy)+" parks="+std::to_string(stats.park_count)+
+            " standard="+std::to_string(stats.standard_tokens));
 }
 
 void run_dspark_draft_cost() {
@@ -518,7 +524,10 @@ void early_target_prefetch() {
             events->push_back('c');
         }
         Head predictor_step(Tensor hidden,Tensor ids,Tensor positions) {
-            events->push_back('p');return Ops::predictor_step(hidden,ids,positions);
+            events->push_back('p');
+            // Keep the parked-path fixture slower than plain decode with coarse host timers.
+            if(!mtp.legacy)std::this_thread::sleep_for(std::chrono::milliseconds(32));
+            return Ops::predictor_step(hidden,ids,positions);
         }
         Tensor target_forward(Tensor ids,Tensor* raw=nullptr,int64_t confirmed=0) {
             events->push_back('t');return Ops::target_forward(ids,raw,confirmed);

@@ -86,6 +86,8 @@ void finalize_moe_expert_cache(
 std::size_t moe_expert_cache_minimum_bytes(const std::shared_ptr<MoeExpertCache>& cache);
 std::size_t moe_expert_cache_budget_bytes(const std::shared_ptr<MoeExpertCache>& cache);
 void resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache, std::size_t bytes);
+// Request boundary only: callers retire graphs before moving primary expert arenas.
+void reclaim_moe_expert_workspace(const std::shared_ptr<MoeExpertCache>& cache, std::size_t bytes);
 // Reclaim lower-priority cache storage before reducing prefill transfer overlap.
 void set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCache>& cache,
     std::function<void(std::size_t)> reserve,std::function<void(std::size_t)> reserve_ram={});

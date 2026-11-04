@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -152,17 +153,11 @@ class _LinearAttentionLayer(nn.Module):
 
 @pytest.mark.parametrize("model_type", ("qwen3_5_text", "qwen3_5_moe_text"))
 def test_backend_normalizes_text_subconfig_family(monkeypatch, tmp_path, model_type):
-    import transformers
-
     import mfq.calibration.layerwise_qwen35 as qwen_backend
 
     sentinel = object()
-    monkeypatch.setattr(
-        transformers.AutoConfig,
-        "from_pretrained",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            text_config=SimpleNamespace(model_type=model_type)
-        ),
+    (tmp_path / "config.json").write_text(
+        json.dumps({"text_config": {"model_type": model_type}}), encoding="utf-8"
     )
     monkeypatch.setattr(
         qwen_backend,
@@ -530,6 +525,7 @@ def test_cli_dispatches_same_imatrix_collector_for_cuda_and_metal(
         received.update(model=model, corpus=actual_corpus, output=output, **kwargs)
 
     monkeypatch.setattr(imatrix_module, "collect_imatrix", fake_collect)
+    monkeypatch.setattr(imatrix_module, "imatrix_model_type", lambda _model: "qwen3_5")
     args = SimpleNamespace(
         model="model",
         corpus="corpus",

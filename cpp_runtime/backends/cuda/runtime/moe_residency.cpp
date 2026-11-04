@@ -306,6 +306,8 @@ struct MoeResidencyManager::Impl {
     std::vector<cudaEvent_t> preserve_events;
     cudaEvent_t done=nullptr;
     cudaEvent_t window_done=nullptr;
+    std::unique_ptr<mfq::cuda::Event> retired_dma_done;
+    std::vector<MoeHostExpertCache::Lease> retired_dma_leases;
     std::unique_ptr<mfq::cuda::HostBuffer> expert_done_host;
     uint32_t* expert_done_device=nullptr;
     cudaStream_t expert_compute_stream=nullptr;
@@ -558,6 +560,11 @@ MoeResidencyManager::~MoeResidencyManager() {
     if(impl_->worker.joinable()) {
         {std::lock_guard<std::mutex> lock(impl_->worker_mutex);impl_->stopping=true;}
         impl_->work_available.notify_one();impl_->work_finished.notify_all();impl_->worker.join();
+    }
+    if(!impl_->retired_dma_leases.empty()) {
+        (void)cudaEventSynchronize(impl_->retired_dma_done->get());
+        (void)cudaEventSynchronize(impl_->window_done);
+        impl_->retired_dma_leases.clear();
     }
     try {if(!impl_->pending.empty())rollback();}catch(...) {}
     // Batch storage is allocated on the adaptation stream. Its async frees
@@ -875,6 +882,16 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
             lock.lock();state.work_ready=true;state.work_finished.notify_one();
         }
     });
+    if(!window_inflight && !s.cache->pipeline_dma_leases_.empty()) {
+        // Eager direct-RAM uploads otherwise retain their readers until the
+        // next fetch, so every hot incoming expert looks busy to this planner.
+        // The recorded consumer fence also covers mapped-copy/direct-read
+        // kernels that can keep reading host fields after weight DMA finishes.
+        // Snapshot uploads separately: predictive prefetch may be unconsumed.
+        if(!s.retired_dma_done)s.retired_dma_done=std::make_unique<mfq::cuda::Event>();
+        s.retired_dma_done->record(s.cache->weight_stream_);
+        s.retired_dma_leases.swap(s.cache->pipeline_dma_leases_);
+    }
     s.work_pending.store(true,std::memory_order_release);
     {std::lock_guard<std::mutex> lock(s.worker_mutex);s.window_inflight=window_inflight;s.work_requested=true;
         s.ssd_predictor_isolated=false;s.ssd_copies_permitted=false;
@@ -939,6 +956,11 @@ void MoeResidencyManager::prepare() {
         s.candidate_projections+=pair.incoming.projection<0?3:1;
     }
     if(!cache.config_.moe_residency_warm && pairs.size()>32)pairs.resize(32);
+    if(!s.retired_dma_leases.empty()) {
+        s.retired_dma_done->synchronize();
+        MFQ_CUDA_CHECK(cudaEventSynchronize(s.window_done));
+        s.retired_dma_leases.clear();
+    }
     s.direct=cache.config_.moe_direct_ram && cache.pipeline_ram_registered_bytes_>0;
     bool copies_ready=false;
     const auto allow_copies=[&] {

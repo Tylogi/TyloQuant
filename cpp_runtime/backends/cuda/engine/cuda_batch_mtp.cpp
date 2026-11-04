@@ -160,9 +160,11 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode_mtp(State& state) {
                         projected.batch = 1;
                         auto convolution = destinations[destination++];
                         auto recurrent = destinations[destination++];
+                        // Views keep the window's single snapshot alive until
+                        // the row resolves; the next window snapshots afresh.
                         prefixes[row].push_back({block, std::move(projected),
-                            block->mixer.speculative_convolution.narrow(0, row, 1).clone(),
-                            block->mixer.speculative_recurrent.narrow(0, row, 1).clone(),
+                            block->mixer.speculative_convolution.narrow(0, row, 1),
+                            block->mixer.speculative_recurrent.narrow(0, row, 1),
                             std::move(convolution), std::move(recurrent)});
                     }
                 }
@@ -185,7 +187,10 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode_mtp(State& state) {
         }
         return result;
     };
-    auto tokens = run_batch_mtp(*predictor_, MtpTarget(model_), inputs, max_context(), verify);
+    // A speculative window snapshots every row of the batch. Rows beyond the
+    // fixed checkpoint budget decode one token instead of growing that snapshot.
+    const auto draft_tokens = int64_t(inputs.size()) <= mtp_checkpoints_ ? -1 : 0;
+    auto tokens = run_batch_mtp(*predictor_, MtpTarget(model_), inputs, max_context(), verify, draft_tokens);
     ++mtp_batches_;
     ++decode_batches_;
     decode_tokens_ += inputs.size();

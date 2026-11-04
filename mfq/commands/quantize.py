@@ -105,6 +105,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help='AlphaQ PLE lookup precision; recipe defaults to native when no recipe is available')
     output.add_argument('--alphaq-cache', default='',
         help='reusable AlphaQ statistics and trained tables; defaults beside the output')
+    output.add_argument('--alphaq-consume-fitted', action='store_true',
+        help='delete fitted payloads as final output is written; interruption requires refitting deleted tensors')
     precision.add_argument(
         "--tokenizer",
         default="",
@@ -558,6 +560,8 @@ def _run_in(args: argparse.Namespace, baseline: Path, output: Path) -> None:
 
 def _validate(args: argparse.Namespace, source_format: str) -> None:
     allocation = bool(getattr(args, 'target_bpw', '') or getattr(args, 'ud_tier', ''))
+    if getattr(args, 'alphaq_consume_fitted', False) and not allocation:
+        raise ValueError('--alphaq-consume-fitted requires --target-bpw or --ud-tier')
     if getattr(args, 'devices', '') and not allocation:
         raise ValueError('--devices requires --target-bpw or --ud-tier')
     if getattr(args, 'alphaq_allocator', 'alphaq') == 'natscale' and not allocation:
@@ -734,6 +738,7 @@ def run(args: argparse.Namespace) -> int:
         base_args.split_max_size = 0
         base_args.split_max_tensors = 0
         base_args.dry_run = False
+        base_args._following_in_output_bytes = args.target_size or Path(args.recipe).stat().st_size
         convert(base_args)
     _run_in(args, baseline, output)
     if owned_baseline and not args.keep_temp and baseline.is_file():

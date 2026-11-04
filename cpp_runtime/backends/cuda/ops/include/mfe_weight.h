@@ -234,6 +234,8 @@ struct MfeWeight {
         std::unordered_set<MoeActivationKey, MoeActivationKeyHash> quantized;
         int nint_pool_phase = 0;
         const bool stable = input_rows <= 2048;
+        const EagerActivationScratch<std::remove_reference_t<decltype(*activation_workspaces)>>
+            eager_scratch{*activation_workspaces, !stable};
         for (const auto & pool : pools) {
             int groups = (int)pool.weight.ng;
             int gs = (int)pool.weight.gs;

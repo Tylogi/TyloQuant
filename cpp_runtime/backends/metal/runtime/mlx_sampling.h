@@ -23,7 +23,7 @@ struct MlxSamplingParams {
     bool warmup = false;
 
     bool greedy() const noexcept {
-        return temperature <= 0.0 || top_k == 1;
+        return temperature <= 0.0 || top_k == 1 || top_p == 0.0;
     }
 
     bool has_penalties() const noexcept {

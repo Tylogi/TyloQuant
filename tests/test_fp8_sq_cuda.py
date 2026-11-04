@@ -47,7 +47,7 @@ def _fixture(dtype: str):
     ).clone().cuda()
     row_q = torch.tensor(layout.row_q_bits, dtype=torch.uint8, device="cuda")
     row_offsets = torch.tensor(
-        layout.row_symbol_byte_offsets, dtype=torch.int32, device="cuda"
+        layout.row_symbol_byte_offsets[:-1], dtype=torch.int32, device="cuda"
     )
     dense = torch.from_numpy(
         E4M3_VALUES[decode_fp8_sq_codes(tensor)].astype(np.float32)
@@ -177,7 +177,7 @@ def test_cuda_dense_dispatch_covers_decode_and_prefill(
             fixture,
             values.to(device="cuda", dtype=activation_dtype),
         )
-        expected = values.double() @ dense.T
+        expected = values.to(activation_dtype).double() @ dense.T
         assert actual.shape == (rows, 8)
         assert actual.dtype == activation_dtype
         torch.testing.assert_close(
@@ -196,7 +196,7 @@ def test_cuda_backward_input(extension, dtype: str, activation_dtype):
         fixture,
         gradient.to(device="cuda", dtype=activation_dtype),
     )
-    expected = gradient.double() @ fixture[-1].double()
+    expected = gradient.to(activation_dtype).double() @ fixture[-1].double()
     assert actual.shape == (3, 128)
     assert actual.dtype == activation_dtype
     torch.testing.assert_close(

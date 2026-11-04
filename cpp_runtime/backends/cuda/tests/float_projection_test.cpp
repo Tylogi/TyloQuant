@@ -947,9 +947,11 @@ int dense_vector_residual() {
 
 void complete_two_stage_residual() {
     int ordinary=0,graphs=0;
+    const int resident=nint_float_projection_resident_blocks(mfq_current_cuda_device());
     for(int group:{5,24,28,32,48,64})for(int profile:{0,1,2})for(int streams:{1,3,4})for(int rank:{17,320})for(bool column_tail:{false,true}) {
         if(column_tail && !(group==64 && profile==1 && streams==4 && rank==320))continue;
-        const int hidden=column_tail?1025:4096/streams,width=hidden*streams;
+        const int minimum_hidden=std::max(4096/streams,(4*resident+streams-1)/streams);
+        const int hidden=column_tail?(minimum_hidden|1):minimum_hidden,width=hidden*streams;
         auto down=make_weight(rank,width,group,profile==2,profile==1);
         auto up=make_weight(width,rank,group,profile==2,profile==1);
         auto inject=make_weight(streams,width,group==5?24:5,profile==2,profile==1);
@@ -1010,7 +1012,8 @@ void complete_two_stage_residual() {
         }
     }
     std::cout<<"complete_two_stage_residual ordinary="<<ordinary<<" changing_graph="<<graphs
-        <<" exact; runtime groups5/24/28/32/48/64, rank17/320, variable/aligned/signed q8, unaligned metadata, differing injection group, streams1/3/4, 1025-column tails and pre/after PASS\n";
+        <<" exact; runtime groups5/24/28/32/48/64, rank17/320, variable/aligned/signed q8, "
+        <<"unaligned metadata, differing injection group, streams1/3/4, odd-column tails and pre/after PASS\n";
 }
 
 void prefill_blas_check() {

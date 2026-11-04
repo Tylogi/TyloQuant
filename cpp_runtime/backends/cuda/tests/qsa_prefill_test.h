@@ -32,8 +32,16 @@ void qsa_incremental_pool_case() {
         auto inputs=data({1,maximum,hidden},17,.4f);
         auto positions=tb::arange(maximum,inputs.options().dtype(tb::kInt64));
         // The first short prefill enters graph execution with no position history.
+        const void* positions_address=nullptr;
+        Tensor occupied;
         for(int reuse=0;reuse<2;++reuse) {
             actual.prepare_graph({},maximum);
+            // Retained graphs capture the pooled position buffer by address, so
+            // a later request must reuse it even when the allocator could not.
+            const auto pooled_positions=actual.resident_cache_tensors().front();
+            if(!reuse)positions_address=pooled_positions.data_ptr();
+            else if(pooled_positions.data_ptr()!=positions_address)
+                throw std::runtime_error("managed QSA pooled positions moved between requests");
             for(int tokens=0;tokens<24;++tokens) {
                 auto x=inputs.narrow(1,tokens,1),pos=positions.narrow(0,tokens,1);
                 Tensor output;
@@ -52,6 +60,8 @@ void qsa_incremental_pool_case() {
             }
             actual.reset();
             oracle.reset();
+            // Hold a block of the same size so a freed buffer cannot return here.
+            occupied=tb::empty({maximum},inputs.options().dtype(tb::kInt64));
         }
     }
     for(int width:{8,64,256,512})for(auto dtype:{tb::kFloat16,tb::kFloat32})

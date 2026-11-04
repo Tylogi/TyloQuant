@@ -18,7 +18,32 @@ QsaWeights batch_qsa_weights(int width, tb::ScalarType dtype, int heads = 4) {
         projection(hidden, (ih + 1) * iw, 5), norm, norm, index_norm, index_norm};
 }
 
-void qsa_independent_batch_case() {
+std::unique_ptr<Qsa> batch_qsa_request(const QsaWeights& weights, const QsaConfig& config,
+        const std::shared_ptr<RotaryEmbedding>& rotary, bool tiered, int cells = 16) {
+    if (!tiered)
+        return std::make_unique<Qsa>(weights, config, rotary);
+    const auto quant = cuda_kv_quantization();
+    const int kw = quant.enabled() ? cuda_kv_packed_width(config.width, quant.key_bits()) : config.width;
+    const int vw = quant.enabled() ? cuda_kv_packed_width(config.width, quant.value_bits()) : config.width;
+    KvMemoryOptions options;
+    options.budget_policy = true;
+    options.additional_request = true;
+    options.gpu_budget = (config.maximum + (config.maximum + config.pool - 1) / config.pool) *
+        config.index_width * 2 + cells * config.kv_heads * (kw + vw) * (quant.enabled() ? 4 : 2);
+    auto memory = std::make_shared<KvMemoryManager>(options);
+    auto request = std::make_unique<Qsa>(weights, config, rotary, true, true, nullptr, memory);
+    memory->finalize();
+    request->activate_memory();
+    const auto metrics = memory->metrics();
+    const auto resident = std::find_if(metrics.begin(), metrics.end(), [](const auto& metric) {
+        return metric.first == "kv_memory_resident_cells";
+    });
+    MFQ_RUNTIME_CHECK(resident != metrics.end() && resident->second == cells,
+        "QSA tier test did not allocate exclusive physical tiers");
+    return request;
+}
+
+void qsa_independent_batch_case(bool tiered) {
     constexpr int hidden = 32, maximum = 512, pool = 4, budget = 16;
     int cases = 0;
     for (int rows : {2, 8, 16, 32}) {
@@ -34,7 +59,7 @@ void qsa_independent_batch_case() {
                 std::vector<Tensor> cancelled_before;
                 std::vector<Tensor> histories;
                 for (int row = 0; row < rows; ++row) {
-                    requests.push_back(std::make_unique<Qsa>(weights, config, rotary));
+                    requests.push_back(batch_qsa_request(weights, config, rotary, tiered));
                     oracles.push_back(std::make_unique<Qsa>(weights, config, rotary));
                     const int length = std::vector<int>{14, 15, 16, 17, 253, 254, 255}[row % 7];
                     auto history = tb::arange(length, tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64));
@@ -44,7 +69,7 @@ void qsa_independent_batch_case() {
                     requests.back()->prepare_graph(history, length <= budget ? budget : 256);
                     histories.push_back(history);
                 }
-                BatchDecodeInputs inputs(rows, 8, 0);
+                BatchDecodeInputs inputs(rows, 8 + HotKvStateFields::Count, 0);
                 auto hidden_input = data({rows, 1, hidden}, 29, .4f).to(dtype);
                 Tensor output;
                 std::map<int64_t, std::unique_ptr<DecodeWindow>> windows;
@@ -79,7 +104,7 @@ void qsa_independent_batch_case() {
                         for (const auto& tensor : cancelled->resident_cache_tensors())
                             if (tensor.defined())
                                 cancelled_before.push_back(tensor.cpu());
-                        requests[0] = std::make_unique<Qsa>(weights, config, rotary);
+                        requests[0] = batch_qsa_request(weights, config, rotary, tiered);
                         oracles[0] = std::make_unique<Qsa>(weights, config, rotary);
                         histories[0] = tb::arange(17, inputs.positions().options());
                         auto input = data({1, 17, hidden}, 315, .4f).to(dtype);
@@ -167,7 +192,13 @@ void qsa_independent_batch_case() {
         }
     }
     std::cout << "QSA independent batch PASS cases=" << cases
-              << " rows=2/8/16/32 heterogeneous=1 disabled_state=1 cancelled=1 reorder=1 growth=1 dense_sparse=1\n";
+              << " tiered=" << tiered << " rows=2/8/16/32 heterogeneous=1 disabled_state=1"
+              << " cancelled=1 reorder=1 growth=1 dense_sparse=1\n";
+}
+
+void qsa_independent_batch_case() {
+    qsa_independent_batch_case(false);
+    qsa_independent_batch_case(true);
 }
 
 std::size_t qsa_kernel_nodes(cudaGraph_t graph) {
@@ -184,6 +215,8 @@ std::size_t qsa_kernel_nodes(cudaGraph_t graph) {
 }
 
 void qsa_independent_batch_benchmark() {
+    const auto* option = std::getenv("MFQ_QSA_BATCH_TIERED");
+    const bool tiered = option && option[0] != '0';
     constexpr int hidden = 32, maximum = 512, width = 256;
     CudaExecutionContext execution;
     auto rotary = std::make_shared<RotaryEmbedding>(8, maximum, 10000.);
@@ -193,9 +226,9 @@ void qsa_independent_batch_benchmark() {
         Tensor reference;
         for (bool independent : {false, true}) {
             std::vector<std::unique_ptr<Qsa>> requests;
-            BatchDecodeInputs inputs(rows, 4, 0);
+            BatchDecodeInputs inputs(rows, 4 + HotKvStateFields::Count, 0);
             for (int row = 0; row < rows; ++row) {
-                requests.push_back(std::make_unique<Qsa>(weights, config, rotary));
+                requests.push_back(batch_qsa_request(weights, config, rotary, tiered));
                 const int length = 128 + row % 4 * 16;
                 auto history = tb::arange(length, tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64));
                 requests.back()->forward(execution, data({1, length, hidden}, 100 + row, .4f), history, history, true);
@@ -282,6 +315,7 @@ void qsa_independent_batch_benchmark() {
             MFQ_CUDA_CHECK(cudaGraphExecDestroy(replay));
             MFQ_CUDA_CHECK(cudaGraphDestroy(chain));
             std::cout << "qsa_independent_batch_bench rows=" << rows << " independent=" << independent
+                      << " tiered=" << tiered << " kv_bits=" << cuda_kv_quantization().bits
                       << " kernels=" << qsa_kernel_nodes(native) << " nodes=" << graph.nodes()
                       << " graph_us=" << milliseconds * 1000 / repeats
                       << " heads=24 kv_heads=2 width=" << width << " context=128..176 capacity=" << maximum

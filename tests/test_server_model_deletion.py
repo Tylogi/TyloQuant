@@ -21,6 +21,7 @@ from mfq.server.services.service import ServerService
 from mfq.server.services.jobs import JobExecutionError
 from mfq.server.state.catalog import ModelCatalog
 from mfq.server.state.storage import SessionStore
+from tests.platform_helpers import symlink_or_skip
 
 
 def checkpoint(path: Path) -> None:
@@ -92,7 +93,7 @@ def test_hf_delete_leaves_nonmodel_files_and_symlink_targets(tmp_path):
         shared = tmp_path / "shared-weights"
         shared.write_bytes(b"shared")
         weights = folder / "model.safetensors"
-        weights.symlink_to(shared)
+        symlink_or_skip(weights, shared)
         keep = folder / "notes.txt"
         keep.write_text("keep")
         artifact = await ModelCatalog([tmp_path]).resolve("hf")

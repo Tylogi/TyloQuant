@@ -3548,7 +3548,6 @@ def _plan(
     is_glm_dsa = model_config.get("model_type") == "glm_moe_dsa"
     is_glm5_next = model_config.get("model_type") == "glm5_next_text"
     is_flash_next = model_config.get("model_type") in _FLASH_NEXT_TEXT_TYPES
-    is_deepseek_v41 = model_config.get("model_type") == "deepseek_v41_text"
     is_minicpmo45 = _is_minicpmo45_config(raw_config)
     source_exclusions = _source_quantization_exclusions(raw_config) if is_flash_next else ()
     if is_glm_dsa and recipe_types is not None:
@@ -3558,9 +3557,14 @@ def _plan(
             "GLM-5-Next GGUF recipe mapping is not implemented; "
             "use the native HF conversion policy or a calibration scheme"
         )
-    if is_deepseek_v41 and recipe_types is not None:
+    if (
+        recipe_types is not None
+        and canonical_schema is not None
+        and canonical_schema.architecture in {"deepseek_v4", "deepseek_v41"}
+    ):
+        family = "DeepSeek-V4.1" if canonical_schema.architecture == "deepseek_v41" else "DeepSeek-V4"
         raise ValueError(
-            "DeepSeek-V4.1 has no GGUF recipe mapping; use an MFQ standard "
+            f"{family} has no GGUF recipe mapping; use an MFQ standard "
             "preset or a calibration scheme"
         )
     source_quantizations, source_auxiliaries = _source_quantizations(inventory, raw_config)
@@ -3712,9 +3716,9 @@ def _plan(
                 pass
             elif (
                 (gguf_name is None or gguf_name not in recipe_types)
-                # A registered UD recipe pins the main text only; MTP keeps its
-                # own precision policy and is reported outside the ceiling.
-                and descriptor.scope is not TensorScope.PREDICTOR
+                # Text recipes need not name auxiliary scopes. Their explicit
+                # quantization policy must still retain every planned tensor.
+                and descriptor.scope not in {TensorScope.PREDICTOR, TensorScope.VISION}
             ):
                 if recipe_name_mapper is not None:
                     raise ValueError(
@@ -3830,7 +3834,9 @@ def _plan(
                     else dense_dtype
                 )
             elif recipe_types is not None:
-                if canonical_name.endswith(".attention.indexer.query_key.weight"):
+                # An MTP head has no GGUF recipe name and takes the predictor
+                # branch below; only recipe-named indexers carry a Q/K pair.
+                if gguf_name is not None and canonical_name.endswith(".attention.indexer.query_key.weight"):
                     key_alias = gguf_name.replace("q_proj.weight", "k_proj.weight")
                     if recipe_types.get(key_alias) != gguf_type:
                         raise ValueError("fused Qwen4 indexer Q/K requires matching recipe types")
@@ -3842,10 +3848,10 @@ def _plan(
                     )
                 elif (
                     name.startswith("mtp.")
-                    or descriptor.scope is TensorScope.PREDICTOR
+                    or descriptor.scope in {TensorScope.PREDICTOR, TensorScope.VISION}
                 ) and gguf_type is None:
-                    # An MTP head without a recipe entry keeps the family
-                    # default integer precision instead of dense storage.
+                    # Auxiliary matrices absent from a text recipe use the
+                    # requested default integer precision when opted in.
                     target = default_nint_dtype if len(shape) in (2, 3) else dense_dtype
                 else:
                     target, anchor_gguf_name, anchor_type = _target_for_recipe_name(
@@ -7180,6 +7186,7 @@ def convert(args: argparse.Namespace) -> None:
         total_src += metadata.nbytes if metadata is not None else int(np.prod(item.shape)) * 2
     target_counts: dict[str, int] = {}
     target_bytes_est: dict[str, int] = {}
+    blob_sizes: list[int] = []
     for p in plan:
         target_counts[p.target_dtype] = target_counts.get(p.target_dtype, 0) + 1
         nb = _plan_blob_nbytes(
@@ -7191,6 +7198,7 @@ def convert(args: argparse.Namespace) -> None:
             nvq_jsc_banks=int(getattr(args, "nvq_jsc_banks", 4)),
         )
         target_bytes_est[p.target_dtype] = target_bytes_est.get(p.target_dtype, 0) + nb
+        blob_sizes.append(nb)
     _progress_print(
         json.dumps(
             {
@@ -7264,6 +7272,37 @@ def convert(args: argparse.Namespace) -> None:
             base_store.close()
         return
 
+    from mfq.disk_space import DiskSpaceRequirement, check_disk_space, source_asset_bytes
+    temp_dir_arg = getattr(args, "temp_dir", "")
+    tmp_root = Path(temp_dir_arg).resolve() if temp_dir_arg else output.parent / f".{output.name}.tmp_blobs"
+    asset_bytes = source_asset_bytes(root)
+    tokenizer_path = getattr(args, "tokenizer_gguf", "")
+    if tokenizer_path:
+        asset_bytes += len(gguf_metadata_asset(_gguf_reader(Path(tokenizer_path).resolve())).data)
+    payload_bytes = sum(blob_sizes)
+    if base_store is not None:
+        payload_bytes += sum(record.nbytes for record in base_store.records.values())
+    elif mfq_checkpoint is not None:
+        asset_bytes += sum(record.nbytes for record in mfq_checkpoint.store.records.values()
+                           if is_asset_record(record.name))
+    scratch_bytes = payload_bytes if staged_blobs else max(blob_sizes, default=0)
+    if staged_blobs and resume_temp:
+        scratch_bytes -= sum(size for index, size in enumerate(blob_sizes, start=1)
+            if (tmp_root/f'{index:05d}.blob').is_file()
+            and (tmp_root/f'{index:05d}.blob').stat().st_size == size)
+    try:
+        check_disk_space([
+            DiskSpaceRequirement(output, payload_bytes + asset_bytes, 'final MFQ including vision/MTP and assets'),
+            DiskSpaceRequirement(tmp_root, scratch_bytes + asset_bytes,
+                                 'staged blobs' if staged_blobs else 'one tensor scratch'),
+        ], stage='HF/MFQ quantization')
+    except OSError:
+        if mfq_checkpoint is not None:
+            mfq_checkpoint.close()
+        if base_store is not None:
+            base_store.close()
+        raise
+
     # Reuse the mature GGUF-source tensor-wise VQ trainers and blob writer.
     # Only the row source differs; format selection and on-disk layout remain
     # one implementation.
@@ -7330,12 +7369,6 @@ def convert(args: argparse.Namespace) -> None:
             if item.target_dtype in _JSC_DTYPES:
                 row_importance.require(item.name, int(item.shape[0]))
 
-    temp_dir_arg = getattr(args, "temp_dir", "")
-    tmp_root = (
-        Path(temp_dir_arg).resolve()
-        if temp_dir_arg
-        else output.parent / f".{output.name}.tmp_blobs"
-    )
     if tmp_root.exists() and not resume_temp:
         raise FileExistsError(f"temporary directory exists: {tmp_root}")
     tmp_root.mkdir(parents=True, exist_ok=resume_temp)

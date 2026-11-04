@@ -501,6 +501,7 @@ void copy_cuda(Tensor& destination, const Tensor& source) {
             stream.stream()));
         if (destination.is_cpu() && source.is_cuda()) {
             MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+            default_context(source.get_device())->check_input_error(stream.stream());
         }
         return;
     }

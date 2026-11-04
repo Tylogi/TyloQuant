@@ -2,6 +2,7 @@
 #include "cuda_runtime_config.h"
 #include "cuda_execution.h"
 #include "generation.h"
+#include "prefill_recovery.h"
 #include "storage/model_loader.h"
 #include "storage/weight_loader.h"
 #include "storage/moe_expert_cache.h"
@@ -15,6 +16,7 @@
 #include "request_executor.h"
 #include "generation_flow.h"
 #include "mfq_weight_memory.h"
+#include "prefill_budget.h"
 
 #include <cuda_runtime_api.h>
 #include "mfq_cuda_kv_quantization.h"
@@ -191,6 +193,7 @@ struct CudaEngineState {
             // caps above three need additional verification storage.
             const int depth=std::max(3,requested);
             if(depth==graph_draft_depth && language.graph_registry)return;
+            PrefillAllocationScope allocation_scope;
             const auto started=std::chrono::steady_clock::now();
             preparing_graph_depth=true;
             try {
@@ -240,6 +243,51 @@ struct CudaEngineState {
             <<" available_bytes="<<context->available_memory()<<" prefix_released_bytes="<<released<<'\n';
     }
 
+    void reserve_request_workspace(const InferenceRequest& input, bool media=false) {
+        auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
+        const auto reserve=runtime_options::workspace_reserve_bytes();
+        auto bytes=reserve;
+        if(media) {
+            bytes=prefill_budget_add(bytes,input.vision->pixel_values.size()*sizeof(float)*8);
+        } else if(input.prompt.size()>128) {
+            const auto rows=std::min<std::size_t>({input.prompt.size(),
+                std::size_t(config.generation.prefill_chunk_size),std::size_t(max_prefill_compute_chunk)});
+            const auto row_bytes=prefill_budget_add(prefill_workspace_row_bytes(
+                language.hidden_size(),language.hc_mult(),language.num_attention_heads(),language.head_dim()),
+                internal::prefill_moe_row_bytes(language));
+            const auto headroom=prefill_workspace_headroom(context->memory_stats().limit,row_bytes);
+            bool borrow=false;
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                borrow=!input.vision && qwen4_layer_major_prefill_eligible(language,rows);
+            const auto budget=moe_prefill_workspace_budget(execution->moe_expert_cache,borrow);
+            const auto fixed_reserve=moe_expert_cache_ssd_experts(execution->moe_expert_cache)
+                ?std::max(reserve,headroom):std::min(reserve,headroom);
+            const auto fixed=prefill_budget_add(fixed_reserve,budget.transfer_bytes);
+            const auto peak=prefill_budget_add(fixed,rows*row_bytes);
+            bytes=std::max(bytes,peak>budget.lendable_bytes?peak-budget.lendable_bytes:0);
+        } else {
+            const auto memory=context->memory_stats();
+            if(!memory.limit || context->resident_memory_usage()<=memory.limit)return;
+        }
+        bytes=std::max(bytes,std::size_t(1));
+        if(context->available_memory()>=bytes)return;
+        reclaim_prefix_workspace(bytes);
+        if(context->available_memory()>=bytes || !execution->moe_expert_cache ||
+                !online_budget_supported())return;
+        if(batching) {
+            if(!batching->empty())return;
+            batching->release_idle_buffers();
+        }
+        // Moving primary arenas invalidates captured expert addresses. This is
+        // a request boundary, before vision, prefix restore or prefill kernels.
+        finish_moe_expert_exchanges(execution->moe_expert_cache);
+        graph.invalidate();
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+            qwen4_release_decode_graphs(language,components.mtp.get());
+        release_moe_decode_buffers(execution->moe_expert_cache);
+        reclaim_moe_expert_workspace(execution->moe_expert_cache,bytes);
+    }
+
     CudaEngineState(std::shared_ptr<CudaExecutionContext> owner, Model loaded,
             RuntimeComponents<Model> optional, CudaRuntimeConfig runtime_config,
             std::shared_ptr<WeightMemoryLedger> weights)
@@ -257,6 +305,14 @@ struct CudaEngineState {
                 cache.reserve_ram(bytes);reclaim_routed_optional_host(*execution,bytes);
             });
         allocation_ceiling=mfq::cuda::default_context(execution->layer_placement.primary_device())->memory_stats().limit;
+        language.reclaim_prefill_workspace=[this] {
+            graph.invalidate();
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                qwen4_release_decode_graphs(language,components.mtp.get());
+            graph_draft_depth=0;
+            release_graph_expert_space();
+            cache.trim_hot(0);
+        };
         if (config.continuous_batch.max_sequences) {
             if constexpr (std::is_same_v<Model, Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)
                 batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
@@ -396,6 +452,7 @@ struct CudaEngineState {
     }
     ~CudaEngineState() {
         language.restore_decode_workspace={};
+        language.reclaim_prefill_workspace={};
         try {release_graph_expert_space();}
         catch(const std::exception& error) {std::cerr<<"runtime_mtp_workspace_cache cleanup_error="<<error.what()<<'\n';}
         if(execution->kv_memory)execution->kv_memory->set_reservation({});
@@ -468,6 +525,7 @@ struct CudaEngineState {
     }
     using Prepared = CudaPreparedPrompt;
     mfq::StepSequence<Prepared> prepare(InferenceRequest& input) {
+        reserve_request_workspace(input,true);
         if (components.composite) return components.composite->prepare(input.prompt, *input.vision);
         if (components.grid_vision) return components.grid_vision->prepare(language, input.prompt, *input.vision);
         if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)
@@ -476,19 +534,62 @@ struct CudaEngineState {
         throw std::invalid_argument("model has no multimodal component");
     }
     auto advance_preparation(mfq::StepSequence<Prepared>& preparation) {
+        mfq::cuda::PrefillAllocationScope allocation_scope;
         PrefillCudaTimer timer;
         auto step = preparation.next();
         MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
         return std::pair{std::move(step), timer.elapsed_ms()};
     }
+    void recover_preparation(const std::exception_ptr& failure,bool reclaimed) {
+        if(!mfq::engine::prefill_resource_failure(failure))std::rethrow_exception(failure);
+        internal::reclaim_prefill_memory(language);
+        language.reset(1);
+        if(components.mtp)components.mtp->reset(1);
+        if(reclaimed)throw MfqResourceExhausted("vision prefill resource exhausted after workspace reclamation: "+
+            mfq::engine::prefill_failure_message(failure));
+        std::cerr<<"runtime_prefill_retry scope=vision action=reclaim\n";
+    }
     Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared,
                              const RequestId& id, bool batched) {
-        if(!batched)prepare_graph_depth(input);
+        if(!batched) {
+            reserve_request_workspace(input);
+            try {prepare_graph_depth(input);}
+            catch(...) {
+                const auto failure=std::current_exception();
+                if(!prefill_resource_failure(failure))std::rethrow_exception(failure);
+                internal::reclaim_prefill_memory(language);
+                language.reset(1);
+                if(components.mtp)components.mtp->reset(1);
+                std::cerr<<"runtime_prefill_retry scope=graph action=reclaim reason="
+                    <<prefill_failure_message(failure)<<'\n';
+            }
+        }
         return internal::generate(language, graph, cache, config,
                                   input, output, batched ? nullptr : components.mtp.get(), std::move(prepared),
                                   batched ? batching.get() : nullptr, id);
     }
     Generation generate(const RequestId& id, ExecutionRequest& request) {
+        if (!request.batched) {
+            if (batching) batching->release_idle_buffers();
+            auto context = mfq::cuda::default_context(execution->layer_placement.primary_device());
+            if (context->available_memory() == 0) {
+                // No request is active in the serial path. Retire the previous
+                // request's async frees before charging it to new admission.
+                context->reclaim_idle_memory();
+                if (context->available_memory() == 0) {
+                    release_graph_expert_space();
+                    graph.invalidate();
+                    if (components.mtp) components.mtp->reset(1);
+                    language.reset(1);
+                    release_moe_prefill_buffers(execution->moe_expert_cache);
+                    release_moe_decode_buffers(execution->moe_expert_cache);
+                    cache.trim_hot(0);
+                    context->reclaim_idle_memory();
+                    std::cerr << "runtime_admission_reclaim available_bytes="
+                              << context->available_memory() << '\n';
+                }
+            }
+        }
         if (request.batched) {
             graph.invalidate();
             if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
@@ -499,8 +600,6 @@ struct CudaEngineState {
                     if (components.mtp) components.mtp->reset(1);
                 }
             }
-        } else if (batching) {
-            batching->release_idle_buffers();
         }
         return generate_prepared(*this, request.input, request.output, id, request.batched);
     }

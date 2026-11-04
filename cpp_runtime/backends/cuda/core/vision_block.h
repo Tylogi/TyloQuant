@@ -7,6 +7,7 @@
 
 #include "mfq_tensor_backend.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <optional>
@@ -102,6 +103,22 @@ inline mfq_tensor_backend::Tensor vision_non_causal_attention(
         mfq_tensor_backend::Tensor query, mfq_tensor_backend::Tensor key,
         mfq_tensor_backend::Tensor value,
         MfqOptional<mfq_tensor_backend::Tensor> additive_mask, double scale) {
+    // Tile queries while attending to every key. Preserve the float32 softmax
+    // used by vision towers without allocating a quadratic full-image matrix.
+    if (query.size(-2) > 128) {
+        auto shape = query.sizes().vec();
+        shape.back() = value.size(-1);
+        auto output = mfq_tensor_backend::empty(shape, query.options());
+        for (int64_t begin = 0; begin < query.size(-2); begin += 128) {
+            const auto count = std::min<int64_t>(128, query.size(-2) - begin);
+            auto mask = additive_mask;
+            if (mask && mask->dim() >= 2 && mask->size(-2) > 1)
+                mask = mask->narrow(-2, begin, count);
+            output.narrow(-2, begin, count).copy_(vision_non_causal_attention(
+                query.narrow(-2, begin, count), key, value, mask, scale));
+        }
+        return output;
+    }
     auto scores = mfq_tensor_backend::matmul(query, key.transpose(-2, -1)) * scale;
     if (additive_mask.has_value()) {
         scores = scores + additive_mask.value().to(scores.scalar_type());

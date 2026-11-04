@@ -12,6 +12,7 @@ from tests.test_benchmark_report import fixture
 
 
 def test_archive_keeps_private_input_and_publishes_verified_report(tmp_path):
+    pytest.importorskip("matplotlib", reason="report rendering requires optional matplotlib")
     raw = fixture()
     output = workflow.archive_report(raw, {"model": "Test model", "hardware": "Test GPU"}, tmp_path)
     workflow.verify_report(output)
@@ -71,6 +72,7 @@ def test_publication_lock_rejects_concurrent_publisher(tmp_path):
 
 @pytest.mark.skipif(os.name != "posix", reason="Executable stdio fixture requires POSIX")
 def test_runner_automatically_publishes_after_success(tmp_path):
+    pytest.importorskip("matplotlib", reason="report rendering requires optional matplotlib")
     runtime = tmp_path / "fake-runtime"
     runtime.write_text(f"""#!{sys.executable}
 import json, sys
@@ -144,6 +146,7 @@ def test_report_preflight_conflict_prevents_runtime_start(tmp_path, monkeypatch,
 
 @pytest.mark.parametrize("failure", ["index", "latest", "status"])
 def test_publication_failure_restores_both_success_pointers(tmp_path, monkeypatch, failure):
+    pytest.importorskip("matplotlib", reason="report rendering requires optional matplotlib")
     public = tmp_path / "public"
     public.mkdir()
     originals = {"index.html": "old history", "latest.json": '{"old":true}'}

@@ -76,14 +76,13 @@ class RadioEncoder {
     Tensor encode(CudaExecutionContext &execution, Tensor patches, std::int64_t rows,
                   std::int64_t columns) const {
         const auto& config = config_;
-        if (rows <= 0 || columns <= 0 || rows > config.position_side() ||
-            columns > config.position_side()) {
-            throw std::runtime_error("Nemotron-H RADIO image patch grid is invalid");
+        if (rows <= 0 || columns <= 0) {
+            throw std::invalid_argument("Nemotron-H RADIO image patch grid must have positive dimensions");
         }
         const auto count = rows * columns;
         if (patches.dim() != 2 || patches.size(0) != count ||
             patches.size(1) != config.patch_width()) {
-            throw std::runtime_error(
+            throw std::invalid_argument(
                 "Nemotron-H RADIO pixel patches disagree with the image grid");
         }
         const auto dtype = layer_dtype();

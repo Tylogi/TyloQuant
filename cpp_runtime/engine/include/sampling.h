@@ -18,11 +18,15 @@ template <class Rng>
 std::int64_t sample_top_k_top_p(std::span<const float> logits, std::int64_t top_k, double top_p,
                                 std::int64_t minimum_keep, Rng &rng) {
     if (logits.empty() || top_k <= 0 || top_k > static_cast<std::int64_t>(logits.size()) ||
-        !(top_p > 0.0 && top_p <= 1.0) || minimum_keep < 0 || minimum_keep > top_k)
+        !(top_p >= 0.0 && top_p <= 1.0) || minimum_keep < 0 || minimum_keep > top_k)
         throw std::invalid_argument("invalid reference sampling geometry");
     const auto maximum = *std::max_element(logits.begin(), logits.end());
     if (!std::isfinite(maximum))
         throw std::invalid_argument("no finite sampling scores");
+    // A zero nucleus always retains the highest-scoring token, even with a
+    // caller-supplied minimum_keep, and never constructs an empty distribution.
+    if (top_p == 0.0)
+        return std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
     std::vector<std::pair<float, std::int64_t>> probabilities;
     probabilities.reserve(logits.size());
     float sum = 0.0F;
@@ -103,7 +107,7 @@ public:
     }
 
     bool greedy() const noexcept {
-        return params_.temperature <= 0.0 || params_.top_k == 1;
+        return params_.temperature <= 0.0 || params_.top_k == 1 || params_.top_p == 0.0;
     }
 
     bool has_penalties() const noexcept {

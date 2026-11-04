@@ -296,6 +296,15 @@ def convert(args: argparse.Namespace) -> list[Path]:
         if temp_arg
         else output.parent / f".{output.name}.full-precision-blobs"
     )
+    from mfq.disk_space import DiskSpaceRequirement, check_disk_space, source_asset_bytes
+    payload_bytes = sum(_plan_blob_nbytes(item) for item in plans) + source_asset_bytes(root)
+    tokenizer_path = getattr(args, "tokenizer_gguf", "")
+    if tokenizer_path:
+        payload_bytes += len(gguf_metadata_asset(_gguf_reader(Path(tokenizer_path).resolve())).data)
+    check_disk_space([
+        DiskSpaceRequirement(output, payload_bytes, 'full-precision MFQ output'),
+        DiskSpaceRequirement(temp_root, payload_bytes, 'full-precision tensor blobs'),
+    ], stage='full-precision MFQ conversion')
     resume = bool(getattr(args, "resume", False))
     if temp_root.exists() and not resume:
         raise FileExistsError(f"temporary directory exists: {temp_root}")

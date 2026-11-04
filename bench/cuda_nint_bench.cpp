@@ -1,4 +1,5 @@
 #include "packed_bench_utils.h"
+#include "mfq_cuda_graph_capture.h"
 #include "mfq_cuda_quant_ops.h"
 
 #include <cuda_runtime_api.h>
@@ -76,7 +77,7 @@ public:
         operator_graph_.capture_begin();
         for(std::size_t i=0;i<calls;++i)outputs_.push_back(weights[i%count]->run());
         cudaGraph_t captured=nullptr;cudaStreamCaptureStatus status;
-        MFQ_NATIVE_CUDA_CHECK(cudaStreamGetCaptureInfo_v2(stream_.stream(),&status,nullptr,&captured,nullptr,nullptr));
+        MFQ_NATIVE_CUDA_CHECK(mfq_stream_capture_info(stream_.stream(),&status,nullptr,&captured));
         if(status!=cudaStreamCaptureStatusActive || !captured)throw std::runtime_error("benchmark capture unavailable");
         operator_graph_.capture_end();operator_graph_.replay();
         MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_.stream()));

@@ -101,7 +101,7 @@ void bench(const Layout& layout,int alignment,const cudaDeviceProp& device) {
             else reference_scatter<<<old_blocks,old_threads,0,stream>>>(wire,reinterpret_cast<uint32_t*>(cancelled.data));
         }
         check(cudaStreamEndCapture(stream,&graphs[mode].graph));
-        check(cudaGraphInstantiate(&graphs[mode].executable,graphs[mode].graph,nullptr,nullptr,0));
+        check(cudaGraphInstantiate(&graphs[mode].executable,graphs[mode].graph,0));
     }
     int exact=0;
     for(int step=0;step<4;++step)for(int mode=0;mode<2;++mode) {
@@ -161,7 +161,7 @@ void mapped_bench(const Layout& layout,int alignment,const cudaDeviceProp& devic
     for(int bank=0;bank<banks;++bank)mfq::cuda::moe_copy_mapped(
         static_cast<uint8_t*>(tables.alias)+table_bytes*bank,reinterpret_cast<uint32_t*>(abort.data),copy_blocks,copy_threads,stream);
     check(cudaStreamEndCapture(stream,&graph.graph));
-    check(cudaGraphInstantiate(&graph.executable,graph.graph,nullptr,nullptr,0));
+    check(cudaGraphInstantiate(&graph.executable,graph.graph,0));
     const auto fill=[&](int step,bool empty) {
         std::fill(expected.begin(),expected.end(),0xa7);
         for(int bank=0;bank<banks;++bank) {

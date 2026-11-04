@@ -21,7 +21,20 @@ int main() {
     assert(select_prefill_chunk(8192,8192,memory(8192),fixed+4096*row,row)==4096);
     assert(select_prefill_chunk(8192,8192,memory(8192),fixed,row)==8192);
     const auto maximum=std::numeric_limits<std::size_t>::max();
+    assert(prefill_workspace_row_bytes(32,1,64,256)==524288);
+    assert(prefill_workspace_row_bytes(128,2,2,64)==8192);
+    assert(prefill_workspace_row_bytes(maximum,2,64,256)==maximum);
     assert(prefill_budget_add(maximum-100,101)==maximum);
+    assert(prefill_workspace_headroom(0,row)==(std::size_t(1)<<30));
+    assert(prefill_workspace_headroom(std::size_t(1)<<30,4096)==(std::size_t(64)<<20));
+    assert(prefill_workspace_headroom(std::size_t(3)<<29,4096)==(std::size_t(96)<<20));
+    assert(prefill_workspace_headroom(std::size_t(32)<<30,4096)==(std::size_t(1)<<30));
+    assert(prefill_workspace_headroom(std::size_t(1)<<30,maximum)==(std::size_t(1)<<30));
+    assert(prefill_budget_multiply(maximum,2)==maximum);
+    assert((PrefillMoeGeometry{8,4096,128}.activation_bytes_per_token()==8*(4096+32*4)));
+    assert((PrefillMoeGeometry{2,65,32}.activation_bytes_per_token()==2*(3*32+3*4)));
+    assert(pressure_prefill_chunk(8192,8192,128*row,0,row)==128);
+    assert(pressure_prefill_chunk(8192,8192,0,fixed,row)==1);
     assert(select_prefill_chunk(8192,8192,maximum,maximum,row)==0);
     for(int rows=0;rows<10000;++rows) {
         const auto result=select_prefill_chunk(8192,8192,memory(rows),fixed,row);

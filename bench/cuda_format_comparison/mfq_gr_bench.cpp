@@ -1,4 +1,5 @@
 #include "timing.h"
+#include "mfq_cuda_graph_capture.h"
 #include "cuda_execution.h"
 #include "gated_residual_fused.h"
 #include "storage/weight_loader.h"
@@ -116,9 +117,9 @@ void profile_stages(cudaGraph_t captured,cudaStream_t stream,std::size_t calls,
         if(type!=cudaGraphNodeTypeKernel)throw std::runtime_error("GR stage graph contains a non-kernel node");
         cudaKernelNodeParams p{};fb::check(cudaGraphKernelNodeGetParams(node,&p));
         stages[index++%3].push_back(p);
-        std::size_t children=0;fb::check(cudaGraphNodeGetDependentNodes(node,nullptr,&children));
+        std::size_t children=0;fb::check(mfq_graph_dependent_nodes(node,nullptr,&children));
         if(children>1)throw std::runtime_error("GR stage graph contains a branch");
-        if(children)fb::check(cudaGraphNodeGetDependentNodes(node,&node,&children));
+        if(children)fb::check(mfq_graph_dependent_nodes(node,&node,&children));
         else node=nullptr;
     }
     if(index!=3*calls)throw std::runtime_error("GR stage profiling requires three kernels per bank");
@@ -220,7 +221,7 @@ int main(int argc,char** argv) try {
             cudaGraph_t captured=nullptr;
             if(stage_mode) {
                 cudaStreamCaptureStatus capture_status;
-                fb::check(cudaStreamGetCaptureInfo_v2(mfq_current_cuda_stream(),&capture_status,nullptr,&captured,nullptr,nullptr));
+                fb::check(mfq_stream_capture_info(mfq_current_cuda_stream(),&capture_status,nullptr,&captured));
             }
             graph.capture_end();
             for(int step=0;step<3;++step) {
