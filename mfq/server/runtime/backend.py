@@ -636,6 +636,10 @@ class OpenAIChatBackend:
                 status["last_request"] = {**last_request, **override}
         return status
 
+    async def runtime_health(self) -> dict[str, Any]:
+        """Expose engine health independently of older status metric payloads."""
+        return await self._runtime.health()
+
     @staticmethod
     def _with_processor_timing(
         performance: ResponsePerformance,

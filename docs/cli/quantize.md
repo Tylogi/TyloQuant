@@ -6,6 +6,22 @@ set.
 
 ## Requirements
 
+Quantization checks free space before tensor fitting and again before final
+assembly. Requirements are added per filesystem: staged/fitted payloads and the
+final output coexist by default, even when output is sharded. `--alphaq-cache`,
+`--temp-dir` and output can use separate disks. Estimates include selected vision
+and MTP payloads, assets, and 5% plus 64 MiB headroom per filesystem for variable
+codec tables, metadata and allocation overhead. Free space is a snapshot; other
+writers and quotas can still cause a later write to fail. Imatrix collection uses
+the same check for its BF16 hidden-state workspace and output arrays.
+
+For AlphaQ, `--alphaq-consume-fitted` releases each fitted tensor after copying it
+into the final output. On one filesystem, peak use approaches the larger of cache
+and output plus one tensor and metadata. This discards fitted-cache resume:
+interruption requires refitting deleted tensors, and successful export also
+consumes them. Statistics and trained tables remain reusable. The option rejects
+shared `encoded-candidates.json` caches; it only consumes individual fitted blobs.
+
 The `train` extra installs PyTorch and safetensors. For a quantization-only
 checkout:
 
