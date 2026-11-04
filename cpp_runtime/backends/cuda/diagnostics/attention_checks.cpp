@@ -309,6 +309,23 @@ int run_glm_dsa_check(int reps) {
     auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
     mfq_tensor_backend::manual_seed(20260722);
 
+    for (const auto dtype : {mfq_tensor_backend::kFloat16, mfq_tensor_backend::kFloat32}) {
+        constexpr int H = 64, T = 8192, D = 64;
+        auto x = mfq_tensor_backend::ones({1, H, T, D}, cuda.dtype(dtype));
+        auto pos = mfq_tensor_backend::arange(T, cuda.dtype(mfq_tensor_backend::kInt64));
+        auto cosine = mfq_tensor_backend::zeros({T, D / 2}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto sine = mfq_tensor_backend::ones_like(cosine);
+        auto output = glm_interleaved_rope_cuda(x, pos, cosine, sine, D)
+            .to(mfq_tensor_backend::kFloat32).cpu();
+        const auto* values = output.data_ptr<float>();
+        for (int64_t i = 0; i < output.numel(); ++i)
+            if (values[i] != (i % 2 ? 1.f : -1.f))
+                throw std::runtime_error("GLM interleaved RoPE incomplete 8192-token coverage at " +
+                    std::to_string(i));
+        std::cout << "glm_rope_coverage tokens=8192 elements=" << output.numel()
+                  << " dtype=" << (dtype == mfq_tensor_backend::kFloat16 ? "FP16" : "FP32") << " PASS\n";
+    }
+
     {
         constexpr int B = 2, H = 3, T = 5, D = 128, RD = 64;
         auto x = mfq_tensor_backend::randn({B, H, T, D}, cuda.dtype(mfq_tensor_backend::kFloat32));

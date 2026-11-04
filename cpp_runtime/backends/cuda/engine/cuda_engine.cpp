@@ -250,13 +250,15 @@ struct CudaEngineState {
         } else if(input.prompt.size()>128) {
             const auto rows=std::min<std::size_t>({input.prompt.size(),
                 std::size_t(config.generation.prefill_chunk_size),std::size_t(max_prefill_compute_chunk)});
-            const auto row_bytes=std::size_t(language.hidden_size())*language.hc_mult()*sizeof(float)*8;
+            const auto row_bytes=prefill_workspace_row_bytes(
+                language.hidden_size(),language.hc_mult(),language.num_attention_heads(),language.head_dim());
+            const auto headroom=prefill_workspace_headroom(context->memory_stats().limit,row_bytes);
             bool borrow=false;
             if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
                 borrow=!input.vision && qwen4_layer_major_prefill_eligible(language,rows);
             const auto budget=moe_prefill_workspace_budget(execution->moe_expert_cache,borrow);
             const auto fixed_reserve=moe_expert_cache_ssd_experts(execution->moe_expert_cache)
-                ?std::max(reserve,std::size_t(1)<<30):std::min(reserve,std::size_t(1)<<30);
+                ?std::max(reserve,headroom):std::min(reserve,headroom);
             const auto fixed=prefill_budget_add(fixed_reserve,budget.transfer_bytes);
             const auto peak=prefill_budget_add(fixed,rows*row_bytes);
             bytes=std::max(bytes,peak>budget.lendable_bytes?peak-budget.lendable_bytes:0);

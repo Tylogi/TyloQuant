@@ -48,26 +48,26 @@ __global__ void glm_interleaved_rope_kernel(
     T * __restrict__ out,
     int B, int H, int Tn, int D, int rotary_dim, int table_stride)
 {
-    const int pair = blockIdx.x * blockDim.x + threadIdx.x;
-    const int pairs = B * H * Tn * (D / 2);
-    if (pair >= pairs) return;
-
-    int tmp = pair;
-    const int p = tmp % (D / 2);
-    tmp /= D / 2;
-    const int token = tmp % Tn;
-    const int64_t position = positions[token];
-    const int base = pair * 2;
-    const float x0 = glm_load(x[base]);
-    const float x1 = glm_load(x[base + 1]);
-    if (2 * p < rotary_dim) {
-        const float c = cos[position * table_stride + p];
-        const float s = sin[position * table_stride + p];
-        out[base] = glm_store<T>(x0 * c - x1 * s);
-        out[base + 1] = glm_store<T>(x1 * c + x0 * s);
-    } else {
-        out[base] = glm_store<T>(x0);
-        out[base + 1] = glm_store<T>(x1);
+    const int64_t pairs = int64_t(B) * H * Tn * (D / 2);
+    for (int64_t pair = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         pair < pairs; pair += int64_t(gridDim.x) * blockDim.x) {
+        int64_t tmp = pair;
+        const int p = tmp % (D / 2);
+        tmp /= D / 2;
+        const int token = tmp % Tn;
+        const int64_t position = positions[token];
+        const int64_t base = pair * 2;
+        const float x0 = glm_load(x[base]);
+        const float x1 = glm_load(x[base + 1]);
+        if (2 * p < rotary_dim) {
+            const float c = cos[position * table_stride + p];
+            const float s = sin[position * table_stride + p];
+            out[base] = glm_store<T>(x0 * c - x1 * s);
+            out[base + 1] = glm_store<T>(x1 * c + x0 * s);
+        } else {
+            out[base] = glm_store<T>(x0);
+            out[base + 1] = glm_store<T>(x1);
+        }
     }
 }
 
@@ -278,8 +278,9 @@ mfq_tensor_backend::Tensor glm_interleaved_rope_cuda(
                 cos.dim() == 2 && sin.sizes() == cos.sizes() && cos.size(1) >= rotary_dim / 2,
                 "glm_interleaved_rope: shape mismatch");
     auto out = mfq_tensor_backend::empty_like(x);
-    const int pairs = static_cast<int>(x.numel() / 2);
-    const int blocks = std::min(65535, (pairs + 255) / 256);
+    const int64_t pairs = x.numel() / 2;
+    if (!pairs) return out;
+    const int blocks = int(std::min<int64_t>(65535, (pairs + 255) / 256));
     auto stream = mfq_current_cuda_stream();
     if (x.scalar_type() == mfq_tensor_backend::kFloat16) {
         glm_interleaved_rope_kernel<<<blocks, 256, 0, stream>>>(

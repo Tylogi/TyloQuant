@@ -32,9 +32,11 @@ static mfq::engine::PrefillChunk budget_batch_prefill(Model& model,
         CudaExecutionContext& execution,mfq::engine::PrefillChunk chunk,std::size_t growth=0) {
     const auto context=default_context(execution.layer_placement.primary_device());
     const auto transfer=moe_prefill_workspace_budget(execution.moe_expert_cache,false).transfer_bytes;
-    const auto fixed=mfq::engine::prefill_budget_add((std::size_t(1)<<30)+growth,transfer);
+    const auto row_bytes=mfq::engine::prefill_workspace_row_bytes(
+        model.hidden_size(),model.hc_mult(),model.num_attention_heads(),model.head_dim());
+    const auto headroom=mfq::engine::prefill_workspace_headroom(context->memory_stats().limit,row_bytes);
+    const auto fixed=mfq::engine::prefill_budget_add(mfq::engine::prefill_budget_add(headroom,growth),transfer);
     const auto available=context->available_memory()+context->workspace_available();
-    const auto row_bytes=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float)*8;
     const auto selected=mfq::engine::select_prefill_chunk(chunk.count,chunk.count,available,fixed,row_bytes);
     if(!selected)throw mfq::engine::InferenceInputError(
         mfq::engine::InferenceInputErrorCode::ContextLength,

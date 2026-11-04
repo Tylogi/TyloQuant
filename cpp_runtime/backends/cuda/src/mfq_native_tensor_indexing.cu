@@ -1,4 +1,5 @@
 #include "mfq_native_tensor_ops_common.cuh"
+#include "mfq_cuda_input_error.cuh"
 
 #include <cub/cub.cuh>
 
@@ -19,7 +20,7 @@ __global__ void index_select_dim0_contiguous_vec16_kernel(
     const uint4* __restrict__ source,
     const Index* __restrict__ indices,
     std::int64_t packs_per_row,
-    std::int64_t total_packs) {
+    std::int64_t total_packs, std::int64_t extent, DeviceInputError* error) {
     for (std::int64_t linear =
              static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          linear < total_packs;
@@ -27,7 +28,8 @@ __global__ void index_select_dim0_contiguous_vec16_kernel(
         const auto output_row = linear / packs_per_row;
         const auto pack = linear - output_row * packs_per_row;
         const auto source_row = load_index(indices, output_row);
-        output[linear] = source[source_row * packs_per_row + pack];
+        output[linear] = valid_device_index(source_row, extent, error, 1)
+            ? source[source_row * packs_per_row + pack] : uint4{};
     }
 }
 
@@ -37,7 +39,7 @@ __global__ void index_select_kernel(
     TensorView source,
     TensorView indices,
     std::int64_t elements,
-    int dimension) {
+    int dimension, DeviceInputError* error) {
     auto* destination = static_cast<Value*>(output.data);
     const auto* input = static_cast<const Value*>(source.data);
     const auto* selected = static_cast<const Index*>(indices.data);
@@ -46,6 +48,7 @@ __global__ void index_select_kernel(
          linear < elements;
          linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
         auto residual = linear;
+        bool valid = true;
         std::int64_t source_offset = 0;
         for (std::size_t reverse = output.rank; reverse > 0; --reverse) {
             const auto axis = reverse - 1;
@@ -53,9 +56,14 @@ __global__ void index_select_kernel(
             residual /= output.sizes[axis];
             if (static_cast<int>(axis) == dimension) {
                 coordinate = load_index(selected, coordinate);
+                if (!valid_device_index(coordinate, source.sizes[axis], error, 1)) {
+                    valid = false;
+                    coordinate = 0;
+                }
             }
             source_offset += coordinate * source.strides[axis];
         }
+        if (!valid) { destination[linear] = Value{}; continue; }
         destination[linear] = input[source_offset];
     }
 }
@@ -66,7 +74,7 @@ __global__ void gather_kernel(
     TensorView source,
     TensorView indices,
     std::int64_t elements,
-    int dimension) {
+    int dimension, DeviceInputError* error) {
     auto* destination = static_cast<Value*>(output.data);
     const auto* input = static_cast<const Value*>(source.data);
     const auto* selected = static_cast<const Index*>(indices.data);
@@ -75,6 +83,7 @@ __global__ void gather_kernel(
          linear < elements;
          linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
         auto residual = linear;
+        bool valid = true;
         std::int64_t source_offset = 0;
         for (std::size_t reverse = output.rank; reverse > 0; --reverse) {
             const auto axis = reverse - 1;
@@ -82,9 +91,14 @@ __global__ void gather_kernel(
             residual /= output.sizes[axis];
             if (static_cast<int>(axis) == dimension) {
                 coordinate = load_index(selected, tensor_offset(indices, linear));
+                if (!valid_device_index(coordinate, source.sizes[axis], error, 2)) {
+                    valid = false;
+                    coordinate = 0;
+                }
             }
             source_offset += coordinate * source.strides[axis];
         }
+        if (!valid) { destination[linear] = Value{}; continue; }
         destination[linear] = input[source_offset];
     }
 }
@@ -208,7 +222,7 @@ __global__ void scatter_kernel(
     TensorView source,
     std::int64_t elements,
     int dimension,
-    bool add) {
+    bool add, DeviceInputError* error) {
     auto* output = static_cast<Value*>(destination.data);
     const auto* input = static_cast<const Value*>(source.data);
     const auto* selected = static_cast<const Index*>(indices.data);
@@ -217,6 +231,7 @@ __global__ void scatter_kernel(
          linear < elements;
          linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
         auto residual = linear;
+        bool valid = true;
         std::int64_t destination_offset = 0;
         for (std::size_t reverse = source.rank; reverse > 0; --reverse) {
             const auto axis = reverse - 1;
@@ -224,9 +239,14 @@ __global__ void scatter_kernel(
             residual /= source.sizes[axis];
             if (static_cast<int>(axis) == dimension) {
                 coordinate = load_index(selected, tensor_offset(indices, linear));
+                if (!valid_device_index(coordinate, destination.sizes[axis], error, 3)) {
+                    valid = false;
+                    coordinate = 0;
+                }
             }
             destination_offset += coordinate * destination.strides[axis];
         }
+        if (!valid) {  continue; }
         const auto value = input[tensor_offset(source, linear)];
         if (add) atomic_add_value(output + destination_offset, value);
         else output[destination_offset] = value;
@@ -239,7 +259,7 @@ __global__ void index_copy_kernel(
     TensorView indices,
     TensorView source,
     std::int64_t elements,
-    int dimension) {
+    int dimension, DeviceInputError* error) {
     auto* output = static_cast<Value*>(destination.data);
     const auto* input = static_cast<const Value*>(source.data);
     const auto* selected = static_cast<const Index*>(indices.data);
@@ -248,6 +268,7 @@ __global__ void index_copy_kernel(
          linear < elements;
          linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
         auto residual = linear;
+        bool valid = true;
         std::int64_t destination_offset = 0;
         for (std::size_t reverse = source.rank; reverse > 0; --reverse) {
             const auto axis = reverse - 1;
@@ -255,9 +276,14 @@ __global__ void index_copy_kernel(
             residual /= source.sizes[axis];
             if (static_cast<int>(axis) == dimension) {
                 coordinate = load_index(selected, coordinate);
+                if (!valid_device_index(coordinate, destination.sizes[axis], error, 4)) {
+                    valid = false;
+                    coordinate = 0;
+                }
             }
             destination_offset += coordinate * destination.strides[axis];
         }
+        if (!valid) {  continue; }
         output[destination_offset] = input[tensor_offset(source, linear)];
     }
 }
@@ -269,7 +295,7 @@ __global__ void index_fill_kernel(
     TensorView indices,
     std::int64_t elements,
     int dimension,
-    double fill) {
+    double fill, DeviceInputError* error) {
     auto* output = static_cast<Value*>(destination.data);
     const auto* selected = static_cast<const Index*>(indices.data);
     for (std::int64_t linear =
@@ -277,6 +303,7 @@ __global__ void index_fill_kernel(
          linear < elements;
          linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
         auto residual = linear;
+        bool valid = true;
         std::int64_t destination_offset = 0;
         for (std::size_t reverse = iteration.rank; reverse > 0; --reverse) {
             const auto axis = reverse - 1;
@@ -284,9 +311,14 @@ __global__ void index_fill_kernel(
             residual /= iteration.sizes[axis];
             if (static_cast<int>(axis) == dimension) {
                 coordinate = load_index(selected, coordinate);
+                if (!valid_device_index(coordinate, destination.sizes[axis], error, 5)) {
+                    valid = false;
+                    coordinate = 0;
+                }
             }
             destination_offset += coordinate * destination.strides[axis];
         }
+        if (!valid) {  continue; }
         output[destination_offset] = store_number<Value>(fill);
     }
 }
@@ -351,7 +383,7 @@ Tensor index_select_cuda(
                         static_cast<uint4*>(output.data_ptr()),
                         static_cast<const uint4*>(source.data_ptr()),
                         indices.data_ptr<Index>(), packs_per_row,
-                        total_packs);
+                        total_packs, source.size(0), default_context(source.get_device())->input_error(stream));
             };
             dispatch_index_type(indices.scalar_type(), launch_index);
             MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
@@ -363,7 +395,8 @@ Tensor index_select_cuda(
         auto launch_index = [&]<typename Index>() {
             index_select_kernel<Value, Index><<<blocks, threads, 0, stream>>>(
                 output.view_descriptor(), source.view_descriptor(),
-                indices.view_descriptor(), output.numel(), static_cast<int>(selected));
+                indices.view_descriptor(), output.numel(), static_cast<int>(selected),
+                default_context(source.get_device())->input_error(stream));
         };
         dispatch_index_type(indices.scalar_type(), launch_index);
     };
@@ -384,13 +417,17 @@ Tensor gather_cuda(
         : indices_source.to(source.device()).contiguous();
     const auto selected = normalize_dimension(dimension, source.dim());
     auto output = empty(indices.sizes(), source.options());
+    for (int64_t axis = 0; axis < source.dim(); ++axis)
+        if (axis != int64_t(selected) && indices.size(axis) > source.size(axis))
+            throw std::invalid_argument("gather index extent exceeds source");
     const auto [blocks, threads] = launch_geometry(output.numel());
     const auto stream = current_stream(source.get_device()).stream();
     auto launch_value = [&]<typename Value>() {
         auto launch_index = [&]<typename Index>() {
             gather_kernel<Value, Index><<<blocks, threads, 0, stream>>>(
                 output.view_descriptor(), source.view_descriptor(),
-                indices.view_descriptor(), output.numel(), static_cast<int>(selected));
+                indices.view_descriptor(), output.numel(), static_cast<int>(selected),
+                default_context(source.get_device())->input_error(stream));
         };
         dispatch_index_type(indices.scalar_type(), launch_index);
     };
@@ -467,13 +504,18 @@ void scatter_cuda(
     auto index = index_source.to(destination.device()).contiguous();
     auto source = source_value.to(destination.device()).contiguous();
     const auto selected = normalize_dimension(dimension, destination.dim());
+    if (source.dim() != destination.dim()) throw std::invalid_argument("scatter rank mismatch");
+    for (int64_t axis = 0; axis < destination.dim(); ++axis)
+        if (axis != int64_t(selected) && source.size(axis) > destination.size(axis))
+            throw std::invalid_argument("scatter source extent exceeds destination");
     const auto [blocks, threads] = launch_geometry(source.numel());
     const auto stream = current_stream(destination.get_device()).stream();
     auto launch_value = [&]<typename Value>() {
         auto launch_index = [&]<typename Index>() {
             scatter_kernel<Value, Index><<<blocks, threads, 0, stream>>>(
                 destination.view_descriptor(), index.view_descriptor(),
-                source.view_descriptor(), source.numel(), static_cast<int>(selected), add);
+                source.view_descriptor(), source.numel(), static_cast<int>(selected), add,
+                default_context(destination.get_device())->input_error(stream));
         };
         dispatch_index_type(index.scalar_type(), launch_index);
     };
@@ -492,16 +534,21 @@ void index_copy_cuda(
     auto index = index_source.to(destination.device()).contiguous();
     auto source = source_value.to(destination.device()).contiguous();
     const auto selected = normalize_dimension(dimension, destination.dim());
-    if (source.size(static_cast<std::int64_t>(selected)) != index.numel()) {
+    if (index.dim() != 1 || source.dim() != destination.dim() ||
+        source.size(static_cast<std::int64_t>(selected)) != index.numel()) {
         throw std::invalid_argument("index_copy source extent does not match indices");
     }
+    for (int64_t axis = 0; axis < destination.dim(); ++axis)
+        if (axis != int64_t(selected) && source.size(axis) != destination.size(axis))
+            throw std::invalid_argument("index_copy source extent does not match destination");
     const auto [blocks, threads] = launch_geometry(source.numel());
     const auto stream = current_stream(destination.get_device()).stream();
     auto launch_value = [&]<typename Value>() {
         auto launch_index = [&]<typename Index>() {
             index_copy_kernel<Value, Index><<<blocks, threads, 0, stream>>>(
                 destination.view_descriptor(), index.view_descriptor(),
-                source.view_descriptor(), source.numel(), static_cast<int>(selected));
+                source.view_descriptor(), source.numel(), static_cast<int>(selected),
+                default_context(destination.get_device())->input_error(stream));
         };
         dispatch_index_type(index.scalar_type(), launch_index);
     };
@@ -515,6 +562,7 @@ void index_fill_cuda(
     const Tensor& index_source,
     double value) {
     if (!destination.is_cuda()) throw std::invalid_argument("index_fill requires CUDA tensor");
+    if (index_source.dim() != 1) throw std::invalid_argument("index_fill requires one-dimensional indices");
     auto index = index_source.to(destination.device()).contiguous();
     const auto selected = normalize_dimension(dimension, destination.dim());
     auto indexed_shape = destination.sizes().vec();
@@ -531,7 +579,8 @@ void index_fill_cuda(
             index_fill_kernel<Value, Index><<<blocks, threads, 0, stream>>>(
                 destination.view_descriptor(), indexed_view,
                 index.view_descriptor(), elements,
-                static_cast<int>(selected), value);
+                static_cast<int>(selected), value,
+                default_context(destination.get_device())->input_error(stream));
         };
         dispatch_index_type(index.scalar_type(), launch_index);
     };
