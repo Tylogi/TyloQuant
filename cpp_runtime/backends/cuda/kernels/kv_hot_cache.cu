@@ -1,6 +1,6 @@
 #include "mfq_cuda_kv_hot_cache.h"
 #include "mfq_cuda_resident_allocations.h"
-#include "../runtime/batch_decode_inputs.h"
+#include "../ops/include/batch_selected_attention.h"
 #include <algorithm>
 #include <limits>
 #include <cassert>
@@ -90,7 +90,26 @@ template<class Word> __global__ void append_exclusive_decode(
         bool index_input_half,bool index_output_half,bool begin_prepare,bool float_keys,bool float_values,
         const int64_t* states,const int64_t* enabled,int rows,int field,int row) {
     if(states) {
+        const bool batch = row < 0;
+        if(batch) {
+            row = int(blockIdx.x);
+            positions += row;
+            input_k = static_cast<const Word*>(input_k) + int64_t(row)*heads*kw;
+            input_v = static_cast<const Word*>(input_v) + int64_t(row)*heads*vw;
+        }
         if(!enabled[row])return;
+        IndirectKvView cache{states, enabled, rows, field - 4, field};
+        if(batch && (!cache.active(row) || positions[0] < 0 || positions[0] >= cache.capacity(row)))return;
+        if(batch && !cache.exclusive(row)) {
+            auto* target_k = cache.resolve<Word>(row, positions[0], 0, kw);
+            auto* target_v = cache.resolve<Word>(row, positions[0], 0, vw, 1);
+            if(!target_k || !target_v)return;
+            for(int x=threadIdx.x;x<heads*kw;x+=blockDim.x)
+                target_k[int64_t(x/kw)*cache.capacity(row)*kw+x%kw] = static_cast<const Word*>(input_k)[x];
+            for(int x=threadIdx.x;x<heads*vw;x+=blockDim.x)
+                target_v[int64_t(x/vw)*cache.capacity(row,1)*vw+x%vw] = static_cast<const Word*>(input_v)[x];
+            return;
+        }
         const auto at=[&](int offset){return 2*(int64_t(field+offset)*rows+row);};
         keys=reinterpret_cast<Word*>(states[at(HotKvStateFields::Keys)]);
         values=reinterpret_cast<Word*>(states[at(HotKvStateFields::Values)]);
@@ -370,6 +389,33 @@ bool HotKvCache::append_decode(const tb::Tensor& k,const tb::Tensor& v,const tb:
     };
     if(keys.element_size()==2)launch(uint16_t{});else if(keys.element_size()==4)launch(uint32_t{});else return false;
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();return true;
+}
+void batch_attention_store(const BatchDecodeInputs& inputs, int64_t field,
+        const tb::Tensor& keys, const tb::Tensor& values) {
+    MFQ_RUNTIME_CHECK(keys.dim() == 4 && values.dim() == 4 && keys.size(0) == inputs.rows() &&
+        values.size(0) == inputs.rows() && keys.size(1) == 1 && values.size(1) == 1 &&
+        keys.size(2) == values.size(2) && keys.scalar_type() == values.scalar_type(),
+        "invalid independent KV update geometry");
+    auto key = keys.contiguous(), value = values.contiguous();
+    const int heads = int(keys.size(2)), kw = int(keys.size(3)), vw = int(values.size(3));
+    const auto launch = [&](auto word) {
+        using Word = decltype(word);
+        append_exclusive_decode<<<unsigned(inputs.rows()), 128, 0, mfq_current_cuda_stream()>>>(
+            key.data_ptr(), value.data_ptr(), static_cast<Word*>(nullptr), static_cast<Word*>(nullptr),
+            static_cast<Word*>(nullptr), static_cast<Word*>(nullptr), inputs.positions().data_ptr<int64_t>(),
+            1, 0, 0, 0, heads, kw, vw, kw, heads*kw, vw, heads*vw,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, 0, 0, false, false, false, false, false,
+            inputs.states().data_ptr<int64_t>(), inputs.enabled().data_ptr<int64_t>(),
+            int(inputs.rows()), int(field + 4), -1);
+    };
+    if(key.scalar_type() == tb::kFloat16)
+        launch(uint16_t{});
+    else {
+        MFQ_RUNTIME_CHECK(key.scalar_type() == tb::kInt32, "independent KV requires F16 or packed I32");
+        launch(uint32_t{});
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 void HotKvCache::bind_decode_state(BatchDecodeInputs& inputs,int64_t field,int64_t row) const {
     MFQ_RUNTIME_CHECK(exclusive(),"indirect KV state requires exclusive tiers");

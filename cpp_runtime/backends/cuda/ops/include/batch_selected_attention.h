@@ -19,6 +19,7 @@ using BatchPoolTransform = std::function<mfq_tensor_backend::Tensor(
 bool batch_selected_attention_enabled();
 
 // Fields are KV keys/values [H,L,D], raw index [L,I] and pooled index [P,I].
+// Optional exclusive tier fields follow at field + 4; unused entries are null.
 // Index caches are F16; KV is F16 or packed I32. Projections contain one token
 // per independent request; rotary positions have [axis,row,1] layout.
 mfq_tensor_backend::Tensor batch_selected_attention(const BatchDecodeInputs&, int64_t field,

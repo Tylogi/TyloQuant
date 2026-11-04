@@ -37,6 +37,7 @@ std::optional<bool> router_lookahead_override();
 bool batch_attention_projections();
 bool gdn_independent_batch();
 bool gdn_independent_batch_trace();
+bool qsa_independent_batch_trace();
 bool batch_packed_prefill();
 int batch_packed_prefill_token_budget();
 bool nint_compressed_decode_batch();

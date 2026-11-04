@@ -21,7 +21,6 @@ inline int64_t Qsa::decode_graph_capacity() const {
 inline Tensor Qsa::forward_independent_graph(CudaExecutionContext& execution, const Tensor& hidden,
         const Tensor& positions, const BatchDecodeInputs& inputs, int64_t field, int64_t capacity,
         std::vector<Tensor> projections) {
-    MFQ_RUNTIME_CHECK(independent_graph_supported(), "independent QSA requires physically contiguous KV");
     auto p = project(execution, hidden, positions, capacity > c_.budget, {}, {}, {}, std::move(projections));
     const auto transform = [&](const Tensor& pooled, const Tensor& block_positions) {
         if (rotary_->fused())

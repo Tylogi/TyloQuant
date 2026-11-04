@@ -375,6 +375,7 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells,
                        MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_HOST_CACHE_BYTES="8388608",
                        MFQ_MEMORY_ARCHITECTURE="discrete", MFQ_KV_RAM_PREALLOCATED="1",
                        MFQ_QSA_INDEPENDENT_BATCH="1", MFQ_KV_TURBOQUANT_BITS=kv_bits,
+                       MFQ_TRACE_QSA_BATCH="1",
                        MFQ_KV_GPU_BUDGET_BYTES=str(98304 + cells * cell_bytes))
     # A small GPU tier exercises eviction and cold reads; a small RAM tier
     # exposes writes through the logical [heads, 512, width] view immediately.
@@ -393,10 +394,10 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells,
             try:
                 await client.status()
 
-                async def generate(prompt):
+                async def generate(prompt, max_tokens=32):
                     async with client.generate({"messages": [{"role": "user", "content": prompt}],
                             "mfq_preformatted_prompt": prompt, "temperature": 0,
-                            "top_k": 1, "max_tokens": 32, "enable_mtp": False, "stream": True}) as events:
+                            "top_k": 1, "max_tokens": max_tokens, "enable_mtp": False, "stream": True}) as events:
                         output = [event async for event in events if event is not None]
                     return "".join(choice.get("delta", {}).get("content", "")
                                    for event in output for choice in event.get("choices", []))
@@ -404,14 +405,24 @@ def test_flash_next_bucket_graph_uses_physical_kv_tiers(tmp_path, budget, cells,
                 single = await generate(prompts[0])
                 outputs = (await asyncio.gather(*(generate(prompt) for prompt in prompts)) if capacity > 1
                            else [await generate(prompt) for prompt in prompts])
+                cold_outputs = []
+                if cells == 496:
+                    # The tokenizer merges each "ab" into one token. These prompts fill
+                    # both tiers before decode, even with only 16 physical RAM cells.
+                    cold_prompts = ["ab" * count for count in (497, 499, 501)]
+                    cold_outputs = (await asyncio.gather(*(generate(prompt, 8) for prompt in cold_prompts))
+                                    if capacity > 1 else [await generate(prompt, 8) for prompt in cold_prompts])
+                    assert all(cold_outputs)
                 status = await _fresh_idle_status(client)
                 assert status["kv_memory_resident_cells"] == cells
                 assert status["kv_memory_ram_bytes"] > 0
                 if capacity > 1:
                     assert status["continuous_batching_cuda_graph_captures"] > 0
                     assert status["continuous_batching_cuda_graph_bucket_reuses"] > 0
+                    trace = log_path.read_text(errors="replace")
+                    assert any(f"qsa_independent_batch rows={rows}" in trace for rows in (2, 4))
                 assert "exclusive=1" in log_path.read_text(errors="replace")
-                return single, outputs
+                return single, outputs, cold_outputs
             finally:
                 with suppress(Exception):
                     await client.aclose()

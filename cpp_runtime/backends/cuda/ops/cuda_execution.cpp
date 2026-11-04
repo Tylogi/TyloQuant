@@ -163,6 +163,7 @@ bool gdn_independent_batch() {
     return !value || value[0]!='0';
 }
 bool gdn_independent_batch_trace() { return exact_one("MFQ_TRACE_GDN_BATCH"); }
+bool qsa_independent_batch_trace() { return exact_one("MFQ_TRACE_QSA_BATCH"); }
 bool batch_packed_prefill() {
     const auto* value=std::getenv("MFQ_BATCH_PACKED_PREFILL");
     return !value || value[0]!='0';

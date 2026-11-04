@@ -204,17 +204,21 @@ update the table before replay. F16 attention retains its Tensor Core path at
 head width 256, and TurboQuant attention reads packed request KV directly.
 `MFQ_QSA_INDEPENDENT_BATCH=0` restores the previous per-request graph core for
 comparisons. Configured KV offload retains the existing eager path.
-Exclusive GPU/RAM KV tiers use the per-request graph core even when independent
-batching is enabled. Its row-table append and gather resolve hot slots and cold
-positions using each physical tier's capacity, including packed TurboQuant KV.
-This adds per-row core launches and selected-KV gathering; batched projections,
-request capacity, context limits, KV budgets and bucket reuse remain unchanged.
+Exclusive GPU/RAM KV tiers also use the independent core. The row table resolves
+hot slots and cold positions with each tier's physical capacity; F16/MMA and
+packed TurboQuant attention read those allocations directly. A single KV
+update launch handles all rows, including eviction before publishing mappings.
+`MFQ_TRACE_QSA_BATCH=1` reports independent core recording. These operators are
+native CUDA; Metal and HIP keep their existing decode paths.
 
 `mfq-window-attention-test --qsa-independent-batch-check` checks heterogeneous
 contexts, paused and cancelled requests, row reuse, cache growth and the
-dense-to-sparse boundary at 2, 8, 16 and 32 rows. The corresponding
+dense-to-sparse boundary at 2, 8, 16 and 32 rows, with contiguous and exclusive
+GPU/RAM KV. The corresponding
 `--qsa-independent-batch-bench` compares core kernel counts and graph replay
-times at 1, 4, 8, 16 and 32 rows. With a synthetic model,
+times at 1, 4, 8, 16 and 32 rows. Set `MFQ_QSA_BATCH_TIERED=1` for exclusive
+GPU/RAM KV with 16 hot cells per request; `MFQ_KV_TURBOQUANT_BITS` selects the
+cache format for both checks and benchmarks. With a synthetic model,
 `MFQ_QSA_BATCH_BENCH=1 mfq-diagnostics --model model.mfq --ctx-size 512 --check-continuous-batching`
 also measures complete decode steps at these batch sizes and verifies their
 tokens against serial generation.

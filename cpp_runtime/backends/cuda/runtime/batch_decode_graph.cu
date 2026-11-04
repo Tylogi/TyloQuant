@@ -1,5 +1,5 @@
 #include "batch_decode_inputs.h"
-#include "mfq_cuda_kv_hot_cache.h"
+#include "mfq_cuda_indirect_kv.h"
 
 #include <algorithm>
 
@@ -26,9 +26,7 @@ __global__ void transfer_state(const int64_t* table, const int64_t* enabled, int
 __global__ void transfer_sequence(const int64_t* table, const int64_t* enabled, int rows,
         int field, int row, const int64_t* indices, int64_t columns, int64_t heads,
         int64_t width_bytes, unsigned char* local, bool store, int hot_field = -1, bool values = false) {
-    const auto entry = 2 * (int64_t(field) * rows + row);
-    auto* state = reinterpret_cast<unsigned char*>(table[entry]);
-    const auto capacity = table[entry + 1];
+    const IndirectKvView cache{table, enabled, rows, field, hot_field};
     const int64_t size = heads * columns * width_bytes;
     for (int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
             index < size; index += int64_t(gridDim.x) * blockDim.x) {
@@ -36,27 +34,12 @@ __global__ void transfer_sequence(const int64_t* table, const int64_t* enabled, 
         const auto column = (index / width_bytes) % columns;
         const auto head = index / (width_bytes * columns);
         const auto position = indices[column];
-        bool active = enabled[row] && state && position >= 0 && position < capacity;
-        auto* physical = state;
-        auto physical_capacity = capacity;
-        auto physical_position = position;
-        if (active && hot_field >= 0) {
-            const auto at = [&](int offset) { return 2 * (int64_t(hot_field + offset) * rows + row); };
-            const auto* mapping = reinterpret_cast<const int32_t*>(table[at(HotKvStateFields::Mapping)]);
-            const auto slot = mapping[position];
-            const auto source = slot >= 0 ? (values ? HotKvStateFields::Values : HotKvStateFields::Keys)
-                : (values ? HotKvStateFields::ColdValues : HotKvStateFields::ColdKeys);
-            physical = reinterpret_cast<unsigned char*>(table[at(source)]);
-            physical_capacity = table[at(source) + 1];
-            physical_position = slot >= 0 ? slot :
-                reinterpret_cast<const int32_t*>(table[at(HotKvStateFields::ColdMapping)])[position];
-            active = physical && physical_position >= 0 && physical_position < physical_capacity;
-        }
+        auto* physical = cache.resolve<unsigned char>(row, position, head, width_bytes, 0, values);
         if (store) {
-            if (active)
-                physical[(head * physical_capacity + physical_position) * width_bytes + byte] = local[index];
+            if (physical)
+                physical[byte] = local[index];
         } else {
-            local[index] = active ? physical[(head * physical_capacity + physical_position) * width_bytes + byte] : 0;
+            local[index] = physical ? physical[byte] : 0;
         }
     }
 }

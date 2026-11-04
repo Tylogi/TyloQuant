@@ -106,11 +106,18 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
         (static_cast<int64_t>(sequence) * heads * M +
          static_cast<int64_t>(zt_q) * M) * (DKQ / 2);
     const bool row_cache = input.indirect.states && input.indirect.active(sequence);
-    const int64_t physical_seq = row_cache ? input.indirect.capacity(sequence) :
+    const bool tiered = row_cache && input.indirect.exclusive(sequence);
+    const int64_t physical_seq = tiered
+        ? input.indirect.tier_capacity(sequence, mfq::cuda::HotKvStateFields::ColdKeys)
+        : row_cache ? input.indirect.capacity(sequence) :
         (use_hot && input.hot.cold_mapping ? input.hot.cold_cells : max_seq);
     if (row_cache) {
-        k = static_cast<const half*>(input.indirect.address(sequence));
-        v = static_cast<const half*>(input.indirect.address(sequence, 1));
+        k = static_cast<const half*>(tiered
+            ? input.indirect.tier_address(sequence, mfq::cuda::HotKvStateFields::ColdKeys)
+            : input.indirect.address(sequence));
+        v = static_cast<const half*>(tiered
+            ? input.indirect.tier_address(sequence, mfq::cuda::HotKvStateFields::ColdValues)
+            : input.indirect.address(sequence, 1));
     }
     const int cache_batch = input.indirect.states ? 0 : sequence;
     const half2 * k_h2 = reinterpret_cast<const half2 *>(k) +
@@ -156,10 +163,25 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
     }
 
     if constexpr(use_hot) {
-        tile_input.hot_keys=reinterpret_cast<const half2*>(input.hot.keys)+(int64_t(sequence)*kv_heads+z_kv)*input.hot.cells*(DKQ/2);
-        tile_input.hot_values=reinterpret_cast<const half2*>(input.hot.values)+(int64_t(sequence)*kv_heads+z_kv)*input.hot.cells*(DV/2);
-        tile_input.hot_mapping=input.hot.mapping;
-        tile_input.cold_mapping=input.hot.cold_mapping;
+        if (tiered) {
+            const auto& cache = input.indirect;
+            const auto cells = cache.tier_capacity(sequence, mfq::cuda::HotKvStateFields::Keys);
+            tile_input.hot_keys = reinterpret_cast<const half2*>(
+                cache.tier_address(sequence, mfq::cuda::HotKvStateFields::Keys)) + int64_t(z_kv)*cells*(DKQ/2);
+            tile_input.hot_values = reinterpret_cast<const half2*>(
+                cache.tier_address(sequence, mfq::cuda::HotKvStateFields::Values)) + int64_t(z_kv)*cells*(DV/2);
+            tile_input.hot_mapping = static_cast<const int32_t*>(
+                cache.tier_address(sequence, mfq::cuda::HotKvStateFields::Mapping));
+            tile_input.cold_mapping = static_cast<const int32_t*>(
+                cache.tier_address(sequence, mfq::cuda::HotKvStateFields::ColdMapping));
+        } else if (input.hot.mapping) {
+            tile_input.hot_keys = reinterpret_cast<const half2*>(input.hot.keys) +
+                (int64_t(sequence)*kv_heads+z_kv)*input.hot.cells*(DKQ/2);
+            tile_input.hot_values = reinterpret_cast<const half2*>(input.hot.values) +
+                (int64_t(sequence)*kv_heads+z_kv)*input.hot.cells*(DV/2);
+            tile_input.hot_mapping = input.hot.mapping;
+            tile_input.cold_mapping = input.hot.cold_mapping;
+        }
     }
     flash_attn_ext_f16_process_tile<
         DKQ, DV, ncols1, ncols2, nwarps,

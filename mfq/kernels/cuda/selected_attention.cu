@@ -250,11 +250,16 @@ __global__ void sparse_attention_kernel(
                 : static_cast<const int32_t*>(causal_positions)[token];
             index = selected <= end ? selected : -1;
         } else index = indices[row * topk + selected];
-        const bool valid = active && index >= 0 && index < cache_length;
+        bool valid = active && index >= 0 && index < cache_length;
         const int64_t cb = ((cache_batch * kv_heads + kv_head) * cache_length +
             (valid ? index : 0)) * width;
-        const half* source_key=key+cb;
-        const half* source_value=value+cb;
+        const half* source_key = indirect.states ? nullptr : key + cb;
+        const half* source_value = indirect.states ? nullptr : value + cb;
+        if (indirect.states) {
+            source_key = indirect.resolve<const half>(batch, index, kv_head, width);
+            source_value = indirect.resolve<const half>(batch, index, kv_head, width, 1);
+            valid = valid && source_key && source_value;
+        }
         if constexpr(use_hot) {
             if(valid) {const int slot=hot.mapping[index];if(slot>=0) {
                 const auto at=((batch*kv_heads+kv_head)*hot.cells+slot)*width;
@@ -410,9 +415,9 @@ static Tensor sparse_impl(const Tensor& q, const Tensor& k, const Tensor& v,
             static_cast<int>(key.size(2)), indirect);
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         if (use_qsa_mma) {
-            if(hot.mapping)return mfq_sparse_attn_mma::launch<256,256,1,16,false,true>(
+            if(hot.mapping || indirect.states)return mfq_sparse_attn_mma::launch<256,256,1,16,false,true>(
                 query,key,value,safe_indices,mask,Tensor{},Tensor{},scale,
-                "qwen4_sparse_gqa_attention_hot",gate,half_output,Tensor{},0,hot);
+                "qwen4_sparse_gqa_attention_hot",gate,half_output,Tensor{},0,hot,indirect);
             return mfq_sparse_attn_mma::launch<256, 256, 1, 16, false>(
                 query, key, value, safe_indices, mask, Tensor{}, Tensor{},
                 scale, "qwen4_sparse_gqa_attention", gate, half_output, Tensor{}, 0, {}, indirect);

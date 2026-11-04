@@ -446,8 +446,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 const int row = use_indirect ? flash_attn_ext_f16_slot_row(
                     row_indices, i, implicit_row, implicit_row_count,
                     slot_count, index_limit) : i;
-                const half2* source_row=KV+int64_t(row)*stride_KV;
-                if constexpr(use_hot) {const int slot=mapping[row];if(slot>=0)source_row=hot+int64_t(slot)*stride_KV;else if(cold_mapping)source_row=KV+int64_t(cold_mapping[row])*stride_KV;}
+                const half2* source_base = KV;
+                int source_index = row;
+                if constexpr (use_hot) {
+                    if (mapping) {
+                        const int slot = mapping[row];
+                        if (slot >= 0) {
+                            source_base = hot;
+                            source_index = slot;
+                        } else if (cold_mapping) {
+                            source_index = cold_mapping[row];
+                        }
+                    }
+                }
+                const half2* source_row = source_base + int64_t(source_index)*stride_KV;
 
 #pragma unroll
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
@@ -500,8 +512,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 const int row = use_indirect && valid ? flash_attn_ext_f16_slot_row(
                     row_indices, i, implicit_row, implicit_row_count,
                     slot_count, index_limit) : i;
-                const half2* source_row=KV+int64_t(row)*stride_KV;
-                if constexpr(use_hot) {if(valid){const int slot=mapping[row];if(slot>=0)source_row=hot+int64_t(slot)*stride_KV;else if(cold_mapping)source_row=KV+int64_t(cold_mapping[row])*stride_KV;}}
+                const half2* source_base = KV;
+                int source_index = valid ? row : 0;
+                if constexpr (use_hot) {
+                    if (valid && mapping) {
+                        const int slot = mapping[row];
+                        if (slot >= 0) {
+                            source_base = hot;
+                            source_index = slot;
+                        } else if (cold_mapping) {
+                            source_index = cold_mapping[row];
+                        }
+                    }
+                }
+                const half2* source_row = source_base + int64_t(source_index)*stride_KV;
 
 #pragma unroll
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
