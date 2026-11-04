@@ -143,6 +143,23 @@ def test_unhealthy_alive_runtime_is_restarted_and_recovers(monkeypatch, status, 
     asyncio.run(run())
 
 
+def test_recoverable_request_failure_does_not_restart_healthy_runtime(monkeypatch):
+    async def run():
+        pool, instance, _saved, loads, _loading, _release = setup_pool(
+            monkeypatch, status={'healthy': True}, error_code='backend_failure')
+        try:
+            with pytest.raises(BackendError) as raised:
+                await drain(pool)
+            assert raised.value.code == 'backend_failure'
+            assert instance.process.terminations == 0
+            assert not loads and not pool._recovering_runtimes
+            instance.backend.error_code = None
+            assert await drain(pool) == ['restored']
+        finally:
+            await pool.aclose()
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize('code', ['backend_failure', 'runtime_unhealthy', 'backend_unhealthy'])
 def test_fatal_request_error_restarts_once_and_rejects_waiting_requests(monkeypatch, code):
     async def run():

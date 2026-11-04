@@ -2495,9 +2495,7 @@ class RuntimePool:
         except BackendError as error:
             result = "timeout" if error.code in _TIMEOUT_ERROR_CODES else "error"
             instance.request_metrics.record_request(result, performance, usage)
-            if error.code in _RUNTIME_FATAL_ERROR_CODES or (
-                instance.error is not None and instance.error.code == "runtime_unhealthy"
-            ):
+            if await self._runtime_error_requires_recovery(instance, error):
                 await self._recover_unhealthy_runtime(instance, str(error))
                 raise self._runtime_restarting_error(instance) from error
             raise
@@ -3475,6 +3473,20 @@ class RuntimePool:
             for key in ("state", "runtime_state", "status")
         )
 
+    async def _runtime_error_requires_recovery(self, instance: _Runtime, error: BackendError) -> bool:
+        if instance.error is not None and instance.error.code == "runtime_unhealthy":
+            return True
+        if error.code not in _RUNTIME_FATAL_ERROR_CODES:
+            return False
+        if error.code == "backend_failure":
+            try:
+                status = await self._managed_runtime_status(instance.backend)
+            except Exception:
+                return True
+            if status.get("healthy") is True and not self._unhealthy_status(status):
+                return False
+        return True
+
     async def _managed_runtime_status(self, backend: ChatBackend) -> dict[str, Any]:
         status = dict(await backend.runtime_status())
         # Master transports expose scheduler health through /health even when
@@ -3787,9 +3799,7 @@ class RuntimePool:
         try:
             yield instance, backend
         except BackendError as error:
-            if instance is not None and (error.code in _RUNTIME_FATAL_ERROR_CODES or (
-                instance.error is not None and instance.error.code == "runtime_unhealthy"
-            )):
+            if instance is not None and await self._runtime_error_requires_recovery(instance, error):
                 await self._recover_unhealthy_runtime(instance, str(error))
                 raise self._runtime_restarting_error(instance) from error
             raise
