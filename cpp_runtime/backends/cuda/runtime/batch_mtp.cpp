@@ -25,6 +25,11 @@ bool batch_mtp_supported(const MtpModule* predictor, const MfqSamplingParams& sa
         (sampling.temperature <= 0 || sampling.top_k == 1);
 }
 
+int64_t batch_mtp_checkpoints(const MtpModule& predictor) {
+    if (const char* option = std::getenv("MFQ_BATCH_MTP_CHECKPOINTS")) return std::max(0, std::atoi(option));
+    return predictor.maximum_draft_depth();
+}
+
 BatchMtpRow::~BatchMtpRow() {
     // A result can be abandoned by cancellation or coroutine destruction.
     if (resolve) {

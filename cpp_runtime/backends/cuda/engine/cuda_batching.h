@@ -93,6 +93,8 @@ class QwenBatchOperations {
     BatchSampling sampling_;
     std::unique_ptr<BatchDecodeGraphCache> decode_graphs_;
     MtpModule* predictor_ = nullptr;
+    // Rows whose pre-window recurrent state batched verification may keep.
+    int64_t mtp_checkpoints_ = 0;
     int64_t mtp_batches_ = 0, mtp_drafted_ = 0, mtp_accepted_ = 0;
 };
 

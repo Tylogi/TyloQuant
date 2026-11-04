@@ -72,6 +72,17 @@ def _mtp_recurrent_model(path):
     ("flash_next_cached", False, 4), ("flash_next_cached", False, 32),
 ])
 def test_uniform_width_batched_mtp_matches_ordinary_greedy(tmp_path, family, paged, requests):
+    metrics = _batched_mtp_check(tmp_path, family, paged, requests)
+    lifecycle = "0" if family == "qwen35_homogeneous" else "1"
+    assert metrics["paused"] == metrics["cancelled"] == lifecycle
+    if family == "qwen35_homogeneous":
+        assert int(metrics["tokens"]) == 32 * 48
+    assert metrics["grammar"] == "1"
+    assert int(metrics["drafted"]) > 0
+
+
+def _batched_mtp_check(tmp_path, family, paged, requests):
+    """Run the diagnostic batched-MTP greedy oracle and return its metrics."""
     executable = os.environ.get("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS")
     if not executable:
         pytest.skip("MFQ_CUDA_BATCH_GRAPH_DIAGNOSTICS must point to CUDA mfq-diagnostics")
@@ -82,6 +93,8 @@ def test_uniform_width_batched_mtp_matches_ordinary_greedy(tmp_path, family, pag
     environment = dict(os.environ, MFQ_CONTINUOUS_PAGED_KV=str(int(paged)),
                        MFQ_BATCH_MTP_TEST_TOKENIZER=str(tokenizer), MFQ_BATCH_MTP_CHECK="1",
                        MFQ_CONTINUOUS_BATCH_MTP="1")
+    # Let every row speculate unless a test fixes a smaller checkpoint budget.
+    environment.setdefault("MFQ_BATCH_MTP_CHECKPOINTS", str(requests))
     if family.startswith("qwen35"):
         _mtp_recurrent_model(model)
         if family == "qwen35_homogeneous":
@@ -125,17 +138,19 @@ def test_uniform_width_batched_mtp_matches_ordinary_greedy(tmp_path, family, pag
     metrics = dict(field.split("=", 1) for field in line.split()[1:])
     assert metrics["greedy"] == "PASS"
     assert metrics["mtp"] == "1"
-    lifecycle = "0" if family == "qwen35_homogeneous" else "1"
-    assert metrics["paused"] == metrics["cancelled"] == lifecycle
-    if family == "qwen35_homogeneous":
-        assert int(metrics["tokens"]) == 32 * 48
-    assert metrics["grammar"] == "1"
-    assert int(metrics["drafted"]) > 0
+    return metrics
 
 def test_flash_next_batched_mtp_drafts_within_fixed_checkpoints(tmp_path, monkeypatch):
     # One checkpoint slot for 32 rows: drafts shrink, memory and outputs do not change.
-    monkeypatch.setenv("MFQ_BATCH_MTP_DRAFT_TOKENS", "1")
+    monkeypatch.setenv("MFQ_BATCH_MTP_CHECKPOINTS", "1")
     test_uniform_width_batched_mtp_matches_ordinary_greedy(tmp_path, "flash_next", False, 32)
+
+@pytest.mark.parametrize("family", ["qwen35", "flash_next"])
+def test_batched_mtp_without_checkpoints_stays_greedy(tmp_path, monkeypatch, family):
+    # A zero budget keeps batched MTP enabled but never speculates.
+    monkeypatch.setenv("MFQ_BATCH_MTP_CHECKPOINTS", "0")
+    metrics = _batched_mtp_check(tmp_path, family, False, 4)
+    assert int(metrics["drafted"]) == 0
 
 @pytest.mark.parametrize("opt_in", [True, False])
 @pytest.mark.parametrize("family", ["qwen35", "flash_next"])

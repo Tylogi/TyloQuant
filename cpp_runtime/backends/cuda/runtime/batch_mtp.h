@@ -12,6 +12,9 @@ namespace mfq::cuda {
 // sampling modes retain the exclusive single-request MTP implementation.
 bool batch_mtp_enabled();
 bool batch_mtp_supported(const MtpModule*, const MfqSamplingParams&);
+// Recurrent-state copies batched verification may hold at once. The budget is
+// fixed per runtime: MFQ_BATCH_MTP_CHECKPOINTS, else the predictor's draft depth.
+int64_t batch_mtp_checkpoints(const MtpModule&);
 
 struct BatchMtpRow {
     using Tensor = mfq_tensor_backend::Tensor;

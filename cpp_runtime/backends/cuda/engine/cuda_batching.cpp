@@ -77,6 +77,9 @@ QwenBatchOperations::QwenBatchOperations(Qwen35CausalLm &model, CudaExecutionCon
     MFQ_RUNTIME_CHECK(config_.max_sequences > 0 && config_.max_sequences <= config_.sequence_limit &&
                       config_.sequence_limit <= mfq::engine::ContinuousBatchConfig::validated_max_sequences,
                       "continuous batching capacity exceeds the configured or validated sequence limit");
+    // Each slot holds one row's recurrent state from before a speculative window.
+    if (batch_mtp_enabled() && predictor_ && predictor_->supports_batch())
+        mtp_checkpoints_ = batch_mtp_checkpoints(*predictor_);
 }
 
 QwenBatchOperations::~QwenBatchOperations() = default;
@@ -91,6 +94,7 @@ std::vector<std::pair<std::string, double>> QwenBatchOperations::metrics() const
         {"continuous_batching_mtp_supported", double(batch_mtp_enabled() && predictor_ && predictor_->supports_batch())},
         {"continuous_batching_mtp_stochastic_supported", 0.0},
         {"continuous_batching_mtp_graph_supported", 0.0},
+        {"continuous_batching_mtp_checkpoints", double(mtp_checkpoints_)},
         {"continuous_batching_mtp_batches", double(mtp_batches_)},
         {"continuous_batching_mtp_drafted_tokens", double(mtp_drafted_)},
         {"continuous_batching_mtp_accepted_tokens", double(mtp_accepted_)},
@@ -288,12 +292,9 @@ FlashNextBatchOperations::FlashNextBatchOperations(Qwen4CausalLm& model,
     model_.reset(1);
     admission_base_kv_bytes_ = managed_kv_bytes();
     if (config_.cuda_graph) graph_ = std::make_unique<Qwen4BatchDecodeGraph>(model_);
-    if (batch_mtp_enabled() && predictor_ && predictor_->supports_batch()) {
-        // As many draft tokens as one exclusive MTP window, unless overridden.
-        int64_t tokens = predictor_->maximum_draft_depth();
-        if (const auto* value = std::getenv("MFQ_BATCH_MTP_DRAFT_TOKENS")) tokens = std::max(0, std::atoi(value));
-        mtp_checkpoints_ = std::make_shared<Qwen4BatchCheckpointPool>(tokens);
-    }
+    // Each slot holds the recurrent state after one drafted token.
+    if (batch_mtp_enabled() && predictor_ && predictor_->supports_batch())
+        mtp_checkpoints_ = std::make_shared<Qwen4BatchCheckpointPool>(batch_mtp_checkpoints(*predictor_));
 }
 FlashNextBatchOperations::~FlashNextBatchOperations() = default;
 int64_t FlashNextBatchOperations::vocab_size() const { return model_.vocab_size(); }
@@ -307,7 +308,7 @@ mfq::engine::Metrics FlashNextBatchOperations::metrics() const {
     return {{"continuous_batching_mtp_supported", double(batch_mtp_enabled() && predictor_ && predictor_->supports_batch())},
         {"continuous_batching_mtp_stochastic_supported", 0.0},
         {"continuous_batching_mtp_graph_supported", 0.0},
-        {"continuous_batching_mtp_checkpoint_tokens", double(mtp_checkpoints_ ? mtp_checkpoints_->tokens() : 0)},
+        {"continuous_batching_mtp_checkpoints", double(mtp_checkpoints_ ? mtp_checkpoints_->tokens() : 0)},
         {"continuous_batching_mtp_batches", double(mtp_batches_)},
         {"continuous_batching_mtp_drafted_tokens", double(mtp_drafted_)},
         {"continuous_batching_mtp_accepted_tokens", double(mtp_accepted_)},
