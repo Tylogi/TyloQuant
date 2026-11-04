@@ -4,12 +4,16 @@ import errno
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from mfq._version import __version__
 
 STUDIO_PROTOCOL_VERSION = "1.0"
+# Windows releases a terminated process's byte-range locks asynchronously, so a
+# server restarted right after a crash briefly sees the old lock.
+_WINDOWS_LOCK_RELEASE_SECONDS = 2.0
 
 
 class ServerAlreadyRunningError(RuntimeError):
@@ -47,12 +51,11 @@ class ServerInstanceLock:
         stream = os.fdopen(os.open(self.path, flags, 0o600), "r+b")
         try:
             if os.name == "nt":
-                import msvcrt
                 if self.path.stat().st_size == 0:
                     stream.write(b"\0")
                     stream.flush()
                 stream.seek(0)
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                _lock_windows_byte(stream.fileno())
             else:
                 import fcntl
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -83,3 +86,18 @@ class ServerInstanceLock:
             finally:
                 self.stream.close()
                 self.stream = None
+
+
+def _lock_windows_byte(descriptor: int) -> None:
+    """Take the first byte's lock, waiting briefly for a dead owner's lock to clear."""
+    import msvcrt
+
+    deadline = time.monotonic() + _WINDOWS_LOCK_RELEASE_SECONDS
+    while True:
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as error:
+            if error.errno not in {errno.EACCES, errno.EDEADLK} or time.monotonic() >= deadline:
+                raise
+        time.sleep(0.05)

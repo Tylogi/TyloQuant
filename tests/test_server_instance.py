@@ -13,6 +13,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from mfq.server.api import create_app
 from mfq.server.instance import ServerInstanceLock, server_identity
+from tests.platform_helpers import symlink_or_skip
 
 
 def test_identity_is_stable_per_app_and_does_not_disclose_paths(tmp_path):
@@ -57,14 +58,10 @@ def test_realtime_connections_are_bound_to_the_confirmed_instance(tmp_path):
         assert error.value.code == 1013
 
 
-def test_directory_lock_rejects_aliases_and_survives_data_directory_removal(tmp_path):
+def test_directory_lock_survives_data_directory_removal(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
-    alias = tmp_path / "alias"
-    alias.symlink_to(data, target_is_directory=True)
     with ServerInstanceLock(data):
-        with pytest.raises(RuntimeError, match="already managed"), ServerInstanceLock(alias):
-            pytest.fail("duplicate writer")
         shutil.rmtree(data)
         data.mkdir()
         with pytest.raises(RuntimeError, match="already managed"), ServerInstanceLock(data):
@@ -73,6 +70,16 @@ def test_directory_lock_rejects_aliases_and_survives_data_directory_removal(tmp_
             pass
     with ServerInstanceLock(data):
         pass
+
+
+def test_directory_lock_rejects_symlink_aliases(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    alias = tmp_path / "alias"
+    symlink_or_skip(alias, data, target_is_directory=True)
+    with ServerInstanceLock(data):
+        with pytest.raises(RuntimeError, match="already managed"), ServerInstanceLock(alias):
+            pytest.fail("duplicate writer")
 
 
 def test_directory_lock_releases_after_exception(tmp_path):

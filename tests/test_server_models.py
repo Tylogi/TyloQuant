@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import stat
 import subprocess
 import sys
 import textwrap
@@ -50,6 +49,7 @@ from mfq.server.runtime.runtime_pool import (
 from mfq.server.services.service import ServerService
 from mfq.server.state.storage import SessionStore
 from mfq.tools.split_mfq import split_mfq
+from tests.platform_helpers import launch_python_runtime
 
 
 class IdleBackend:
@@ -266,12 +266,12 @@ def test_load_pressure_reclaims_shared_host_cache_before_model_memory(
     asyncio.run(run())
 
 
-def test_startup_models_use_the_managed_load_path(tmp_path: Path) -> None:
+def test_startup_models_use_the_managed_load_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         model = tmp_path / "startup.mfq"
         executable = tmp_path / "fake-runtime"
         _model(model, architecture="qwen35")
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve_path(model)
         request = ModelLoadRequest(
@@ -306,12 +306,12 @@ def test_startup_models_use_the_managed_load_path(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
-def test_startup_model_can_use_stdio_runtime_transport(tmp_path: Path) -> None:
+def test_startup_model_can_use_stdio_runtime_transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         model = tmp_path / "stdio.mfq"
         executable = tmp_path / "fake-stdio-runtime"
         _model(model, architecture="qwen35")
-        _fake_stdio_runtime(executable)
+        _fake_stdio_runtime(executable, monkeypatch)
         pool = RuntimePool(
             ModelCatalog([tmp_path], cache_seconds=0),
             executable,
@@ -337,12 +337,13 @@ def test_startup_model_can_use_stdio_runtime_transport(tmp_path: Path) -> None:
 
 def test_automatic_expert_residency_is_recomputed_for_later_loads(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def run() -> None:
         model = tmp_path / "automatic-residency.mfq"
         executable = tmp_path / "fake-runtime"
         _model(model, architecture="qwen35")
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         pool = RuntimePool(
             catalog,
@@ -378,12 +379,13 @@ def test_automatic_expert_residency_is_recomputed_for_later_loads(
 
 def test_failed_startup_model_remains_retryable_without_spawning(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def run() -> None:
         model = tmp_path / "too-large.mfq"
         executable = tmp_path / "fake-runtime"
         _model(model, architecture="qwen35")
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve_path(model)
         request = ModelLoadRequest(
@@ -420,7 +422,7 @@ def _model(path: Path, *, architecture: str = "test-model") -> None:
     )
 
 
-def _fake_stdio_runtime(path: Path) -> None:
+def _fake_stdio_runtime(path: Path, monkeypatch) -> None:
     path.write_text(
         textwrap.dedent(
             """\
@@ -481,10 +483,10 @@ def _fake_stdio_runtime(path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    launch_python_runtime(path, monkeypatch)
 
 
-def _fake_runtime(path: Path) -> None:
+def _fake_runtime(path: Path, monkeypatch) -> None:
     path.write_text(
         textwrap.dedent(
             """\
@@ -543,7 +545,7 @@ def _fake_runtime(path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    launch_python_runtime(path, monkeypatch)
 
 
 async def _wait_for_job(
@@ -1616,19 +1618,12 @@ def test_managed_runtime_retries_timed_out_startup_probe(
     async def run() -> None:
         _model(tmp_path / "tiny.mfq", architecture="qwen35")
         executable = tmp_path / "fake-runtime.py"
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         pool = RuntimePool(
             ModelCatalog([tmp_path], cache_seconds=0), executable,
             startup_timeout_seconds=5, automatic_memory_budget=False,
         )
         pool.memory_policy.prefix_directory = str(tmp_path / "prefix")
-        launch = pool._launch_configuration
-
-        def launch_python(*args, **kwargs):
-            command, environment = launch(*args, **kwargs)
-            return [sys.executable, *command], environment
-
-        monkeypatch.setattr(pool, "_launch_configuration", launch_python)
         original_capabilities = OpenAIChatBackend.capabilities
         probes = 0
         cancelled = False
@@ -1660,13 +1655,15 @@ def test_managed_runtime_retries_timed_out_startup_probe(
     asyncio.run(run())
 
 
-def test_managed_runtime_loads_and_unloads_through_persistent_jobs(tmp_path: Path) -> None:
+def test_managed_runtime_loads_and_unloads_through_persistent_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
         _model(model_dir / "tiny.mfq", architecture="qwen35")
         executable = tmp_path / "fake-runtime"
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
         pool = RuntimePool(
             catalog,
@@ -1750,14 +1747,14 @@ def test_managed_runtime_loads_and_unloads_through_persistent_jobs(tmp_path: Pat
     asyncio.run(run())
 
 
-def test_managed_runtime_dispatches_qwen4_mfq_to_native_cpp(tmp_path: Path) -> None:
+def test_managed_runtime_dispatches_qwen4_mfq_to_native_cpp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
         model = model_dir / "Qwen3.8-Flash-Next.mfq"
         _model(model, architecture="qwen4_exp-hf-mfq-nint-recipe")
         native_executable = tmp_path / "fake-native-runtime"
-        _fake_runtime(native_executable)
+        _fake_runtime(native_executable, monkeypatch)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
         pool = RuntimePool(
             catalog,
@@ -1934,14 +1931,14 @@ def test_managed_native_runtime_leaves_continuous_batching_validation_to_worker(
     asyncio.run(run())
 
 
-def test_runtime_instances_keep_model_bound_mtp_capabilities(tmp_path: Path) -> None:
+def test_runtime_instances_keep_model_bound_mtp_capabilities(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
         _model(model_dir / "plain.mfq", architecture="qwen35")
         _model(model_dir / "ready-with-mtp.mfq", architecture="qwen35")
         executable = tmp_path / "fake-runtime"
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
         pool = RuntimePool(
             catalog,
@@ -1973,13 +1970,13 @@ def test_runtime_instances_keep_model_bound_mtp_capabilities(tmp_path: Path) -> 
     asyncio.run(run())
 
 
-def test_concurrent_loads_reserve_the_catalog_name(tmp_path: Path) -> None:
+def test_concurrent_loads_reserve_the_catalog_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
         _model(model_dir / "tiny.mfq", architecture="qwen35")
         executable = tmp_path / "fake-runtime"
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
         pool = RuntimePool(
             catalog,
@@ -2021,7 +2018,7 @@ def test_concurrent_loads_reserve_the_catalog_name(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
-def test_failed_runtime_start_does_not_leave_a_stuck_pool_slot(tmp_path: Path) -> None:
+def test_failed_runtime_start_does_not_leave_a_stuck_pool_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
@@ -2031,7 +2028,7 @@ def test_failed_runtime_start_does_not_leave_a_stuck_pool_slot(tmp_path: Path) -
             "#!/usr/bin/env python3\nraise SystemExit(2)\n",
             encoding="utf-8",
         )
-        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        launch_python_runtime(executable, monkeypatch)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
         pool = RuntimePool(
             catalog,
@@ -2056,7 +2053,7 @@ def test_failed_runtime_start_does_not_leave_a_stuck_pool_slot(tmp_path: Path) -
                     await asyncio.sleep(0.01)
                 assert (await pool.instances()).data == []
 
-                _fake_runtime(executable)
+                _fake_runtime(executable, monkeypatch)
                 accepted = await client.post(
                     "/api/v1/models/load", json={"model": "tiny"}
                 )
@@ -2688,7 +2685,7 @@ def test_request_driven_load_waiters_receive_the_same_startup_error(
             "raise SystemExit(2)\n",
             encoding="utf-8",
         )
-        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        launch_python_runtime(executable, monkeypatch)
         pool = RuntimePool(
             ModelCatalog([model_dir], cache_seconds=0),
             executable,
@@ -2742,6 +2739,7 @@ def test_request_driven_load_waiters_receive_the_same_startup_error(
 
 def test_request_driven_model_loads_coalesce_and_restore_exact_settings(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
@@ -2749,7 +2747,7 @@ def test_request_driven_model_loads_coalesce_and_restore_exact_settings(
         _model(model_dir / "first.mfq", architecture="qwen35")
         _model(model_dir / "second.mfq", architecture="qwen35")
         executable = tmp_path / "fake-runtime"
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
         pool = RuntimePool(
             catalog,
@@ -2811,6 +2809,7 @@ def test_request_driven_model_loads_coalesce_and_restore_exact_settings(
 
 def test_named_load_replaces_an_idle_stale_artifact_revision(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
@@ -2818,7 +2817,7 @@ def test_named_load_replaces_an_idle_stale_artifact_revision(
         model = model_dir / "revision.mfq"
         _model(model, architecture="qwen35")
         executable = tmp_path / "fake-runtime"
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         pool = RuntimePool(
             ModelCatalog([model_dir], cache_seconds=0),
             executable,
@@ -2868,6 +2867,7 @@ def test_named_load_replaces_an_idle_stale_artifact_revision(
 
 def test_runtime_pool_evicts_idle_lru_but_preserves_pinned_models(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
@@ -2875,7 +2875,7 @@ def test_runtime_pool_evicts_idle_lru_but_preserves_pinned_models(
         _model(model_dir / "older.mfq", architecture="qwen35")
         _model(model_dir / "newer.mfq", architecture="qwen35")
         executable = tmp_path / "fake-runtime"
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
         pool = RuntimePool(
             catalog,
@@ -2919,13 +2919,14 @@ def test_runtime_pool_evicts_idle_lru_but_preserves_pinned_models(
 
 def test_runtime_memory_budget_evicts_idle_models_and_respects_pins(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario(root: Path, *, pinned: bool) -> None:
         root.mkdir()
         _model(root / "first.mfq", architecture="qwen35")
         _model(root / "second.mfq", architecture="qwen35")
         executable = root / "fake-runtime"
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         catalog = ModelCatalog([root], cache_seconds=0)
         artifacts = (await catalog.list()).data
         budget = max(item.total_bytes for item in artifacts)
@@ -3057,13 +3058,13 @@ def test_failed_load_admission_does_not_partially_retire_lru_models(
     asyncio.run(run())
 
 
-def test_runtime_pool_unloads_an_idle_ttl_model(tmp_path: Path) -> None:
+def test_runtime_pool_unloads_an_idle_ttl_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
         _model(model_dir / "ephemeral.mfq", architecture="qwen35")
         executable = tmp_path / "fake-runtime"
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
         pool = RuntimePool(
             catalog,
@@ -3096,13 +3097,13 @@ def test_runtime_pool_unloads_an_idle_ttl_model(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
-def test_runtime_pool_close_waits_for_an_inflight_idle_unload(tmp_path: Path) -> None:
+def test_runtime_pool_close_waits_for_an_inflight_idle_unload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
         _model(model_dir / "ephemeral.mfq", architecture="qwen35")
         executable = tmp_path / "fake-runtime"
-        _fake_runtime(executable)
+        _fake_runtime(executable, monkeypatch)
         catalog = ModelCatalog([model_dir], cache_seconds=0)
         pool = RuntimePool(
             catalog,
@@ -3396,6 +3397,11 @@ def test_runtime_pool_close_retires_instances_concurrently(tmp_path: Path) -> No
         assert pool._instances == {}
 
     asyncio.run(run())
+
+
+def test_process_resident_bytes_reads_the_current_process() -> None:
+    assert RuntimePool._process_resident_bytes(os.getpid()) > 0
+    assert RuntimePool._process_resident_bytes(-1) is None
 
 
 def test_started_runtime_is_registered_in_the_instances_api(tmp_path: Path) -> None:

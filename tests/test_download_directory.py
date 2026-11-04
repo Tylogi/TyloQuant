@@ -12,6 +12,7 @@ from mfq.server.api import create_app
 from mfq.server.services.jobs import JobExecutionError
 from mfq.server.services.tool_jobs import ToolJobHandlers, ToolJobPaths
 from mfq.server.state.catalog import ModelCatalog
+from tests.platform_helpers import symlink_or_skip
 
 
 def make_handlers(workspace: Path) -> ToolJobHandlers:
@@ -52,13 +53,16 @@ def test_download_directory_api_persists_and_uses_server_folder_ids(tmp_path: Pa
     asyncio.run(run())
 
 
-def test_download_space_uses_selected_filesystem_and_updates_free_bytes(tmp_path, monkeypatch):
+@pytest.mark.parametrize('use_symlink', [False, True])
+def test_download_space_uses_selected_filesystem_and_updates_free_bytes(tmp_path, monkeypatch, use_symlink):
     from mfq.server.services import download_directory
     default = tmp_path / 'models'
     chosen = tmp_path / 'external'
     chosen.mkdir()
-    link = tmp_path / 'external-link'
-    link.symlink_to(chosen, target_is_directory=True)
+    link = chosen
+    if use_symlink:
+        link = tmp_path / 'external-link'
+        symlink_or_skip(link, chosen, target_is_directory=True)
     available = 200
     calls = []
     def usage(path):

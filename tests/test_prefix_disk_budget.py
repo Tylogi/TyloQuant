@@ -3,6 +3,7 @@ import struct
 from pathlib import Path
 
 from mfq.server.runtime.prefix_disk_budget import maintain_prefix_disk_budget
+from tests.platform_helpers import symlink_or_skip
 
 
 def block(root, namespace, digest, payload=32, accessed=1):
@@ -43,9 +44,9 @@ def test_eviction_never_follows_links_or_deletes_unmanaged_files(tmp_path):
     external = tmp_path / 'external'
     path = block(external, 'b', '2')
     cache.mkdir()
-    (cache / ('b' * 64)).symlink_to(external / ('b' * 64), target_is_directory=True)
+    symlink_or_skip(cache / ('b' * 64), external / ('b' * 64), target_is_directory=True)
     owned = block(cache, 'a', '1')
-    (owned.parent / ('2' * 64 + '.mfqkv')).symlink_to(path)
+    symlink_or_skip(owned.parent / ('2' * 64 + '.mfqkv'), path)
     unrelated = owned.parent / 'notes.txt'
     unrelated.write_text('keep')
     malformed = owned.parent / ('3' * 64 + '.mfqkv')
