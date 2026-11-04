@@ -348,14 +348,16 @@ Tensor launch(
     const int cc = properties.major * 100 + properties.minor * 10;
     MFQ_RUNTIME_CHECK(turing_mma_available(cc),
         name, ": requires Turing-class tensor cores or newer");
-    // Inline selection rewrites the logit mask inside the synchronous loader
-    // path; the multi-stage pipeline owns a different mask preload.
-    MFQ_RUNTIME_CHECK(!inline_indices ||
-        ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc) <= 1,
-        name, ": inline selection requires the synchronous KV loader");
     const auto config = ampere_mma_available(cc)
         ? ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols)
         : ggml_cuda_fattn_mma_get_config_turing(DKQ, DV, ncols);
+    // Inline selection rewrites the logit mask inside the synchronous loader
+    // path; the multi-stage pipeline owns a different mask preload. This is
+    // ggml_cuda_fattn_mma_get_nstages for the chosen config, without the host
+    // GGML_ASSERT path that needs ggml_abort from the full ggml library.
+    const int nstages = cp_async_available(cc) && ncols2 >= 2 ? config.nstages_target : 0;
+    MFQ_RUNTIME_CHECK(!inline_indices || nstages <= 1,
+        name, ": inline selection requires the synchronous KV loader");
     const int nthreads = config.nthreads;
     const int nwarps = nthreads / 32;
     const int nbatch_fa = config.nbatch_fa;
