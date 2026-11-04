@@ -15,13 +15,14 @@ std::size_t PooledCache::growth_bytes(int64_t tokens,int64_t pool,int64_t width,
 }
 
 std::size_t PooledCache::position_bytes(int64_t capacity) const {
+    if(positions_.defined() && positions_.size(-1)==capacity)return 0;
     const auto axes=positions_.defined()?positions_.numel()/positions_.size(-1):3;
     return std::size_t(axes)*capacity*sizeof(int64_t);
 }
 
 void PooledCache::reset() {
+    // Keep positions_: retained decode graphs captured its address.
     values_={};
-    positions_={};
     processed_rows_={};
     completed_=0;
     processed_=0;
@@ -87,7 +88,11 @@ void PooledCache::prepare_graph(const Tensor& full_positions,int64_t capacity) {
     MFQ_RUNTIME_CHECK(capacity>=full_positions.size(-1),"pooled position cache exceeds capacity");
     auto shape=full_positions.sizes().vec();
     shape.back()=capacity;
-    positions_=tb::zeros(shape,full_positions.options().dtype(tb::kInt64));
+    // Graphs retained across requests read and write this buffer by address,
+    // so a later request must refill it rather than allocate a new one.
+    if(positions_.defined() && positions_.sizes().vec()==shape && positions_.device()==full_positions.device())
+        positions_.zero_();
+    else positions_=tb::zeros(shape,full_positions.options().dtype(tb::kInt64));
     positions_.narrow(-1,0,full_positions.size(-1)).copy_(full_positions);
 }
 
