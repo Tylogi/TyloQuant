@@ -59,6 +59,9 @@ def routing(scope, imatrix, config, mode, cache_path, root, *, absolute=False):
         if cache_path:
             raise ValueError('--alphaq-router-cache requires router frequency weighting')
         return None, {p.name: topk/p.shape[0] for p in scope.experts}
+    if imatrix.metadata.get('objective') == 'uniform_calibration_free' and not cache_path:
+        raise ValueError('uniform imatrix has no observed router counts; use --alphaq-router none '
+                         'or provide --alphaq-router-cache with measured routing frequencies')
     router = {}
     for item in scope.plans:
         match = re.fullmatch(r'model\.block\.(\d+)\.mlp\.router\.weight', item.name)

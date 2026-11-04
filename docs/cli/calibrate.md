@@ -29,7 +29,7 @@ uv sync --extra metal --extra calibration
 | `data` | Tokenize eaddario calibration records |
 | `trace-data` | Tokenize model-generated HF JSONL traces |
 | `collect` | Collect activation and Fisher statistics |
-| `imatrix` | Create a reusable activation importance matrix on CUDA or Metal |
+| `imatrix` | Create activation importance on CUDA/Metal, or calibration-free uniform importance |
 | `allocate` | Score candidates and allocate tensor precision |
 | `candidates` | Materialize packed dense candidates without allocating a scheme |
 | `inint` | Select per-neuron NINT4/NINT8 rows |
@@ -97,6 +97,29 @@ expert; it does not store a matrix with the same shape as the weight.
 For NINT tensors, the neuron factor also reallocates subgroup scale/minimum
 precision at the same mean subgroup-bit budget. Loaders expand that metadata
 into the existing runtime representation, so no new matmul kernel is required.
+
+### Uniform importance without calibration
+
+`--uniform` replaces `--corpus` and works for every architecture the HF
+quantizer can plan, including architectures without an activation calibration
+backend. It reads only config and safetensors headers; no tokenizer, weight
+payload, corpus, forward pass or accelerator is needed.
+
+```shell
+uv run mfq calibrate imatrix \
+  --model model-hf --uniform --output uniform.imatrix
+
+uv run mfq quantize model-hf model-alphaq.mfq \
+  --ud-tier IQ4_XS --imatrix uniform.imatrix --alphaq-router none
+```
+
+The artifact covers dense matrices, routed expert banks, MTP, vision and other
+planned components, including fused and split layouts. Each dense input vector
+has shape `(1, width)`; a rank-3 bank has shape `(matrices, width)`. Values are
+all ones. Counts and token totals are zero, with objective
+`uniform_calibration_free`; these are equal importance weights, not measured
+activation or routing statistics. AlphaQ requires `--alphaq-router none` or a
+matching measured `--alphaq-router-cache` when using this artifact.
 
 ## Reuse during quantization
 

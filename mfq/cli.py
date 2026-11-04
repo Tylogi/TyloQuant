@@ -208,8 +208,27 @@ def _calibrate_collect(args: argparse.Namespace) -> int:
 
 
 def _calibrate_imatrix(args: argparse.Namespace) -> int:
+    if getattr(args, "uniform", False):
+        from mfq.calibration.uniform import uniform_imatrix
+
+        result = uniform_imatrix(args.model, args.output)
+        print(json.dumps({
+            "event": "imatrix_saved",
+            "output": str(result.path),
+            "entries": len(result.entries),
+            "objective": "uniform_calibration_free",
+            "tokens": 0,
+        }))
+        return 0
+
     from mfq.calibration.chat import prepare_calibration_corpus
-    from mfq.calibration.imatrix import collect_imatrix
+    from mfq.calibration.imatrix import collect_imatrix, imatrix_model_type
+
+    try:
+        imatrix_model_type(args.model)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     device = args.device or ("mps" if args.backend == "metal" else "cuda:0")
     device_type = device.split(":", 1)[0]
@@ -594,10 +613,15 @@ def _add_calibration_parsers(sub: argparse._SubParsersAction) -> None:
 
     imatrix = stages.add_parser(
         "imatrix",
-        help="collect a reusable activation importance matrix on CUDA or Metal",
+        help="create reusable activation or calibration-free uniform importance",
     )
     imatrix.add_argument("--model", required=True, help="local full-precision HF model")
-    imatrix.add_argument("--corpus", required=True, help=".txt/.json/.jsonl file or prepared MFQ calibration corpus")
+    imatrix_source = imatrix.add_mutually_exclusive_group(required=True)
+    imatrix_source.add_argument("--corpus", help=".txt/.json/.jsonl file or prepared MFQ calibration corpus")
+    imatrix_source.add_argument(
+        "--uniform", action="store_true",
+        help="calibration-free all-ones importance from config and tensor headers; includes vision and MTP",
+    )
     imatrix.add_argument("--render-mode", choices=("auto", "plain"), default="auto",
         help="auto adds the model chat template only to unformatted records; plain disables automatic wrapping")
     imatrix.add_argument("--output", required=True, help="native MFQ imatrix artifact")
