@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import numpy as np
 import pytest
 
@@ -401,6 +399,7 @@ def test_synthetic_mixed_moe_writer_covers_all_runtime_families(tmp_path):
     ("quant_backend", "device"),
     (("cpu", "cpu"), ("cuda", "cuda")),
 )
+@pytest.mark.filterwarnings("error:NVQ1-S has no CUDA:RuntimeWarning")
 def test_streaming_writer_builds_all_precision_families(
     tmp_path,
     quant_backend: str,
@@ -437,23 +436,17 @@ def test_streaming_writer_builds_all_precision_families(
     shape = (len(expert_precisions), rows, neuron_len)
     weight = rng.normal(0, 0.04, shape).astype(np.float32)
     path = tmp_path / "all-families.blob"
-    context = (
-        pytest.warns(RuntimeWarning, match="NVQ1-S has no CUDA")
-        if device == "cuda"
-        else nullcontext()
+    nbytes = _write_mixed_moe_axis0_blob(
+        weight,
+        shape,
+        shape,
+        expert_precisions,
+        path,
+        row_chunk=8,
+        quant_backend=quant_backend,
+        device=device,
+        artifact_root=tmp_path,
     )
-    with context:
-        nbytes = _write_mixed_moe_axis0_blob(
-            weight,
-            shape,
-            shape,
-            expert_precisions,
-            path,
-            row_chunk=8,
-            quant_backend=quant_backend,
-            device=device,
-            artifact_root=tmp_path,
-        )
     restored = io.unpack_mfe(path.read_bytes())
     assert nbytes == path.stat().st_size
     assert len(restored.pools) == len(expert_precisions) - 1

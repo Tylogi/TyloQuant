@@ -65,7 +65,18 @@ def test_kv_policy_generation(tmp_path, placement, allocation, gpu_limit, ram_li
                 if limit and not after.get("kv_memory_auto_ram"):
                     assert after["qsa_kv_gpu_evictions"] > 0
                     assert after["qsa_kv_ram_hits"] > 0
-                    assert bool(after["qsa_kv_ssd_bytes"]) == (mode == "auto_ssd")
+                    assert bool(after["qsa_kv_ssd_enabled"]) == (mode == "auto_ssd")
+                    # Request cleanup releases live blocks; writes record completed SSD use.
+                    deadline = asyncio.get_running_loop().time() + 5
+                    while (
+                        (after["qsa_kv_pending_bytes"] or after["qsa_kv_ssd_bytes"])
+                        and asyncio.get_running_loop().time() < deadline
+                    ):
+                        await asyncio.sleep(0.01)
+                        after = await client.status()
+                    assert after["qsa_kv_pending_bytes"] == 0
+                    assert bool(after["qsa_kv_ssd_written_bytes"]) == (mode == "auto_ssd")
+                    assert after["qsa_kv_ssd_bytes"] == 0
                 return results
             finally:
                 with suppress(Exception):

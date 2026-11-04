@@ -379,7 +379,8 @@ std::vector<double> reference_moe(const std::vector<double>& input, const MoeGeo
         }
     std::vector<double> latent = input;
     if (with_latent) latent = project(w.latent_down, input, tokens, g.hidden, g.latent);
-    std::vector<double> routed(static_cast<std::size_t>(tokens) * g.hidden, 0.0);
+    const int routed_width = with_latent ? g.latent : g.hidden;
+    std::vector<double> routed(static_cast<std::size_t>(tokens) * routed_width, 0.0);
     for (int t = 0; t < tokens; ++t) {
         std::vector<int> order(g.experts);
         std::iota(order.begin(), order.end(), 0);
@@ -410,13 +411,13 @@ std::vector<double> reference_moe(const std::vector<double>& input, const MoeGeo
                 }
                 up[o] = activated;
             }
-            for (int o = 0; o < g.hidden; ++o) {
+            for (int o = 0; o < routed_width; ++o) {
                 double value = 0.0;
                 for (int i = 0; i < g.expert_width; ++i)
                     value += w.down[(static_cast<std::size_t>(expert) * g.latent + o) *
                                         g.expert_width + i] *
                              up[i];
-                routed[t * g.hidden + o] += weight * value;
+                routed[t * routed_width + o] += weight * value;
             }
         }
     }
@@ -494,10 +495,39 @@ void check_latent_moe(tb::ScalarType dtype, float tolerance) {
             "latent relu-squared MoE differs from the double reference: " +
                 std::to_string(difference));
 
+    // Exact identity projections isolate activation from the shared branch and cancellation.
+    auto activation_weights = weights;
+    for (auto* values : {&activation_weights.latent_down, &activation_weights.latent_up,
+                        &activation_weights.up, &activation_weights.down,
+                        &activation_weights.shared_up, &activation_weights.shared_down}) {
+        std::fill(values->begin(), values->end(), 0.0);
+    }
+    for (int column = 0; column < g.latent; ++column) {
+        activation_weights.latent_down[column * g.hidden + column] = 1.0;
+        activation_weights.latent_up[column * g.latent + column] = 1.0;
+        for (int expert = 0; expert < g.experts; ++expert) {
+            activation_weights.up[(expert * g.expert_width + column) * g.latent + column] = 1.0;
+            activation_weights.down[(expert * g.latent + column) * g.expert_width + column] = 1.0;
+        }
+    }
+    std::vector<float> activation_values(static_cast<std::size_t>(tokens) * g.hidden);
+    for (std::size_t index = 0; index < activation_values.size(); ++index)
+        activation_values[index] = index % 2 ? -0.5f : 0.5f;
+    std::vector<double> activation_input;
+    auto activation_tensor = make_tensor(activation_values, {1, tokens, g.hidden}, tb::kFloat16,
+                                         &activation_input);
+    auto activation_ffn = make_moe_ffn(g, dtype, activation_weights, true);
+    auto activation_actual = host_values(activation_ffn->forward(execution, activation_tensor));
+    auto activation_expected = reference_moe(activation_input, g, activation_weights, true, true);
+    require(max_difference(activation_actual, activation_expected) <= tolerance,
+            "isolated latent activation differs from the double reference");
+
     // Replacing relu^2 with a SwiGLU-style activation must change the result.
-    auto swiglu = reference_moe(input, g, weights, true, false);
-    const auto activation_difference = max_difference(actual, swiglu);
-    require(activation_difference > 1e-3,
+    auto swiglu = reference_moe(activation_input, g, activation_weights, true, false);
+    require(max_difference(activation_expected, swiglu) > 4 * tolerance,
+            "latent MoE fixture does not distinguish the activation within its error bound");
+    const auto activation_difference = max_difference(activation_actual, swiglu);
+    require(activation_difference > 2 * tolerance,
             "relu-squared activation swap was not detected: " +
                 std::to_string(activation_difference));
 
