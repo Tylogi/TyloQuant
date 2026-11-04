@@ -907,16 +907,9 @@ void test_validation_and_greedy_precedence() {
                 1.0);
         },
         "top_k above vocab was accepted");
-    require_throws(
-        [&] {
-            (void)mfq::metal::sample_top_k_top_p(
-                logits,
-                random,
-                1.0,
-                2,
-                0.0);
-        },
-        "zero top_p was accepted");
+    require_ids(
+        mfq::metal::sample_top_k_top_p(logits, random, 1.0, 2, 0.0),
+        {2}, "zero nucleus must select the maximum");
     require_throws(
         [&] {
             mfq::metal::MlxSamplingParams params;

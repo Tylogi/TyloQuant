@@ -26,6 +26,15 @@ def _array(value: mx.array) -> np.ndarray:
     return np.asarray(value)
 
 
+@pytest.mark.parametrize("top_k", [0, 1, 3])
+def test_zero_nucleus_is_greedy(top_k):
+    logits = np.array([[1, 5, 2], [4, 4, -1]], dtype=np.float32)
+    expected = np.argmax(logits, axis=-1)
+    assert np.array_equal(_array(sample(logits, temperature=1, top_k=top_k, top_p=0)), expected)
+    if top_k > 0:
+        assert np.array_equal(_array(sample_top_k_top_p(logits, top_k=top_k, top_p=0)), expected)
+
+
 def _categorical_reference(
     logits: np.ndarray,
     random: np.ndarray,

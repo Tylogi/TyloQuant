@@ -67,7 +67,7 @@ static void check_sampling_fallback() {
                 std::vector<float> probabilities(k);float sum=0;
                 for(int i=0;i<k;++i){probabilities[i]=std::exp(scaled[order[i]]-scaled[order[0]]);sum+=probabilities[i];}
                 int keep=k;float keep_sum=sum;
-                if(p>0 && p<1) {
+                if(p>=0 && p<1) {
                     float cumulative=0;
                     for(int i=0;i<k;++i)if((cumulative+=probabilities[i])>=p*sum){keep=i+1;keep_sum=cumulative;break;}
                 }

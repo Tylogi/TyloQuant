@@ -1047,8 +1047,8 @@ RequestInput parse_input(
     if (work.sampling.temperature < 0.0 || work.sampling.temperature > 10.0) {
         throw ApiError(400, "invalid_request_error", "temperature must be in [0, 10]", "temperature");
     }
-    if (work.sampling.top_p <= 0.0 || work.sampling.top_p > 1.0) {
-        throw ApiError(400, "invalid_request_error", "top_p must be in (0, 1]", "top_p");
+    if (work.sampling.top_p < 0.0 || work.sampling.top_p > 1.0) {
+        throw ApiError(400, "invalid_request_error", "top_p must be in [0, 1]", "top_p");
     }
     if (work.sampling.top_k < 0 || work.sampling.top_k > 1024) {
         throw ApiError(400, "invalid_request_error", "top_k must be in [0, 1024]", "top_k");
@@ -1061,7 +1061,8 @@ RequestInput parse_input(
             "mtp_max_draft_tokens must be in [1, 5]",
             "mtp_max_draft_tokens");
     }
-    if (work.sampling.temperature > 0.0 && work.sampling.top_k == 0 && work.sampling.top_p < 1.0) {
+    if (work.sampling.temperature > 0.0 && work.sampling.top_k == 0 &&
+        work.sampling.top_p > 0.0 && work.sampling.top_p < 1.0) {
         throw ApiError(400, "invalid_request_error", "top_p below 1 requires top_k above 0 in this sampler", "top_p");
     }
     if (work.sampling.presence_penalty < -2.0 || work.sampling.presence_penalty > 2.0) {

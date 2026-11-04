@@ -15,6 +15,7 @@ from mfq.server.api.openai_compat import (
     backend_error_status,
     collect_chat_completion,
     parse_chat_request,
+    require_json_content_type,
     stream_chat_completion,
 )
 from mfq.server.api.openai_compat import (
@@ -93,7 +94,13 @@ async def openai_models(
 @router.post("/v1/chat/completions", include_in_schema=False)
 async def openai_chat_completions(service: ServiceDependency, request: Request) -> Response:
     try:
+        require_json_content_type(request.headers.get("content-type", ""))
         body = await request.json()
+    except OpenAIRequestError as error:
+        return JSONResponse(
+            status_code=error.status_code,
+            content=openai_error_body(str(error), param=error.param),
+        )
     except ValueError as error:
         return JSONResponse(
             status_code=400,
@@ -155,3 +162,14 @@ async def openai_chat_completions(service: ServiceDependency, request: Request) 
             ),
         )
     return JSONResponse(content=result)
+
+
+@router.post("/v1/completions", include_in_schema=False)
+async def unsupported_completions() -> Response:
+    return JSONResponse(
+        status_code=404,
+        content=openai_error_body(
+            "Legacy /v1/completions is not supported. Use /v1/chat/completions or /v1/messages.",
+            code="unsupported_endpoint",
+        ),
+    )

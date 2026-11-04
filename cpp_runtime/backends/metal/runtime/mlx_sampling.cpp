@@ -1176,13 +1176,16 @@ array sample_top_k_top_p(
         throw std::invalid_argument(
             "temperature must be finite and positive");
     }
-    if (!std::isfinite(top_p) || top_p <= 0.0 || top_p > 1.0) {
-        throw std::invalid_argument("top_p must be in (0,1]");
+    if (!std::isfinite(top_p) || top_p < 0.0 || top_p > 1.0) {
+        throw std::invalid_argument("top_p must be in [0,1]");
     }
     auto view = normalize_logits(logits);
     if (top_k < 1 || top_k > std::min(view.vocab, kMaxTopK)) {
         throw std::invalid_argument(
             "top_k must be in [1,min(vocab,1024)]");
+    }
+    if (top_p == 0.0) {
+        return sample_greedy(logits);
     }
     auto uniforms = normalize_random(random, view.rows);
     if (view.rows == 1 && view.vocab > kTopKBlock &&
