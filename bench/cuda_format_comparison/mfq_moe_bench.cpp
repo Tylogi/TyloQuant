@@ -1,4 +1,5 @@
 #include "weights.h"
+#include "mfq_cuda_graph_capture.h"
 #include "nint_row_metadata.h"
 #include "mfq_cuda_moe_ops.h"
 #include <set>
@@ -117,7 +118,7 @@ struct Replay {
         fb::check(cudaStreamSynchronize(mfq_current_cuda_stream()));output.clear();
         graph.capture_begin();for(size_t i=0;i<calls;++i)output.push_back(run(i));
         cudaStreamCaptureStatus status;
-        fb::check(cudaStreamGetCaptureInfo_v2(mfq_current_cuda_stream(),&status,nullptr,&captured,nullptr,nullptr));
+        fb::check(mfq_stream_capture_info(mfq_current_cuda_stream(),&status,nullptr,&captured));
         graph.capture_end();
         graph.replay();fb::check(cudaStreamSynchronize(mfq_current_cuda_stream()));
     }

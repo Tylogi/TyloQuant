@@ -48,7 +48,7 @@ template<class Body> double time(Body body,cudaStream_t stream,int iterations=32
     MFQ_CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
     for(int i=0;i<iterations;++i)body();
     MFQ_CUDA_CHECK(cudaStreamEndCapture(stream,&graph));
-    MFQ_CUDA_CHECK(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
+    MFQ_CUDA_CHECK(cudaGraphInstantiate(&executable,graph,0));
     for(int i=0;i<8;++i)MFQ_CUDA_CHECK(cudaGraphLaunch(executable,stream));
     cudaEvent_t begin,end;
     MFQ_CUDA_CHECK(cudaEventCreate(&begin));
