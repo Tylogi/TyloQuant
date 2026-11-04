@@ -47,6 +47,13 @@ struct AllocationBudget {
     std::mutex graph_memory_mutex;
     // Retired pools remain visible until their persistent request tensors die.
     std::unordered_map<cudaMemPool_t,bool> graph_memory_pools;
+    // Drained graph pools, trimmed and kept for the next graph. A pool's used
+    // bytes drop when cudaFreeAsync is enqueued, and the driver finishes a
+    // free's bookkeeping lazily, on a later call for that stream. Destroying
+    // a drained pool first made the driver fault inside cudaStreamSynchronize
+    // on a busy GPU, so graph pools are recycled instead of destroyed. Their
+    // number is bounded by the peak number of live graph pools.
+    std::vector<cudaMemPool_t> idle_graph_pools;
     cudaMemPool_t resident_memory_pool=nullptr;
     std::size_t limit = 0;
     std::atomic<std::size_t> allocated{},peak{};
@@ -67,6 +74,17 @@ struct AllocationBudget {
     void release(std::size_t bytes) noexcept {allocated.fetch_sub(bytes,std::memory_order_relaxed);}
 };
 namespace {
+
+// Returns a drained graph pool's pages and keeps the pool for reuse. The
+// caller holds graph_memory_mutex.
+void park_graph_pool(AllocationBudget& budget, cudaMemPool_t memory) noexcept {
+    if(cudaMemPoolTrimTo(memory,0)!=cudaSuccess)(void)cudaGetLastError();
+    try {
+        budget.idle_graph_pools.push_back(memory);
+    } catch(...) {
+        // Losing track of the handle leaks it, which is safe; destroying it is not.
+    }
+}
 
 std::mutex allocation_budgets_mutex;
 std::unordered_map<int,std::shared_ptr<AllocationBudget>> allocation_budgets;
@@ -695,6 +713,11 @@ std::optional<std::size_t> shared_memory_available(int device) {
     return std::nullopt;
 }
 
+std::size_t Context::graph_memory_pool_count() const {
+    std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+    return allocation_budget_->graph_memory_pools.size()+allocation_budget_->idle_graph_pools.size();
+}
+
 std::pair<std::uint64_t,std::uint64_t> Context::pool_memory_stats() const {
     DeviceGuard guard(device_);
     std::uint64_t used=0,reserved=0;
@@ -708,6 +731,7 @@ std::pair<std::uint64_t,std::uint64_t> Context::pool_memory_stats() const {
     add(pool_);
     std::lock_guard lock(allocation_budget_->graph_memory_mutex);
     for(const auto& [memory,retired]:allocation_budget_->graph_memory_pools)add(memory);
+    for(const auto memory:allocation_budget_->idle_graph_pools)add(memory);
     return {used,reserved};
 }
 
@@ -720,10 +744,12 @@ void Context::trim_pool_pages() const {
         std::uint64_t used=0;
         if(retired)MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrUsedMemCurrent,&used));
         if(retired && !used) {
-            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolDestroy(memory));
             entry=allocation_budget_->graph_memory_pools.erase(entry);
+            park_graph_pool(*allocation_budget_,memory);
         } else ++entry;
     }
+    for(const auto memory:allocation_budget_->idle_graph_pools)
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(memory,0));
 }
 
 std::size_t Context::available_memory() const {
@@ -1090,9 +1116,10 @@ void Context::begin_graph_pool(cudaStream_t stream) {
         properties.location.type=cudaMemLocationTypeDevice;
         properties.location.id=device_;
         cudaMemPool_t memory=nullptr;
+        bool created=false;
         try {
-            // A workspace may outlive its graph by one operation. Reap its
-            // retired pool once its async free completes; pool handles are a
+            // A workspace may outlive its graph by one operation. Recycle its
+            // retired pool once that allocation is freed; pool handles are a
             // finite driver resource even when their pages have been trimmed.
             {
                 std::lock_guard shared_lock(allocation_budget_->graph_memory_mutex);
@@ -1102,19 +1129,29 @@ void Context::begin_graph_pool(cudaStream_t stream) {
                     if(entry->second)MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(
                         entry->first,cudaMemPoolAttrUsedMemCurrent,&used));
                     if(entry->second && !used) {
-                        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolDestroy(entry->first));
+                        const auto drained=entry->first;
                         entry=allocation_budget_->graph_memory_pools.erase(entry);
+                        park_graph_pool(*allocation_budget_,drained);
                     } else ++entry;
                 }
+                auto& idle=allocation_budget_->idle_graph_pools;
+                if(!idle.empty()) {memory=idle.back();idle.pop_back();}
             }
-            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolCreate(&memory,&properties));
-            std::uint64_t threshold=std::numeric_limits<std::uint64_t>::max();
-            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolAttrReleaseThreshold,&threshold));
+            if(!memory) {
+                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolCreate(&memory,&properties));
+                created=true;
+                std::uint64_t threshold=std::numeric_limits<std::uint64_t>::max();
+                MFQ_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolAttrReleaseThreshold,&threshold));
+            }
             std::lock_guard shared_lock(allocation_budget_->graph_memory_mutex);
             allocation_budget_->graph_memory_pools.emplace(memory,false);
             graph_pools_.at(stream).memory=memory;
         } catch(...) {
-            if(memory)(void)cudaMemPoolDestroy(memory);
+            if(memory && created)(void)cudaMemPoolDestroy(memory);
+            else if(memory) {
+                std::lock_guard shared_lock(allocation_budget_->graph_memory_mutex);
+                park_graph_pool(*allocation_budget_,memory);
+            }
             graph_pools_.erase(stream);throw;
         }
     }
@@ -1183,7 +1220,7 @@ void Context::end_graph_pool(cudaStream_t stream) noexcept {
             std::uint64_t used=0;
             if(cudaMemPoolGetAttribute(pool.memory,cudaMemPoolAttrUsedMemCurrent,&used)==cudaSuccess && !used) {
                 allocation_budget_->graph_memory_pools.erase(pool.memory);
-                (void)cudaMemPoolDestroy(pool.memory);
+                park_graph_pool(*allocation_budget_,pool.memory);
             } else allocation_budget_->graph_memory_pools.at(pool.memory)=true;
         }
     });
