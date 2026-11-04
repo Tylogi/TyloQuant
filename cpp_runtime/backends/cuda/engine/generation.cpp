@@ -17,6 +17,7 @@
 #include "mfq_cuda_sampling_ops.h"
 #include "storage/moe_expert_cache.h"
 #include "runtime/execution_options.h"
+#include "runtime/workspace_budget.h"
 #include "prefill_budget.h"
 
 #include <algorithm>
@@ -429,7 +430,7 @@ template <class Model> struct CudaGenerationContext {
         {
             reserve_moe_workspace(model.execution->moe_expert_cache,bytes);
             auto context=mfq::cuda::default_context(mfq_current_cuda_device());
-            auto available=context->available_memory();
+            auto available=mfq::cuda::available_workspace_memory(*context);
             if(available>=bytes)return;
             std::size_t hot=0;
             for(const auto& metric:cache.metrics())
@@ -463,14 +464,15 @@ template <class Model> struct CudaGenerationContext {
         auto budget=moe_prefill_workspace_budget(model.execution->moe_expert_cache,allow_borrow);
         const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
         auto available=mfq::engine::prefill_budget_add(
-            mfq::engine::prefill_budget_add(context->available_memory(),context->workspace_available()),
+            mfq::engine::prefill_budget_add(mfq::cuda::available_workspace_memory(*context),
+                context->workspace_available()),
             budget.lendable_bytes);
         const auto row_bytes=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float)*8;
         const auto sequence_bytes=allow_borrow
             ? std::size_t(tokens<=16384?tokens:std::min<std::size_t>(tokens,limit))*row_bytes*3/8 : 0;
         const auto reserve=moe_expert_cache_ssd_experts(model.execution->moe_expert_cache)
             ? std::max(std::size_t(1)<<30,mfq::cuda::runtime_options::workspace_reserve_bytes())
-            : std::size_t(1)<<30;
+            : std::min(std::size_t(1)<<30,mfq::cuda::runtime_options::workspace_reserve_bytes());
         const auto fixed=mfq::engine::prefill_budget_add(reserve+sequence_bytes,budget.transfer_bytes);
         const auto wanted=std::min<int64_t>({int64_t(tokens),limit,mfq::engine::max_prefill_compute_chunk});
         const auto required=mfq::engine::prefill_budget_add(fixed,std::size_t(wanted)*row_bytes);
@@ -480,7 +482,8 @@ template <class Model> struct CudaGenerationContext {
             reserve_workspace(required>budget.lendable_bytes?required-budget.lendable_bytes:0);
             budget=moe_prefill_workspace_budget(model.execution->moe_expert_cache,allow_borrow);
             available=mfq::engine::prefill_budget_add(
-                context->available_memory()+context->workspace_available(),budget.lendable_bytes);
+                mfq::engine::prefill_budget_add(mfq::cuda::available_workspace_memory(*context),
+                    context->workspace_available()),budget.lendable_bytes);
         }
         const auto selected=mfq::engine::select_prefill_chunk(tokens,limit,available,fixed,row_bytes);
         if(!selected)throw mfq::engine::InferenceInputError(

@@ -15,6 +15,7 @@
 #include "request_executor.h"
 #include "generation_flow.h"
 #include "mfq_weight_memory.h"
+#include "prefill_budget.h"
 
 #include <cuda_runtime_api.h>
 #include "mfq_cuda_kv_quantization.h"
@@ -238,6 +239,48 @@ struct CudaEngineState {
         context->reclaim_idle_memory();
         if(released)std::cerr<<"runtime_workspace_reclaim requested_bytes="<<bytes
             <<" available_bytes="<<context->available_memory()<<" prefix_released_bytes="<<released<<'\n';
+    }
+
+    void reserve_request_workspace(const InferenceRequest& input, bool media=false) {
+        auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
+        const auto reserve=runtime_options::workspace_reserve_bytes();
+        auto bytes=reserve;
+        if(media) {
+            bytes=prefill_budget_add(bytes,input.vision->pixel_values.size()*sizeof(float)*8);
+        } else if(input.prompt.size()>128) {
+            const auto rows=std::min<std::size_t>({input.prompt.size(),
+                std::size_t(config.generation.prefill_chunk_size),std::size_t(max_prefill_compute_chunk)});
+            const auto row_bytes=std::size_t(language.hidden_size())*language.hc_mult()*sizeof(float)*8;
+            bool borrow=false;
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                borrow=!input.vision && qwen4_layer_major_prefill_eligible(language,rows);
+            const auto budget=moe_prefill_workspace_budget(execution->moe_expert_cache,borrow);
+            const auto fixed_reserve=moe_expert_cache_ssd_experts(execution->moe_expert_cache)
+                ?std::max(reserve,std::size_t(1)<<30):std::min(reserve,std::size_t(1)<<30);
+            const auto fixed=prefill_budget_add(fixed_reserve,budget.transfer_bytes);
+            const auto peak=prefill_budget_add(fixed,rows*row_bytes);
+            bytes=std::max(bytes,peak>budget.lendable_bytes?peak-budget.lendable_bytes:0);
+        } else {
+            const auto memory=context->memory_stats();
+            if(!memory.limit || context->resident_memory_usage()<=memory.limit)return;
+        }
+        bytes=std::max(bytes,std::size_t(1));
+        if(context->available_memory()>=bytes)return;
+        reclaim_prefix_workspace(bytes);
+        if(context->available_memory()>=bytes || !execution->moe_expert_cache ||
+                !online_budget_supported())return;
+        if(batching) {
+            if(!batching->empty())return;
+            batching->release_idle_buffers();
+        }
+        // Moving primary arenas invalidates captured expert addresses. This is
+        // a request boundary, before vision, prefix restore or prefill kernels.
+        finish_moe_expert_exchanges(execution->moe_expert_cache);
+        graph.invalidate();
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+            qwen4_release_decode_graphs(language,components.mtp.get());
+        release_moe_decode_buffers(execution->moe_expert_cache);
+        reclaim_moe_expert_workspace(execution->moe_expert_cache,bytes);
     }
 
     CudaEngineState(std::shared_ptr<CudaExecutionContext> owner, Model loaded,
@@ -468,6 +511,7 @@ struct CudaEngineState {
     }
     using Prepared = CudaPreparedPrompt;
     mfq::StepSequence<Prepared> prepare(InferenceRequest& input) {
+        reserve_request_workspace(input,true);
         if (components.composite) return components.composite->prepare(input.prompt, *input.vision);
         if (components.grid_vision) return components.grid_vision->prepare(language, input.prompt, *input.vision);
         if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)
@@ -483,6 +527,7 @@ struct CudaEngineState {
     }
     Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared,
                              const RequestId& id, bool batched) {
+        if(!batched)reserve_request_workspace(input);
         if(!batched)prepare_graph_depth(input);
         return internal::generate(language, graph, cache, config,
                                   input, output, batched ? nullptr : components.mtp.get(), std::move(prepared),

@@ -451,6 +451,9 @@ void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budg
         mfq::plan_moe_arena_slots(budget_bytes_, demands);
     for (auto & item : arenas_) {
         auto & arena = *item.second;
+        // Keep revocable expert fields out of pages pinned by ordinary request
+        // state, so shrinking the cache can return physical headroom to graphs.
+        mfq::cuda::ResidentAllocationScope resident;
         arena.slots = plan.at(arena.signature);
         arena.fields.reserve(arena.layouts.size());
         for (size_t index = 0;
@@ -1348,10 +1351,14 @@ void MoeExpertCache::resize(std::size_t bytes) {
         for(auto& cohort:source->cohorts_)cohort.active={};
     }
     try {
+        // Arenas can share allocator pages. Return every replaced field before
+        // allocating any replacement, so shrinking also works at the cap.
+        for(auto& entry:saved)entry.arena->fields.clear();
+        context->reclaim_idle_memory();
         for(auto& entry:saved) {
+            mfq::cuda::ResidentAllocationScope resident;
             auto& arena=*entry.arena;
             const auto slots=plan.at(arena.signature);
-            arena.fields.clear();context->reclaim_idle_memory();
             for(std::size_t i=0;i<entry.fields.size();++i) {
                 auto shape=arena.layouts[i].slot_shape;shape[0]*=slots;
                 auto field=mfq_tensor_backend::empty(shape,entry.fields[i].options().device(mfq_tensor_backend::kCUDA));
@@ -1361,8 +1368,10 @@ void MoeExpertCache::resize(std::size_t bytes) {
             }
         }
     } catch(...) {
+        for(auto& entry:saved)entry.arena->fields.clear();
+        context->reclaim_idle_memory();
         for(auto& entry:saved) {
-            entry.arena->fields.clear();context->reclaim_idle_memory();
+            mfq::cuda::ResidentAllocationScope resident;
             for(const auto& field:entry.fields)entry.arena->fields.push_back(field.to(mfq_tensor_backend::kCUDA));
         }
         rebuild_sources();
@@ -2525,6 +2534,29 @@ void resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache,std::s
     if(!cache)return;
     release_moe_decode_buffers(cache);
     cache->resize(bytes);
+}
+void reclaim_moe_expert_workspace(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
+    if(!cache)return;
+    const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    context->reclaim_idle_memory();
+    auto available=context->available_memory();
+    while(available<bytes) {
+        const auto memory=context->memory_stats();
+        const auto usage=context->resident_memory_usage();
+        const auto overage=memory.limit && usage>memory.limit?usage-memory.limit:0;
+        const auto deficit=bytes-available;
+        const auto shortage=overage>std::numeric_limits<std::size_t>::max()-deficit
+            ?std::numeric_limits<std::size_t>::max():deficit+overage;
+        const auto allocated=std::size_t(cache->allocated_bytes());
+        const auto minimum=cache->minimum_bytes();
+        const auto target=std::max(minimum,allocated>shortage?allocated-shortage:0);
+        if(target>=allocated)return;
+        resize_moe_expert_cache(cache,target);
+        available=context->available_memory();
+        std::cerr<<"runtime_expert_workspace_reclaim requested_bytes="<<bytes
+            <<" previous_bytes="<<allocated<<" budget_bytes="<<target<<" available_bytes="<<available<<'\n';
+        if(std::size_t(cache->allocated_bytes())>=allocated)return;
+    }
 }
 void set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCache>& cache,
         std::function<void(std::size_t)> reserve,std::function<void(std::size_t)> reserve_ram) {
