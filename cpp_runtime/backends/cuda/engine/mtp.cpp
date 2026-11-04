@@ -352,6 +352,7 @@ template <class Model> struct CudaMtpOps {
     return timer.elapsed_ms();
   }
   PrefillResult prefill(mfq::engine::PrefillChunk chunk) {
+    mfq::cuda::PrefillAllocationScope allocation_scope;
     PrefillCudaTimer timer;
     bool prefill_finished=false;
     const auto finish_prefill=[&] {
@@ -601,6 +602,7 @@ template <class Model> struct CudaMtpOps {
     return 0;
   }
   double predictor_prefill(Tensor hidden, Tensor ids, Tensor positions) {
+    mfq::cuda::PrefillAllocationScope allocation_scope;
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(!cache_only_prompt_history() && model.reuse_decode_graphs && model.graph_registry && ids.size(1)<=128)
         end_predictor_prefill();
@@ -823,11 +825,11 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
                    std::size_t reused_tokens,
                    mfq_tensor_backend::Tensor restored_last_hidden,
                    mfq_tensor_backend::Tensor *session_last_hidden,
-                   std::size_t stable_prefix_tokens) {
+                   std::size_t stable_prefix_tokens, bool pressure_retry) {
   auto logical_chunk=prefill_chunk_size;
   if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
     logical_chunk=std::min<int64_t>(logical_chunk,8192);
-    if(prefill_chunk_size>8 && reused_tokens==0 && (!prepared || !prepared->transformed()) &&
+    if(!pressure_retry && prefill_chunk_size>8 && reused_tokens==0 && (!prepared || !prepared->transformed()) &&
         mfq::cuda::qwen4_layer_major_prefill_eligible(model,request.prompt.size()))
       logical_chunk=request.prompt.size();
   }
@@ -835,7 +837,8 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
     // Retained small-M continuations must bound decoder replay as well as
     // encoder tiles; merging the suffix would re-enter the large PP pipeline.
     const bool retained_chunks=reused_tokens>0 && prefill_chunk_size<=8;
-    if(!retained_chunks && (!prepared || !prepared->transformed()))logical_chunk=request.prompt.size();
+    if(!pressure_retry && !retained_chunks && (!prepared || !prepared->transformed()))
+      logical_chunk=request.prompt.size();
   }
   return mfq::engine::speculative_sequence(
       CudaMtpOps<Model>{model, mtp, prepared, prefill_chunk_size, &output}, request, output,
@@ -846,7 +849,7 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
   template Generation run_mtp_generation<MODEL>(                               \
       MODEL &, MtpModule &, InferenceRequest &, InferenceOutput &, int64_t,    \
       const CudaPreparedPrompt *, std::size_t, mfq_tensor_backend::Tensor,     \
-      mfq_tensor_backend::Tensor *, std::size_t)
+      mfq_tensor_backend::Tensor *, std::size_t, bool)
 
 MFQ_INSTANTIATE_MTP(mfq::cuda::Qwen35CausalLm);
 MFQ_INSTANTIATE_MTP(mfq::cuda::MiniCPMO45CausalLm);

@@ -14,6 +14,7 @@
 #include "mfe_expert_store.h"
 #include "moe_quant_range_source.h"
 #include "mfq/packed_nint_expert_store.h"
+#include "prefill_budget.h"
 #include <cstdlib>
 #include <cstdio>
 #include <atomic>
@@ -50,7 +51,7 @@ std::shared_ptr<mfq::NintRows> load_nint_row_table(
     return table;
 }
 
-MfeWeight load_mfe_gpu(
+static MfeWeight load_mfe_gpu_impl(
         CudaExecutionContext& execution,
         const mfq::ModelSource & mfq, const std::string & name,
         bool cacheable,
@@ -169,6 +170,27 @@ MfeWeight load_mfe_gpu(
     return all_nint
         ? to_gpu_mfe(cpu)
         : to_gpu_mixed_moe(cpu, execution.config);
+}
+
+MfeWeight load_mfe_gpu(CudaExecutionContext& execution,const mfq::ModelSource& source,
+        const std::string& name,bool cacheable,int layer_id,const std::string& projection_role) {
+    auto result=load_mfe_gpu_impl(execution,source,name,cacheable,layer_id,projection_role);
+    if(cacheable && (projection_role=="down" || name.ends_with(".experts.down.weight"))) {
+        const auto scratch_bytes=[](auto&& self,const MfeWeight& weight)->std::size_t {
+            std::size_t bytes=0;
+            for(const auto& geometry:weight.activation_geometries) {
+                const mfq::engine::PrefillMoeGeometry scratch{1,
+                    std::size_t(geometry.groups)*geometry.gs,std::size_t(geometry.gs)};
+                bytes=mfq::engine::prefill_budget_add(bytes,scratch.activation_bytes_per_token());
+            }
+            for(const auto& shard:weight.expert_parallel_shards)
+                bytes=std::max(bytes,self(self,*shard.weight));
+            return bytes;
+        };
+        execution.prefill_moe_route_bytes=std::max(execution.prefill_moe_route_bytes,
+            scratch_bytes(scratch_bytes,result));
+    }
+    return result;
 }
 
 std::shared_ptr<MixedMoeRuntime> load_mfe_cpu_offloaded(

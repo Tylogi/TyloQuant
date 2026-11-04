@@ -2630,6 +2630,7 @@ void release_moe_prefill_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
 void release_moe_prefill_buffers(MoeExpertCache* cache) {
     if(!cache)return;
     if(!cache->pipeline_prefill_copy_pending_ && cache->pipeline_prefill_release_.empty() &&
+            !cache->pipeline_prefill_activations_ &&
             !cache->pipeline_prefill_layer_buffer_.defined() && !cache->pipeline_prefill_pool_ &&
             !cache->pipeline_prefill_activations_ && cache->pipeline_prefill_host_workspaces_.empty() &&
             !cache->pipeline_prefill_route_publication_ &&

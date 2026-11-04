@@ -37,6 +37,33 @@ void record_gpu_timestamp(uint64_t* timestamps, std::size_t index, cudaStream_t 
     MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
 }
 namespace { thread_local bool resident_allocations=false; }
+namespace {
+thread_local unsigned prefill_allocation_depth=0;
+struct PrefillAllocationFault {
+    uint64_t remaining=0, interval=0, failures=1;
+    uint64_t scopes=0, first_scope=1;
+    PrefillAllocationFault() {
+        const auto parse=[](const char* name,uint64_t fallback) {
+            const auto* value=std::getenv(name);
+            if(!value || !*value)return fallback;
+            char* end=nullptr;
+            const auto result=std::strtoull(value,&end,10);
+            if(*value=='-' || !end || *end)throw std::invalid_argument(std::string("invalid ")+name);
+            return uint64_t(result);
+        };
+        remaining=interval=parse("MFQ_TEST_CUDA_PREFILL_FAIL_AFTER",0);
+        failures=parse("MFQ_TEST_CUDA_PREFILL_FAIL_COUNT",1);
+        first_scope=parse("MFQ_TEST_CUDA_PREFILL_FAIL_SCOPE",1);
+    }
+};
+thread_local PrefillAllocationFault prefill_allocation_fault;
+}
+PrefillAllocationScope::PrefillAllocationScope() {
+    if(!prefill_allocation_depth)++prefill_allocation_fault.scopes;
+    ++prefill_allocation_depth;
+}
+PrefillAllocationScope::~PrefillAllocationScope() { --prefill_allocation_depth; }
+
 ResidentAllocationScope::ResidentAllocationScope(bool enabled) noexcept
     :previous_(resident_allocations) {resident_allocations=enabled;}
 void ResidentAllocationScope::finish() noexcept {
@@ -194,9 +221,11 @@ void check(cudaError_t status, const char* expression, const char* file, int lin
             throw MfqBackendFailure(location_message(
                 "CUDA", cudaGetErrorString(status), expression, file, line));
         }
-        if (status == cudaErrorMemoryAllocation)
+        if (status == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
             throw MfqResourceExhausted(location_message(
                 "CUDA", cudaGetErrorString(status), expression, file, line));
+        }
         throw Error(location_message(
             "CUDA", cudaGetErrorString(status), expression, file, line));
     }
@@ -960,6 +989,13 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     if (bytes == 0) {
         return nullptr;
     }
+    auto& fault=prefill_allocation_fault;
+    if(prefill_allocation_depth && fault.scopes>=fault.first_scope &&
+            fault.remaining && fault.failures && !--fault.remaining) {
+        --fault.failures;
+        if(fault.failures)fault.remaining=fault.interval;
+        throw MfqResourceExhausted("injected CUDA prefill allocation failure: requested="+std::to_string(bytes));
+    }
     DeviceGuard guard(device_);
     const auto allocation_stream =
         stream != nullptr ? stream : stream_.get();
@@ -1069,9 +1105,11 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
             result=async ? cudaMallocFromPoolAsync(&pointer,bytes,allocation_pool,allocation_stream)
                 : cudaMalloc(&pointer,bytes);
         }
-        if(result==cudaErrorMemoryAllocation)
+        if(result==cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
             throw MfqResourceExhausted("CUDA allocation failed: requested="+std::to_string(bytes)+
                 " allocated="+std::to_string(memory_stats().allocated));
+        }
         MFQ_NATIVE_CUDA_CHECK(result);
         if(verify_pool_reuse)check_memory_limit();
         if(pooled_allocation) {

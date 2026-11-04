@@ -30,4 +30,4 @@ mfq::engine::Generation run_mtp_generation(
     const CudaPreparedPrompt* prepared = nullptr, std::size_t reused_tokens = 0,
     mfq_tensor_backend::Tensor restored_last_hidden = {},
     mfq_tensor_backend::Tensor* session_last_hidden = nullptr,
-    std::size_t stable_prefix_tokens = 0);
+    std::size_t stable_prefix_tokens = 0, bool pressure_retry = false);
