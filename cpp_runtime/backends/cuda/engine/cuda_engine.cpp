@@ -489,6 +489,27 @@ struct CudaEngineState {
                                   batched ? batching.get() : nullptr, id);
     }
     Generation generate(const RequestId& id, ExecutionRequest& request) {
+        if (!request.batched) {
+            if (batching) batching->release_idle_buffers();
+            auto context = mfq::cuda::default_context(execution->layer_placement.primary_device());
+            if (context->available_memory() == 0) {
+                // No request is active in the serial path. Retire the previous
+                // request's async frees before charging it to new admission.
+                context->reclaim_idle_memory();
+                if (context->available_memory() == 0) {
+                    release_graph_expert_space();
+                    graph.invalidate();
+                    if (components.mtp) components.mtp->reset(1);
+                    language.reset(1);
+                    release_moe_prefill_buffers(execution->moe_expert_cache);
+                    release_moe_decode_buffers(execution->moe_expert_cache);
+                    cache.trim_hot(0);
+                    context->reclaim_idle_memory();
+                    std::cerr << "runtime_admission_reclaim available_bytes="
+                              << context->available_memory() << '\n';
+                }
+            }
+        }
         if (request.batched) {
             graph.invalidate();
             if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
@@ -499,8 +520,6 @@ struct CudaEngineState {
                     if (components.mtp) components.mtp->reset(1);
                 }
             }
-        } else if (batching) {
-            batching->release_idle_buffers();
         }
         return generate_prepared(*this, request.input, request.output, id, request.batched);
     }

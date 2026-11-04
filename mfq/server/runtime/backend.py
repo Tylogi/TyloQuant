@@ -243,6 +243,13 @@ class OpenAIChatBackend:
                 "vision is disabled for this request; enable Vision to send images or video",
                 status_code=400,
             )
+        if self._contains_visual_media(messages):
+            from mfq.server.vision.decode import validate_image_messages
+
+            try:
+                await asyncio.to_thread(validate_image_messages, messages)
+            except VisionProcessingError as error:
+                raise BackendError("media_processing_error", str(error), status_code=400) from error
         capabilities = await self.capabilities()
         if model == capabilities.model:
             return
@@ -303,6 +310,7 @@ class OpenAIChatBackend:
             raise BackendError(
                 "vision_disabled",
                 "vision is disabled for this request; enable Vision to send images or video",
+                status_code=400,
             )
         if self._contains_media(backend_messages):
             if self._model_type is None:
@@ -324,7 +332,7 @@ class OpenAIChatBackend:
                         use_binary_file=self._local_tensor_files,
                     )
                 except VisionProcessingError as error:
-                    raise BackendError("media_processing_error", str(error)) from error
+                    raise BackendError("media_processing_error", str(error), status_code=400) from error
                 processor_ms = (time.perf_counter() - processor_started) * 1000.0
                 if processed is not None:
                     backend_messages = processed.messages
@@ -334,6 +342,7 @@ class OpenAIChatBackend:
                 raise BackendError(
                     "media_processing_unsupported",
                     f"the loaded {self._model_type or 'unknown'} model has no registered media processor",
+                    status_code=400,
                 )
         payload = {
             "model": model,

@@ -1,6 +1,25 @@
 # Backend-neutral graph, policies, interfaces, and generated tables.
 
 find_package(Threads REQUIRED)
+add_library(mfq-fatal-diagnostics STATIC fatal_diagnostics.cpp)
+target_include_directories(mfq-fatal-diagnostics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(mfq-fatal-diagnostics PUBLIC cxx_std_17)
+set_target_properties(mfq-fatal-diagnostics PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(MFQ_ENABLE_FATAL_TESTS)
+    target_compile_definitions(mfq-fatal-diagnostics PRIVATE MFQ_ENABLE_FATAL_TESTS=1)
+endif()
+if(WIN32)
+    target_link_libraries(mfq-fatal-diagnostics PRIVATE dbghelp)
+endif()
+if(MSVC)
+    target_compile_options(mfq-fatal-diagnostics PRIVATE /EHsc)
+elseif(APPLE)
+    target_link_options(mfq-fatal-diagnostics INTERFACE -Wl,-export_dynamic)
+elseif(UNIX)
+    target_link_options(mfq-fatal-diagnostics INTERFACE
+        "$<$<LINK_LANGUAGE:CUDA>:-Xlinker=--export-dynamic>"
+        "$<$<NOT:$<LINK_LANGUAGE:CUDA>>:-rdynamic>")
+endif()
 add_library(mfq-host-parallel STATIC host_parallel.cpp include/mfq/host_parallel.h
     host_copy.cpp include/mfq/host_copy.h
     cpu_expert_pool.cpp include/mfq/cpu_expert_pool.h)
@@ -78,6 +97,7 @@ set_target_properties(mfq-model-source PROPERTIES
 )
 
 add_library(mfq-core INTERFACE)
+target_link_libraries(mfq-core INTERFACE mfq-fatal-diagnostics)
 add_library(mfq-qsa-kv-store STATIC qsa_kv_store.cpp include/mfq/qsa_kv_store.h)
 target_include_directories(mfq-qsa-kv-store PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(mfq-qsa-kv-store PUBLIC Threads::Threads)
