@@ -118,7 +118,9 @@ def test_linear_forward_m9_uses_prefill_path():
 
 
 
-def test_linear_group_matches_separate_linears():
+@pytest.mark.parametrize("mixed_rows", [False, True])
+@pytest.mark.parametrize("activation_rows", [1, 2])
+def test_linear_group_matches_separate_linears(mixed_rows, activation_rows):
     din = 96
     specs = [NintSpec(4, 24, 6)] * 3
     tensors = [
@@ -126,9 +128,17 @@ def test_linear_group_matches_separate_linears():
         nint_quant.quantize(_W(22, (16, din)), specs[1]),
         nint_quant.quantize(_W(23, (8, din)), specs[2]),
     ]
+    if mixed_rows:
+        tensors = [
+            nint_quant.quantize(
+                _W(21 + index, (rows, din)), specs[index],
+                row_q_bits=np.resize(np.roll(np.arange(1, 9, dtype=np.uint8), index), rows),
+            )
+            for index, rows in enumerate((32, 16, 8))
+        ]
     group = TorchNintLinearGroup(tensors, DEV)
     linears = [TorchNintLinear(t, DEV) for t in tensors]
-    x = torch.as_tensor(_W(24, (2, din)) * 3, device=DEV, dtype=torch.float16)
+    x = torch.as_tensor(_W(24, (activation_rows, din)) * 3, device=DEV, dtype=torch.float16)
     y_group = torch.cat(group(x), dim=-1)
     y_ref = torch.cat([lin(x) for lin in linears], dim=-1)
     torch.testing.assert_close(y_group, y_ref, atol=0, rtol=0)

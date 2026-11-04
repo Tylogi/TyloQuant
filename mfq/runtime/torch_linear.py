@@ -406,6 +406,13 @@ def _cat_nint_gpu_dicts(gs: Sequence[dict]) -> dict:
             fused[key] = torch.cat(values, dim=0).contiguous()
         elif key in fused:
             fused.pop(key, None)
+    fused["row_q_bits"] = torch.cat([g["row_q_bits"] for g in gs]).contiguous()
+    row_offsets = []
+    bit_offset = 0
+    for g in gs:
+        row_offsets.append(g["row_q_bit_offsets"] + bit_offset)
+        bit_offset += g["q_packed"].numel() * 8
+    fused["row_q_bit_offsets"] = torch.cat(row_offsets).contiguous()
     for key in (
         "q_mmq_packed",
         "q_prefill_u8_mmq",
