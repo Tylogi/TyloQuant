@@ -1,0 +1,47 @@
+{
+  "stage": ["r0"],
+  "quantize": {
+    "enabled": true,
+    "source": null,
+    "backend": "cpu",
+    "device": "cpu",
+    "bits": 4,
+    "groupsize": 24,
+    "sub_bits": 6,
+    "text_only": true,
+    "timeout_sec": 3600
+  },
+  "artifact": null,
+  "expect_sha256": null,
+  "expect_records": null,
+  "expect_arch": null,
+  "service": {
+    "base_url": "http://127.0.0.1:8090",
+    "model": null,
+    "question": "只回答数字：2+3 等于多少？",
+    "answer_pattern": "(?:^|[=\\s:：])\\s*5\\s*[。.!！]?\\s*$",
+    "max_tokens": 64,
+    "temperature": 0,
+    "timeout_sec": 180,
+    "require": false
+  },
+  "app": {
+    "register_dir": null,
+    "artifact_name": null,
+    "load_timeout_sec": 300
+  },
+  "stream": {
+    "timeout_sec": 180
+  },
+  "multi_turn": {
+    "timeout_sec": 180
+  },
+  "unload_switch": {
+    "model_b": null,
+    "load_timeout_sec": 300
+  },
+  "negative": {
+    "timeout_sec": 180
+  },
+  "report": null
+}
