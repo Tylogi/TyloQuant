@@ -1,0 +1,66 @@
+{
+  "$comment": "e2e 回归测试使用的派生 .mfq 产物校验清单。产物体积大（484,845,334 字节/个），不随仓库提交；复跑前请先按本清单校验。",
+  "checked_at": "2026-11-06",
+  "checked_on": [
+    "Windows 11 (portable 0.4.0+dev.867b54f2.modified)",
+    "WSL2 Ubuntu 26.04 + RTX 4060 (source-level mfq serve)"
+  ],
+  "source_model": {
+    "provider": "modelscope",
+    "model_id": "Qwen/Qwen3.5-0.8B",
+    "revision": "4d58a7b524cd33ed843d5125be8cd8f0a452d9bf",
+    "lock_file": "docs/test-models/modelscope-qwen3.5-0.8b.lock.json"
+  },
+  "runtime_artifacts": [
+    {
+      "names": [
+        "qwen35-0.8b-nint4-source-current.mfq",
+        "qwen35-0.8b-nint4-source-rerun-20261103.mfq"
+      ],
+      "size_bytes": 484845334,
+      "sha256": "26ed9eee9af0f38232c404984f1b8caa2f31896735ab1b8b7d5b5a3fdee9a9d2",
+      "header_version": 2,
+      "arch": "qwen3_5-hf-mfq-nint-recipe",
+      "records": 340,
+      "dtypes": ["BF16", "BLOB", "F32", "NINT"],
+      "embedded_assets": [
+        "__mfq_asset__/model_config.json",
+        "__mfq_asset__/model_graph.json",
+        "__mfq_asset__/hf/tokenizer.json",
+        "__mfq_asset__/hf/tokenizer_config.json",
+        "__mfq_asset__/hf/chat_template.jinja"
+      ],
+      "note": "两个文件名内容完全相同（同一 SHA-256），分别用作 unload_switch 的模型 A / 模型 B。Windows 与 Linux 读取到的 SHA、记录数、dtypes、内嵌资产一致。",
+      "used_by_stages": [
+        "artifact",
+        "app",
+        "service",
+        "session",
+        "stream",
+        "multi_turn",
+        "unload_switch",
+        "negative"
+      ]
+    }
+  ],
+  "generated_fixtures": [
+    {
+      "name": "tiny-r0.mfq",
+      "produced_by": "r0 stage: 确定性 tiny HF fixture -> mfq quantize (CPU)",
+      "size_bytes": 2441,
+      "sha256": "d0dea5dc2ddabf1230d4664abeeabd2f247fdbf5042b9e3ae79fd9f67196c07a",
+      "header_version": 2,
+      "arch": "qwen3_5-hf-mfq-nint-recipe",
+      "records": 4,
+      "embedded_assets": [
+        "__mfq_asset__/model_config.json",
+        "__mfq_asset__/model_graph.json"
+      ],
+      "note": "每次 r0 运行重新生成；同机同环境逐字节一致（Windows 与 Linux 实测 SHA 相同）。参数见 tests/e2e/app_regression.config.example.json 的 quantize 段。"
+    }
+  ],
+  "verification": [
+    "sha256sum qwen35-0.8b-nint4-source-current.mfq qwen35-0.8b-nint4-source-rerun-20261103.mfq",
+    "python tests/e2e/app_regression.py --stage artifact --artifact <path>/qwen35-0.8b-nint4-source-rerun-20261103.mfq --expect-sha256 26ed9eee9af0f38232c404984f1b8caa2f31896735ab1b8b7d5b5a3fdee9a9d2 --expect-records 340 --expect-arch qwen3_5-hf-mfq-nint-recipe"
+  ]
+}

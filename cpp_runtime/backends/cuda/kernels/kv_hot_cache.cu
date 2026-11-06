@@ -458,7 +458,8 @@ void batch_attention_store(const BatchDecodeInputs& inputs, int64_t field,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             nullptr, nullptr, 0, 0, false, false, false, false, false,
             inputs.states().data_ptr<int64_t>(), inputs.enabled().data_ptr<int64_t>(),
-            int(inputs.rows()), int(field + 4), -1);
+            int(inputs.rows()), int(field + 4), -1,
+            default_context(keys.get_device())->input_error(mfq_current_cuda_stream()));
     };
     if(key.scalar_type() == tb::kFloat16)
         launch(uint16_t{});
