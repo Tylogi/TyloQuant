@@ -119,5 +119,14 @@ License: Apache-2.0 (`LICENSE`)
 Source: https://github.com/jundot/omlx
 Reference: omlx/patches/mlx_lm_mtp/batch_policy.py
 
+GPTQModel / EXL3
+---------------
+The experimental row Trellis encoder adapts GPTQModel's MLX two-pass Viterbi
+implementation at revision 7cac0a35ad5c8bfa116b3194ab2a453cff441d84.
+Copyright (c) 2026 ModelCloud.ai
+EXL3 quantization formats: TurboDerp and ExLlamaV3 contributors.
+License: Apache License 2.0 (`LICENSE`)
+Source: https://github.com/ModelCloud/GPTQModel
+
 The third-party license notices above must accompany source and binary
 distributions that contain these components or substantial portions of them.
